@@ -33,7 +33,8 @@ jobs:
         with:
           images: ghcr.io/${{ github.repository }}
           tags: |
-            type=sha,prefix=
+            type=ref,event=tag
+            type=raw,value=${{ github.run_number }},enable={{is_default_branch}}
             type=raw,value=latest,enable={{is_default_branch}}
 
       - name: Build and push image
@@ -51,8 +52,11 @@ jobs:
         id: deploytag
         if: github.event_name == 'push'
         run: |
-          short_sha=$(echo "${{ github.sha }}" | cut -c1-7)
-          echo "tag=${short_sha}" >> "$GITHUB_OUTPUT"
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Trigger bbc-devops auto-deploy
         if: github.event_name == 'push'
