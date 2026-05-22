@@ -1,4 +1,4 @@
-name: Build and Deploy to DO App Platform
+name: Build and dispatch deploy
 
 on:
   push:
@@ -70,19 +70,3 @@ jobs:
               "version": "${{ steps.deploytag.outputs.tag }}",
               "host": "bbc-evo"
             }
-
-  # Legacy App Platform deploy. After Phase 4.1 cutover (evo.respon.io DNS
-  # flipped to bbc-evo droplet), this job is dead weight — `apps create-deployment`
-  # will run against a scaled-to-0 component. Remove in the cutover follow-up PR.
-  deploy:
-    needs: build
-    if: github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Install doctl
-        uses: digitalocean/action-doctl@v2
-        with:
-          token: ${{ secrets.DIGITALOCEAN_ACCESS_TOKEN }}
-
-      - name: Trigger deployment
-        run: doctl apps create-deployment ${{ secrets.DO_APP_ID }} --force-rebuild
