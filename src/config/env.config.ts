@@ -29,6 +29,10 @@ export type Log = {
   BAILEYS: LogBaileys;
 };
 
+export type BaileysConfig = {
+  FORCE_GROUP_SENDER_KEY_REFRESH: boolean;
+};
+
 export type ProviderSession = {
   ENABLED: boolean;
   HOST: string;
@@ -404,6 +408,7 @@ export interface Env {
   WEBSOCKET: Websocket;
   WA_BUSINESS: WaBusiness;
   LOG: Log;
+  BAILEYS: BaileysConfig;
   DEL_INSTANCE: DelInstance;
   DEL_TEMP_INSTANCES: boolean;
   LANGUAGE: Language;
@@ -736,6 +741,9 @@ export class ConfigService {
           (['ERROR', 'WARN', 'DEBUG', 'INFO', 'LOG', 'VERBOSE', 'DARK', 'WEBHOOKS', 'WEBSOCKET'] as LogLevel[]),
         COLOR: process.env?.LOG_COLOR === 'true',
         BAILEYS: (process.env?.LOG_BAILEYS as LogBaileys) || 'error',
+      },
+      BAILEYS: {
+        FORCE_GROUP_SENDER_KEY_REFRESH: process.env?.BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH === 'true',
       },
       DEL_INSTANCE: isBooleanString(process.env?.DEL_INSTANCE)
         ? process.env.DEL_INSTANCE === 'true'

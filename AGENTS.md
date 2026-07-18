@@ -36,6 +36,16 @@ This document provides comprehensive guidelines for AI agents (Claude, GPT, Curs
 - **`public/`** – Static assets and media files
 - **`Docker*`**, **`docker-compose*.yaml`** – Containerization and local development stack
 
+### Production Compatibility Guard: Group Sender Keys
+- `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH` is a local mitigation for
+  [WhiskeySockets/Baileys#2704](https://github.com/WhiskeySockets/Baileys/issues/2704).
+- Before every Evolution API or Baileys upgrade, read
+  `docs/operations/baileys-group-sender-key-refresh.md` and re-run its mobile plus linked-device acceptance test.
+- Do not remove the mitigation solely because the dependency version changed. Remove it only after the upstream fix is
+  identified and the regression test passes with the flag disabled.
+- Any reset must use `this.client.authState.keys`, not the underlying instance store, so the Baileys signal-key cache is
+  invalidated too.
+
 ## Build, Test, and Development Commands
 
 ### Development Workflow
@@ -352,4 +362,3 @@ export DATABASE_PROVIDER=postgresql  # or mysql
 - **Error tracking**: Comprehensive error scenarios
 - **Health checks**: Instance status and connection monitoring
 - **Telemetry**: Usage analytics (non-sensitive data only)
-
