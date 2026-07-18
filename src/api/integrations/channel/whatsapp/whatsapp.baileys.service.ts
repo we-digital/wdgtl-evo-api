@@ -227,6 +227,10 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 
 export class BaileysStartupService extends ChannelStartupService {
   private messageProcessor = new BaileysMessageProcessor();
+  private readonly groupSenderKeyRepairs = new WeakMap<
+    WASocket,
+    Map<string, Promise<{ groupJid: string; participantCount: number; deviceCount: number; sessionCount: number }>>
+  >();
 
   constructor(
     public readonly configService: ConfigService,
@@ -1908,6 +1912,15 @@ export class BaileysStartupService extends ChannelStartupService {
               this.instance.authState.saveCreds();
             }
 
+            if (events['identity-change']) {
+              const recovery = events['identity-change'];
+              this.logger.info(
+                `Identity recovery for ${recovery.jid}: ${recovery.refreshedSessions} sessions refreshed, ` +
+                  `${recovery.deviceEntriesRemoved} sender-key entries removed from ${recovery.groupsUpdated}/` +
+                  `${recovery.groupsChecked} groups`,
+              );
+            }
+
             if (events['messaging-history.set']) {
               const payload = events['messaging-history.set'];
               await this.messageHandle['messaging-history.set'](payload);
@@ -2128,10 +2141,38 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  private async refreshGroupSenderKey(groupJid: string): Promise<void> {
+  private async refreshGroupSenderKey(groupJid: string): Promise<boolean> {
     const baileysConfig = this.configService.get<BaileysConfig>('BAILEYS');
 
-    if (!baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH) return;
+    if (!baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH) return false;
+
+    let clientRepairs = this.groupSenderKeyRepairs.get(this.client);
+    if (!clientRepairs) {
+      clientRepairs = new Map();
+      this.groupSenderKeyRepairs.set(this.client, clientRepairs);
+    }
+
+    let repair = clientRepairs.get(groupJid);
+    const isFirstRepairForConnection = !repair;
+
+    if (!repair) {
+      repair = this.client.repairGroupSenderKeyDistribution(groupJid).catch((error) => {
+        clientRepairs.delete(groupJid);
+        throw error;
+      });
+      clientRepairs.set(groupJid, repair);
+    }
+
+    if (isFirstRepairForConnection) {
+      const result = await repair;
+      this.logger.info(
+        `Fully repaired sender keys for group ${groupJid}: ${result.participantCount} participants, ` +
+          `${result.deviceCount} devices, ${result.sessionCount} sessions`,
+      );
+      return true;
+    }
+
+    await repair;
 
     // Baileys can retain stale device identities in sender-key-memory after a
     // group member changes phones. Use the client's cache-aware key store so
@@ -2144,6 +2185,7 @@ export class BaileysStartupService extends ChannelStartupService {
     });
 
     this.logger.debug(`Reset sender-key-memory for group ${groupJid}`);
+    return false;
   }
 
   private async sendMessage(
@@ -2162,8 +2204,8 @@ export class BaileysStartupService extends ChannelStartupService {
     const option: any = { quoted };
 
     if (isJidGroup(sender)) {
-      await this.refreshGroupSenderKey(sender);
-      option.useCachedGroupMetadata = true;
+      const usedFreshGroupMetadata = await this.refreshGroupSenderKey(sender);
+      option.useCachedGroupMetadata = !usedFreshGroupMetadata;
       // if (participants)
       //   option.cachedGroupMetadata = async () => {
       //     return { participants: participants as GroupParticipant[] };
