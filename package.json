@@ -77,7 +77,7 @@
     "amqplib": "^0.10.5",
     "audio-decode": "^2.2.3",
     "axios": "^1.7.9",
-    "baileys": "https://github.com/we-digital/Baileys/releases/download/wdgtl-v7.0.0-rc.9.2/baileys-7.0.0-rc.9-wdgtl.2.tgz",
+    "baileys": "https://github.com/we-digital/Baileys/releases/download/wdgtl-v7.0.0-rc.9.3/baileys-7.0.0-rc.9-wdgtl.3.tgz",
     "class-validator": "^0.14.1",
     "compression": "^1.7.5",
     "cors": "^2.8.5",
