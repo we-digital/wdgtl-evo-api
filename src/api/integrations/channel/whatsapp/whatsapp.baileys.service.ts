@@ -63,6 +63,7 @@ import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.type
 import { CacheEngine } from '@cache/cacheengine';
 import {
   AudioConverter,
+  BaileysConfig,
   CacheConf,
   Chatwoot,
   ConfigService,
@@ -2127,6 +2128,24 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  private async refreshGroupSenderKey(groupJid: string): Promise<void> {
+    const baileysConfig = this.configService.get<BaileysConfig>('BAILEYS');
+
+    if (!baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH) return;
+
+    // Baileys can retain stale device identities in sender-key-memory after a
+    // group member changes phones. Use the client's cache-aware key store so
+    // the next send redistributes the group sender key to current devices.
+    // See docs/operations/baileys-group-sender-key-refresh.md.
+    await this.client.authState.keys.set({
+      'sender-key-memory': {
+        [groupJid]: null,
+      },
+    });
+
+    this.logger.debug(`Reset sender-key-memory for group ${groupJid}`);
+  }
+
   private async sendMessage(
     sender: string,
     message: any,
@@ -2143,6 +2162,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const option: any = { quoted };
 
     if (isJidGroup(sender)) {
+      await this.refreshGroupSenderKey(sender);
       option.useCachedGroupMetadata = true;
       // if (participants)
       //   option.cachedGroupMetadata = async () => {
