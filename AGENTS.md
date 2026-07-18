@@ -37,14 +37,18 @@ This document provides comprehensive guidelines for AI agents (Claude, GPT, Curs
 - **`Docker*`**, **`docker-compose*.yaml`** – Containerization and local development stack
 
 ### Production Compatibility Guard: Group Sender Keys
-- `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH` is a local mitigation for
+- `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH` and the controlled `we-digital/Baileys` release are a compatibility layer for
   [WhiskeySockets/Baileys#2704](https://github.com/WhiskeySockets/Baileys/issues/2704).
 - Before every Evolution API or Baileys upgrade, read
   `docs/operations/baileys-group-sender-key-refresh.md` and re-run its mobile plus linked-device acceptance test.
-- Do not remove the mitigation solely because the dependency version changed. Remove it only after the upstream fix is
-  identified and the regression test passes with the flag disabled.
+- Do not replace the pinned fork with a registry version or floating Git branch solely because the dependency version
+  changed. Diff every recovery behavior, identify the exact upstream fix, and run the identity-change regression test.
+- The fork release, commit and lockfile integrity are recorded in the runbook. New fork builds require a new immutable
+  release; never retag or replace an existing artifact.
 - Any reset must use `this.client.authState.keys`, not the underlying instance store, so the Baileys signal-key cache is
   invalidated too.
+- Remove the controlled fork or feature flag only after the runbook's disabled-layer test passes on a phone whose Signal
+  identity actually changed, including primary mobile and linked devices.
 
 ## Build, Test, and Development Commands
 
