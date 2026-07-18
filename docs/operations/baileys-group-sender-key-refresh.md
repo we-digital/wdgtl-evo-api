@@ -27,9 +27,9 @@ also had to be refreshed.
 Production uses the controlled public fork [we-digital/Baileys](https://github.com/we-digital/Baileys), not an untracked
 working-tree patch:
 
-- release: [`wdgtl-v7.0.0-rc.9.1`](https://github.com/we-digital/Baileys/releases/tag/wdgtl-v7.0.0-rc.9.1)
-- package version: `7.0.0-rc.9-wdgtl.1`
-- fork commit: `ac4f3dd5736465a07fdaaf1dcc64764d930e9f34`
+- release: [`wdgtl-v7.0.0-rc.9.2`](https://github.com/we-digital/Baileys/releases/tag/wdgtl-v7.0.0-rc.9.2)
+- package version: `7.0.0-rc.9-wdgtl.2`
+- fork commit: `ffbb936744595d20acabd9145ae3a1887be02b5d`
 - upstream base: `v7.0.0-rc.9` / `cb8b3717aaede47460ba700651ee936f268c0ce4`
 - release asset SHA-512 is pinned by `package-lock.json`
 
@@ -41,6 +41,11 @@ The release implements four recovery paths:
    pairwise sessions, and reset the group's sender-key delivery memory.
 3. Before later sends, retain the inexpensive group-memory reset as a defense-in-depth fallback.
 4. On a participant-hash rejection, perform a bounded full repair and retry the original message once.
+
+The identity scan calls `groupFetchAllParticipating(false)`. The `false` is operationally important: emitting
+`groups.update` caused Evolution API to fan out a metadata query for every group. On the 2026-07-18 production rollout,
+an account with 114 groups generated 94 WhatsApp `rate-overlimit` responses. Release `.2` suppresses events only for the
+internal recovery scan while preserving the public method's default behavior.
 
 `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH=true` enables the proactive send-time paths in Evolution API. Identity-change
 and participant-hash recovery live in the fork and remain event-driven.
@@ -70,7 +75,7 @@ The production flag is owned by `we-digital/bbc-devops` in `droplets/evo/runtime
 1. Set `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH=true` in the production runtime environment.
 2. Verify `package.json` and `package-lock.json` point to the immutable controlled release asset above.
 3. Build and deploy the Evolution API image containing the compatibility layer.
-4. Confirm the container package reports `7.0.0-rc.9-wdgtl.1` and the recovery log appears on the next group send.
+4. Confirm the container package reports `7.0.0-rc.9-wdgtl.2` and the recovery log appears on the next group send.
 5. Send a new test message and verify it on the affected primary mobile and linked devices. Old placeholders cannot be
    repaired because their ciphertext was already delivered without an available key.
 6. Roll back the application image first if runtime errors appear. The prior image uses the same auth/database state.
@@ -95,8 +100,9 @@ Before upgrading Evolution API or Baileys:
 
 1. Read this runbook and the fork's `FORK_NOTES.md` before changing Evolution API or Baileys.
 2. Check issue #2704, related sender-key/SKDM changes, and upstream PRs. An open or version-bumped PR is not a fix.
-3. Diff the candidate upstream source against fork commit `ac4f3dd5`; account for identity notifications, PN/LID aliases,
-   device-cache eviction, forced session refresh, sender-key invalidation, and participant-hash retry separately.
+3. Diff the candidate upstream source against fork commit `ffbb9367`; account for identity notifications, PN/LID aliases,
+   device-cache eviction, forced session refresh, silent group enumeration, sender-key invalidation, and participant-hash
+   retry separately.
 4. Keep the controlled dependency and production flag unless every required behavior is present upstream.
 5. Generate Prisma, run `npm run build`, `npm run lint:check`, build the production Docker image, and run the acceptance
    test with the feature flag enabled.
