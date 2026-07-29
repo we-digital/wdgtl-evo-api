@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  dedupeHistoryMessagesBySourceId,
   normalizeStoredHistoryMessages,
   toCanonicalHistoryJid,
   toChatwootSourceId,
@@ -39,6 +40,17 @@ const message = ({
 test('normalizes Chatwoot source ids exactly once', () => {
   assert.equal(toChatwootSourceId('ABC'), 'WAID:ABC');
   assert.equal(toChatwootSourceId('WAID:ABC'), 'WAID:ABC');
+});
+
+test('deduplicates stored history rows by canonical Chatwoot source id', () => {
+  const first = message({ id: 'duplicate', remoteJid: '628111@s.whatsapp.net' });
+  const duplicate = message({ id: 'WAID:duplicate', remoteJid: '628222@s.whatsapp.net' });
+  const unique = message({ id: 'unique', remoteJid: '628333@s.whatsapp.net' });
+
+  const result = dedupeHistoryMessagesBySourceId([first, duplicate, unique]);
+
+  assert.deepEqual(result.messages, [first, unique]);
+  assert.equal(result.duplicateMessages, 1);
 });
 
 test('reuses stored LID mappings and skips groups and unresolved LIDs', async () => {

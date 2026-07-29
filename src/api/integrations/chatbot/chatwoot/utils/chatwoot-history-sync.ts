@@ -33,6 +33,30 @@ export type HistoryNormalizationOptions = {
 
 export const toChatwootSourceId = (sourceId: string) => `WAID:${sourceId.replace(/^WAID:/, '')}`;
 
+export const dedupeHistoryMessagesBySourceId = (messages: Message[]) => {
+  const seenSourceIds = new Set<string>();
+  const uniqueMessages: Message[] = [];
+  let duplicateMessages = 0;
+
+  for (const message of messages) {
+    const sourceId = readKey(message).id;
+    if (!sourceId) {
+      continue;
+    }
+
+    const canonicalSourceId = toChatwootSourceId(sourceId);
+    if (seenSourceIds.has(canonicalSourceId)) {
+      duplicateMessages++;
+      continue;
+    }
+
+    seenSourceIds.add(canonicalSourceId);
+    uniqueMessages.push(message);
+  }
+
+  return { messages: uniqueMessages, duplicateMessages };
+};
+
 export const isPhoneJid = (remoteJid?: string): remoteJid is string =>
   Boolean(remoteJid?.endsWith('@s.whatsapp.net') || remoteJid?.endsWith('@hosted'));
 
