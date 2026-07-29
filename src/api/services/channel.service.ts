@@ -357,9 +357,7 @@ export class ChannelStartupService {
   }
 
   public clearCacheChatwoot() {
-    if (this.localChatwoot?.enabled) {
-      this.chatwootService.getCache()?.deleteAll(this.instanceName);
-    }
+    this.chatwootService.getCache()?.deleteAll(this.instanceName);
   }
 
   public async loadProxy() {
