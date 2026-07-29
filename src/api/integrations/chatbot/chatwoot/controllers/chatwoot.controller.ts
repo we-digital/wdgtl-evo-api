@@ -1,5 +1,5 @@
 import { InstanceDto } from '@api/dto/instance.dto';
-import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
 import { Chatwoot, ConfigService, HttpServer } from '@config/env.config';
 import { BadRequestException } from '@exceptions';
@@ -80,5 +80,11 @@ export class ChatwootController {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 
     return this.chatwootService.receiveWebhook(instance, data);
+  }
+
+  public async syncHistory(instance: InstanceDto, data: ChatwootHistorySyncDto) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
+
+    return this.chatwootService.syncStoredHistory(instance, data);
   }
 }

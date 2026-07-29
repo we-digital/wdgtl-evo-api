@@ -21,6 +21,13 @@ export class ChatwootDto {
   ignoreJids?: string[];
 }
 
+export class ChatwootHistorySyncDto {
+  dryRun?: boolean;
+  since?: string;
+  remoteJid?: string;
+  limit?: number;
+}
+
 export function ChatwootInstanceMixin<TBase extends Constructor>(Base: TBase) {
   return class extends Base {
     chatwootAccountId?: string;
