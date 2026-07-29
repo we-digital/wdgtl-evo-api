@@ -437,16 +437,21 @@ class ChatwootImport {
               ),
 
               only_new_phone_number AS (
-                SELECT * FROM phone_number
-                WHERE phone_number NOT IN (
-                  SELECT phone_number
-                  FROM contacts
-                    JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
-                    JOIN conversations con ON con.contact_inbox_id = ci.id 
-                      AND con.account_id = $1
-                      AND con.inbox_id = $2
-                      AND con.contact_id = contacts.id
-                  WHERE contacts.account_id = $1
+                SELECT p.*
+                FROM phone_number p
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM contacts c
+                  JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
+                  JOIN conversations con ON con.contact_inbox_id = ci.id
+                    AND con.account_id = $1
+                    AND con.inbox_id = $2
+                    AND con.contact_id = c.id
+                  WHERE c.account_id = $1
+                    AND (
+                      c.phone_number = p.phone_number
+                      OR c.identifier = CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')
+                    )
                 )
               ),
 
@@ -455,7 +460,9 @@ class ChatwootImport {
                 SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1, CONCAT(REPLACE(p.phone_number, '+', ''),
                   '@s.whatsapp.net'), to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
                 FROM only_new_phone_number AS p
-                ON CONFLICT(identifier, account_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
+                ON CONFLICT(identifier, account_id) DO UPDATE SET
+                  phone_number = EXCLUDED.phone_number,
+                  updated_at = EXCLUDED.updated_at
                 RETURNING id, phone_number, created_at, updated_at
               ),
 
@@ -483,7 +490,11 @@ class ChatwootImport {
 
               SELECT p.phone_number, c.id contact_id, con.id conversation_id
                 FROM phone_number p
-              JOIN contacts c ON c.phone_number = p.phone_number
+              JOIN contacts c ON c.account_id = $1
+                AND (
+                  c.phone_number = p.phone_number
+                  OR c.identifier = CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')
+                )
               JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
               JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
                 AND con.inbox_id = $2 AND con.contact_id = c.id`;
