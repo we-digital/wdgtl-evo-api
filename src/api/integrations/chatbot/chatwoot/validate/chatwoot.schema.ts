@@ -53,8 +53,11 @@ export const chatwootHistorySyncSchema: JSONSchema7 = {
     since: { type: 'string', format: 'date-time' },
     remoteJid: {
       type: 'string',
-      pattern: '^[0-9]+@(s\\.whatsapp\\.net|lid)$',
+      pattern: '^[0-9:-]+@(s\\.whatsapp\\.net|hosted|lid|hosted\\.lid|g\\.us)$',
     },
     limit: { type: 'integer', minimum: 1, maximum: 4000 },
+    scope: { type: 'string', enum: ['direct', 'groups', 'all'] },
+    unresolvedLidMode: { type: 'string', enum: ['skip', 'provisional'] },
+    refreshLidMappings: { type: 'boolean' },
   },
 };

@@ -1912,6 +1912,19 @@ export class BaileysStartupService extends ChannelStartupService {
               this.instance.authState.saveCreds();
             }
 
+            if (events['lid-mapping.update'] && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+              const mapping = events['lid-mapping.update'];
+              try {
+                await this.chatwootService.reconcileLidIdentity(
+                  { instanceName: this.instance.name },
+                  mapping.lid,
+                  mapping.pn,
+                );
+              } catch (error) {
+                this.logger.error(`Unable to reconcile Chatwoot LID identity: ${error.toString()}`);
+              }
+            }
+
             if (events['identity-change']) {
               const recovery = events['identity-change'];
               this.logger.info(
@@ -4779,9 +4792,42 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  public async refreshLidMappingsForPhoneJids(phoneJids: string[]) {
+    const uniquePhoneJids = Array.from(new Set(phoneJids.filter((jid) => isPnUser(jid))));
+    const refreshedLids = new Set<string>();
+    const batchSize = 50;
+
+    for (let offset = 0; offset < uniquePhoneJids.length; offset += batchSize) {
+      const mappings = await this.client.signalRepository.lidMapping.getLIDsForPNs(
+        uniquePhoneJids.slice(offset, offset + batchSize),
+      );
+      mappings?.forEach((mapping) => refreshedLids.add(mapping.lid));
+      if (offset + batchSize < uniquePhoneJids.length) {
+        await delay(250);
+      }
+    }
+
+    return {
+      attemptedPhoneJids: uniquePhoneJids.length,
+      refreshedMappings: refreshedLids.size,
+    };
+  }
+
+  public async resolveGroupName(groupJid: string): Promise<string | null> {
+    if (!isJidGroup(groupJid)) {
+      return null;
+    }
+
+    const group = await this.getGroupMetadataCache(groupJid);
+    return group?.subject || group?.Name || null;
+  }
+
   private async syncChatwootLostMessages() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-      this.chatwootService.syncLostMessages({ instanceName: this.instance.name });
+      this.chatwootService
+        .syncLostMessages({ instanceName: this.instance.name })
+        .then(() => this.chatwootService.reconcileStoredLidContacts({ instanceName: this.instance.name }))
+        .catch((error) => this.logger.error(`Unable to run startup Chatwoot history reconciliation: ${error}`));
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
@@ -4802,6 +4848,26 @@ export class BaileysStartupService extends ChannelStartupService {
         this.chatwootService.syncLostMessages({ instanceName: this.instance.name });
       });
       task.start();
+
+      const reconcileCronId = cuid();
+      const reconcileCronKey = `chatwoot:reconcileLidContacts`;
+      await this.chatwootService.getCache()?.hSet(reconcileCronKey, this.instance.name, reconcileCronId);
+
+      const reconcileTask = cron.schedule('15 3 * * *', async () => {
+        const cache = this.chatwootService.getCache();
+        if (cache) {
+          const storedId = await cache.hGet(reconcileCronKey, this.instance.name);
+          if (storedId && storedId !== reconcileCronId) {
+            this.logger.info(
+              `Stopping reconcileStoredLidContacts cron - ID mismatch: ${reconcileCronId} vs ${storedId}`,
+            );
+            reconcileTask.stop();
+            return;
+          }
+        }
+        await this.chatwootService.reconcileStoredLidContacts({ instanceName: this.instance.name });
+      });
+      reconcileTask.start();
     }
   }
 

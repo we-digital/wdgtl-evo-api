@@ -4,8 +4,11 @@ import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/c
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import {
   buildStoredLidMap,
+  isGroupJid,
+  isLidJid,
   isPhoneJid,
   normalizeStoredHistoryMessages,
+  toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
@@ -51,6 +54,7 @@ interface ChatwootMessage {
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly activeStoredHistorySyncs = new Set<string>();
+  private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -528,7 +532,7 @@ export class ChatwootService {
     }
   }
 
-  private async mergeContacts(baseId: number, mergeId: number) {
+  public async mergeContacts(baseId: number, mergeId: number) {
     try {
       const contact = await chatwootRequest(this.getClientCwConfig(), {
         method: 'POST',
@@ -2663,6 +2667,206 @@ export class ChatwootService {
     return isPhoneJid(resolved) ? resolved : null;
   }
 
+  private async refreshKnownLidMappings(instance: InstanceDto, mappingMessages: Pick<MessageModel, 'key'>[]) {
+    const phoneJids = new Set<string>();
+    for (const message of mappingMessages) {
+      const key = message.key as { remoteJid?: string; remoteJidAlt?: string };
+      if (isPhoneJid(key?.remoteJid)) {
+        phoneJids.add(toCanonicalHistoryJid(key.remoteJid));
+      }
+      if (isPhoneJid(key?.remoteJidAlt)) {
+        phoneJids.add(toCanonicalHistoryJid(key.remoteJidAlt));
+      }
+    }
+
+    const [contacts, chats] = await Promise.all([
+      this.prismaRepository.contact.findMany({
+        where: { Instance: { name: instance.instanceName }, remoteJid: { endsWith: '@s.whatsapp.net' } },
+        select: { remoteJid: true },
+      }),
+      this.prismaRepository.chat.findMany({
+        where: { Instance: { name: instance.instanceName }, remoteJid: { endsWith: '@s.whatsapp.net' } },
+        select: { remoteJid: true },
+      }),
+    ]);
+    contacts.forEach((contact) => phoneJids.add(toCanonicalHistoryJid(contact.remoteJid)));
+    chats.forEach((chat) => phoneJids.add(toCanonicalHistoryJid(chat.remoteJid)));
+
+    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const result = await waInstance?.refreshLidMappingsForPhoneJids?.(Array.from(phoneJids));
+    return {
+      attemptedPhoneJids: phoneJids.size,
+      refreshedMappings: Number(result?.refreshedMappings || 0),
+    };
+  }
+
+  private async getGroupIdentityNames(instance: InstanceDto, messages: MessageModel[]) {
+    const groupJids = Array.from(
+      new Set(
+        messages
+          .map((message) => (message.key as { remoteJid?: string })?.remoteJid)
+          .filter((remoteJid): remoteJid is string => isGroupJid(remoteJid)),
+      ),
+    );
+    const identityNames = new Map<string, string>();
+    if (groupJids.length === 0) {
+      return identityNames;
+    }
+
+    const storedGroups = await this.prismaRepository.chat.findMany({
+      where: {
+        Instance: { name: instance.instanceName },
+        remoteJid: { in: groupJids },
+      },
+      select: { remoteJid: true, name: true },
+    });
+    storedGroups.forEach((group) => {
+      if (group.name?.trim()) {
+        identityNames.set(group.remoteJid, group.name.trim());
+      }
+    });
+
+    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const missingGroupJids = groupJids.filter((groupJid) => !identityNames.has(groupJid));
+    const batchSize = 5;
+    for (let offset = 0; offset < missingGroupJids.length; offset += batchSize) {
+      const batch = missingGroupJids.slice(offset, offset + batchSize);
+      const groupNames = await Promise.all(
+        batch.map(async (groupJid) => {
+          try {
+            return [groupJid, await waInstance?.resolveGroupName?.(groupJid)] as const;
+          } catch {
+            return [groupJid, null] as const;
+          }
+        }),
+      );
+      groupNames.forEach(([groupJid, groupName]) => {
+        if (groupName?.trim()) {
+          identityNames.set(groupJid, groupName.trim());
+        }
+      });
+    }
+
+    return identityNames;
+  }
+
+  private async enableExtendedHistorySync(instance: InstanceDto) {
+    await this.cache.hSet(this.extendedHistorySyncKey, instance.instanceName, true);
+  }
+
+  private async isExtendedHistorySyncEnabled(instance: InstanceDto) {
+    return Boolean(await this.cache.hGet(this.extendedHistorySyncKey, instance.instanceName));
+  }
+
+  private async removeUnresolvedLidLabel(contactId: number) {
+    await this.pgClient.query(
+      `WITH target_tag AS (
+         SELECT id FROM tags WHERE name = 'unresolved_lid' LIMIT 1
+       ),
+       removed AS (
+         DELETE FROM taggings
+         WHERE tag_id = (SELECT id FROM target_tag)
+           AND taggable_type = 'Contact'
+           AND taggable_id = $1
+           AND context = 'labels'
+         RETURNING tag_id
+       )
+       UPDATE tags
+       SET taggings_count = (
+         SELECT COUNT(*) FROM taggings
+         WHERE taggings.tag_id = tags.id
+           AND taggings.context = 'labels'
+       )
+       WHERE id = (SELECT id FROM target_tag)`,
+      [contactId],
+    );
+  }
+
+  public async reconcileLidIdentity(instance: InstanceDto, lid: string, phoneJid: string) {
+    if (!isLidJid(lid) || !isPhoneJid(phoneJid)) {
+      return { status: 'invalid_mapping' };
+    }
+
+    const client = await this.clientCw(instance);
+    if (!client) {
+      return { status: 'chatwoot_unavailable' };
+    }
+
+    const canonicalLid = toCanonicalHistoryJid(lid);
+    const canonicalPhoneJid = toCanonicalHistoryJid(phoneJid);
+    const provisionalContact = await this.findContactByIdentifier(instance, canonicalLid);
+    if (!provisionalContact?.id) {
+      return { status: 'no_provisional_contact' };
+    }
+
+    const phoneNumber = canonicalPhoneJid.split('@')[0].split(':')[0];
+    const canonicalContact =
+      (await this.findContactByIdentifier(instance, canonicalPhoneJid)) ||
+      (await this.findContact(instance, phoneNumber));
+
+    if (canonicalContact?.id && canonicalContact.id !== provisionalContact.id) {
+      const merged = await this.mergeContacts(canonicalContact.id, provisionalContact.id);
+      if (!merged) {
+        throw new Error(`Unable to merge provisional Chatwoot LID contact for ${instance.instanceName}`);
+      }
+      await this.removeUnresolvedLidLabel(canonicalContact.id);
+      return { status: 'merged' };
+    }
+
+    await this.updateContact(instance, provisionalContact.id, {
+      identifier: canonicalPhoneJid,
+      phone_number: `+${phoneNumber}`,
+    });
+    const updatedContact = await this.findContactByIdentifier(instance, canonicalPhoneJid);
+    if (updatedContact?.id !== provisionalContact.id) {
+      throw new Error(`Unable to update provisional Chatwoot LID contact for ${instance.instanceName}`);
+    }
+
+    await this.removeUnresolvedLidLabel(provisionalContact.id);
+    return { status: 'updated' };
+  }
+
+  public async reconcileStoredLidContacts(instance: InstanceDto) {
+    if (!this.isImportHistoryAvailable()) {
+      return { checked: 0, reconciled: 0 };
+    }
+
+    const provider = await this.getProvider(instance);
+    const inbox = await this.getInbox(instance);
+    if (!provider?.enabled || !inbox) {
+      return { checked: 0, reconciled: 0 };
+    }
+
+    const provisionalContacts = (
+      await this.pgClient.query(
+        `SELECT DISTINCT contacts.identifier
+         FROM contacts
+         JOIN contact_inboxes ON contact_inboxes.contact_id = contacts.id
+         WHERE contacts.account_id = $1
+           AND contact_inboxes.inbox_id = $2
+           AND (
+             contacts.identifier LIKE '%@lid'
+             OR contacts.identifier LIKE '%@hosted.lid'
+           )`,
+        [provider.accountId, inbox.id],
+      )
+    ).rows as Array<{ identifier: string }>;
+
+    let reconciled = 0;
+    for (const contact of provisionalContacts) {
+      const phoneJid = await this.resolvePhoneJidForLid(instance, contact.identifier);
+      if (!phoneJid) {
+        continue;
+      }
+      const result = await this.reconcileLidIdentity(instance, contact.identifier, phoneJid);
+      if (result.status === 'merged' || result.status === 'updated') {
+        reconciled++;
+      }
+    }
+
+    return { checked: provisionalContacts.length, reconciled };
+  }
+
   public async syncStoredHistory(instance: InstanceDto, data: ChatwootHistorySyncDto = {}) {
     if (!this.isImportHistoryAvailable()) {
       throw new BadRequestException('Chatwoot history import database connection is not configured');
@@ -2710,19 +2914,46 @@ export class ChatwootService {
               select: { key: true },
             });
 
-      const normalized = await normalizeStoredHistoryMessages(savedMessages, mappingMessages, (lid) =>
-        this.resolvePhoneJidForLid(instance, lid),
+      const scope = data.scope || 'direct';
+      const unresolvedLidMode = data.unresolvedLidMode || 'skip';
+      const lidMappingRefresh = data.refreshLidMappings
+        ? await this.refreshKnownLidMappings(instance, mappingMessages)
+        : { attemptedPhoneJids: 0, refreshedMappings: 0 };
+
+      const normalized = await normalizeStoredHistoryMessages(
+        savedMessages,
+        mappingMessages,
+        (lid) => this.resolvePhoneJidForLid(instance, lid),
+        {
+          includeGroups: scope === 'groups' || scope === 'all',
+          includeUnresolvedLids: unresolvedLidMode === 'provisional' && (scope === 'direct' || scope === 'all'),
+        },
       );
 
-      let targetRemoteJid = data.remoteJid;
-      if (targetRemoteJid?.endsWith('@lid')) {
+      let targetRemoteJid: string | null | undefined = data.remoteJid;
+      if (isLidJid(targetRemoteJid)) {
         const storedMapping = buildStoredLidMap(mappingMessages).get(targetRemoteJid);
-        targetRemoteJid = storedMapping || (await this.resolvePhoneJidForLid(instance, targetRemoteJid));
+        const resolvedMapping = storedMapping || (await this.resolvePhoneJidForLid(instance, targetRemoteJid));
+        targetRemoteJid =
+          resolvedMapping || (unresolvedLidMode === 'provisional' ? toCanonicalHistoryJid(targetRemoteJid) : null);
+      } else if (targetRemoteJid) {
+        targetRemoteJid = toCanonicalHistoryJid(targetRemoteJid);
       }
 
+      const scopedMessages = normalized.messages.filter((message: any) => {
+        const remoteJid = message.key?.remoteJid;
+        if (scope === 'groups') {
+          return isGroupJid(remoteJid);
+        }
+        if (scope === 'direct') {
+          return !isGroupJid(remoteJid);
+        }
+        return true;
+      });
+
       const routeMessages = targetRemoteJid
-        ? normalized.messages.filter((message: any) => message.key?.remoteJid === targetRemoteJid)
-        : normalized.messages;
+        ? scopedMessages.filter((message: any) => message.key?.remoteJid === targetRemoteJid)
+        : scopedMessages;
 
       const existingSourceIds = await chatwootImport.getExistingSourceIds(
         routeMessages.map((message: any) => message.key.id),
@@ -2738,41 +2969,83 @@ export class ChatwootService {
       );
       const selectedMessages = data.limit ? importableMessages.slice(0, data.limit) : importableMessages;
       const dryRun = data.dryRun !== false;
+      const selectedGroupMessages = selectedMessages.filter((message: any) =>
+        isGroupJid(message.key?.remoteJid),
+      ).length;
+      const selectedProvisionalLidMessages = selectedMessages.filter((message: any) =>
+        isLidJid(message.key?.remoteJid),
+      ).length;
 
       const result = {
         status: dryRun ? 'dry_run' : 'completed',
         instanceName: instance.instanceName,
         inboxId: inbox.id,
         since: data.since || null,
+        scope,
+        unresolvedLidMode,
+        attemptedPhoneJids: lidMappingRefresh.attemptedPhoneJids,
+        refreshedLidMappings: lidMappingRefresh.refreshedMappings,
         remoteJidFiltered: Boolean(data.remoteJid),
         sourceMessages: normalized.stats.sourceMessages,
         directMessages: normalized.stats.directMessages,
-        groupMessagesSkipped: normalized.stats.groupMessages,
+        groupMessages: normalized.stats.groupMessages,
+        groupMessagesSkipped: scope === 'direct' ? normalized.stats.groupMessages : 0,
         systemMessagesSkipped: normalized.stats.systemMessages,
         invalidMessagesSkipped: normalized.stats.invalidMessages,
-        unresolvedLidMessagesSkipped: normalized.stats.unresolvedLidMessages,
-        unresolvedLidChatsSkipped: normalized.stats.unresolvedLidChats,
+        unresolvedLidMessages: normalized.stats.unresolvedLidMessages,
+        unresolvedLidChats: normalized.stats.unresolvedLidChats,
+        provisionalLidMessages: normalized.stats.provisionalLidMessages,
+        unresolvedLidMessagesSkipped:
+          unresolvedLidMode === 'provisional' && scope !== 'groups' ? 0 : normalized.stats.unresolvedLidMessages,
+        unresolvedLidChatsSkipped:
+          unresolvedLidMode === 'provisional' && scope !== 'groups' ? 0 : normalized.stats.unresolvedLidChats,
         normalizedMessages: normalized.stats.normalizedMessages,
         routeMessages: routeMessages.length,
         existingMessages: routeMessages.length - missingMessages.length,
         unsupportedMessagesSkipped: missingMessages.length - importableMessages.length,
         selectedMessages: selectedMessages.length,
+        selectedGroupMessages,
+        selectedProvisionalLidMessages,
         importedMessages: 0,
+        appliedMessages: 0,
       };
 
-      if (dryRun || selectedMessages.length === 0) {
+      if (dryRun) {
+        return result;
+      }
+      if (selectedMessages.length === 0) {
+        if (scope === 'all' && unresolvedLidMode === 'provisional') {
+          await this.enableExtendedHistorySync(instance);
+        }
         return result;
       }
 
+      const identityNames = await this.getGroupIdentityNames(instance, selectedMessages);
+      chatwootImport.addHistoryIdentityNames(instance, identityNames);
       this.addHistoryMessages(instance, selectedMessages);
       const importedMessages = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
       if (!Number.isInteger(importedMessages)) {
         throw new Error(`Chatwoot history import failed for ${instance.instanceName}`);
       }
 
+      const appliedSourceIds = await chatwootImport.getExistingSourceIds(
+        selectedMessages.map((message: any) => message.key.id),
+        undefined,
+        inbox.id,
+      );
+      if (appliedSourceIds.size !== selectedMessages.length) {
+        throw new Error(
+          `Chatwoot history import only applied ${appliedSourceIds.size}/${selectedMessages.length} messages for ${instance.instanceName}`,
+        );
+      }
+
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       waInstance?.clearCacheChatwoot?.();
       result.importedMessages = Number(importedMessages);
+      result.appliedMessages = appliedSourceIds.size;
+      if (scope === 'all' && unresolvedLidMode === 'provisional') {
+        await this.enableExtendedHistorySync(instance);
+      }
 
       return result;
     } finally {
@@ -2786,9 +3059,12 @@ export class ChatwootService {
         return;
       }
 
+      const extendedHistorySync = await this.isExtendedHistorySyncEnabled(instance);
       return await this.syncStoredHistory(instance, {
         dryRun: false,
         since: dayjs().subtract(6, 'hours').toISOString(),
+        scope: extendedHistorySync ? 'all' : 'direct',
+        unresolvedLidMode: extendedHistorySync ? 'provisional' : 'skip',
       });
     } catch (error) {
       this.logger.error(`Error on incremental Chatwoot history sync: ${error.toString()}`);

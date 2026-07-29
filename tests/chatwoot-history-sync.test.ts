@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
   normalizeStoredHistoryMessages,
+  toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { Message } from '@prisma/client';
 
 const message = ({
@@ -12,17 +14,24 @@ const message = ({
   remoteJid,
   remoteJidAlt,
   fromMe = false,
+  participant,
+  participantAlt,
+  pushName,
   timestamp = 1_700_000_000,
 }: {
   id: string;
   remoteJid: string;
   remoteJidAlt?: string;
   fromMe?: boolean;
+  participant?: string;
+  participantAlt?: string;
+  pushName?: string;
   timestamp?: number;
 }) =>
   ({
     id,
-    key: { id, remoteJid, remoteJidAlt, fromMe },
+    key: { id, remoteJid, remoteJidAlt, participant, participantAlt, fromMe },
+    pushName,
     message: { conversation: id },
     messageTimestamp: timestamp,
   }) as Message;
@@ -68,4 +77,48 @@ test('uses the live resolver once per unresolved LID', async () => {
   assert.equal(result.messages.length, 2);
   assert.equal(result.stats.unresolvedLidMessages, 0);
   assert.ok(result.messages.every((item) => (item.key as any).remoteJid === '628333@s.whatsapp.net'));
+});
+
+test('can include groups and provisional LIDs without inventing phone mappings', async () => {
+  const group = message({
+    id: 'group',
+    remoteJid: '123-456@g.us',
+    participant: '628123@s.whatsapp.net',
+    pushName: 'Participant',
+  });
+  const unresolved = message({ id: 'unresolved', remoteJid: '222:7@lid', pushName: 'LID Contact' });
+
+  const result = await normalizeStoredHistoryMessages([group, unresolved], [], undefined, {
+    includeGroups: true,
+    includeUnresolvedLids: true,
+  });
+
+  assert.equal(result.messages.length, 2);
+  assert.equal(result.stats.groupMessages, 1);
+  assert.equal(result.stats.provisionalLidMessages, 1);
+  assert.equal((result.messages[1].key as any).remoteJid, '222@lid');
+});
+
+test('canonicalizes device-specific phone and LID identities', () => {
+  assert.equal(toCanonicalHistoryJid('628123:7@s.whatsapp.net'), '628123@s.whatsapp.net');
+  assert.equal(toCanonicalHistoryJid('222:7@lid'), '222@lid');
+  assert.equal(toCanonicalHistoryJid('123-456@g.us'), '123-456@g.us');
+});
+
+test('attributes imported incoming group content to the stored participant', () => {
+  const group = message({
+    id: 'hello',
+    remoteJid: '123-456@g.us',
+    participant: '999@lid',
+    participantAlt: '628123@s.whatsapp.net',
+    pushName: 'Participant',
+  });
+  const chatwootService = {
+    getConversationMessage: (content: any) => content.conversation,
+  } as any;
+
+  assert.equal(
+    chatwootImport.getHistoryContentMessage(chatwootService, group as any),
+    '**+628123 - Participant:**\n\nhello',
+  );
 });
