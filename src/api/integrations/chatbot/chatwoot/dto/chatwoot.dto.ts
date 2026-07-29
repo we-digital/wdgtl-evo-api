@@ -26,6 +26,9 @@ export class ChatwootHistorySyncDto {
   since?: string;
   remoteJid?: string;
   limit?: number;
+  scope?: 'direct' | 'groups' | 'all';
+  unresolvedLidMode?: 'skip' | 'provisional';
+  refreshLidMappings?: boolean;
 }
 
 export function ChatwootInstanceMixin<TBase extends Constructor>(Base: TBase) {

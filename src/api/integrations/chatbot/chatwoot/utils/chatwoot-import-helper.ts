@@ -2,7 +2,13 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
-import { toChatwootSourceId } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import {
+  isGroupJid,
+  isLidJid,
+  isPhoneJid,
+  toCanonicalHistoryJid,
+  toChatwootSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -15,7 +21,7 @@ type ChatwootUser = {
 };
 
 type FksChatwoot = {
-  phone_number: string;
+  identity_key: string;
   contact_id: string;
   conversation_id: string;
 };
@@ -25,6 +31,13 @@ type firstLastTimestamp = {
   last: number;
 };
 
+type HistoryIdentity = firstLastTimestamp & {
+  identityKey: string;
+  identifier: string;
+  phoneNumber: string | null;
+  name: string;
+};
+
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
 
 class ChatwootImport {
@@ -32,6 +45,7 @@ class ChatwootImport {
   private repositoryMessagesCache = new Map<string, Set<string>>();
   private historyMessages = new Map<string, Message[]>();
   private historyContacts = new Map<string, Contact[]>();
+  private historyIdentityNames = new Map<string, Map<string, string>>();
 
   public getRepositoryMessagesCache(instance: InstanceDto) {
     return this.repositoryMessagesCache.has(instance.instanceName)
@@ -61,6 +75,12 @@ class ChatwootImport {
     this.historyContacts.set(instance.instanceName, actualValue.concat(contactsRaw));
   }
 
+  public addHistoryIdentityNames(instance: InstanceDto, identityNames: Map<string, string>) {
+    const current = this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>();
+    identityNames.forEach((name, jid) => current.set(jid, name));
+    this.historyIdentityNames.set(instance.instanceName, current);
+  }
+
   public deleteHistoryMessages(instance: InstanceDto) {
     this.historyMessages.delete(instance.instanceName);
   }
@@ -69,10 +89,15 @@ class ChatwootImport {
     this.historyContacts.delete(instance.instanceName);
   }
 
+  public deleteHistoryIdentityNames(instance: InstanceDto) {
+    this.historyIdentityNames.delete(instance.instanceName);
+  }
+
   public clearAll(instance: InstanceDto) {
     this.deleteRepositoryMessagesCache(instance);
     this.deleteHistoryMessages(instance);
     this.deleteHistoryContacts(instance);
+    this.deleteHistoryIdentityNames(instance);
   }
 
   public getHistoryMessagesLenght(instance: InstanceDto) {
@@ -239,7 +264,7 @@ class ChatwootImport {
         return 0;
       }
 
-      // ordering messages by number and timestamp asc
+      // Order by conversation identity and timestamp so historical chronology stays deterministic.
       messagesOrdered.sort((a, b) => {
         const aKey = a.key as {
           remoteJid: string;
@@ -252,14 +277,13 @@ class ChatwootImport {
         const aMessageTimestamp = a.messageTimestamp as any as number;
         const bMessageTimestamp = b.messageTimestamp as any as number;
 
-        return parseInt(aKey.remoteJid) - parseInt(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
+        return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
-      const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
-      // Map structure: +552199999999 => { first message timestamp from number, last message timestamp from number}
-      const phoneNumbersWithTimestamp = new Map<string, firstLastTimestamp>();
-      allMessagesMappedByPhoneNumber.forEach((messages: Message[], phoneNumber: string) => {
-        phoneNumbersWithTimestamp.set(phoneNumber, {
+      const allMessagesMappedByIdentity = this.createMessagesMapByIdentity(messagesOrdered);
+      const identitiesWithTimestamp = new Map<string, firstLastTimestamp>();
+      allMessagesMappedByIdentity.forEach((messages: Message[], identityKey: string) => {
+        identitiesWithTimestamp.set(identityKey, {
           first: messages[0]?.messageTimestamp as any as number,
           last: messages[messages.length - 1]?.messageTimestamp as any as number,
         });
@@ -277,23 +301,28 @@ class ChatwootImport {
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
       while (messagesChunk.length > 0) {
-        // Map structure: +552199999999 => Message[]
-        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk);
+        const messagesByIdentity = this.createMessagesMapByIdentity(messagesChunk);
 
-        if (messagesByPhoneNumber.size > 0) {
-          const fksByNumber = await this.selectOrCreateFksFromChatwoot(
+        if (messagesByIdentity.size > 0) {
+          const fksByIdentity = await this.selectOrCreateFksFromChatwoot(
             provider,
             inbox,
-            phoneNumbersWithTimestamp,
-            messagesByPhoneNumber,
+            identitiesWithTimestamp,
+            messagesByIdentity,
+            this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
           );
+          const provisionalContactIds = Array.from(messagesByIdentity.keys())
+            .filter((identityKey) => isLidJid(identityKey))
+            .map((identityKey) => Number(fksByIdentity.get(identityKey)?.contact_id))
+            .filter((contactId) => Number.isInteger(contactId) && contactId > 0);
+          await this.addUnresolvedLidLabel(provider, provisionalContactIds);
 
           // inserting messages in chatwoot db
           let sqlValues = '';
           const bindInsertMsg = [provider.accountId, inbox.id];
 
-          messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
-            const fksChatwoot = fksByNumber.get(phoneNumber);
+          messagesByIdentity.forEach((messages: any[], identityKey: string) => {
+            const fksChatwoot = fksByIdentity.get(identityKey);
 
             messages.forEach((message) => {
               if (!message.message) {
@@ -304,7 +333,7 @@ class ChatwootImport {
                 return;
               }
 
-              const contentMessage = this.getContentMessage(chatwootService, message);
+              const contentMessage = this.getHistoryContentMessage(chatwootService, message);
               if (!contentMessage) {
                 return;
               }
@@ -384,6 +413,7 @@ class ChatwootImport {
 
       this.deleteHistoryMessages(instance);
       this.deleteRepositoryMessagesCache(instance);
+      this.deleteHistoryIdentityNames(instance);
 
       const providerData: ChatwootDto = {
         ...provider,
@@ -398,47 +428,73 @@ class ChatwootImport {
 
       this.deleteHistoryMessages(instance);
       this.deleteRepositoryMessagesCache(instance);
+      this.deleteHistoryIdentityNames(instance);
     }
   }
 
   public async selectOrCreateFksFromChatwoot(
     provider: ChatwootModel,
     inbox: inbox,
-    phoneNumbersWithTimestamp: Map<string, firstLastTimestamp>,
-    messagesByPhoneNumber: Map<string, Message[]>,
+    identitiesWithTimestamp: Map<string, firstLastTimestamp>,
+    messagesByIdentity: Map<string, Message[]>,
+    identityNames: Map<string, string>,
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
 
     const bindValues = [provider.accountId, inbox.id];
-    const phoneNumberBind = Array.from(messagesByPhoneNumber.keys())
-      .map((phoneNumber) => {
-        const phoneNumberTimestamp = phoneNumbersWithTimestamp.get(phoneNumber);
-
-        if (phoneNumberTimestamp) {
-          bindValues.push(phoneNumber);
-          let bindStr = `($${bindValues.length},`;
-
-          bindValues.push(phoneNumberTimestamp.first);
-          bindStr += `$${bindValues.length},`;
-
-          bindValues.push(phoneNumberTimestamp.last);
-          return `${bindStr}$${bindValues.length})`;
+    const identityBind = Array.from(messagesByIdentity.entries())
+      .map(([identityKey, messages]) => {
+        const timestamps = identitiesWithTimestamp.get(identityKey);
+        if (!timestamps) {
+          return null;
         }
+
+        const identity = this.getHistoryIdentity(identityKey, messages, timestamps, identityNames);
+        const values = [
+          identity.identityKey,
+          identity.identifier,
+          identity.phoneNumber,
+          identity.name,
+          identity.first,
+          identity.last,
+        ];
+        const placeholders = values.map((value) => {
+          bindValues.push(value);
+          return `$${bindValues.length}`;
+        });
+        return `(${placeholders.join(',')})`;
       })
+      .filter(Boolean)
       .join(',');
 
-    // select (or insert when necessary) data from tables contacts, contact_inboxes, conversations from chatwoot db
+    if (!identityBind) {
+      return new Map<string, FksChatwoot>();
+    }
+
     const sqlFromChatwoot = `WITH
-              phone_number AS (
-                SELECT phone_number, created_at::INTEGER, last_activity_at::INTEGER FROM (
-                  VALUES 
-                   ${phoneNumberBind}
-                 ) as t (phone_number, created_at, last_activity_at)
+              identity_input AS (
+                SELECT
+                  identity_key,
+                  identifier,
+                  phone_number,
+                  contact_name,
+                  created_at::INTEGER,
+                  last_activity_at::INTEGER
+                FROM (
+                  VALUES ${identityBind}
+                ) AS t (
+                  identity_key,
+                  identifier,
+                  phone_number,
+                  contact_name,
+                  created_at,
+                  last_activity_at
+                )
               ),
 
-              only_new_phone_number AS (
-                SELECT p.*
-                FROM phone_number p
+              only_new_identity AS (
+                SELECT identity.*
+                FROM identity_input identity
                 WHERE NOT EXISTS (
                   SELECT 1
                   FROM contacts c
@@ -449,59 +505,163 @@ class ChatwootImport {
                     AND con.contact_id = c.id
                   WHERE c.account_id = $1
                     AND (
-                      c.phone_number = p.phone_number
-                      OR c.identifier = CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')
+                      c.identifier = identity.identifier
+                      OR (
+                        identity.phone_number IS NOT NULL
+                        AND c.phone_number = identity.phone_number
+                      )
                     )
                 )
               ),
 
               new_contact AS (
                 INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
-                SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1, CONCAT(REPLACE(p.phone_number, '+', ''),
-                  '@s.whatsapp.net'), to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
-                FROM only_new_phone_number AS p
+                SELECT
+                  identity.contact_name,
+                  identity.phone_number,
+                  $1,
+                  identity.identifier,
+                  to_timestamp(identity.created_at),
+                  to_timestamp(identity.last_activity_at)
+                FROM only_new_identity identity
                 ON CONFLICT(identifier, account_id) DO UPDATE SET
-                  phone_number = EXCLUDED.phone_number,
-                  updated_at = EXCLUDED.updated_at
-                RETURNING id, phone_number, created_at, updated_at
+                  name = CASE
+                    WHEN contacts.name IS NULL OR contacts.name = '' OR contacts.name = contacts.identifier
+                      THEN EXCLUDED.name
+                    ELSE contacts.name
+                  END,
+                  phone_number = COALESCE(contacts.phone_number, EXCLUDED.phone_number),
+                  updated_at = GREATEST(contacts.updated_at, EXCLUDED.updated_at)
+                RETURNING id, identifier, created_at, updated_at
               ),
 
               new_contact_inbox AS (
                 INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
-                SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
-                FROM new_contact 
+                SELECT contact.id, $2, gen_random_uuid(), contact.created_at, contact.updated_at
+                FROM new_contact contact
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM contact_inboxes existing
+                  WHERE existing.contact_id = contact.id
+                    AND existing.inbox_id = $2
+                )
                 RETURNING id, contact_id, created_at, updated_at
+              ),
+
+              available_contact_inbox AS (
+                SELECT id, contact_id, created_at, updated_at
+                FROM new_contact_inbox
+
+                UNION
+
+                SELECT existing.id, existing.contact_id, existing.created_at, existing.updated_at
+                FROM new_contact contact
+                JOIN contact_inboxes existing
+                  ON existing.contact_id = contact.id
+                  AND existing.inbox_id = $2
               ),
 
               new_conversation AS (
                 INSERT INTO conversations (account_id, inbox_id, status, contact_id,
                   contact_inbox_id, uuid, last_activity_at, created_at, updated_at)
-                SELECT $1, $2, 0, new_contact_inbox.contact_id, new_contact_inbox.id, gen_random_uuid(),
-                  new_contact_inbox.updated_at, new_contact_inbox.created_at, new_contact_inbox.updated_at
-                FROM new_contact_inbox
+                SELECT
+                  $1,
+                  $2,
+                  0,
+                  contact_inbox.contact_id,
+                  contact_inbox.id,
+                  gen_random_uuid(),
+                  contact.updated_at,
+                  contact.created_at,
+                  contact.updated_at
+                FROM available_contact_inbox contact_inbox
+                JOIN new_contact contact ON contact.id = contact_inbox.contact_id
+                WHERE NOT EXISTS (
+                  SELECT 1
+                  FROM conversations existing
+                  WHERE existing.contact_inbox_id = contact_inbox.id
+                    AND existing.account_id = $1
+                    AND existing.inbox_id = $2
+                    AND existing.contact_id = contact_inbox.contact_id
+                )
                 RETURNING id, contact_id
               )
 
-              SELECT new_contact.phone_number, new_conversation.contact_id, new_conversation.id AS conversation_id
-              FROM new_conversation 
-              JOIN new_contact ON new_conversation.contact_id = new_contact.id
+              SELECT
+                identity.identity_key,
+                conversation.contact_id,
+                conversation.id AS conversation_id
+              FROM new_conversation conversation
+              JOIN new_contact contact ON conversation.contact_id = contact.id
+              JOIN only_new_identity identity ON identity.identifier = contact.identifier
 
               UNION
 
-              SELECT p.phone_number, c.id contact_id, con.id conversation_id
-                FROM phone_number p
-              JOIN contacts c ON c.account_id = $1
+              SELECT
+                identity.identity_key,
+                contact.id AS contact_id,
+                conversation.id AS conversation_id
+              FROM identity_input identity
+              JOIN contacts contact ON contact.account_id = $1
                 AND (
-                  c.phone_number = p.phone_number
-                  OR c.identifier = CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')
+                  contact.identifier = identity.identifier
+                  OR (
+                    identity.phone_number IS NOT NULL
+                    AND contact.phone_number = identity.phone_number
+                  )
                 )
-              JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
-              JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
-                AND con.inbox_id = $2 AND con.contact_id = c.id`;
+              JOIN contact_inboxes contact_inbox
+                ON contact_inbox.contact_id = contact.id
+                AND contact_inbox.inbox_id = $2
+              JOIN conversations conversation
+                ON conversation.contact_inbox_id = contact_inbox.id
+                AND conversation.account_id = $1
+                AND conversation.inbox_id = $2
+                AND conversation.contact_id = contact.id`;
 
     const fksFromChatwoot = await pgClient.query(sqlFromChatwoot, bindValues);
 
-    return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.phone_number, item]));
+    return new Map(fksFromChatwoot.rows.map((item: FksChatwoot) => [item.identity_key, item]));
+  }
+
+  private getHistoryIdentity(
+    identityKey: string,
+    messages: Message[],
+    timestamps: firstLastTimestamp,
+    identityNames: Map<string, string>,
+  ): HistoryIdentity {
+    const canonicalJid = toCanonicalHistoryJid(identityKey);
+    const jidUser = canonicalJid.split('@')[0].split(':')[0];
+    const firstPushName = messages.find((message) => Boolean(message.pushName?.trim()))?.pushName?.trim();
+
+    if (isPhoneJid(canonicalJid)) {
+      return {
+        ...timestamps,
+        identityKey: canonicalJid,
+        identifier: canonicalJid,
+        phoneNumber: `+${jidUser}`,
+        name: firstPushName || jidUser,
+      };
+    }
+
+    if (isGroupJid(canonicalJid)) {
+      const groupName = identityNames.get(canonicalJid);
+      return {
+        ...timestamps,
+        identityKey: canonicalJid,
+        identifier: canonicalJid,
+        phoneNumber: null,
+        name: `${groupName || `WhatsApp Group ${jidUser.slice(-6)}`} (GROUP)`,
+      };
+    }
+
+    return {
+      ...timestamps,
+      identityKey: canonicalJid,
+      identifier: canonicalJid,
+      phoneNumber: null,
+      name: firstPushName || `WhatsApp LID ${jidUser.slice(-6)}`,
+    };
   }
 
   public async getChatwootUser(provider: ChatwootModel): Promise<ChatwootUser> {
@@ -518,23 +678,71 @@ class ChatwootImport {
     }
   }
 
-  public createMessagesMapByPhoneNumber(messages: Message[]): Map<string, Message[]> {
+  public createMessagesMapByIdentity(messages: Message[]): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
       const key = message?.key as {
         remoteJid: string;
       };
-      if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        const phoneNumber = key?.remoteJid?.split('@')[0];
-        if (phoneNumber) {
-          const phoneNumberPlus = `+${phoneNumber}`;
-          const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
-          messages.push(message);
-          acc.set(phoneNumberPlus, messages);
-        }
+      const remoteJid = key?.remoteJid;
+      if (!remoteJid || (!isPhoneJid(remoteJid) && !isGroupJid(remoteJid) && !isLidJid(remoteJid))) {
+        return acc;
       }
+
+      const identityKey = toCanonicalHistoryJid(remoteJid);
+      const identityMessages = acc.get(identityKey) || [];
+      identityMessages.push(message);
+      acc.set(identityKey, identityMessages);
 
       return acc;
     }, new Map());
+  }
+
+  private async addUnresolvedLidLabel(provider: ChatwootModel, contactIds: number[]) {
+    const uniqueContactIds = Array.from(new Set(contactIds));
+    if (uniqueContactIds.length === 0) {
+      return;
+    }
+
+    const pgClient = postgresClient.getChatwootConnection();
+    const labelName = 'unresolved_lid';
+
+    await pgClient.query(
+      `INSERT INTO labels (title, color, show_on_sidebar, account_id, created_at, updated_at)
+       SELECT $1, '#B7791F', TRUE, $2, NOW(), NOW()
+       WHERE NOT EXISTS (
+         SELECT 1 FROM labels WHERE title = $1 AND account_id = $2
+       )`,
+      [labelName, provider.accountId],
+    );
+
+    const tagId = (
+      await pgClient.query(
+        `INSERT INTO tags (name, taggings_count)
+         VALUES ($1, 0)
+         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+         RETURNING id`,
+        [labelName],
+      )
+    ).rows[0]?.id;
+
+    await pgClient.query(
+      `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at)
+       SELECT $1, 'Contact', contact_id, 'labels', NOW()
+       FROM UNNEST($2::BIGINT[]) AS contact_id
+       ON CONFLICT DO NOTHING`,
+      [tagId, uniqueContactIds],
+    );
+
+    await pgClient.query(
+      `UPDATE tags
+       SET taggings_count = (
+         SELECT COUNT(*) FROM taggings
+         WHERE taggings.tag_id = tags.id
+           AND taggings.context = 'labels'
+       )
+       WHERE id = $1`,
+      [tagId],
+    );
   }
 
   public async getContactsOrderByRecentConversations(
@@ -618,6 +826,31 @@ class ChatwootImport {
       default:
         return '';
     }
+  }
+
+  public getHistoryContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
+    const content = this.getContentMessage(chatwootService, msg);
+    const key = msg.key as {
+      remoteJid?: string;
+      participant?: string;
+      participantAlt?: string;
+      fromMe?: boolean;
+    };
+
+    if (!content || !isGroupJid(key?.remoteJid) || key.fromMe) {
+      return content;
+    }
+
+    const participantJid = isPhoneJid(key?.participantAlt)
+      ? key.participantAlt
+      : isPhoneJid(key?.participant)
+        ? key.participant
+        : null;
+    const participantPhone = participantJid ? `+${participantJid.split('@')[0].split(':')[0]}` : null;
+    const participantName = msg.pushName?.trim() || 'Group participant';
+    const participantLabel = participantPhone ? `${participantPhone} - ${participantName}` : participantName;
+
+    return `**${participantLabel}:**\n\n${content}`;
   }
 
   public sliceIntoChunks(arr: any[], chunkSize: number) {

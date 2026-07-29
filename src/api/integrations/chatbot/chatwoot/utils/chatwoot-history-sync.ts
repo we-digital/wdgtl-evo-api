@@ -11,6 +11,7 @@ export type HistoryNormalizationStats = {
   sourceMessages: number;
   directMessages: number;
   groupMessages: number;
+  provisionalLidMessages: number;
   systemMessages: number;
   invalidMessages: number;
   unresolvedLidMessages: number;
@@ -25,11 +26,33 @@ export type NormalizedHistoryMessages = {
 
 export type ResolvePhoneJid = (lid: string) => Promise<string | null | undefined>;
 
+export type HistoryNormalizationOptions = {
+  includeGroups?: boolean;
+  includeUnresolvedLids?: boolean;
+};
+
 export const toChatwootSourceId = (sourceId: string) => `WAID:${sourceId.replace(/^WAID:/, '')}`;
 
-export const isPhoneJid = (remoteJid?: string): remoteJid is string => Boolean(remoteJid?.endsWith('@s.whatsapp.net'));
+export const isPhoneJid = (remoteJid?: string): remoteJid is string =>
+  Boolean(remoteJid?.endsWith('@s.whatsapp.net') || remoteJid?.endsWith('@hosted'));
 
-export const isLidJid = (remoteJid?: string): remoteJid is string => Boolean(remoteJid?.endsWith('@lid'));
+export const isLidJid = (remoteJid?: string): remoteJid is string =>
+  Boolean(remoteJid?.endsWith('@lid') || remoteJid?.endsWith('@hosted.lid'));
+
+export const isGroupJid = (remoteJid?: string) => Boolean(remoteJid?.endsWith('@g.us'));
+
+const toUserLevelJid = (jid: string) => {
+  const separator = jid.lastIndexOf('@');
+  if (separator < 0) {
+    return jid;
+  }
+
+  const user = jid.slice(0, separator).split(':')[0];
+  return `${user}${jid.slice(separator)}`;
+};
+
+export const toCanonicalHistoryJid = (remoteJid: string) =>
+  isPhoneJid(remoteJid) || isLidJid(remoteJid) ? toUserLevelJid(remoteJid) : remoteJid;
 
 const readKey = (message: Pick<Message, 'key'>): StoredMessageKey => (message.key || {}) as StoredMessageKey;
 
@@ -50,6 +73,7 @@ export const normalizeStoredHistoryMessages = async (
   messages: Message[],
   mappingMessages: Pick<Message, 'key'>[],
   resolvePhoneJid?: ResolvePhoneJid,
+  options: HistoryNormalizationOptions = {},
 ): Promise<NormalizedHistoryMessages> => {
   const lidMap = buildStoredLidMap(mappingMessages);
   const unresolvedLids = new Set<string>();
@@ -80,6 +104,7 @@ export const normalizeStoredHistoryMessages = async (
   const unresolvedMessages = new Set<string>();
   let directMessages = 0;
   let groupMessages = 0;
+  let provisionalLidMessages = 0;
   let systemMessages = 0;
   let invalidMessages = 0;
 
@@ -90,8 +115,17 @@ export const normalizeStoredHistoryMessages = async (
       continue;
     }
 
-    if (key.remoteJid.endsWith('@g.us')) {
+    if (isGroupJid(key.remoteJid)) {
       groupMessages++;
+      if (options.includeGroups) {
+        normalizedMessages.push({
+          ...message,
+          key: {
+            ...key,
+            remoteJid: key.remoteJid,
+          },
+        });
+      }
       continue;
     }
 
@@ -105,6 +139,16 @@ export const normalizeStoredHistoryMessages = async (
       normalizedJid = lidMap.get(key.remoteJid);
       if (!normalizedJid) {
         unresolvedMessages.add(key.remoteJid);
+        if (options.includeUnresolvedLids) {
+          provisionalLidMessages++;
+          normalizedMessages.push({
+            ...message,
+            key: {
+              ...key,
+              remoteJid: toCanonicalHistoryJid(key.remoteJid),
+            },
+          });
+        }
         continue;
       }
     }
@@ -119,7 +163,7 @@ export const normalizeStoredHistoryMessages = async (
       ...message,
       key: {
         ...key,
-        remoteJid: normalizedJid,
+        remoteJid: toCanonicalHistoryJid(normalizedJid),
       },
     });
   }
@@ -130,6 +174,7 @@ export const normalizeStoredHistoryMessages = async (
       sourceMessages: messages.length,
       directMessages,
       groupMessages,
+      provisionalLidMessages,
       systemMessages,
       invalidMessages,
       unresolvedLidMessages: messages.filter((message) => unresolvedMessages.has(readKey(message).remoteJid)).length,
