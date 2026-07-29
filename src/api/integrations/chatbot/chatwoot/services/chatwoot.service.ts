@@ -2951,9 +2951,12 @@ export class ChatwootService {
         return true;
       });
 
-      const routeMessages = targetRemoteJid
-        ? scopedMessages.filter((message: any) => message.key?.remoteJid === targetRemoteJid)
-        : scopedMessages;
+      const routeMessages =
+        data.remoteJid && !targetRemoteJid
+          ? []
+          : targetRemoteJid
+            ? scopedMessages.filter((message: any) => message.key?.remoteJid === targetRemoteJid)
+            : scopedMessages;
 
       const existingSourceIds = await chatwootImport.getExistingSourceIds(
         routeMessages.map((message: any) => message.key.id),
