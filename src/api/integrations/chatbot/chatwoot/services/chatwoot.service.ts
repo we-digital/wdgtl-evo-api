@@ -4,6 +4,7 @@ import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/c
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import {
   buildStoredLidMap,
+  dedupeHistoryMessagesBySourceId,
   isGroupJid,
   isLidJid,
   isPhoneJid,
@@ -2967,9 +2968,11 @@ export class ChatwootService {
       const missingMessages = routeMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
-      const importableMessages = missingMessages.filter((message: any) =>
+      const importableMessagesWithDuplicates = missingMessages.filter((message: any) =>
         Boolean(chatwootImport.getContentMessage(this, message)),
       );
+      const { messages: importableMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
+        dedupeHistoryMessagesBySourceId(importableMessagesWithDuplicates);
       const selectedMessages = data.limit ? importableMessages.slice(0, data.limit) : importableMessages;
       const dryRun = data.dryRun !== false;
       const selectedGroupMessages = selectedMessages.filter((message: any) =>
@@ -3005,7 +3008,8 @@ export class ChatwootService {
         normalizedMessages: normalized.stats.normalizedMessages,
         routeMessages: routeMessages.length,
         existingMessages: routeMessages.length - missingMessages.length,
-        unsupportedMessagesSkipped: missingMessages.length - importableMessages.length,
+        unsupportedMessagesSkipped: missingMessages.length - importableMessagesWithDuplicates.length,
+        duplicateSourceMessagesSkipped,
         selectedMessages: selectedMessages.length,
         selectedGroupMessages,
         selectedProvisionalLidMessages,

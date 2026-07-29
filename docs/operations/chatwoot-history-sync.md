@@ -110,6 +110,9 @@ global limit can span multiple conversations.
 5. Repeat the same request. `selectedMessages` and `importedMessages` must both be zero.
 6. Confirm there are no duplicate `(inbox_id, source_id)` pairs in Chatwoot.
 
+Stored rows that repeat the same canonical message ID are collapsed before selection and reported as
+`duplicateSourceMessagesSkipped`; they cannot turn a successful idempotent insert into a false partial-write error.
+
 The incremental repair job uses a six-hour overlap and remains idempotent through `source_id`; it is not a replacement
 for the initial full backfill. It stays in the legacy-safe `direct`/`skip` mode until a successful explicit write with
 `scope: "all"` and `unresolvedLidMode: "provisional"` enables extended sync for that instance in the shared cache.
