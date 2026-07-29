@@ -8,6 +8,9 @@ The same operation is used by the six-hour incremental repair job that runs at s
 - `POST /chatwoot/historySync/:instanceName` is protected by the normal Evolution API guards.
 - Dry-run is the default. A write requires `"dryRun": false`.
 - The target account and inbox come from the instance's Chatwoot configuration; callers cannot override them.
+- An explicit authenticated history-sync request may use an existing provider with `importMessages: true` while its
+  live `enabled` flag is false. This does not enable Chatwoot webhooks, live message forwarding, or scheduled sync.
+  The response reports `providerEnabled` so operators can distinguish a one-off import from an active integration.
 - `scope` explicitly selects `direct` (default), `groups`, or `all`; callers cannot accidentally import groups through
   the legacy/default request.
 - WhatsApp LIDs are mapped to phone JIDs from stored `remoteJidAlt` values and the active Baileys signal repository.
@@ -119,3 +122,7 @@ for the initial full backfill. It stays in the legacy-safe `direct`/`skip` mode 
 After activation, the incremental job includes groups and provisional LIDs. Confirmed `lid-mapping.update` events
 reconcile provisional contacts immediately. A daily 03:15 job retries only unresolved LID contacts against the current
 Signal store.
+
+Startup, 30-minute incremental repair, and the daily LID reconciliation are scheduled only for providers whose live
+`enabled` flag is true. For a disabled provider, use this endpoint explicitly or enable the integration separately
+after reviewing its webhook and outbound-message behavior.

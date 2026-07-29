@@ -2880,7 +2880,7 @@ export class ChatwootService {
     this.activeStoredHistorySyncs.add(instance.instanceName);
     try {
       const provider = await this.getProvider(instance);
-      if (!provider?.enabled || !provider.importMessages) {
+      if (!provider?.importMessages) {
         throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
       }
 
@@ -2986,6 +2986,7 @@ export class ChatwootService {
         status: dryRun ? 'dry_run' : 'completed',
         instanceName: instance.instanceName,
         inboxId: inbox.id,
+        providerEnabled: Boolean(provider.enabled),
         since: data.since || null,
         scope,
         unresolvedLidMode,
