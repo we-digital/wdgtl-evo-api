@@ -708,9 +708,9 @@ class ChatwootImport {
 
     await pgClient.query(
       `INSERT INTO labels (title, color, show_on_sidebar, account_id, created_at, updated_at)
-       SELECT $1, '#B7791F', TRUE, $2, NOW(), NOW()
+       SELECT $1::TEXT, '#B7791F', TRUE, $2::BIGINT, NOW(), NOW()
        WHERE NOT EXISTS (
-         SELECT 1 FROM labels WHERE title = $1 AND account_id = $2
+         SELECT 1 FROM labels WHERE title = $1::TEXT AND account_id = $2::BIGINT
        )`,
       [labelName, provider.accountId],
     );
@@ -718,7 +718,7 @@ class ChatwootImport {
     const tagId = (
       await pgClient.query(
         `INSERT INTO tags (name, taggings_count)
-         VALUES ($1, 0)
+         VALUES ($1::TEXT, 0)
          ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
          RETURNING id`,
         [labelName],
@@ -727,8 +727,8 @@ class ChatwootImport {
 
     await pgClient.query(
       `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at)
-       SELECT $1, 'Contact', contact_id, 'labels', NOW()
-       FROM UNNEST($2::BIGINT[]) AS contact_id
+       SELECT $1::INTEGER, 'Contact', contact_id, 'labels', NOW()
+       FROM UNNEST($2::INTEGER[]) AS contact_id
        ON CONFLICT DO NOTHING`,
       [tagId, uniqueContactIds],
     );
@@ -740,7 +740,7 @@ class ChatwootImport {
          WHERE taggings.tag_id = tags.id
            AND taggings.context = 'labels'
        )
-       WHERE id = $1`,
+       WHERE id = $1::INTEGER`,
       [tagId],
     );
   }
