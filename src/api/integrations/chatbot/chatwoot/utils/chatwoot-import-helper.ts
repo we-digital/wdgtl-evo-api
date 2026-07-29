@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { toChatwootSourceId } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -176,7 +177,11 @@ class ChatwootImport {
     }
   }
 
-  public async getExistingSourceIds(sourceIds: string[], conversationId?: number): Promise<Set<string>> {
+  public async getExistingSourceIds(
+    sourceIds: string[],
+    conversationId?: number,
+    inboxId?: number,
+  ): Promise<Set<string>> {
     try {
       const existingSourceIdsSet = new Set<string>();
 
@@ -185,14 +190,21 @@ class ChatwootImport {
       }
 
       // Ensure all sourceIds are consistently prefixed with 'WAID:' as required by downstream systems and database queries.
-      const formattedSourceIds = sourceIds.map((sourceId) => `WAID:${sourceId.replace('WAID:', '')}`);
+      const formattedSourceIds = sourceIds.map(toChatwootSourceId);
       const pgClient = postgresClient.getChatwootConnection();
 
-      const params = conversationId ? [formattedSourceIds, conversationId] : [formattedSourceIds];
+      const params: Array<string[] | number> = [formattedSourceIds];
+      const filters = ['source_id = ANY($1)'];
+      if (conversationId) {
+        params.push(conversationId);
+        filters.push(`conversation_id = $${params.length}`);
+      }
+      if (inboxId) {
+        params.push(inboxId);
+        filters.push(`inbox_id = $${params.length}`);
+      }
 
-      const query = conversationId
-        ? 'SELECT source_id FROM messages WHERE source_id = ANY($1) AND conversation_id = $2'
-        : 'SELECT source_id FROM messages WHERE source_id = ANY($1)';
+      const query = `SELECT source_id FROM messages WHERE ${filters.join(' AND ')}`;
 
       const result = await pgClient.query(query, params);
       for (const row of result.rows) {
@@ -253,8 +265,14 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      const existingSourceIds = await this.getExistingSourceIds(
+        messagesOrdered.map((message: any) => message.key.id),
+        undefined,
+        inbox.id,
+      );
+      messagesOrdered = messagesOrdered.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -271,9 +289,7 @@ class ChatwootImport {
           );
 
           // inserting messages in chatwoot db
-          let sqlInsertMsg = `INSERT INTO messages
-            (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type,
-            sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
+          let sqlValues = '';
           const bindInsertMsg = [provider.accountId, inbox.id];
 
           messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
@@ -308,20 +324,58 @@ class ChatwootImport {
               bindInsertMsg.push(message.key.fromMe ? chatwootUser.user_id : fksChatwoot.contact_id);
               const bindSenderId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push('WAID:' + message.key.id);
+              bindInsertMsg.push(toChatwootSourceId(message.key.id));
               const bindSourceId = `$${bindInsertMsg.length}`;
 
               bindInsertMsg.push(message.messageTimestamp as number);
               const bindmessageTimestamp = `$${bindInsertMsg.length}`;
 
-              sqlInsertMsg += `(${bindContent}, ${bindContent}, $1, $2, ${bindConversationId}, ${bindMessageType}, FALSE, 0,
-                  ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
+              sqlValues += `(${bindContent}::text, $1::bigint, $2::bigint, ${bindConversationId}::bigint,
+                  ${bindMessageType}::integer, ${bindSenderType}::text, ${bindSenderId}::bigint,
+                  ${bindSourceId}::text, ${bindmessageTimestamp}::bigint),`;
             });
           });
           if (bindInsertMsg.length > 2) {
-            if (sqlInsertMsg.slice(-1) === ',') {
-              sqlInsertMsg = sqlInsertMsg.slice(0, -1);
+            if (sqlValues.slice(-1) === ',') {
+              sqlValues = sqlValues.slice(0, -1);
             }
+
+            const sqlInsertMsg = `INSERT INTO messages
+              (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private,
+              content_type, sender_type, sender_id, source_id, created_at, updated_at)
+              SELECT DISTINCT ON (candidate.inbox_id, candidate.source_id)
+                candidate.content,
+                candidate.content,
+                candidate.account_id,
+                candidate.inbox_id,
+                candidate.conversation_id,
+                candidate.message_type,
+                FALSE,
+                0,
+                candidate.sender_type,
+                candidate.sender_id,
+                candidate.source_id,
+                to_timestamp(candidate.message_timestamp),
+                to_timestamp(candidate.message_timestamp)
+              FROM (VALUES ${sqlValues}) AS candidate(
+                content,
+                account_id,
+                inbox_id,
+                conversation_id,
+                message_type,
+                sender_type,
+                sender_id,
+                source_id,
+                message_timestamp
+              )
+              WHERE NOT EXISTS (
+                SELECT 1
+                FROM messages existing
+                WHERE existing.inbox_id = candidate.inbox_id
+                  AND existing.source_id = candidate.source_id
+              )
+              ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
+
             totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
           }
         }

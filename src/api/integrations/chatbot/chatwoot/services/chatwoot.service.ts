@@ -1,7 +1,13 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
-import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
+import {
+  buildStoredLidMap,
+  isPhoneJid,
+  normalizeStoredHistoryMessages,
+  toChatwootSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -9,6 +15,7 @@ import { WAMonitoringService } from '@api/services/monitor.service';
 import { Events } from '@api/types/wa.types';
 import { Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
 import { Logger } from '@config/logger.config';
+import { BadRequestException } from '@exceptions';
 import ChatwootClient, {
   ChatwootAPIConfig,
   contact,
@@ -43,6 +50,7 @@ interface ChatwootMessage {
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
+  private readonly activeStoredHistorySyncs = new Set<string>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -2649,65 +2657,141 @@ export class ChatwootService {
     }
   }
 
-  public async syncLostMessages(
-    instance: InstanceDto,
-    chatwootConfig: ChatwootDto,
-    prepareMessage: (message: any) => any,
-  ) {
+  private async resolvePhoneJidForLid(instance: InstanceDto, lid: string) {
+    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const resolved = await waInstance?.resolvePhoneJidForLid?.(lid);
+    return isPhoneJid(resolved) ? resolved : null;
+  }
+
+  public async syncStoredHistory(instance: InstanceDto, data: ChatwootHistorySyncDto = {}) {
+    if (!this.isImportHistoryAvailable()) {
+      throw new BadRequestException('Chatwoot history import database connection is not configured');
+    }
+
+    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
+      throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
+    }
+
+    this.activeStoredHistorySyncs.add(instance.instanceName);
     try {
-      if (!this.isImportHistoryAvailable()) {
-        return;
+      const provider = await this.getProvider(instance);
+      if (!provider?.enabled || !provider.importMessages) {
+        throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
       }
-      if (!this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
-        return;
+
+      const client = await this.clientCw(instance);
+      if (!client) {
+        throw new BadRequestException(`Chatwoot client is not available for ${instance.instanceName}`);
       }
 
       const inbox = await this.getInbox(instance);
+      if (!inbox) {
+        throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
+      }
 
-      const sqlMessages = `select * from messages m
-      where account_id = ${chatwootConfig.accountId}
-      and inbox_id = ${inbox.id}
-      and created_at >= now() - interval '6h'
-      order by created_at desc`;
-
-      const messagesData = (await this.pgClient.query(sqlMessages))?.rows;
-      const ids: string[] = messagesData
-        .filter((message) => !!message.source_id)
-        .map((message) => message.source_id.replace('WAID:', ''));
+      const sinceTimestamp = data.since ? dayjs(data.since).unix() : null;
+      if (data.since && (!dayjs(data.since).isValid() || sinceTimestamp <= 0)) {
+        throw new BadRequestException('since must be a valid ISO-8601 timestamp');
+      }
 
       const savedMessages = await this.prismaRepository.message.findMany({
         where: {
           Instance: { name: instance.instanceName },
-          messageTimestamp: { gte: Number(dayjs().subtract(6, 'hours').unix()) },
-          AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
+          ...(sinceTimestamp ? { messageTimestamp: { gte: Number(sinceTimestamp) } } : {}),
         },
+        orderBy: [{ messageTimestamp: 'asc' }, { id: 'asc' }],
       });
 
-      const filteredMessages = savedMessages.filter(
-        (msg: any) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid),
+      const mappingMessages =
+        sinceTimestamp === null
+          ? savedMessages
+          : await this.prismaRepository.message.findMany({
+              where: { Instance: { name: instance.instanceName } },
+              select: { key: true },
+            });
+
+      const normalized = await normalizeStoredHistoryMessages(savedMessages, mappingMessages, (lid) =>
+        this.resolvePhoneJidForLid(instance, lid),
       );
-      const messagesRaw: any[] = [];
-      for (const m of filteredMessages) {
-        if (!m.message || !m.key || !m.messageTimestamp) {
-          continue;
-        }
 
-        if (Long.isLong(m?.messageTimestamp)) {
-          m.messageTimestamp = m.messageTimestamp?.toNumber();
-        }
-
-        messagesRaw.push(prepareMessage(m as any));
+      let targetRemoteJid = data.remoteJid;
+      if (targetRemoteJid?.endsWith('@lid')) {
+        const storedMapping = buildStoredLidMap(mappingMessages).get(targetRemoteJid);
+        targetRemoteJid = storedMapping || (await this.resolvePhoneJidForLid(instance, targetRemoteJid));
       }
 
-      this.addHistoryMessages(
-        instance,
-        messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
+      const routeMessages = targetRemoteJid
+        ? normalized.messages.filter((message: any) => message.key?.remoteJid === targetRemoteJid)
+        : normalized.messages;
+
+      const existingSourceIds = await chatwootImport.getExistingSourceIds(
+        routeMessages.map((message: any) => message.key.id),
+        undefined,
+        inbox.id,
       );
 
-      await chatwootImport.importHistoryMessages(instance, this, inbox, this.provider);
+      const missingMessages = routeMessages.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      const importableMessages = missingMessages.filter((message: any) =>
+        Boolean(chatwootImport.getContentMessage(this, message)),
+      );
+      const selectedMessages = data.limit ? importableMessages.slice(0, data.limit) : importableMessages;
+      const dryRun = data.dryRun !== false;
+
+      const result = {
+        status: dryRun ? 'dry_run' : 'completed',
+        instanceName: instance.instanceName,
+        inboxId: inbox.id,
+        since: data.since || null,
+        remoteJidFiltered: Boolean(data.remoteJid),
+        sourceMessages: normalized.stats.sourceMessages,
+        directMessages: normalized.stats.directMessages,
+        groupMessagesSkipped: normalized.stats.groupMessages,
+        systemMessagesSkipped: normalized.stats.systemMessages,
+        invalidMessagesSkipped: normalized.stats.invalidMessages,
+        unresolvedLidMessagesSkipped: normalized.stats.unresolvedLidMessages,
+        unresolvedLidChatsSkipped: normalized.stats.unresolvedLidChats,
+        normalizedMessages: normalized.stats.normalizedMessages,
+        routeMessages: routeMessages.length,
+        existingMessages: routeMessages.length - missingMessages.length,
+        unsupportedMessagesSkipped: missingMessages.length - importableMessages.length,
+        selectedMessages: selectedMessages.length,
+        importedMessages: 0,
+      };
+
+      if (dryRun || selectedMessages.length === 0) {
+        return result;
+      }
+
+      this.addHistoryMessages(instance, selectedMessages);
+      const importedMessages = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+      if (!Number.isInteger(importedMessages)) {
+        throw new Error(`Chatwoot history import failed for ${instance.instanceName}`);
+      }
+
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
-      waInstance.clearCacheChatwoot();
-    } catch {
+      waInstance?.clearCacheChatwoot?.();
+      result.importedMessages = Number(importedMessages);
+
+      return result;
+    } finally {
+      this.activeStoredHistorySyncs.delete(instance.instanceName);
+    }
+  }
+
+  public async syncLostMessages(instance: InstanceDto) {
+    try {
+      if (!this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
+        return;
+      }
+
+      return await this.syncStoredHistory(instance, {
+        dryRun: false,
+        since: dayjs().subtract(6, 'hours').toISOString(),
+      });
+    } catch (error) {
+      this.logger.error(`Error on incremental Chatwoot history sync: ${error.toString()}`);
       return;
     }
   }

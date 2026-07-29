@@ -43,3 +43,18 @@ export const chatwootSchema: JSONSchema7 = {
   required: ['enabled', 'accountId', 'token', 'url', 'signMsg', 'reopenConversation', 'conversationPending'],
   ...isNotEmpty('enabled', 'accountId', 'token', 'url', 'signMsg', 'reopenConversation', 'conversationPending'),
 };
+
+export const chatwootHistorySyncSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    dryRun: { type: 'boolean' },
+    since: { type: 'string', format: 'date-time' },
+    remoteJid: {
+      type: 'string',
+      pattern: '^[0-9]+@(s\\.whatsapp\\.net|lid)$',
+    },
+    limit: { type: 'integer', minimum: 1, maximum: 4000 },
+  },
+};

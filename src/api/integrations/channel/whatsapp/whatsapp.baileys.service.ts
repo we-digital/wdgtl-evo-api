@@ -4765,11 +4765,23 @@ export class BaileysStartupService extends ChannelStartupService {
     return messageRaw;
   }
 
+  public async resolvePhoneJidForLid(lid: string): Promise<string | null> {
+    if (!lid?.endsWith('@lid')) {
+      return null;
+    }
+
+    try {
+      const phoneJid = await this.client.signalRepository.lidMapping.getPNForLID(lid);
+      return phoneJid && isPnUser(phoneJid) ? phoneJid : null;
+    } catch (error) {
+      this.logger.warn(`Unable to resolve LID ${lid}: ${error?.message || error}`);
+      return null;
+    }
+  }
+
   private async syncChatwootLostMessages() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-      const chatwootConfig = await this.findChatwoot();
-      const prepare = (message: any) => this.prepareMessage(message);
-      this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+      this.chatwootService.syncLostMessages({ instanceName: this.instance.name });
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
@@ -4787,7 +4799,7 @@ export class BaileysStartupService extends ChannelStartupService {
             return;
           }
         }
-        this.chatwootService.syncLostMessages({ instanceName: this.instance.name }, chatwootConfig, prepare);
+        this.chatwootService.syncLostMessages({ instanceName: this.instance.name });
       });
       task.start();
     }

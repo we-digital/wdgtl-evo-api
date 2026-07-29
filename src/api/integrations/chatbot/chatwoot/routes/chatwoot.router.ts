@@ -1,9 +1,9 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
-import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { HttpStatus } from '@api/routes/index.router';
 import { chatwootController } from '@api/server.module';
-import { chatwootSchema, instanceSchema } from '@validate/validate.schema';
+import { chatwootHistorySyncSchema, chatwootSchema, instanceSchema } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
 export class ChatwootRouter extends RouterBroker {
@@ -26,6 +26,16 @@ export class ChatwootRouter extends RouterBroker {
           schema: instanceSchema,
           ClassRef: InstanceDto,
           execute: (instance) => chatwootController.findChatwoot(instance),
+        });
+
+        res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('historySync'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<ChatwootHistorySyncDto>({
+          request: req,
+          schema: chatwootHistorySyncSchema,
+          ClassRef: ChatwootHistorySyncDto,
+          execute: (instance, data) => chatwootController.syncHistory(instance, data),
         });
 
         res.status(HttpStatus.OK).json(response);
