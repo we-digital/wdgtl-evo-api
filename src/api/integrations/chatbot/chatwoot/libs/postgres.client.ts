@@ -4,6 +4,14 @@ import postgresql from 'pg';
 
 const { Pool } = postgresql;
 
+type QueryableClient = {
+  query: (query: string) => Promise<unknown>;
+};
+
+export const setChatwootSearchPath = async (client: QueryableClient) => {
+  await client.query('SET search_path TO public');
+};
+
 class Postgres {
   private logger = new Logger('Postgres');
   private pool;
@@ -18,6 +26,12 @@ class Postgres {
         ssl: {
           rejectUnauthorized: false,
         },
+      });
+
+      this.pool.on('connect', (client) => {
+        setChatwootSearchPath(client).catch((error) => {
+          this.logger.error(`failed to initialize Chatwoot postgres search_path: ${error.toString()}`);
+        });
       });
 
       this.pool.on('error', () => {
