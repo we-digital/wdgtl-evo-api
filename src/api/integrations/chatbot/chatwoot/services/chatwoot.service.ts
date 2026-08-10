@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
+import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildStoredLidMap,
   dedupeHistoryMessagesBySourceId,
@@ -446,45 +447,30 @@ export class ChatwootService {
       return null;
     }
 
-    // Direct search by query (q) - most common way to search by identifier/email/phone
-    const contact = (await (client as any).get('contacts/search', {
-      params: {
-        q: identifier,
-        sort: 'name',
-      },
-    })) as any;
-
-    if (contact && contact.data && contact.data.payload && contact.data.payload.length > 0) {
-      return contact.data.payload[0];
+    const searchResult = await client.contacts.search({
+      accountId: this.provider.accountId,
+      q: identifier,
+      sort: 'name',
+    });
+    const searchContacts = extractChatwootContacts(searchResult);
+    const exactSearchMatch = searchContacts.find((contact) => contact.identifier === identifier);
+    if (exactSearchMatch) {
+      return exactSearchMatch;
     }
 
-    // Fallback for older API versions or different response structures
-    if (contact && contact.payload && contact.payload.length > 0) {
-      return contact.payload[0];
-    }
-
-    // Try search by attribute
-    const contactByAttr = (await (client as any).post('contacts/filter', {
+    const filterResult = await client.contacts.filter({
+      accountId: this.provider.accountId,
       payload: [
         {
           attribute_key: 'identifier',
           filter_operator: 'equal_to',
           values: [identifier],
-          query_operator: null,
         },
       ],
-    })) as any;
+    });
+    const filteredContacts = extractChatwootContacts(filterResult);
 
-    if (contactByAttr && contactByAttr.payload && contactByAttr.payload.length > 0) {
-      return contactByAttr.payload[0];
-    }
-
-    // Check inside data property if using axios interceptors wrapper
-    if (contactByAttr && contactByAttr.data && contactByAttr.data.payload && contactByAttr.data.payload.length > 0) {
-      return contactByAttr.data.payload[0];
-    }
-
-    return null;
+    return filteredContacts.find((contact) => contact.identifier === identifier) || filteredContacts[0] || null;
   }
 
   public async findContact(instance: InstanceDto, phoneNumber: string) {
@@ -521,15 +507,16 @@ export class ChatwootService {
       });
     }
 
-    if (!contact && contact?.payload?.length === 0) {
+    const contacts = extractChatwootContacts(contact);
+    if (contacts.length === 0) {
       this.logger.warn('contact not found');
       return null;
     }
 
     if (!isGroup) {
-      return contact.payload.length > 1 ? this.findContactInContactList(contact.payload, query) : contact.payload[0];
+      return contacts.length > 1 ? this.findContactInContactList(contacts, query) : contacts[0];
     } else {
-      return contact.payload.find((contact) => contact.identifier === query);
+      return contacts.find((contact) => contact.identifier === query);
     }
   }
 

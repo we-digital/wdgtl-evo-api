@@ -52,6 +52,10 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import {
+  shouldEnrichChatwootContacts,
+  shouldForwardChatwootMessageUpsert,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
@@ -811,7 +815,7 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private readonly contactHandle = {
-    'contacts.upsert': async (contacts: Contact[]) => {
+    'contacts.upsert': async (contacts: Contact[], options: { enrich?: boolean } = {}) => {
       try {
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
@@ -842,20 +846,26 @@ export class BaileysStartupService extends ChannelStartupService {
             { instanceName: this.instance.name, instanceId: this.instance.id },
             contactsRaw,
           );
-          chatwootImport.importHistoryContacts(
+          await chatwootImport.importHistoryContacts(
             { instanceName: this.instance.name, instanceId: this.instance.id },
             this.localChatwoot,
           );
         }
 
-        const updatedContacts = await Promise.all(
-          contacts.map(async (contact) => ({
+        if (!shouldEnrichChatwootContacts(contacts.length, options.enrich !== false)) {
+          this.logger.info(`Skipping per-contact enrichment for bulk/history contact batch (${contacts.length})`);
+          return;
+        }
+
+        const updatedContacts = [];
+        for (const contact of contacts) {
+          updatedContacts.push({
             remoteJid: contact.id,
             pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
             profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
             instanceId: this.instanceId,
-          })),
-        );
+          });
+        }
 
         if (updatedContacts.length > 0) {
           const usersContacts = updatedContacts.filter((c) => c.remoteJid.includes('@s.whatsapp'));
@@ -864,34 +874,29 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           this.sendDataWebhook(Events.CONTACTS_UPDATE, updatedContacts);
-          await Promise.all(
-            updatedContacts.map(async (contact) => {
-              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
-                await this.prismaRepository.contact.updateMany({
-                  where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
-                  data: { profilePicUrl: contact.profilePicUrl },
-                });
+          for (const contact of updatedContacts) {
+            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+              await this.prismaRepository.contact.updateMany({
+                where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+                data: { profilePicUrl: contact.profilePicUrl },
+              });
+            }
+
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+              const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
+
+              const findParticipant = await this.chatwootService.findContact(instance, contact.remoteJid.split('@')[0]);
+
+              if (!findParticipant) {
+                continue;
               }
 
-              if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-                const instance = { instanceName: this.instance.name, instanceId: this.instance.id };
-
-                const findParticipant = await this.chatwootService.findContact(
-                  instance,
-                  contact.remoteJid.split('@')[0],
-                );
-
-                if (!findParticipant) {
-                  return;
-                }
-
-                this.chatwootService.updateContact(instance, findParticipant.id, {
-                  name: contact.pushName,
-                  avatar_url: contact.profilePicUrl,
-                });
-              }
-            }),
-          );
+              await this.chatwootService.updateContact(instance, findParticipant.id, {
+                name: contact.pushName,
+                avatar_url: contact.profilePicUrl,
+              });
+            }
+          }
         }
       } catch (error) {
         console.error(error);
@@ -1074,6 +1079,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         await this.contactHandle['contacts.upsert'](
           contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          { enrich: false },
         );
 
         contacts = undefined;
@@ -1329,6 +1335,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (
+            shouldForwardChatwootMessageUpsert(type) &&
             this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
             this.localChatwoot?.enabled &&
             !received.key.id.includes('@broadcast')
@@ -2012,12 +2019,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['contacts.upsert']) {
               const payload = events['contacts.upsert'];
-              this.contactHandle['contacts.upsert'](payload);
+              await this.contactHandle['contacts.upsert'](payload);
             }
 
             if (events['contacts.update']) {
               const payload = events['contacts.update'];
-              this.contactHandle['contacts.update'](payload);
+              await this.contactHandle['contacts.update'](payload);
             }
 
             if (events[Events.LABELS_ASSOCIATION]) {
