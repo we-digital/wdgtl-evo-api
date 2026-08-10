@@ -121,7 +121,8 @@ for the initial full backfill. It stays in the legacy-safe `direct`/`skip` mode 
 `scope: "all"` and `unresolvedLidMode: "provisional"` enables extended sync for that instance in the shared cache.
 After activation, the incremental job includes groups and provisional LIDs. Confirmed `lid-mapping.update` events
 reconcile provisional contacts immediately. A daily 03:15 job retries only unresolved LID contacts against the current
-Signal store.
+Signal store. Each contact is isolated during that retry, so one failed Chatwoot merge/update is logged and counted
+without aborting reconciliation of the remaining contacts.
 
 Startup, 30-minute incremental repair, and the daily LID reconciliation are scheduled only for providers whose live
 `enabled` flag is true. For a disabled provider, use this endpoint explicitly or enable the integration separately

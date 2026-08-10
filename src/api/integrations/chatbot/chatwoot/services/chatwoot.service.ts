@@ -32,6 +32,7 @@ import ChatwootClient, {
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
+import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
 import axios from 'axios';
@@ -2816,13 +2817,13 @@ export class ChatwootService {
 
   public async reconcileStoredLidContacts(instance: InstanceDto) {
     if (!this.isImportHistoryAvailable()) {
-      return { checked: 0, reconciled: 0 };
+      return { checked: 0, reconciled: 0, failed: 0 };
     }
 
     const provider = await this.getProvider(instance);
     const inbox = await this.getInbox(instance);
     if (!provider?.enabled || !inbox) {
-      return { checked: 0, reconciled: 0 };
+      return { checked: 0, reconciled: 0, failed: 0 };
     }
 
     const provisionalContacts = (
@@ -2841,18 +2842,26 @@ export class ChatwootService {
     ).rows as Array<{ identifier: string }>;
 
     let reconciled = 0;
+    let failed = 0;
     for (const contact of provisionalContacts) {
-      const phoneJid = await this.resolvePhoneJidForLid(instance, contact.identifier);
-      if (!phoneJid) {
-        continue;
-      }
-      const result = await this.reconcileLidIdentity(instance, contact.identifier, phoneJid);
-      if (result.status === 'merged' || result.status === 'updated') {
-        reconciled++;
+      try {
+        const phoneJid = await this.resolvePhoneJidForLid(instance, contact.identifier);
+        if (!phoneJid) {
+          continue;
+        }
+        const result = await this.reconcileLidIdentity(instance, contact.identifier, phoneJid);
+        if (result.status === 'merged' || result.status === 'updated') {
+          reconciled++;
+        }
+      } catch (error) {
+        failed++;
+        this.logger.error(
+          `Unable to reconcile stored Chatwoot LID contact ${contact.identifier}: ${formatCaughtError(error)}`,
+        );
       }
     }
 
-    return { checked: provisionalContacts.length, reconciled };
+    return { checked: provisionalContacts.length, reconciled, failed };
   }
 
   public async syncStoredHistory(instance: InstanceDto, data: ChatwootHistorySyncDto = {}) {
@@ -3062,7 +3071,7 @@ export class ChatwootService {
         unresolvedLidMode: extendedHistorySync ? 'provisional' : 'skip',
       });
     } catch (error) {
-      this.logger.error(`Error on incremental Chatwoot history sync: ${error.toString()}`);
+      this.logger.error(`Error on incremental Chatwoot history sync: ${formatCaughtError(error)}`);
       return;
     }
   }

@@ -27,13 +27,13 @@ also had to be refreshed.
 Production uses the controlled public fork [we-digital/Baileys](https://github.com/we-digital/Baileys), not an untracked
 working-tree patch:
 
-- release: [`wdgtl-v7.0.0-rc.9.3`](https://github.com/we-digital/Baileys/releases/tag/wdgtl-v7.0.0-rc.9.3)
-- package version: `7.0.0-rc.9-wdgtl.3`
-- fork commit: `a18ac6723ccdc9625c1691dc4d9698b6c6517223`
+- release: [`wdgtl-v7.0.0-rc.9.4`](https://github.com/we-digital/Baileys/releases/tag/wdgtl-v7.0.0-rc.9.4)
+- package version: `7.0.0-rc.9-wdgtl.4`
+- fork commit: `1e4e955a5e4b4beda7e37f9efee57ef9193e52cd`
 - upstream base: `v7.0.0-rc.9` / `cb8b3717aaede47460ba700651ee936f268c0ce4`
 - release asset SHA-512 is pinned by `package-lock.json`
 
-The release implements four recovery paths:
+The release implements six compatibility and recovery paths:
 
 1. On a WhatsApp identity-change notification, resolve PN/LID aliases, evict their device-cache entries, force fresh
    pairwise Signal sessions, and remove only those devices from all stored group sender-key memories.
@@ -42,6 +42,8 @@ The release implements four recovery paths:
 3. Before later sends, retain the inexpensive group-memory reset as a defense-in-depth fallback.
 4. On a participant-hash rejection, perform a bounded full repair and retry the original message once.
 5. Preserve libsignal session state transitions without logging complete `SessionEntry` objects or their key material.
+6. Emit validated `lid-mapping.update` events when mappings are learned from history, migration, message alternate JIDs,
+   or app-state contact actions so Evolution API can reconcile provisional Chatwoot contacts.
 
 The identity scan calls `groupFetchAllParticipating(false)`. The `false` is operationally important: emitting
 `groups.update` caused Evolution API to fan out a metadata query for every group. On the 2026-07-18 production rollout,
@@ -76,7 +78,7 @@ The production flag is owned by `we-digital/bbc-devops` in `droplets/evo/runtime
 1. Set `BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH=true` in the production runtime environment.
 2. Verify `package.json` and `package-lock.json` point to the immutable controlled release asset above.
 3. Build and deploy the Evolution API image containing the compatibility layer.
-4. Confirm the container package reports `7.0.0-rc.9-wdgtl.3` and the recovery log appears on the next group send.
+4. Confirm the container package reports `7.0.0-rc.9-wdgtl.4` and the recovery log appears on the next group send.
 5. Send a new test message and verify it on the affected primary mobile and linked devices. Old placeholders cannot be
    repaired because their ciphertext was already delivered without an available key.
 6. Roll back the application image first if runtime errors appear. The prior image uses the same auth/database state.
@@ -102,7 +104,7 @@ Before upgrading Evolution API or Baileys:
 
 1. Read this runbook and the fork's `FORK_NOTES.md` before changing Evolution API or Baileys.
 2. Check issue #2704, related sender-key/SKDM changes, and upstream PRs. An open or version-bumped PR is not a fix.
-3. Diff the candidate upstream source against fork commit `a18ac672`; account for identity notifications, PN/LID aliases,
+3. Diff the candidate upstream source against fork commit `1e4e955`; account for identity notifications, PN/LID aliases,
    device-cache eviction, forced session refresh, silent group enumeration, sender-key invalidation, and participant-hash
    retry separately. Ensure session lifecycle logs cannot contain key material.
 4. Keep the controlled dependency and production flag unless every required behavior is present upstream.
