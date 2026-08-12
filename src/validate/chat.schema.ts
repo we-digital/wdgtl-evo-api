@@ -241,6 +241,29 @@ export const messageValidateSchema: JSONSchema7 = {
   },
 };
 
+export const messageCursorValidateSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    contractVersion: { type: 'string', enum: ['2026-08-12'] },
+    limit: { type: 'integer', minimum: 1, maximum: 500 },
+    since: { type: 'string', format: 'date-time' },
+    until: { type: 'string', format: 'date-time' },
+    remoteJid: { type: 'string', minLength: 3, maxLength: 255 },
+    cursor: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        messageTimestamp: { type: 'integer', minimum: 0 },
+        id: { type: 'string', minLength: 1, maxLength: 255 },
+      },
+      required: ['messageTimestamp', 'id'],
+    },
+  },
+  required: ['contractVersion', 'limit', 'since', 'until'],
+};
+
 export const messageUpSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

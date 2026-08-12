@@ -59,6 +59,13 @@ export class ChatwootRouter extends RouterBroker {
 
         res.status(HttpStatus.OK).json(response);
       })
+      .get(this.routerPath('historySyncBatch/v1'), ...guards, async (_req, res) => {
+        res.status(HttpStatus.OK).json({
+          contractVersion: '2026-08-01',
+          maxBatchSize: 500,
+          operation: 'bounded-cached-apply',
+        });
+      })
       .post(this.routerPath('webhook'), async (req, res) => {
         const response = await this.dataValidate<InstanceDto>({
           request: req,

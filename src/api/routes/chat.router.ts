@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FindMessagesCursorDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -25,6 +26,7 @@ import {
   contactValidateSchema,
   deleteMessageSchema,
   markChatUnreadSchema,
+  messageCursorValidateSchema,
   messageUpSchema,
   messageValidateSchema,
   presenceSchema,
@@ -167,6 +169,19 @@ export class ChatRouter extends RouterBroker {
           schema: messageValidateSchema,
           ClassRef: Query<Message>,
           execute: (instance, data) => chatController.fetchMessages(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      .get(this.routerPath('findMessagesCursor/v1'), ...guards, async (_req, res) => {
+        return res.status(HttpStatus.OK).json(chatController.messageCursorCapabilities());
+      })
+      .post(this.routerPath('findMessagesCursor/v1'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<FindMessagesCursorDto>({
+          request: req,
+          schema: messageCursorValidateSchema,
+          ClassRef: FindMessagesCursorDto,
+          execute: (instance, data) => chatController.fetchMessagesCursor(instance, data),
         });
 
         return res.status(HttpStatus.OK).json(response);

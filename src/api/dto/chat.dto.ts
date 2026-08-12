@@ -127,3 +127,17 @@ export class BlockUserDto {
   number: string;
   status: 'block' | 'unblock';
 }
+
+export class MessageCursorDto {
+  messageTimestamp: number;
+  id: string;
+}
+
+export class FindMessagesCursorDto {
+  contractVersion: '2026-08-12';
+  limit: number;
+  since: string;
+  until: string;
+  remoteJid?: string;
+  cursor?: MessageCursorDto;
+}

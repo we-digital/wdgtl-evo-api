@@ -2,6 +2,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FindMessagesCursorDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -17,10 +18,21 @@ import {
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Query } from '@api/repository/repository.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
-import { Contact, Message, MessageUpdate } from '@prisma/client';
+import {
+  createMessageCursorPage,
+  MESSAGE_CURSOR_CONTRACT_VERSION,
+  MESSAGE_CURSOR_MAX_PAGE_SIZE,
+} from '@api/utils/message-cursor';
+import { BadRequestException } from '@exceptions';
+import { Contact, Message, MessageUpdate, Prisma } from '@prisma/client';
+
+import { PrismaRepository } from '../repository/repository.service';
 
 export class ChatController {
-  constructor(private readonly waMonitor: WAMonitoringService) {}
+  constructor(
+    private readonly waMonitor: WAMonitoringService,
+    private readonly prismaRepository: PrismaRepository,
+  ) {}
 
   public async whatsappNumber({ instanceName }: InstanceDto, data: WhatsAppNumberDto) {
     return await this.waMonitor.waInstances[instanceName].whatsappNumber(data);
@@ -60,6 +72,50 @@ export class ChatController {
 
   public async fetchMessages({ instanceName }: InstanceDto, query: Query<Message>) {
     return await this.waMonitor.waInstances[instanceName].fetchMessages(query);
+  }
+
+  public messageCursorCapabilities() {
+    return {
+      contractVersion: MESSAGE_CURSOR_CONTRACT_VERSION,
+      maxPageSize: MESSAGE_CURSOR_MAX_PAGE_SIZE,
+      pagination: 'keyset' as const,
+      ordering: ['messageTimestamp:desc', 'id:desc'],
+    };
+  }
+
+  public async fetchMessagesCursor({ instanceName }: InstanceDto, data: FindMessagesCursorDto) {
+    if (data.contractVersion !== MESSAGE_CURSOR_CONTRACT_VERSION) {
+      throw new BadRequestException('Unsupported message cursor contract');
+    }
+    const since = Date.parse(data.since);
+    const until = Date.parse(data.until);
+    if (!Number.isFinite(since) || !Number.isFinite(until) || since > until) {
+      throw new BadRequestException('since and until must define a valid ascending ISO-8601 range');
+    }
+
+    const cursorFilter: Prisma.MessageWhereInput | undefined = data.cursor
+      ? {
+          OR: [
+            { messageTimestamp: { lt: data.cursor.messageTimestamp } },
+            { messageTimestamp: data.cursor.messageTimestamp, id: { lt: data.cursor.id } },
+          ],
+        }
+      : undefined;
+    const messages = await this.prismaRepository.message.findMany({
+      where: {
+        Instance: { name: instanceName },
+        messageTimestamp: {
+          gte: Math.floor(since / 1_000),
+          lte: Math.floor(until / 1_000),
+        },
+        ...(data.remoteJid ? { key: { path: ['remoteJid'], equals: data.remoteJid } } : {}),
+        ...(cursorFilter ? { AND: [cursorFilter] } : {}),
+      },
+      orderBy: [{ messageTimestamp: 'desc' }, { id: 'desc' }],
+      take: data.limit + 1,
+    });
+
+    return createMessageCursorPage(messages, data.limit);
   }
 
   public async fetchStatusMessage({ instanceName }: InstanceDto, query: Query<MessageUpdate>) {
