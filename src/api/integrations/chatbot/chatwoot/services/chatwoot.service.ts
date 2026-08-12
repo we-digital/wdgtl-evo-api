@@ -1,6 +1,10 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
-import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import {
+  ChatwootDto,
+  ChatwootHistorySyncBatchDto,
+  ChatwootHistorySyncDto,
+} from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
@@ -3053,6 +3057,151 @@ export class ChatwootService {
 
       return result;
     } finally {
+      this.activeStoredHistorySyncs.delete(instance.instanceName);
+    }
+  }
+
+  public async syncStoredHistoryBatch(instance: InstanceDto, data: ChatwootHistorySyncBatchDto) {
+    if (!this.isImportHistoryAvailable()) {
+      throw new BadRequestException('Chatwoot history import database connection is not configured');
+    }
+    if (data.contractVersion !== '2026-08-01' || data.dryRun !== false) {
+      throw new BadRequestException('Unsupported Chatwoot cached history batch contract');
+    }
+    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
+      throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
+    }
+
+    this.activeStoredHistorySyncs.add(instance.instanceName);
+    try {
+      const provider = await this.getProvider(instance);
+      if (!provider?.importMessages) {
+        throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
+      }
+
+      const client = await this.clientCw(instance);
+      if (!client) {
+        throw new BadRequestException(`Chatwoot client is not available for ${instance.instanceName}`);
+      }
+      const inbox = await this.getInbox(instance);
+      if (!inbox) {
+        throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
+      }
+
+      const requestedSourceIds = new Set<string>();
+      const requestedDatabaseIds = new Set<string>();
+      for (const entry of data.messages) {
+        const databaseId = String(entry.message.id || '');
+        const key = entry.message.key as { id?: unknown };
+        const canonicalSourceId = typeof key?.id === 'string' ? toChatwootSourceId(key.id) : '';
+        if (!databaseId || canonicalSourceId !== entry.sourceId) {
+          throw new BadRequestException('Cached history message source id does not match its embedded payload');
+        }
+        if (requestedSourceIds.has(entry.sourceId) || requestedDatabaseIds.has(databaseId)) {
+          throw new BadRequestException('Cached history batch contains duplicate messages');
+        }
+        requestedSourceIds.add(entry.sourceId);
+        requestedDatabaseIds.add(databaseId);
+      }
+
+      const storedMessages = await this.prismaRepository.message.findMany({
+        where: {
+          Instance: { name: instance.instanceName },
+          id: { in: Array.from(requestedDatabaseIds) },
+        },
+      });
+      const storedById = new Map(storedMessages.map((message) => [message.id, message]));
+      const authoritativeMessages = data.messages.map((entry) => {
+        const stored = storedById.get(String(entry.message.id));
+        const storedKey = stored?.key as { id?: unknown } | undefined;
+        if (!stored || typeof storedKey?.id !== 'string' || toChatwootSourceId(storedKey.id) !== entry.sourceId) {
+          throw new BadRequestException('Cached history message is not available for the requested instance');
+        }
+        return stored;
+      });
+
+      const lidMappingRefresh = data.refreshLidMappings
+        ? await this.refreshKnownLidMappings(instance, authoritativeMessages)
+        : { attemptedPhoneJids: 0, refreshedMappings: 0 };
+      const normalized = await normalizeStoredHistoryMessages(
+        authoritativeMessages,
+        authoritativeMessages,
+        (lid) => this.resolvePhoneJidForLid(instance, lid),
+        {
+          includeGroups: data.scope === 'groups' || data.scope === 'all',
+          includeUnresolvedLids:
+            data.unresolvedLidMode === 'provisional' && (data.scope === 'direct' || data.scope === 'all'),
+        },
+      );
+      const scopedMessages = normalized.messages.filter((message: any) => {
+        const remoteJid = message.key?.remoteJid;
+        if (data.scope === 'groups') return isGroupJid(remoteJid);
+        if (data.scope === 'direct') return !isGroupJid(remoteJid);
+        return true;
+      });
+      const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
+        dedupeHistoryMessagesBySourceId(scopedMessages);
+      const existingSourceIds = await chatwootImport.getExistingSourceIds(
+        Array.from(requestedSourceIds),
+        undefined,
+        inbox.id,
+      );
+      const missingMessages = uniqueMessages.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      const importableMessages = missingMessages.filter((message: any) =>
+        Boolean(chatwootImport.getContentMessage(this, message)),
+      );
+
+      let importedMessages = 0;
+      let appliedMessages = 0;
+      if (importableMessages.length > 0) {
+        const identityNames = await this.getGroupIdentityNames(instance, importableMessages);
+        chatwootImport.addHistoryIdentityNames(instance, identityNames);
+        this.addHistoryMessages(instance, importableMessages);
+        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+        if (!Number.isInteger(imported)) {
+          throw new Error(`Chatwoot cached history import failed for ${instance.instanceName}`);
+        }
+        importedMessages = Number(imported);
+        const appliedSourceIds = await chatwootImport.getExistingSourceIds(
+          importableMessages.map((message: any) => message.key.id),
+          undefined,
+          inbox.id,
+        );
+        if (appliedSourceIds.size !== importableMessages.length) {
+          throw new Error(
+            `Chatwoot cached history import only applied ${appliedSourceIds.size}/${importableMessages.length} messages for ${instance.instanceName}`,
+          );
+        }
+        appliedMessages = appliedSourceIds.size;
+        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+      }
+      if (data.scope === 'all' && data.unresolvedLidMode === 'provisional') {
+        await this.enableExtendedHistorySync(instance);
+      }
+
+      return {
+        contractVersion: '2026-08-01',
+        status: 'completed',
+        instanceName: instance.instanceName,
+        inboxId: inbox.id,
+        providerEnabled: Boolean(provider.enabled),
+        scope: data.scope,
+        unresolvedLidMode: data.unresolvedLidMode,
+        attemptedPhoneJids: lidMappingRefresh.attemptedPhoneJids,
+        refreshedLidMappings: lidMappingRefresh.refreshedMappings,
+        sourceMessages: data.messages.length,
+        existingMessages: existingSourceIds.size,
+        selectedMessages: data.messages.length,
+        importedMessages,
+        appliedMessages,
+        unsupportedMessagesSkipped: missingMessages.length - importableMessages.length,
+        duplicateSourceMessagesSkipped,
+        processedSourceIds: Array.from(requestedSourceIds),
+      };
+    } finally {
+      chatwootImport.clearAll(instance);
       this.activeStoredHistorySyncs.delete(instance.instanceName);
     }
   }

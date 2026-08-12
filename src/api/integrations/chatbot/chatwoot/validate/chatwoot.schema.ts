@@ -61,3 +61,44 @@ export const chatwootHistorySyncSchema: JSONSchema7 = {
     refreshLidMappings: { type: 'boolean' },
   },
 };
+
+export const chatwootHistorySyncBatchSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    contractVersion: { type: 'string', enum: ['2026-08-01'] },
+    dryRun: { type: 'boolean', enum: [false] },
+    scope: { type: 'string', enum: ['direct', 'groups', 'all'] },
+    unresolvedLidMode: { type: 'string', enum: ['skip', 'provisional'] },
+    refreshLidMappings: { type: 'boolean' },
+    messages: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 500,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          sourceId: { type: 'string', pattern: '^WAID:[^\\s]+$', maxLength: 255 },
+          message: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 255 },
+              key: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', minLength: 1, maxLength: 255 },
+                },
+                required: ['id'],
+              },
+            },
+            required: ['id', 'key'],
+          },
+        },
+        required: ['sourceId', 'message'],
+      },
+    },
+  },
+  required: ['contractVersion', 'dryRun', 'scope', 'unresolvedLidMode', 'refreshLidMappings', 'messages'],
+};

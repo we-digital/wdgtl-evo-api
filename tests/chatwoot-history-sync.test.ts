@@ -7,8 +7,10 @@ import {
   toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import { chatwootHistorySyncBatchSchema } from '@api/integrations/chatbot/chatwoot/validate/chatwoot.schema';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { Message } from '@prisma/client';
+import { validate } from 'jsonschema';
 
 const message = ({
   id,
@@ -132,5 +134,30 @@ test('attributes imported incoming group content to the stored participant', () 
   assert.equal(
     chatwootImport.getHistoryContentMessage(chatwootService, group as any),
     '**+628123 - Participant:**\n\nhello',
+  );
+});
+
+test('accepts only the versioned bounded cached history batch contract', () => {
+  const validRequest = {
+    contractVersion: '2026-08-01',
+    dryRun: false,
+    scope: 'all',
+    unresolvedLidMode: 'provisional',
+    refreshLidMappings: false,
+    messages: [
+      {
+        sourceId: 'WAID:message-1',
+        message: { id: 'database-id-1', key: { id: 'message-1' }, messageTimestamp: 1_700_000_000 },
+      },
+    ],
+  };
+
+  assert.equal(validate(validRequest, chatwootHistorySyncBatchSchema).valid, true);
+  assert.equal(validate({ ...validRequest, contractVersion: 'latest' }, chatwootHistorySyncBatchSchema).valid, false);
+  assert.equal(validate({ ...validRequest, dryRun: true }, chatwootHistorySyncBatchSchema).valid, false);
+  assert.equal(
+    validate({ ...validRequest, messages: Array.from({ length: 501 }, () => validRequest.messages[0]) }, chatwootHistorySyncBatchSchema)
+      .valid,
+    false,
   );
 });

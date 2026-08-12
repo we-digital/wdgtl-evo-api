@@ -31,6 +31,20 @@ export class ChatwootHistorySyncDto {
   refreshLidMappings?: boolean;
 }
 
+export class ChatwootHistorySyncBatchMessageDto {
+  sourceId: string;
+  message: Record<string, unknown>;
+}
+
+export class ChatwootHistorySyncBatchDto {
+  contractVersion: '2026-08-01';
+  dryRun: false;
+  scope: 'direct' | 'groups' | 'all';
+  unresolvedLidMode: 'skip' | 'provisional';
+  refreshLidMappings: boolean;
+  messages: ChatwootHistorySyncBatchMessageDto[];
+}
+
 export function ChatwootInstanceMixin<TBase extends Constructor>(Base: TBase) {
   return class extends Base {
     chatwootAccountId?: string;

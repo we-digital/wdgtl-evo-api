@@ -1,9 +1,18 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
-import { ChatwootDto, ChatwootHistorySyncDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import {
+  ChatwootDto,
+  ChatwootHistorySyncBatchDto,
+  ChatwootHistorySyncDto,
+} from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { HttpStatus } from '@api/routes/index.router';
 import { chatwootController } from '@api/server.module';
-import { chatwootHistorySyncSchema, chatwootSchema, instanceSchema } from '@validate/validate.schema';
+import {
+  chatwootHistorySyncBatchSchema,
+  chatwootHistorySyncSchema,
+  chatwootSchema,
+  instanceSchema,
+} from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
 export class ChatwootRouter extends RouterBroker {
@@ -36,6 +45,16 @@ export class ChatwootRouter extends RouterBroker {
           schema: chatwootHistorySyncSchema,
           ClassRef: ChatwootHistorySyncDto,
           execute: (instance, data) => chatwootController.syncHistory(instance, data),
+        });
+
+        res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('historySyncBatch/v1'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<ChatwootHistorySyncBatchDto>({
+          request: req,
+          schema: chatwootHistorySyncBatchSchema,
+          ClassRef: ChatwootHistorySyncBatchDto,
+          execute: (instance, data) => chatwootController.syncHistoryBatch(instance, data),
         });
 
         res.status(HttpStatus.OK).json(response);
