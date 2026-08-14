@@ -311,12 +311,6 @@ class ChatwootImport {
             messagesByIdentity,
             this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
           );
-          const provisionalContactIds = Array.from(messagesByIdentity.keys())
-            .filter((identityKey) => isLidJid(identityKey))
-            .map((identityKey) => Number(fksByIdentity.get(identityKey)?.contact_id))
-            .filter((contactId) => Number.isInteger(contactId) && contactId > 0);
-          await this.addUnresolvedLidLabel(provider, provisionalContactIds);
-
           // inserting messages in chatwoot db
           let sqlValues = '';
           const bindInsertMsg = [provider.accountId, inbox.id];
@@ -695,54 +689,6 @@ class ChatwootImport {
 
       return acc;
     }, new Map());
-  }
-
-  private async addUnresolvedLidLabel(provider: ChatwootModel, contactIds: number[]) {
-    const uniqueContactIds = Array.from(new Set(contactIds));
-    if (uniqueContactIds.length === 0) {
-      return;
-    }
-
-    const pgClient = postgresClient.getChatwootConnection();
-    const labelName = 'unresolved_lid';
-
-    await pgClient.query(
-      `INSERT INTO labels (title, color, show_on_sidebar, account_id, created_at, updated_at)
-       SELECT $1::TEXT, '#B7791F', TRUE, $2::BIGINT, NOW(), NOW()
-       WHERE NOT EXISTS (
-         SELECT 1 FROM labels WHERE title = $1::TEXT AND account_id = $2::BIGINT
-       )`,
-      [labelName, provider.accountId],
-    );
-
-    const tagId = (
-      await pgClient.query(
-        `INSERT INTO tags (name, taggings_count)
-         VALUES ($1::TEXT, 0)
-         ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
-         RETURNING id`,
-        [labelName],
-      )
-    ).rows[0]?.id;
-
-    await pgClient.query(
-      `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at)
-       SELECT $1::INTEGER, 'Contact', contact_id, 'labels', NOW()
-       FROM UNNEST($2::INTEGER[]) AS contact_id
-       ON CONFLICT DO NOTHING`,
-      [tagId, uniqueContactIds],
-    );
-
-    await pgClient.query(
-      `UPDATE tags
-       SET taggings_count = (
-         SELECT COUNT(*) FROM taggings
-         WHERE taggings.tag_id = tags.id
-           AND taggings.context = 'labels'
-       )
-       WHERE id = $1::INTEGER`,
-      [tagId],
-    );
   }
 
   public async getContactsOrderByRecentConversations(

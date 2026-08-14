@@ -17,7 +17,8 @@ The same operation is used by the six-hour incremental repair job that runs at s
 - An explicit `refreshLidMappings` request can query known phone JIDs through Baileys USync and persists confirmed
   mappings in the normal Signal store. It never guesses a phone number.
 - `unresolvedLidMode: "provisional"` preserves messages that still have no confirmed mapping in a contact whose
-  identifier is the canonical LID, whose phone is empty, and whose label is `unresolved_lid`.
+  identifier is the canonical LID and whose phone is empty. Reconciliation discovers these contacts by identifier, so
+  the import does not create a customer-facing Chatwoot label for this internal state.
 - Groups use their group JID as the contact identifier and keep the incoming participant name/confirmed phone in the
   message content, matching live Chatwoot group conversations.
 - Status broadcasts, invalid messages, and unsupported content are skipped and counted.
@@ -123,6 +124,10 @@ After activation, the incremental job includes groups and provisional LIDs. Conf
 reconcile provisional contacts immediately. A daily 03:15 job retries only unresolved LID contacts against the current
 Signal store. Each contact is isolated during that retry, so one failed Chatwoot merge/update is logged and counted
 without aborting reconciliation of the remaining contacts.
+
+Reconciliation selects provisional contacts by their canonical `@lid` or `@hosted.lid` identifier. Legacy
+`unresolved_lid` Chatwoot labels are not used by this process and can be removed without deleting contacts,
+conversations, or imported messages.
 
 Startup, 30-minute incremental repair, and the daily LID reconciliation are scheduled only for providers whose live
 `enabled` flag is true. For a disabled provider, use this endpoint explicitly or enable the integration separately
