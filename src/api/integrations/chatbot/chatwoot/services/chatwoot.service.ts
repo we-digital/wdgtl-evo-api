@@ -119,7 +119,7 @@ export class ChatwootService {
       basePath: this.provider.url,
       with_credentials: true,
       credentials: 'include',
-      token: this.provider.token,
+      headers: { 'api-access-token': this.provider.token },
       nameInbox: this.provider.nameInbox,
       mergeBrazilContacts: this.provider.mergeBrazilContacts,
     };
@@ -1108,7 +1108,7 @@ export class ChatwootService {
       maxBodyLength: Infinity,
       url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversationId}/messages`,
       headers: {
-        api_access_token: this.provider.token,
+        'api-access-token': this.provider.token,
         ...data.getHeaders(),
       },
       data: data,
@@ -1181,7 +1181,7 @@ export class ChatwootService {
       maxBodyLength: Infinity,
       url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversation.id}/messages`,
       headers: {
-        api_access_token: this.provider.token,
+        'api-access-token': this.provider.token,
         ...data.getHeaders(),
       },
       data: data,
