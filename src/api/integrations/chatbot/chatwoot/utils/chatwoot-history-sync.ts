@@ -44,6 +44,13 @@ export const historyRecoveryDestination = (accountId: string | number, inboxId: 
   destinationKey: `chatwoot:${accountId}:${inboxId}`,
 });
 
+export const uniqueHistoryRecoveryInboxId = (rows: Array<{ id?: unknown }>): number | null => {
+  if (rows.length !== 1) return null;
+
+  const inboxId = Number(rows[0]?.id);
+  return Number.isSafeInteger(inboxId) && inboxId > 0 ? inboxId : null;
+};
+
 export const matchesHistoryRecoveryDestination = (
   expectedDestinationKey: string,
   expectedInboxId: number,

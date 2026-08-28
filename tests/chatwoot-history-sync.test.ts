@@ -9,6 +9,7 @@ import {
   prepareStoredHistoryRecoveryMessage,
   toCanonicalHistoryJid,
   toChatwootSourceId,
+  uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import {
   chatwootHistoryRecoveryBatchSchema,
@@ -241,4 +242,12 @@ test('pins recovery apply to the exact capability destination', () => {
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 99), true);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 100), false);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 100, '1', 99), false);
+});
+
+test('accepts only one valid authoritative recovery inbox', () => {
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 99 }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: '99' }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 45 }, { id: 99 }]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 'not-an-id' }]), null);
 });
