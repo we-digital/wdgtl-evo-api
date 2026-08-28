@@ -2,11 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  chatwootInboxCacheKey,
   dedupeHistoryMessagesBySourceId,
   historyRecoveryDestination,
   matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
+  resolveProviderClientContext,
+  selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
   uniqueHistoryRecoveryInboxId,
@@ -242,6 +245,63 @@ test('pins recovery apply to the exact capability destination', () => {
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 99), true);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 100), false);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 100, '1', 99), false);
+});
+
+test('selects an inbox only from the captured provider name', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Other instance' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.deepEqual(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), {
+    id: 99,
+    name: 'WA - Gabby',
+  });
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Missing'), null);
+});
+
+test('refuses ambiguous duplicate inbox names', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Gabby' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), null);
+});
+
+test('namespaces inbox cache entries by provider URL', () => {
+  const provider = { accountId: 1, nameInbox: 'WA - Gabby' };
+  const first = chatwootInboxCacheKey('instance', { ...provider, url: 'https://first.example/' });
+  const second = chatwootInboxCacheKey('instance', { ...provider, url: 'https://second.example' });
+
+  assert.notEqual(first, second);
+  assert.equal(first, chatwootInboxCacheKey('instance', { ...provider, url: 'https://first.example' }));
+});
+
+test('keeps provider contexts isolated when concurrent loads interleave', async () => {
+  let releaseFirst: () => void = () => {};
+  const secondLoaded = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const createClient = (provider: { accountId: number }) => ({ accountId: provider.accountId });
+
+  const first = resolveProviderClientContext(async () => {
+    await secondLoaded;
+    return { accountId: 11 };
+  }, createClient);
+  const second = resolveProviderClientContext(async () => {
+    releaseFirst();
+    return { accountId: 22 };
+  }, createClient);
+
+  const [firstContext, secondContext] = await Promise.all([first, second]);
+
+  assert.ok(firstContext);
+  assert.ok(secondContext);
+  assert.equal(firstContext.provider.accountId, 11);
+  assert.equal(firstContext.client.accountId, 11);
+  assert.equal(secondContext.provider.accountId, 22);
+  assert.equal(secondContext.client.accountId, 22);
 });
 
 test('accepts only one valid authoritative recovery inbox', () => {

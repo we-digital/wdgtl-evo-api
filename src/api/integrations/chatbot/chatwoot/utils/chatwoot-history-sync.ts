@@ -61,6 +61,31 @@ export const matchesHistoryRecoveryDestination = (
   return destination.destinationKey === expectedDestinationKey && destination.inboxId === expectedInboxId;
 };
 
+export const selectUniqueChatwootInbox = <T extends { name?: string }>(
+  inboxes: T[],
+  expectedName: string,
+): T | null => {
+  const matches = inboxes.filter((candidate) => candidate.name === expectedName);
+  return matches.length === 1 ? matches[0] : null;
+};
+
+export const chatwootInboxCacheKey = (
+  instanceName: string,
+  provider: { url: string; accountId: string | number; nameInbox: string },
+) => {
+  const providerUrl = provider.url.trim().replace(/\/+$/, '');
+  return `${instanceName}:getInbox:v3:${encodeURIComponent(providerUrl)}:${provider.accountId}:${provider.nameInbox}`;
+};
+
+export const resolveProviderClientContext = async <Provider, Client>(
+  loadProvider: () => Promise<Provider | null>,
+  createClient: (provider: Provider) => Client,
+): Promise<{ provider: Provider; client: Client } | null> => {
+  const provider = await loadProvider();
+  if (!provider) return null;
+  return { provider, client: createClient(provider) };
+};
+
 const recoveryText = (messageType: string, raw: Record<string, any> | null) => {
   if (messageType === 'reactionMessage') {
     const reaction = raw?.reactionMessage;
