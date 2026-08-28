@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import {
   ChatwootDto,
+  ChatwootHistoryRecoveryBatchDto,
   ChatwootHistorySyncBatchDto,
   ChatwootHistorySyncDto,
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
@@ -9,13 +10,20 @@ import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildStoredLidMap,
+  chatwootInboxCacheKey,
   dedupeHistoryMessagesBySourceId,
+  historyRecoveryDestination,
   isGroupJid,
   isLidJid,
   isPhoneJid,
+  matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
+  prepareStoredHistoryRecoveryMessage,
+  resolveProviderClientContext,
+  selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
+  uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
@@ -59,6 +67,11 @@ interface ChatwootMessage {
   isRead?: boolean;
 }
 
+interface ChatwootClientContext {
+  client: ChatwootClient;
+  provider: ChatwootModel;
+}
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly activeStoredHistorySyncs = new Set<string>();
@@ -66,8 +79,6 @@ export class ChatwootService {
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
-
-  private provider: any;
 
   constructor(
     private readonly waMonitor: WAMonitoringService,
@@ -98,31 +109,26 @@ export class ChatwootService {
     return provider;
   }
 
-  private async clientCw(instance: InstanceDto) {
-    const provider = await this.getProvider(instance);
-
-    if (!provider) {
-      this.logger.error('provider not found');
-      return null;
-    }
-
-    this.provider = provider;
-
-    const client = new ChatwootClient({
-      config: this.getClientCwConfig(),
-    });
-
-    return client;
+  private async clientCw(instance: InstanceDto): Promise<ChatwootClientContext | null> {
+    return resolveProviderClientContext(
+      () => this.getProvider(instance),
+      (provider) =>
+        new ChatwootClient({
+          config: this.getClientCwConfig(provider),
+        }),
+    );
   }
 
-  public getClientCwConfig(): ChatwootAPIConfig & { nameInbox: string; mergeBrazilContacts: boolean } {
+  public getClientCwConfig(
+    provider: ChatwootModel,
+  ): ChatwootAPIConfig & { nameInbox: string; mergeBrazilContacts: boolean } {
     return {
-      basePath: this.provider.url,
+      basePath: provider.url,
       with_credentials: true,
       credentials: 'include',
-      headers: { 'api-access-token': this.provider.token },
-      nameInbox: this.provider.nameInbox,
-      mergeBrazilContacts: this.provider.mergeBrazilContacts,
+      headers: { 'api-access-token': provider.token },
+      nameInbox: provider.nameInbox,
+      mergeBrazilContacts: provider.mergeBrazilContacts,
     };
   }
 
@@ -189,12 +195,13 @@ export class ChatwootService {
   }
 
   public async getContact(instance: InstanceDto, id: number) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     if (!id) {
       this.logger.warn('id is required');
@@ -202,7 +209,7 @@ export class ChatwootService {
     }
 
     const contact = await client.contact.getContactable({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       id,
     });
 
@@ -223,15 +230,16 @@ export class ChatwootService {
     organization?: string,
     logo?: string,
   ) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     const findInbox: any = await client.inboxes.list({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
     });
 
     const checkDuplicate = findInbox.payload.map((inbox) => inbox.name).includes(inboxName);
@@ -246,7 +254,7 @@ export class ChatwootService {
       };
 
       const inbox = await client.inboxes.create({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         data: {
           name: inboxName,
           channel: data as any,
@@ -305,7 +313,7 @@ export class ChatwootService {
       };
 
       const conversation = await client.conversations.create({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         data,
       });
 
@@ -321,7 +329,7 @@ export class ChatwootService {
       }
 
       const message = await client.messages.create({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         conversationId: conversation.id,
         data: {
           content: contentMsg,
@@ -349,12 +357,13 @@ export class ChatwootService {
     jid?: string,
   ) {
     try {
-      const client = await this.clientCw(instance);
+      const context = await this.clientCw(instance);
 
-      if (!client) {
+      if (!context) {
         this.logger.warn('client not found');
         return null;
       }
+      const { client, provider } = context;
 
       let data: any = {};
       if (!isGroup) {
@@ -378,7 +387,7 @@ export class ChatwootService {
       }
 
       const contact = await client.contacts.create({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         data,
       });
 
@@ -391,7 +400,7 @@ export class ChatwootService {
 
       const contactId = findContact?.id;
 
-      await this.addLabelToContact(this.provider.nameInbox, contactId);
+      await this.addLabelToContact(provider.nameInbox, contactId);
 
       return contact;
     } catch (error) {
@@ -400,7 +409,11 @@ export class ChatwootService {
         const existingContact = await this.findContactByIdentifier(instance, jid);
         if (existingContact) {
           const contactId = existingContact.id;
-          await this.addLabelToContact(this.provider.nameInbox, contactId);
+          const provider = await this.getProvider(instance);
+          if (!provider) {
+            return null;
+          }
+          await this.addLabelToContact(provider.nameInbox, contactId);
           return existingContact;
         }
       }
@@ -412,12 +425,13 @@ export class ChatwootService {
   }
 
   public async updateContact(instance: InstanceDto, id: number, data: any) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     if (!id) {
       this.logger.warn('id is required');
@@ -426,7 +440,7 @@ export class ChatwootService {
 
     try {
       const contact = await client.contacts.update({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         id,
         data,
       });
@@ -475,15 +489,16 @@ export class ChatwootService {
   }
 
   public async findContactByIdentifier(instance: InstanceDto, identifier: string) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     const searchResult = await client.contacts.search({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       q: identifier,
       sort: 'name',
     });
@@ -494,7 +509,7 @@ export class ChatwootService {
     }
 
     const filterResult = await client.contacts.filter({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       payload: [
         {
           attribute_key: 'identifier',
@@ -509,12 +524,13 @@ export class ChatwootService {
   }
 
   public async findContact(instance: InstanceDto, phoneNumber: string) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     let query: any;
     const isGroup = phoneNumber.includes('@g.us');
@@ -529,13 +545,13 @@ export class ChatwootService {
 
     if (isGroup) {
       contact = await client.contacts.search({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         q: query,
       });
     } else {
-      contact = await chatwootRequest(this.getClientCwConfig(), {
+      contact = await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
-        url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
+        url: `/api/v1/accounts/${provider.accountId}/contacts/filter`,
         body: {
           payload: this.getFilterPayload(query),
         },
@@ -549,17 +565,17 @@ export class ChatwootService {
     }
 
     if (!isGroup) {
-      return contacts.length > 1 ? this.findContactInContactList(contacts, query) : contacts[0];
+      return contacts.length > 1 ? this.findContactInContactList(contacts, query, provider) : contacts[0];
     } else {
       return contacts.find((contact) => contact.identifier === query);
     }
   }
 
-  public async mergeContacts(baseId: number, mergeId: number) {
+  public async mergeContacts(baseId: number, mergeId: number, provider: ChatwootModel) {
     try {
-      const contact = await chatwootRequest(this.getClientCwConfig(), {
+      const contact = await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
-        url: `/api/v1/accounts/${this.provider.accountId}/actions/contact_merge`,
+        url: `/api/v1/accounts/${provider.accountId}/actions/contact_merge`,
         body: {
           base_contact_id: baseId,
           mergee_contact_id: mergeId,
@@ -573,11 +589,11 @@ export class ChatwootService {
     }
   }
 
-  private async mergeBrazilianContacts(contacts: any[]) {
+  private async mergeBrazilianContacts(contacts: any[], provider: ChatwootModel) {
     try {
-      const contact = await chatwootRequest(this.getClientCwConfig(), {
+      const contact = await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
-        url: `/api/v1/accounts/${this.provider.accountId}/actions/contact_merge`,
+        url: `/api/v1/accounts/${provider.accountId}/actions/contact_merge`,
         body: {
           base_contact_id: contacts.find((contact) => contact.phone_number.length === 14)?.id,
           mergee_contact_id: contacts.find((contact) => contact.phone_number.length === 13)?.id,
@@ -591,13 +607,13 @@ export class ChatwootService {
     }
   }
 
-  private findContactInContactList(contacts: any[], query: string) {
+  private findContactInContactList(contacts: any[], query: string, provider: ChatwootModel) {
     const phoneNumbers = this.getNumbers(query);
     const searchableFields = this.getSearchableFields();
 
     // eslint-disable-next-line prettier/prettier
-    if (contacts.length === 2 && this.getClientCwConfig().mergeBrazilContacts && query.startsWith('+55')) {
-      const contact = this.mergeBrazilianContacts(contacts);
+    if (contacts.length === 2 && this.getClientCwConfig(provider).mergeBrazilContacts && query.startsWith('+55')) {
+      const contact = this.mergeBrazilianContacts(contacts, provider);
       if (contact) {
         return contact;
       }
@@ -672,8 +688,9 @@ export class ChatwootService {
     const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
     const maxWaitTime = 5000; // 5 seconds
-    const client = await this.clientCw(instance);
-    if (!client) return null;
+    const context = await this.clientCw(instance);
+    if (!context) return null;
+    const { client, provider } = context;
 
     try {
       // Processa atualização de contatos já criados @lid
@@ -691,7 +708,7 @@ export class ChatwootService {
           if (updateContact === null) {
             const baseContact = await this.findContact(instance, phoneNumber.split('@')[0]);
             if (baseContact) {
-              await this.mergeContacts(baseContact.id, contact.id);
+              await this.mergeContacts(baseContact.id, contact.id, provider);
               this.logger.verbose(
                 `Merge contacts: (${baseContact.id}) ${baseContact.phone_number} and (${contact.id}) ${contact.phone_number}`,
               );
@@ -709,7 +726,7 @@ export class ChatwootService {
         let conversationExists: any;
         try {
           conversationExists = await client.conversations.get({
-            accountId: this.provider.accountId,
+            accountId: Number(provider.accountId),
             conversationId: conversationId,
           });
           this.logger.verbose(
@@ -846,7 +863,7 @@ export class ChatwootService {
         this.logger.verbose(`Contact ID: ${contactId}`);
 
         const contactConversations = (await client.contacts.listConversations({
-          accountId: this.provider.accountId,
+          accountId: Number(provider.accountId),
           id: contactId,
         })) as any;
 
@@ -859,13 +876,13 @@ export class ChatwootService {
           (conversation) => conversation.inbox_id == filterInbox.id,
         );
         if (inboxConversation) {
-          if (this.provider.reopenConversation) {
+          if (provider.reopenConversation) {
             this.logger.verbose(
               `Found conversation in reopenConversation mode: ID: ${inboxConversation.id} - Name: ${inboxConversation.meta.sender.name} - Identifier: ${inboxConversation.meta.sender.identifier}`,
             );
-            if (inboxConversation && this.provider.conversationPending && inboxConversation.status !== 'open') {
+            if (inboxConversation && provider.conversationPending && inboxConversation.status !== 'open') {
               await client.conversations.toggleStatus({
-                accountId: this.provider.accountId,
+                accountId: Number(provider.accountId),
                 conversationId: inboxConversation.id,
                 data: {
                   status: 'pending',
@@ -892,12 +909,12 @@ export class ChatwootService {
           inbox_id: filterInbox.id.toString(),
         };
 
-        if (this.provider.conversationPending) {
+        if (provider.conversationPending) {
           data['status'] = 'pending';
         }
 
         const conversation = await client.conversations.create({
-          accountId: this.provider.accountId,
+          accountId: Number(provider.accountId),
           data,
         });
 
@@ -920,31 +937,37 @@ export class ChatwootService {
   }
 
   public async getInbox(instance: InstanceDto): Promise<inbox | null> {
-    const cacheKey = `${instance.instanceName}:getInbox`;
-    if (await this.cache.has(cacheKey)) {
-      return (await this.cache.get(cacheKey)) as inbox;
-    }
-
-    const client = await this.clientCw(instance);
-
-    if (!client) {
-      this.logger.warn('client not found');
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      this.logger.warn('provider not found');
       return null;
     }
 
-    const inbox = (await client.inboxes.list({
-      accountId: this.provider.accountId,
+    const cacheKey = chatwootInboxCacheKey(instance.instanceName, provider);
+    if (await this.cache.has(cacheKey)) {
+      const cachedInbox = (await this.cache.get(cacheKey)) as inbox;
+      if (cachedInbox?.name === provider.nameInbox) return cachedInbox;
+      await this.cache.delete(cacheKey);
+    }
+
+    const client = new ChatwootClient({
+      config: this.getClientCwConfig(provider),
+    });
+
+    const inboxList = (await client.inboxes.list({
+      accountId: Number(provider.accountId),
     })) as any;
 
-    if (!inbox) {
+    if (!Array.isArray(inboxList?.payload)) {
       this.logger.warn('inbox not found');
       return null;
     }
 
-    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().nameInbox);
+    const findByName = selectUniqueChatwootInbox(inboxList.payload, provider.nameInbox);
 
     if (!findByName) {
-      this.logger.warn('inbox not found');
+      const matchingInboxes = inboxList.payload.filter((candidate) => candidate.name === provider.nameInbox).length;
+      this.logger.warn(`Expected one Chatwoot inbox for ${instance.instanceName}, found ${matchingInboxes}`);
       return null;
     }
 
@@ -967,19 +990,20 @@ export class ChatwootService {
     sourceId?: string,
     quotedMsg?: MessageModel,
   ) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     const replyToIds = await this.getReplyToIds(messageBody, instance);
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     const message = await client.messages.create({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       conversationId: conversationId,
       data: {
         content: content,
@@ -1007,15 +1031,16 @@ export class ChatwootService {
     inbox: inbox,
     contact: generic_id & contact,
   ): Promise<conversation> {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     const conversations = (await client.contacts.listConversations({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       id: contact.id,
     })) as any;
 
@@ -1036,12 +1061,13 @@ export class ChatwootService {
       filename: string;
     }[],
   ) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { client, provider } = context;
 
     const contact = await this.findContact(instance, '123456');
 
@@ -1065,7 +1091,7 @@ export class ChatwootService {
     }
 
     const message = await client.messages.create({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       conversationId: conversation.id,
       data: {
         content: content,
@@ -1092,6 +1118,7 @@ export class ChatwootService {
     messageBody?: any,
     sourceId?: string,
     quotedMsg?: MessageModel,
+    provider?: ChatwootModel,
   ) {
     if (sourceId && this.isImportHistoryAvailable()) {
       const messageAlreadySaved = await chatwootImport.getExistingSourceIds([sourceId], conversationId);
@@ -1133,12 +1160,17 @@ export class ChatwootService {
       data.append('source_id', sourceId);
     }
 
+    if (!provider) {
+      this.logger.warn('provider not found');
+      return null;
+    }
+
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversationId}/messages`,
+      url: `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
       headers: {
-        'api-access-token': this.provider.token,
+        'api-access-token': provider.token,
         ...data.getHeaders(),
       },
       data: data,
@@ -1160,12 +1192,13 @@ export class ChatwootService {
     fileStream?: Readable,
     fileName?: string,
   ) {
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       this.logger.warn('client not found');
       return null;
     }
+    const { provider } = context;
 
     if (!this.configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT) {
       this.logger.log('Chatwoot bot contact is disabled');
@@ -1209,9 +1242,9 @@ export class ChatwootService {
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${conversation.id}/messages`,
+      url: `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversation.id}/messages`,
       headers: {
-        'api-access-token': this.provider.token,
+        'api-access-token': provider.token,
         ...data.getHeaders(),
       },
       data: data,
@@ -1306,15 +1339,16 @@ export class ChatwootService {
   public async onSendMessageError(instance: InstanceDto, conversation: number, error?: any) {
     this.logger.verbose(`onSendMessageError ${JSON.stringify(error)}`);
 
-    const client = await this.clientCw(instance);
+    const context = await this.clientCw(instance);
 
-    if (!client) {
+    if (!context) {
       return;
     }
+    const { client, provider } = context;
 
     if (error && error?.status === 400 && error?.message[0]?.exists === false) {
       client.messages.create({
-        accountId: this.provider.accountId,
+        accountId: Number(provider.accountId),
         conversationId: conversation,
         data: {
           content: `${i18next.t('cw.message.numbernotinwhatsapp')}`,
@@ -1327,7 +1361,7 @@ export class ChatwootService {
     }
 
     client.messages.create({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
       conversationId: conversation,
       data: {
         content: i18next.t('cw.message.notsent', {
@@ -1343,15 +1377,16 @@ export class ChatwootService {
     try {
       await new Promise((resolve) => setTimeout(resolve, 500));
 
-      const client = await this.clientCw(instance);
+      const context = await this.clientCw(instance);
 
-      if (!client) {
+      if (!context) {
         this.logger.warn('client not found');
         return null;
       }
+      const { provider } = context;
 
       if (
-        this.provider.reopenConversation === false &&
+        provider.reopenConversation === false &&
         body.event === 'conversation_status_changed' &&
         body.status === 'resolved' &&
         body.meta?.sender?.identifier
@@ -1490,10 +1525,8 @@ export class ChatwootService {
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
         } else {
-          const formattedDelimiter = this.provider.signDelimiter
-            ? this.provider.signDelimiter.replaceAll('\\n', '\n')
-            : '\n';
-          const textToConcat = this.provider.signMsg ? [`*${senderName}:*`] : [];
+          const formattedDelimiter = provider.signDelimiter ? provider.signDelimiter.replace(/\\n/g, '\n') : '\n';
+          const textToConcat = provider.signMsg ? [`*${senderName}:*`] : [];
           textToConcat.push(messageReceived);
 
           formatText = textToConcat.join(formattedDelimiter);
@@ -1991,16 +2024,18 @@ export class ChatwootService {
         return null;
       }
 
-      const client = await this.clientCw(instance);
+      const context = await this.clientCw(instance);
 
-      if (!client) {
+      if (!context) {
         this.logger.warn('client not found');
         return null;
       }
+      const { client, provider } = context;
 
-      if (this.provider?.ignoreJids && this.provider?.ignoreJids.length > 0) {
-        const ignoreJids: any = this.provider?.ignoreJids;
-
+      const ignoreJids = Array.isArray(provider.ignoreJids)
+        ? provider.ignoreJids.filter((jid): jid is string => typeof jid === 'string')
+        : [];
+      if (ignoreJids.length > 0) {
         let ignoreGroups = false;
         let ignoreContacts = false;
 
@@ -2147,6 +2182,7 @@ export class ChatwootService {
               body,
               'WAID:' + body.key.id,
               quotedMsg,
+              provider,
             );
 
             if (!send) {
@@ -2166,6 +2202,7 @@ export class ChatwootService {
               body,
               'WAID:' + body.key.id,
               quotedMsg,
+              provider,
             );
 
             if (!send) {
@@ -2291,6 +2328,8 @@ export class ChatwootService {
             instance,
             body,
             'WAID:' + body.key.id,
+            null,
+            provider,
           );
 
           if (!send) {
@@ -2380,7 +2419,7 @@ export class ChatwootService {
             });
 
             return await client.messages.delete({
-              accountId: this.provider.accountId,
+              accountId: Number(provider.accountId),
               conversationId: message.chatwootConversationId,
               messageId: message.chatwootMessageId,
             });
@@ -2458,7 +2497,7 @@ export class ChatwootService {
 
           if (!sourceId && inbox) {
             const conversation = (await client.conversations.get({
-              accountId: this.provider.accountId,
+              accountId: Number(provider.accountId),
               conversationId: conversationId,
             })) as conversation_show & {
               last_non_activity_message: { conversation: { contact_inbox: contact_inboxes } };
@@ -2470,7 +2509,7 @@ export class ChatwootService {
             const url =
               `/public/api/v1/inboxes/${inbox.inbox_identifier}/contacts/${sourceId}` +
               `/conversations/${conversationId}/update_last_seen`;
-            await chatwootRequest(this.getClientCwConfig(), {
+            await chatwootRequest(this.getClientCwConfig(provider), {
               method: 'POST',
               url: url,
             });
@@ -2609,12 +2648,14 @@ export class ChatwootService {
 
     this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
 
-    const totalMessagesImported = await chatwootImport.importHistoryMessages(
-      instance,
-      this,
-      await this.getInbox(instance),
-      this.provider,
-    );
+    const provider = await this.getProvider(instance);
+    const inbox = await this.getInbox(instance);
+    if (!provider || !inbox) {
+      this.logger.warn('Chatwoot provider or inbox not found');
+      return null;
+    }
+
+    const totalMessagesImported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
     this.updateContactAvatarInRecentConversations(instance);
 
     const msg = Number.isInteger(totalMessagesImported)
@@ -2632,11 +2673,12 @@ export class ChatwootService {
         return;
       }
 
-      const client = await this.clientCw(instance);
-      if (!client) {
+      const context = await this.clientCw(instance);
+      if (!context) {
         this.logger.warn('client not found');
         return null;
       }
+      const { client, provider } = context;
 
       const inbox = await this.getInbox(instance);
       if (!inbox) {
@@ -2644,11 +2686,7 @@ export class ChatwootService {
         return null;
       }
 
-      const recentContacts = await chatwootImport.getContactsOrderByRecentConversations(
-        inbox,
-        this.provider,
-        limitContacts,
-      );
+      const recentContacts = await chatwootImport.getContactsOrderByRecentConversations(inbox, provider, limitContacts);
 
       const contactIdentifiers = recentContacts
         .map((contact) => contact.identifier)
@@ -2671,7 +2709,7 @@ export class ChatwootService {
       recentContacts.forEach(async (contact) => {
         if (contactsWithProfilePicture.has(contact.identifier)) {
           client.contacts.update({
-            accountId: this.provider.accountId,
+            accountId: Number(provider.accountId),
             id: contact.id,
             data: {
               avatar_url: contactsWithProfilePicture.get(contact.identifier).profilePictureUrl || null,
@@ -2810,10 +2848,11 @@ export class ChatwootService {
       return { status: 'invalid_mapping' };
     }
 
-    const client = await this.clientCw(instance);
-    if (!client) {
+    const context = await this.clientCw(instance);
+    if (!context) {
       return { status: 'chatwoot_unavailable' };
     }
+    const { provider } = context;
 
     const canonicalLid = toCanonicalHistoryJid(lid);
     const canonicalPhoneJid = toCanonicalHistoryJid(phoneJid);
@@ -2828,7 +2867,7 @@ export class ChatwootService {
       (await this.findContact(instance, phoneNumber));
 
     if (canonicalContact?.id && canonicalContact.id !== provisionalContact.id) {
-      const merged = await this.mergeContacts(canonicalContact.id, provisionalContact.id);
+      const merged = await this.mergeContacts(canonicalContact.id, provisionalContact.id, provider);
       if (!merged) {
         throw new Error(`Unable to merge provisional Chatwoot LID contact for ${instance.instanceName}`);
       }
@@ -2914,8 +2953,8 @@ export class ChatwootService {
         throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
       }
 
-      const client = await this.clientCw(instance);
-      if (!client) {
+      const context = await this.clientCw(instance);
+      if (!context) {
         throw new BadRequestException(`Chatwoot client is not available for ${instance.instanceName}`);
       }
 
@@ -2923,7 +2962,6 @@ export class ChatwootService {
       if (!inbox) {
         throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
       }
-
       const sinceTimestamp = data.since ? dayjs(data.since).unix() : null;
       if (data.since && (!dayjs(data.since).isValid() || sinceTimestamp <= 0)) {
         throw new BadRequestException('since must be a valid ISO-8601 timestamp');
@@ -3109,8 +3147,8 @@ export class ChatwootService {
         throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
       }
 
-      const client = await this.clientCw(instance);
-      if (!client) {
+      const context = await this.clientCw(instance);
+      if (!context) {
         throw new BadRequestException(`Chatwoot client is not available for ${instance.instanceName}`);
       }
       const inbox = await this.getInbox(instance);
@@ -3229,6 +3267,254 @@ export class ChatwootService {
         unsupportedMessagesSkipped: missingMessages.length - importableMessages.length,
         duplicateSourceMessagesSkipped,
         processedSourceIds: Array.from(requestedSourceIds),
+      };
+    } finally {
+      chatwootImport.clearAll(instance);
+      this.activeStoredHistorySyncs.delete(instance.instanceName);
+    }
+  }
+
+  private async getStoredHistoryRecoveryInbox(provider: ChatwootModel): Promise<inbox | null> {
+    const result = await this.pgClient.query('SELECT id FROM inboxes WHERE account_id = $1 AND name = $2 ORDER BY id', [
+      provider.accountId,
+      provider.nameInbox,
+    ]);
+    const inboxId = uniqueHistoryRecoveryInboxId(result?.rows || []);
+    if (!inboxId) {
+      this.logger.warn(
+        `Expected exactly one Chatwoot recovery inbox for account ${provider.accountId} and name ${provider.nameInbox}`,
+      );
+      return null;
+    }
+
+    return { id: inboxId } as inbox;
+  }
+
+  public async getStoredHistoryRecoveryCapability(instance: InstanceDto) {
+    if (!this.isImportHistoryAvailable()) {
+      throw new BadRequestException('Chatwoot history import database connection is not configured');
+    }
+    const provider = await this.getProvider(instance);
+    if (!provider?.importMessages) {
+      throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
+    }
+    const inbox = await this.getStoredHistoryRecoveryInbox(provider);
+    if (!inbox) {
+      throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
+    }
+    return {
+      contractVersion: '2026-08-28',
+      maxBatchSize: 500,
+      operation: 'destination-aware-recovery',
+      recoveryModes: ['standard', 'maximize'],
+      ...historyRecoveryDestination(provider.accountId, inbox.id),
+    };
+  }
+
+  public async syncStoredHistoryRecoveryBatch(instance: InstanceDto, data: ChatwootHistoryRecoveryBatchDto) {
+    if (!this.isImportHistoryAvailable()) {
+      throw new BadRequestException('Chatwoot history import database connection is not configured');
+    }
+    if (data.contractVersion !== '2026-08-28' || data.dryRun !== false) {
+      throw new BadRequestException('Unsupported Chatwoot destination-aware recovery contract');
+    }
+    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
+      throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
+    }
+
+    this.activeStoredHistorySyncs.add(instance.instanceName);
+    try {
+      const provider = await this.getProvider(instance);
+      if (!provider?.importMessages) {
+        throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
+      }
+      const inbox = await this.getStoredHistoryRecoveryInbox(provider);
+      if (!inbox) {
+        throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
+      }
+      const destination = historyRecoveryDestination(provider.accountId, inbox.id);
+      if (
+        !matchesHistoryRecoveryDestination(
+          data.expectedDestinationKey,
+          data.expectedInboxId,
+          provider.accountId,
+          inbox.id,
+        )
+      ) {
+        throw new BadRequestException(
+          `Chatwoot destination changed for ${instance.instanceName}; refresh capability before recovery`,
+        );
+      }
+
+      const requestedSourceIds = new Set<string>();
+      const requestedDatabaseIds = new Set<string>();
+      for (const entry of data.messages) {
+        const databaseId = String(entry.message.id || '');
+        const key = entry.message.key as { id?: unknown };
+        const canonicalSourceId = typeof key?.id === 'string' ? toChatwootSourceId(key.id) : '';
+        if (!databaseId || canonicalSourceId !== entry.sourceId) {
+          throw new BadRequestException('Cached history message source id does not match its embedded payload');
+        }
+        if (requestedSourceIds.has(entry.sourceId) || requestedDatabaseIds.has(databaseId)) {
+          throw new BadRequestException('Cached history batch contains duplicate messages');
+        }
+        requestedSourceIds.add(entry.sourceId);
+        requestedDatabaseIds.add(databaseId);
+      }
+
+      const storedMessages = await this.prismaRepository.message.findMany({
+        where: {
+          Instance: { name: instance.instanceName },
+          id: { in: Array.from(requestedDatabaseIds) },
+        },
+      });
+      const storedById = new Map(storedMessages.map((message) => [message.id, message]));
+      const authoritativeMessages = data.messages.map((entry) => {
+        const stored = storedById.get(String(entry.message.id));
+        const storedKey = stored?.key as { id?: unknown } | undefined;
+        if (!stored || typeof storedKey?.id !== 'string' || toChatwootSourceId(storedKey.id) !== entry.sourceId) {
+          throw new BadRequestException('Cached history message is not available for the requested instance');
+        }
+        return stored;
+      });
+      const preparedBySourceId = new Map(
+        authoritativeMessages.map((message) => {
+          const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+          const prepared =
+            data.recoveryMode === 'maximize'
+              ? prepareStoredHistoryRecoveryMessage(message)
+              : { message, recovery: 'native' as const, reason: 'standard_mode' };
+          return [sourceId, prepared] as const;
+        }),
+      );
+      const preparedMessages = authoritativeMessages.map((message) => {
+        const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+        return preparedBySourceId.get(sourceId)?.message || message;
+      });
+
+      const lidMappingRefresh = data.refreshLidMappings
+        ? await this.refreshKnownLidMappings(instance, authoritativeMessages)
+        : { attemptedPhoneJids: 0, refreshedMappings: 0 };
+      const normalized = await normalizeStoredHistoryMessages(
+        preparedMessages,
+        authoritativeMessages,
+        (lid) => this.resolvePhoneJidForLid(instance, lid),
+        {
+          includeGroups: data.scope === 'groups' || data.scope === 'all',
+          includeUnresolvedLids:
+            data.unresolvedLidMode === 'provisional' && (data.scope === 'direct' || data.scope === 'all'),
+        },
+      );
+      const normalizedSourceIds = new Set(
+        normalized.messages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
+      );
+      const scopedMessages = normalized.messages.filter((message: any) => {
+        const remoteJid = message.key?.remoteJid;
+        if (data.scope === 'groups') return isGroupJid(remoteJid);
+        if (data.scope === 'direct') return !isGroupJid(remoteJid);
+        return true;
+      });
+      const scopedSourceIds = new Set(
+        scopedMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
+      );
+      const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
+        dedupeHistoryMessagesBySourceId(scopedMessages);
+      const existingSourceIds = await chatwootImport.getExistingSourceIds(
+        Array.from(requestedSourceIds),
+        undefined,
+        inbox.id,
+      );
+      const missingMessages = uniqueMessages.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      const importableMessages = missingMessages.filter((message: any) =>
+        Boolean(chatwootImport.getContentMessage(this, message)),
+      );
+      const importableSourceIds = new Set(
+        importableMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
+      );
+
+      let importedMessages = 0;
+      let appliedMessages = 0;
+      let appliedSourceIds = new Set<string>();
+      if (importableMessages.length > 0) {
+        const identityNames = await this.getGroupIdentityNames(instance, importableMessages);
+        chatwootImport.addHistoryIdentityNames(instance, identityNames);
+        this.addHistoryMessages(instance, importableMessages);
+        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+        if (!Number.isInteger(imported)) {
+          throw new Error(`Chatwoot recovery import failed for ${instance.instanceName}`);
+        }
+        importedMessages = Number(imported);
+        appliedSourceIds = await chatwootImport.getExistingSourceIds(
+          importableMessages.map((message: any) => message.key.id),
+          undefined,
+          inbox.id,
+        );
+        if (appliedSourceIds.size !== importableMessages.length) {
+          throw new Error(
+            `Chatwoot recovery only applied ${appliedSourceIds.size}/${importableMessages.length} messages for ${instance.instanceName}`,
+          );
+        }
+        appliedMessages = appliedSourceIds.size;
+        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+      }
+
+      const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
+        const preparation = preparedBySourceId.get(sourceId);
+        if (existingSourceIds.has(sourceId)) {
+          return { sourceId, status: 'existing', reason: 'already_in_destination', recovery: preparation?.recovery };
+        }
+        if (appliedSourceIds.has(sourceId)) {
+          return {
+            sourceId,
+            status: 'imported',
+            reason: preparation?.reason || 'native',
+            recovery: preparation?.recovery,
+          };
+        }
+        const reason = !normalizedSourceIds.has(sourceId)
+          ? 'normalization_filtered'
+          : !scopedSourceIds.has(sourceId)
+            ? 'scope_filtered'
+            : !importableSourceIds.has(sourceId)
+              ? 'unsupported_content'
+              : 'not_applied';
+        if (reason === 'not_applied') {
+          throw new Error(`Chatwoot recovery outcome is ambiguous for ${sourceId}`);
+        }
+        return { sourceId, status: 'skipped', reason, recovery: preparation?.recovery };
+      });
+      const skippedMessages = outcomes.filter((outcome) => outcome.status === 'skipped').length;
+      const placeholderMessages = outcomes.filter(
+        (outcome) => outcome.status === 'imported' && outcome.recovery === 'placeholder',
+      ).length;
+
+      if (data.scope === 'all' && data.unresolvedLidMode === 'provisional') {
+        await this.enableExtendedHistorySync(instance);
+      }
+
+      return {
+        contractVersion: '2026-08-28',
+        status: 'completed',
+        instanceName: instance.instanceName,
+        ...destination,
+        providerEnabled: Boolean(provider.enabled),
+        scope: data.scope,
+        unresolvedLidMode: data.unresolvedLidMode,
+        recoveryMode: data.recoveryMode,
+        attemptedPhoneJids: lidMappingRefresh.attemptedPhoneJids,
+        refreshedLidMappings: lidMappingRefresh.refreshedMappings,
+        sourceMessages: data.messages.length,
+        existingMessages: existingSourceIds.size,
+        selectedMessages: data.messages.length,
+        importedMessages,
+        appliedMessages,
+        skippedMessages,
+        placeholderMessages,
+        duplicateSourceMessagesSkipped,
+        processedSourceIds: Array.from(requestedSourceIds),
+        outcomes,
       };
     } finally {
       chatwootImport.clearAll(instance);

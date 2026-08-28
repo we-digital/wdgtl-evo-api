@@ -2,12 +2,22 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  chatwootInboxCacheKey,
   dedupeHistoryMessagesBySourceId,
+  historyRecoveryDestination,
+  matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
+  prepareStoredHistoryRecoveryMessage,
+  resolveProviderClientContext,
+  selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
+  uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
-import { chatwootHistorySyncBatchSchema } from '@api/integrations/chatbot/chatwoot/validate/chatwoot.schema';
+import {
+  chatwootHistoryRecoveryBatchSchema,
+  chatwootHistorySyncBatchSchema,
+} from '@api/integrations/chatbot/chatwoot/validate/chatwoot.schema';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { Message } from '@prisma/client';
 import { validate } from 'jsonschema';
@@ -160,4 +170,144 @@ test('accepts only the versioned bounded cached history batch contract', () => {
       .valid,
     false,
   );
+});
+
+test('renders recoverable WhatsApp history gaps without changing identity or timestamp', () => {
+  const reaction = {
+    ...message({ id: 'reaction', remoteJid: '628111@s.whatsapp.net', timestamp: 1_700_000_123 }),
+    messageType: 'reactionMessage',
+    message: { reactionMessage: { text: '👍', key: { id: 'target' } } },
+  } as Message;
+  const recovered = prepareStoredHistoryRecoveryMessage(reaction);
+
+  assert.equal(recovered.recovery, 'converted');
+  assert.equal((recovered.message.key as any).id, 'reaction');
+  assert.equal(recovered.message.messageTimestamp, 1_700_000_123);
+  assert.deepEqual(recovered.message.message, { conversation: '_WhatsApp reaction: 👍_' });
+});
+
+test('creates an explicit placeholder only for missing user-content payloads', () => {
+  const missingImage = {
+    ...message({ id: 'missing-image', remoteJid: '628111@s.whatsapp.net' }),
+    messageType: 'imageMessage',
+    message: null,
+  } as unknown as Message;
+  const protocol = {
+    ...message({ id: 'protocol', remoteJid: '628111@s.whatsapp.net' }),
+    messageType: 'protocolMessage',
+    message: { protocolMessage: { type: 0 } },
+  } as Message;
+
+  assert.deepEqual(prepareStoredHistoryRecoveryMessage(missingImage).message.message, {
+    conversation: '_<Unavailable WhatsApp image message>_',
+  });
+  assert.equal(prepareStoredHistoryRecoveryMessage(protocol).recovery, 'native');
+});
+
+test('accepts only the destination-aware recovery batch contract', () => {
+  const validRequest = {
+    contractVersion: '2026-08-28',
+    dryRun: false,
+    scope: 'all',
+    unresolvedLidMode: 'provisional',
+    refreshLidMappings: false,
+    recoveryMode: 'maximize',
+    expectedDestinationKey: 'chatwoot:1:99',
+    expectedInboxId: 99,
+    messages: [
+      {
+        sourceId: 'WAID:message-1',
+        message: { id: 'database-id-1', key: { id: 'message-1' }, messageTimestamp: 1_700_000_000 },
+      },
+    ],
+  };
+
+  assert.equal(validate(validRequest, chatwootHistoryRecoveryBatchSchema).valid, true);
+  assert.equal(
+    validate({ ...validRequest, recoveryMode: 'unknown' }, chatwootHistoryRecoveryBatchSchema).valid,
+    false,
+  );
+  assert.equal(
+    validate({ ...validRequest, contractVersion: '2026-08-01' }, chatwootHistoryRecoveryBatchSchema).valid,
+    false,
+  );
+  assert.equal(
+    validate({ ...validRequest, expectedInboxId: undefined }, chatwootHistoryRecoveryBatchSchema).valid,
+    false,
+  );
+});
+
+test('pins recovery apply to the exact capability destination', () => {
+  assert.deepEqual(historyRecoveryDestination('1', 99), {
+    destinationKey: 'chatwoot:1:99',
+    inboxId: 99,
+  });
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 99), true);
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 100), false);
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 100, '1', 99), false);
+});
+
+test('selects an inbox only from the captured provider name', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Other instance' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.deepEqual(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), {
+    id: 99,
+    name: 'WA - Gabby',
+  });
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Missing'), null);
+});
+
+test('refuses ambiguous duplicate inbox names', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Gabby' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), null);
+});
+
+test('namespaces inbox cache entries by provider URL', () => {
+  const provider = { accountId: 1, nameInbox: 'WA - Gabby' };
+  const first = chatwootInboxCacheKey('instance', { ...provider, url: 'https://first.example/' });
+  const second = chatwootInboxCacheKey('instance', { ...provider, url: 'https://second.example' });
+
+  assert.notEqual(first, second);
+  assert.equal(first, chatwootInboxCacheKey('instance', { ...provider, url: 'https://first.example' }));
+});
+
+test('keeps provider contexts isolated when concurrent loads interleave', async () => {
+  let releaseFirst: () => void = () => {};
+  const secondLoaded = new Promise<void>((resolve) => {
+    releaseFirst = resolve;
+  });
+  const createClient = (provider: { accountId: number }) => ({ accountId: provider.accountId });
+
+  const first = resolveProviderClientContext(async () => {
+    await secondLoaded;
+    return { accountId: 11 };
+  }, createClient);
+  const second = resolveProviderClientContext(async () => {
+    releaseFirst();
+    return { accountId: 22 };
+  }, createClient);
+
+  const [firstContext, secondContext] = await Promise.all([first, second]);
+
+  assert.ok(firstContext);
+  assert.ok(secondContext);
+  assert.equal(firstContext.provider.accountId, 11);
+  assert.equal(firstContext.client.accountId, 11);
+  assert.equal(secondContext.provider.accountId, 22);
+  assert.equal(secondContext.client.accountId, 22);
+});
+
+test('accepts only one valid authoritative recovery inbox', () => {
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 99 }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: '99' }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 45 }, { id: 99 }]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 'not-an-id' }]), null);
 });

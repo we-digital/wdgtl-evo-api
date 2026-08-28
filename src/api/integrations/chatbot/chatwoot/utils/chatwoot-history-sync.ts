@@ -31,7 +31,117 @@ export type HistoryNormalizationOptions = {
   includeUnresolvedLids?: boolean;
 };
 
+export type HistoryRecoveryPreparation = {
+  message: Message;
+  recovery: 'native' | 'converted' | 'placeholder' | 'unsupported';
+  reason: string;
+};
+
 export const toChatwootSourceId = (sourceId: string) => `WAID:${sourceId.replace(/^WAID:/, '')}`;
+
+export const historyRecoveryDestination = (accountId: string | number, inboxId: string | number) => ({
+  inboxId: Number(inboxId),
+  destinationKey: `chatwoot:${accountId}:${inboxId}`,
+});
+
+export const uniqueHistoryRecoveryInboxId = (rows: Array<{ id?: unknown }>): number | null => {
+  if (rows.length !== 1) return null;
+
+  const inboxId = Number(rows[0]?.id);
+  return Number.isSafeInteger(inboxId) && inboxId > 0 ? inboxId : null;
+};
+
+export const matchesHistoryRecoveryDestination = (
+  expectedDestinationKey: string,
+  expectedInboxId: number,
+  accountId: string | number,
+  inboxId: string | number,
+) => {
+  const destination = historyRecoveryDestination(accountId, inboxId);
+  return destination.destinationKey === expectedDestinationKey && destination.inboxId === expectedInboxId;
+};
+
+export const selectUniqueChatwootInbox = <T extends { name?: string }>(
+  inboxes: T[],
+  expectedName: string,
+): T | null => {
+  const matches = inboxes.filter((candidate) => candidate.name === expectedName);
+  return matches.length === 1 ? matches[0] : null;
+};
+
+export const chatwootInboxCacheKey = (
+  instanceName: string,
+  provider: { url: string; accountId: string | number; nameInbox: string },
+) => {
+  const providerUrl = provider.url.trim().replace(/\/+$/, '');
+  return `${instanceName}:getInbox:v3:${encodeURIComponent(providerUrl)}:${provider.accountId}:${provider.nameInbox}`;
+};
+
+export const resolveProviderClientContext = async <Provider, Client>(
+  loadProvider: () => Promise<Provider | null>,
+  createClient: (provider: Provider) => Client,
+): Promise<{ provider: Provider; client: Client } | null> => {
+  const provider = await loadProvider();
+  if (!provider) return null;
+  return { provider, client: createClient(provider) };
+};
+
+const recoveryText = (messageType: string, raw: Record<string, any> | null) => {
+  if (messageType === 'reactionMessage') {
+    const reaction = raw?.reactionMessage;
+    return reaction?.text ? `_WhatsApp reaction: ${reaction.text}_` : '_WhatsApp reaction removed_';
+  }
+  if (messageType === 'buttonsResponseMessage') {
+    const response = raw?.buttonsResponseMessage;
+    const selected = response?.selectedDisplayText || response?.selectedButtonId;
+    return selected ? `_WhatsApp button response: ${selected}_` : null;
+  }
+  if (messageType === 'buttonsMessage') {
+    const buttons = raw?.buttonsMessage;
+    const labels = Array.isArray(buttons?.buttons)
+      ? buttons.buttons
+          .map((button: any) => button?.buttonText?.displayText)
+          .filter((label: unknown): label is string => typeof label === 'string' && label.length > 0)
+      : [];
+    const parts = [buttons?.contentText, ...labels].filter(
+      (part: unknown): part is string => typeof part === 'string' && part.length > 0,
+    );
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+  if (messageType === 'lottieStickerMessage') {
+    return '_<Lottie Sticker Message>_';
+  }
+  if (!raw) {
+    const unavailableTypes: Record<string, string> = {
+      conversation: 'text',
+      imageMessage: 'image',
+      documentMessage: 'document',
+      videoMessage: 'video',
+      audioMessage: 'audio',
+      stickerMessage: 'sticker',
+    };
+    const label = unavailableTypes[messageType];
+    return label ? `_<Unavailable WhatsApp ${label} message>_` : null;
+  }
+  return null;
+};
+
+export const prepareStoredHistoryRecoveryMessage = (message: Message): HistoryRecoveryPreparation => {
+  const raw = message.message && typeof message.message === 'object' ? (message.message as Record<string, any>) : null;
+  const text = recoveryText(message.messageType, raw);
+  if (!text) {
+    return {
+      message,
+      recovery: raw ? 'native' : 'unsupported',
+      reason: raw ? 'native_or_structural' : 'missing_payload',
+    };
+  }
+  return {
+    message: { ...message, message: { conversation: text } },
+    recovery: raw ? 'converted' : 'placeholder',
+    reason: raw ? `rendered_${message.messageType}` : `unavailable_${message.messageType}`,
+  };
+};
 
 export const dedupeHistoryMessagesBySourceId = (messages: Message[]) => {
   const seenSourceIds = new Set<string>();
