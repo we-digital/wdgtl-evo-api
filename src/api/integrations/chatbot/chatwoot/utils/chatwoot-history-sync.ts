@@ -31,7 +31,85 @@ export type HistoryNormalizationOptions = {
   includeUnresolvedLids?: boolean;
 };
 
+export type HistoryRecoveryPreparation = {
+  message: Message;
+  recovery: 'native' | 'converted' | 'placeholder' | 'unsupported';
+  reason: string;
+};
+
 export const toChatwootSourceId = (sourceId: string) => `WAID:${sourceId.replace(/^WAID:/, '')}`;
+
+export const historyRecoveryDestination = (accountId: string | number, inboxId: string | number) => ({
+  inboxId: Number(inboxId),
+  destinationKey: `chatwoot:${accountId}:${inboxId}`,
+});
+
+export const matchesHistoryRecoveryDestination = (
+  expectedDestinationKey: string,
+  expectedInboxId: number,
+  accountId: string | number,
+  inboxId: string | number,
+) => {
+  const destination = historyRecoveryDestination(accountId, inboxId);
+  return destination.destinationKey === expectedDestinationKey && destination.inboxId === expectedInboxId;
+};
+
+const recoveryText = (messageType: string, raw: Record<string, any> | null) => {
+  if (messageType === 'reactionMessage') {
+    const reaction = raw?.reactionMessage;
+    return reaction?.text ? `_WhatsApp reaction: ${reaction.text}_` : '_WhatsApp reaction removed_';
+  }
+  if (messageType === 'buttonsResponseMessage') {
+    const response = raw?.buttonsResponseMessage;
+    const selected = response?.selectedDisplayText || response?.selectedButtonId;
+    return selected ? `_WhatsApp button response: ${selected}_` : null;
+  }
+  if (messageType === 'buttonsMessage') {
+    const buttons = raw?.buttonsMessage;
+    const labels = Array.isArray(buttons?.buttons)
+      ? buttons.buttons
+          .map((button: any) => button?.buttonText?.displayText)
+          .filter((label: unknown): label is string => typeof label === 'string' && label.length > 0)
+      : [];
+    const parts = [buttons?.contentText, ...labels].filter(
+      (part: unknown): part is string => typeof part === 'string' && part.length > 0,
+    );
+    return parts.length > 0 ? parts.join('\n') : null;
+  }
+  if (messageType === 'lottieStickerMessage') {
+    return '_<Lottie Sticker Message>_';
+  }
+  if (!raw) {
+    const unavailableTypes: Record<string, string> = {
+      conversation: 'text',
+      imageMessage: 'image',
+      documentMessage: 'document',
+      videoMessage: 'video',
+      audioMessage: 'audio',
+      stickerMessage: 'sticker',
+    };
+    const label = unavailableTypes[messageType];
+    return label ? `_<Unavailable WhatsApp ${label} message>_` : null;
+  }
+  return null;
+};
+
+export const prepareStoredHistoryRecoveryMessage = (message: Message): HistoryRecoveryPreparation => {
+  const raw = message.message && typeof message.message === 'object' ? (message.message as Record<string, any>) : null;
+  const text = recoveryText(message.messageType, raw);
+  if (!text) {
+    return {
+      message,
+      recovery: raw ? 'native' : 'unsupported',
+      reason: raw ? 'native_or_structural' : 'missing_payload',
+    };
+  }
+  return {
+    message: { ...message, message: { conversation: text } },
+    recovery: raw ? 'converted' : 'placeholder',
+    reason: raw ? `rendered_${message.messageType}` : `unavailable_${message.messageType}`,
+  };
+};
 
 export const dedupeHistoryMessagesBySourceId = (messages: Message[]) => {
   const seenSourceIds = new Set<string>();

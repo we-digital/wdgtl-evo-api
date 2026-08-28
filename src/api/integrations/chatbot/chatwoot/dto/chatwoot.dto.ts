@@ -45,6 +45,18 @@ export class ChatwootHistorySyncBatchDto {
   messages: ChatwootHistorySyncBatchMessageDto[];
 }
 
+export class ChatwootHistoryRecoveryBatchDto {
+  contractVersion: '2026-08-28';
+  dryRun: false;
+  scope: 'direct' | 'groups' | 'all';
+  unresolvedLidMode: 'skip' | 'provisional';
+  refreshLidMappings: boolean;
+  recoveryMode: 'standard' | 'maximize';
+  expectedDestinationKey: string;
+  expectedInboxId: number;
+  messages: ChatwootHistorySyncBatchMessageDto[];
+}
+
 export function ChatwootInstanceMixin<TBase extends Constructor>(Base: TBase) {
   return class extends Base {
     chatwootAccountId?: string;
