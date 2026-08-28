@@ -18,6 +18,7 @@ import {
   matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
+  selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
@@ -112,20 +113,22 @@ export class ChatwootService {
     this.provider = provider;
 
     const client = new ChatwootClient({
-      config: this.getClientCwConfig(),
+      config: this.getClientCwConfig(provider),
     });
 
     return client;
   }
 
-  public getClientCwConfig(): ChatwootAPIConfig & { nameInbox: string; mergeBrazilContacts: boolean } {
+  public getClientCwConfig(
+    provider: ChatwootModel = this.provider,
+  ): ChatwootAPIConfig & { nameInbox: string; mergeBrazilContacts: boolean } {
     return {
-      basePath: this.provider.url,
+      basePath: provider.url,
       with_credentials: true,
       credentials: 'include',
-      token: this.provider.token,
-      nameInbox: this.provider.nameInbox,
-      mergeBrazilContacts: this.provider.mergeBrazilContacts,
+      token: provider.token,
+      nameInbox: provider.nameInbox,
+      mergeBrazilContacts: provider.mergeBrazilContacts,
     };
   }
 
@@ -894,20 +897,23 @@ export class ChatwootService {
   }
 
   public async getInbox(instance: InstanceDto): Promise<inbox | null> {
-    const cacheKey = `${instance.instanceName}:getInbox`;
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      this.logger.warn('provider not found');
+      return null;
+    }
+
+    const cacheKey = `${instance.instanceName}:getInbox:v2:${provider.accountId}:${provider.nameInbox}`;
     if (await this.cache.has(cacheKey)) {
       return (await this.cache.get(cacheKey)) as inbox;
     }
 
-    const client = await this.clientCw(instance);
-
-    if (!client) {
-      this.logger.warn('client not found');
-      return null;
-    }
+    const client = new ChatwootClient({
+      config: this.getClientCwConfig(provider),
+    });
 
     const inbox = (await client.inboxes.list({
-      accountId: this.provider.accountId,
+      accountId: Number(provider.accountId),
     })) as any;
 
     if (!inbox) {
@@ -915,10 +921,11 @@ export class ChatwootService {
       return null;
     }
 
-    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().nameInbox);
+    const findByName = selectUniqueChatwootInbox(inbox.payload, provider.nameInbox);
 
     if (!findByName) {
-      this.logger.warn('inbox not found');
+      const matchingInboxes = inbox.payload.filter((candidate) => candidate.name === provider.nameInbox).length;
+      this.logger.warn(`Expected one Chatwoot inbox for ${instance.instanceName}, found ${matchingInboxes}`);
       return null;
     }
 

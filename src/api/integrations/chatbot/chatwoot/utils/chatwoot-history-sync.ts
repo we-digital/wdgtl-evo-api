@@ -54,6 +54,14 @@ export const matchesHistoryRecoveryDestination = (
   return destination.destinationKey === expectedDestinationKey && destination.inboxId === expectedInboxId;
 };
 
+export const selectUniqueChatwootInbox = <T extends { name?: string }>(
+  inboxes: T[],
+  expectedName: string,
+): T | null => {
+  const matches = inboxes.filter((candidate) => candidate.name === expectedName);
+  return matches.length === 1 ? matches[0] : null;
+};
+
 const recoveryText = (messageType: string, raw: Record<string, any> | null) => {
   if (messageType === 'reactionMessage') {
     const reaction = raw?.reactionMessage;

@@ -7,6 +7,7 @@ import {
   matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
+  selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
@@ -241,4 +242,26 @@ test('pins recovery apply to the exact capability destination', () => {
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 99), true);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 100), false);
   assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 100, '1', 99), false);
+});
+
+test('selects an inbox only from the captured provider name', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Other instance' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.deepEqual(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), {
+    id: 99,
+    name: 'WA - Gabby',
+  });
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Missing'), null);
+});
+
+test('refuses ambiguous duplicate inbox names', () => {
+  const inboxes = [
+    { id: 45, name: 'WA - Gabby' },
+    { id: 99, name: 'WA - Gabby' },
+  ];
+
+  assert.equal(selectUniqueChatwootInbox(inboxes, 'WA - Gabby'), null);
 });
