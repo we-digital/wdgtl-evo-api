@@ -102,3 +102,27 @@ export const chatwootHistorySyncBatchSchema: JSONSchema7 = {
   },
   required: ['contractVersion', 'dryRun', 'scope', 'unresolvedLidMode', 'refreshLidMappings', 'messages'],
 };
+
+export const chatwootHistoryRecoveryBatchSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    contractVersion: { type: 'string', enum: ['2026-08-28'] },
+    dryRun: { type: 'boolean', enum: [false] },
+    scope: { type: 'string', enum: ['direct', 'groups', 'all'] },
+    unresolvedLidMode: { type: 'string', enum: ['skip', 'provisional'] },
+    refreshLidMappings: { type: 'boolean' },
+    recoveryMode: { type: 'string', enum: ['standard', 'maximize'] },
+    messages: chatwootHistorySyncBatchSchema.properties.messages,
+  },
+  required: [
+    'contractVersion',
+    'dryRun',
+    'scope',
+    'unresolvedLidMode',
+    'refreshLidMappings',
+    'recoveryMode',
+    'messages',
+  ],
+};
