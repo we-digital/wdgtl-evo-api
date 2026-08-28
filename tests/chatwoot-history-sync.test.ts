@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   dedupeHistoryMessagesBySourceId,
+  historyRecoveryDestination,
+  matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
   toCanonicalHistoryJid,
@@ -206,6 +208,8 @@ test('accepts only the destination-aware recovery batch contract', () => {
     unresolvedLidMode: 'provisional',
     refreshLidMappings: false,
     recoveryMode: 'maximize',
+    expectedDestinationKey: 'chatwoot:1:99',
+    expectedInboxId: 99,
     messages: [
       {
         sourceId: 'WAID:message-1',
@@ -223,4 +227,18 @@ test('accepts only the destination-aware recovery batch contract', () => {
     validate({ ...validRequest, contractVersion: '2026-08-01' }, chatwootHistoryRecoveryBatchSchema).valid,
     false,
   );
+  assert.equal(
+    validate({ ...validRequest, expectedInboxId: undefined }, chatwootHistoryRecoveryBatchSchema).valid,
+    false,
+  );
+});
+
+test('pins recovery apply to the exact capability destination', () => {
+  assert.deepEqual(historyRecoveryDestination('1', 99), {
+    destinationKey: 'chatwoot:1:99',
+    inboxId: 99,
+  });
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 99), true);
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 99, '1', 100), false);
+  assert.equal(matchesHistoryRecoveryDestination('chatwoot:1:99', 100, '1', 99), false);
 });

@@ -39,6 +39,21 @@ export type HistoryRecoveryPreparation = {
 
 export const toChatwootSourceId = (sourceId: string) => `WAID:${sourceId.replace(/^WAID:/, '')}`;
 
+export const historyRecoveryDestination = (accountId: string | number, inboxId: string | number) => ({
+  inboxId: Number(inboxId),
+  destinationKey: `chatwoot:${accountId}:${inboxId}`,
+});
+
+export const matchesHistoryRecoveryDestination = (
+  expectedDestinationKey: string,
+  expectedInboxId: number,
+  accountId: string | number,
+  inboxId: string | number,
+) => {
+  const destination = historyRecoveryDestination(accountId, inboxId);
+  return destination.destinationKey === expectedDestinationKey && destination.inboxId === expectedInboxId;
+};
+
 const recoveryText = (messageType: string, raw: Record<string, any> | null) => {
   if (messageType === 'reactionMessage') {
     const reaction = raw?.reactionMessage;

@@ -34,6 +34,9 @@ so a previous inbox cannot suppress a later import after an instance is reconnec
   placeholders for user-message rows whose original body is no longer stored. Protocol, encrypted, album-wrapper, and
   other structural records remain skipped.
 
+Every POST also repeats the capability values as `expectedDestinationKey` and `expectedInboxId`. Evolution compares them
+with the current provider/inbox immediately before recovery and rejects a changed route before any write.
+
 The response contains one outcome for every requested source ID: `existing`, `imported`, or `skipped`, with a reason.
 The caller verifies destination identity, outcome membership, uniqueness, and acknowledgement before checkpointing the
 batch. Existing and imported rows are always scoped to the resolved destination inbox. The recovery writer still uses the

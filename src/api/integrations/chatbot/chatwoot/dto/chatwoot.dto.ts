@@ -52,6 +52,8 @@ export class ChatwootHistoryRecoveryBatchDto {
   unresolvedLidMode: 'skip' | 'provisional';
   refreshLidMappings: boolean;
   recoveryMode: 'standard' | 'maximize';
+  expectedDestinationKey: string;
+  expectedInboxId: number;
   messages: ChatwootHistorySyncBatchMessageDto[];
 }
 

@@ -114,6 +114,8 @@ export const chatwootHistoryRecoveryBatchSchema: JSONSchema7 = {
     unresolvedLidMode: { type: 'string', enum: ['skip', 'provisional'] },
     refreshLidMappings: { type: 'boolean' },
     recoveryMode: { type: 'string', enum: ['standard', 'maximize'] },
+    expectedDestinationKey: { type: 'string', minLength: 1, maxLength: 255 },
+    expectedInboxId: { type: 'integer', minimum: 1 },
     messages: chatwootHistorySyncBatchSchema.properties.messages,
   },
   required: [
@@ -123,6 +125,8 @@ export const chatwootHistoryRecoveryBatchSchema: JSONSchema7 = {
     'unresolvedLidMode',
     'refreshLidMappings',
     'recoveryMode',
+    'expectedDestinationKey',
+    'expectedInboxId',
     'messages',
   ],
 };

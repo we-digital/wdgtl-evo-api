@@ -11,9 +11,11 @@ import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/util
 import {
   buildStoredLidMap,
   dedupeHistoryMessagesBySourceId,
+  historyRecoveryDestination,
   isGroupJid,
   isLidJid,
   isPhoneJid,
+  matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
   toCanonicalHistoryJid,
@@ -2895,7 +2897,6 @@ export class ChatwootService {
       if (!inbox) {
         throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
       }
-
       const sinceTimestamp = data.since ? dayjs(data.since).unix() : null;
       if (data.since && (!dayjs(data.since).isValid() || sinceTimestamp <= 0)) {
         throw new BadRequestException('since must be a valid ISO-8601 timestamp');
@@ -3225,8 +3226,7 @@ export class ChatwootService {
       maxBatchSize: 500,
       operation: 'destination-aware-recovery',
       recoveryModes: ['standard', 'maximize'],
-      inboxId: Number(inbox.id),
-      destinationKey: `chatwoot:${provider.accountId}:${inbox.id}`,
+      ...historyRecoveryDestination(provider.accountId, inbox.id),
     };
   }
 
@@ -3254,6 +3254,19 @@ export class ChatwootService {
       const inbox = await this.getInbox(instance);
       if (!inbox) {
         throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
+      }
+      const destination = historyRecoveryDestination(provider.accountId, inbox.id);
+      if (
+        !matchesHistoryRecoveryDestination(
+          data.expectedDestinationKey,
+          data.expectedInboxId,
+          provider.accountId,
+          inbox.id,
+        )
+      ) {
+        throw new BadRequestException(
+          `Chatwoot destination changed for ${instance.instanceName}; refresh capability before recovery`,
+        );
       }
 
       const requestedSourceIds = new Set<string>();
@@ -3408,8 +3421,7 @@ export class ChatwootService {
         contractVersion: '2026-08-28',
         status: 'completed',
         instanceName: instance.instanceName,
-        inboxId: Number(inbox.id),
-        destinationKey: `chatwoot:${provider.accountId}:${inbox.id}`,
+        ...destination,
         providerEnabled: Boolean(provider.enabled),
         scope: data.scope,
         unresolvedLidMode: data.unresolvedLidMode,
