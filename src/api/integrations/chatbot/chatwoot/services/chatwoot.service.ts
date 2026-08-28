@@ -20,6 +20,7 @@ import {
   prepareStoredHistoryRecoveryMessage,
   toCanonicalHistoryJid,
   toChatwootSourceId,
+  uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -895,27 +896,36 @@ export class ChatwootService {
 
   public async getInbox(instance: InstanceDto): Promise<inbox | null> {
     const cacheKey = `${instance.instanceName}:getInbox`;
-    if (await this.cache.has(cacheKey)) {
-      return (await this.cache.get(cacheKey)) as inbox;
-    }
-
-    const client = await this.clientCw(instance);
-
-    if (!client) {
-      this.logger.warn('client not found');
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      this.logger.warn('provider not found');
       return null;
     }
+    if (await this.cache.has(cacheKey)) {
+      const cachedInbox = (await this.cache.get(cacheKey)) as inbox;
+      if (cachedInbox?.name === provider.nameInbox) return cachedInbox;
+      await this.cache.delete(cacheKey);
+    }
 
-    const inbox = (await client.inboxes.list({
-      accountId: this.provider.accountId,
+    const client = new ChatwootClient({
+      config: {
+        basePath: provider.url,
+        with_credentials: true,
+        credentials: 'include',
+        token: provider.token,
+      },
+    });
+
+    const inboxList = (await client.inboxes.list({
+      accountId: Number(provider.accountId),
     })) as any;
 
-    if (!inbox) {
+    if (!inboxList) {
       this.logger.warn('inbox not found');
       return null;
     }
 
-    const findByName = inbox.payload.find((inbox) => inbox.name === this.getClientCwConfig().nameInbox);
+    const findByName = inboxList.payload.find((candidate) => candidate.name === provider.nameInbox);
 
     if (!findByName) {
       this.logger.warn('inbox not found');
@@ -3209,6 +3219,22 @@ export class ChatwootService {
     }
   }
 
+  private async getStoredHistoryRecoveryInbox(provider: ChatwootModel): Promise<inbox | null> {
+    const result = await this.pgClient.query('SELECT id FROM inboxes WHERE account_id = $1 AND name = $2 ORDER BY id', [
+      provider.accountId,
+      provider.nameInbox,
+    ]);
+    const inboxId = uniqueHistoryRecoveryInboxId(result?.rows || []);
+    if (!inboxId) {
+      this.logger.warn(
+        `Expected exactly one Chatwoot recovery inbox for account ${provider.accountId} and name ${provider.nameInbox}`,
+      );
+      return null;
+    }
+
+    return { id: inboxId } as inbox;
+  }
+
   public async getStoredHistoryRecoveryCapability(instance: InstanceDto) {
     if (!this.isImportHistoryAvailable()) {
       throw new BadRequestException('Chatwoot history import database connection is not configured');
@@ -3217,7 +3243,7 @@ export class ChatwootService {
     if (!provider?.importMessages) {
       throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
     }
-    const inbox = await this.getInbox(instance);
+    const inbox = await this.getStoredHistoryRecoveryInbox(provider);
     if (!inbox) {
       throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
     }
@@ -3247,11 +3273,7 @@ export class ChatwootService {
       if (!provider?.importMessages) {
         throw new BadRequestException(`Chatwoot message import is disabled for ${instance.instanceName}`);
       }
-      const client = await this.clientCw(instance);
-      if (!client) {
-        throw new BadRequestException(`Chatwoot client is not available for ${instance.instanceName}`);
-      }
-      const inbox = await this.getInbox(instance);
+      const inbox = await this.getStoredHistoryRecoveryInbox(provider);
       if (!inbox) {
         throw new BadRequestException(`Chatwoot inbox is not available for ${instance.instanceName}`);
       }
