@@ -12,6 +12,7 @@ import {
   selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
   toChatwootSourceId,
+  uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import {
   chatwootHistoryRecoveryBatchSchema,
@@ -301,4 +302,12 @@ test('keeps provider contexts isolated when concurrent loads interleave', async 
   assert.equal(firstContext.client.accountId, 11);
   assert.equal(secondContext.provider.accountId, 22);
   assert.equal(secondContext.client.accountId, 22);
+});
+
+test('accepts only one valid authoritative recovery inbox', () => {
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 99 }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: '99' }]), 99);
+  assert.equal(uniqueHistoryRecoveryInboxId([]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 45 }, { id: 99 }]), null);
+  assert.equal(uniqueHistoryRecoveryInboxId([{ id: 'not-an-id' }]), null);
 });
