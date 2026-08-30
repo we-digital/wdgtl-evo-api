@@ -2,16 +2,24 @@ name: Build and dispatch deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main, staging]
   pull_request:
+    branches: [main, staging]
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: evo-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
+    timeout-minutes: 45
+    outputs:
+      image_ref: ${{ steps.deployref.outputs.image_ref }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -27,39 +35,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=ref,event=tag
-            type=raw,value=${{ github.run_number }},enable={{is_default_branch}}
-            type=raw,value=latest,enable={{is_default_branch}}
+      - name: Resolve image tag
+        id: tag
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT_NAME" == push ]]; then
+            [[ "${GITHUB_REF_NAME}" == main || "${GITHUB_REF_NAME}" == staging ]]
+            tag="${GITHUB_REF_NAME}-${GITHUB_SHA}"
+          else
+            [[ "$PR_NUMBER" =~ ^[0-9]+$ ]]
+            tag="pr-${PR_NUMBER}-${GITHUB_SHA}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push image
+      - name: Build and push branch image
         id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
           push: ${{ github.event_name == 'push' }}
-          tags: ${{ steps.meta.outputs.tags }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          tags: ghcr.io/we-digital/wdgtl-evo-api:${{ steps.tag.outputs.tag }}
+          cache-from: type=gha,scope=wdgtl-evo-api-${{ github.ref_name }}
+          cache-to: type=gha,mode=max,scope=wdgtl-evo-api-${{ github.ref_name }}
 
-      - name: Compute deploy tag
-        id: deploytag
+      - name: Export immutable image reference
+        id: deployref
         if: github.event_name == 'push'
+        env:
+          DIGEST: ${{ steps.docker_build.outputs.digest }}
         run: |
-          if [[ "${{ github.ref_type }}" == "tag" ]]; then
-            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=${{ github.run_number }}" >> "$GITHUB_OUTPUT"
-          fi
+          set -euo pipefail
+          [[ "${GITHUB_REF_NAME}" == main || "${GITHUB_REF_NAME}" == staging ]]
+          [[ "${GITHUB_SHA}" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$DIGEST" =~ ^sha256:[a-f0-9]{64}$ ]]
+          image_ref="ghcr.io/we-digital/wdgtl-evo-api:${GITHUB_REF_NAME}-${GITHUB_SHA}@$DIGEST"
+          echo "image_ref=$image_ref" >> "$GITHUB_OUTPUT"
 
-      - name: Trigger bbc-devops auto-deploy
-        if: github.event_name == 'push'
+      - name: Dispatch production deployment
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/main' &&
+          vars.PRODUCTION_AUTO_DEPLOY_ENABLED == 'true'
         uses: peter-evans/repository-dispatch@v3
         with:
           token: ${{ secrets.BBC_DEVOPS_DISPATCH_TOKEN }}
@@ -67,6 +87,27 @@ jobs:
           event-type: deploy-evo-api
           client-payload: |
             {
-              "version": "${{ steps.deploytag.outputs.tag }}",
+              "image_ref": "${{ steps.deployref.outputs.image_ref }}",
+              "source_repository": "${{ github.repository }}",
+              "source_ref": "${{ github.ref_name }}",
+              "source_sha": "${{ github.sha }}",
               "host": "bbc-evo"
             }
+
+      - name: Dispatch staging deployment
+        if: >-
+          github.event_name == 'push' &&
+          github.ref == 'refs/heads/staging' &&
+          vars.STAGE_AUTO_DEPLOY_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.BBC_DEVOPS_DISPATCH_TOKEN }}
+          IMAGE_REF: ${{ steps.deployref.outputs.image_ref }}
+        run: |
+          set -euo pipefail
+          [[ "$IMAGE_REF" =~ ^ghcr\.io/we-digital/wdgtl-evo-api:staging-${GITHUB_SHA}@sha256:[a-f0-9]{64}$ ]]
+          gh workflow run deploy-stage-evo.yml \
+            --repo we-digital/bbc-devops \
+            --ref staging \
+            --field image_ref="$IMAGE_REF" \
+            --field source_ref=staging \
+            --field source_sha="$GITHUB_SHA"
