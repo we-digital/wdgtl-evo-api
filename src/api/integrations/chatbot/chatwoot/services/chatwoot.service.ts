@@ -26,6 +26,7 @@ import {
   uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -125,7 +126,7 @@ export class ChatwootService {
       basePath: provider.url,
       with_credentials: true,
       credentials: 'include',
-      token: provider.token,
+      headers: { 'api-access-token': provider.token },
       nameInbox: provider.nameInbox,
       mergeBrazilContacts: provider.mergeBrazilContacts,
     };
@@ -133,6 +134,35 @@ export class ChatwootService {
 
   public getCache() {
     return this.cache;
+  }
+
+  public async externalRead(
+    instance: InstanceDto,
+    params: { conversationId: number; messageId: number; sourceCursor: string },
+  ): Promise<{ owners_updated?: number; owners_unchanged?: number } | null> {
+    const token = this.configService.get<Chatwoot>('CHATWOOT').READ_STATE_INGRESS_TOKEN;
+    if (!token) return null;
+
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      this.logger.warn('provider not found for external read');
+      return null;
+    }
+
+    const request = buildExternalReadRequest({
+      baseUrl: provider.url,
+      accountId: provider.accountId,
+      conversationId: params.conversationId,
+      messageId: params.messageId,
+      sourceCursor: params.sourceCursor,
+      token,
+    });
+    const response = await axios.post(request.url, request.data, {
+      headers: request.headers,
+      timeout: 20_000,
+    });
+
+    return response.data;
   }
 
   public async create(instance: InstanceDto, data: ChatwootDto) {
@@ -1140,7 +1170,7 @@ export class ChatwootService {
       maxBodyLength: Infinity,
       url: `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
       headers: {
-        api_access_token: provider.token,
+        'api-access-token': provider.token,
         ...data.getHeaders(),
       },
       data: data,
@@ -1214,7 +1244,7 @@ export class ChatwootService {
       maxBodyLength: Infinity,
       url: `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversation.id}/messages`,
       headers: {
-        api_access_token: provider.token,
+        'api-access-token': provider.token,
         ...data.getHeaders(),
       },
       data: data,

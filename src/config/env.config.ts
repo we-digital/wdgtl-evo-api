@@ -323,6 +323,7 @@ export type Chatwoot = {
   ENABLED: boolean;
   MESSAGE_DELETE: boolean;
   MESSAGE_READ: boolean;
+  READ_STATE_INGRESS_TOKEN: string;
   BOT_CONTACT: boolean;
   IMPORT: {
     DATABASE: {
@@ -821,6 +822,7 @@ export class ConfigService {
         ENABLED: process.env?.CHATWOOT_ENABLED === 'true',
         MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'true',
         MESSAGE_READ: process.env.CHATWOOT_MESSAGE_READ === 'true',
+        READ_STATE_INGRESS_TOKEN: process.env.CHATWOOT_READ_STATE_INGRESS_TOKEN || '',
         BOT_CONTACT: !process.env.CHATWOOT_BOT_CONTACT || process.env.CHATWOOT_BOT_CONTACT === 'true',
         IMPORT: {
           DATABASE: {

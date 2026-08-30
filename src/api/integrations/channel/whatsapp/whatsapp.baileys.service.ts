@@ -57,6 +57,10 @@ import {
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import {
+  buildWhatsAppReadCursor,
+  selectWhatsAppOwnerReadTimestamps,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -1961,13 +1965,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['message-receipt.update']) {
               const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap: Record<string, number> = {};
-
-              for (const event of payload) {
-                if (typeof event.key.remoteJid === 'string' && typeof event.receipt.readTimestamp === 'number') {
-                  remotesJidMap[event.key.remoteJid] = event.receipt.readTimestamp;
-                }
-              }
+              const remotesJidMap = selectWhatsAppOwnerReadTimestamps(payload);
 
               await Promise.all(
                 Object.keys(remotesJidMap).map(async (remoteJid) =>
@@ -4897,11 +4895,61 @@ export class BaileysStartupService extends ChannelStartupService {
       if (result > 0) {
         this.updateChatUnreadMessages(remoteJid);
       }
-
-      return result;
     }
 
-    return 0;
+    await this.forwardChatwootOwnerRead(remoteJid, timestamp);
+
+    return result || 0;
+  }
+
+  private async forwardChatwootOwnerRead(remoteJid: string, readTimestamp: number): Promise<void> {
+    const chatwoot = this.configService.get<Chatwoot>('CHATWOOT');
+    if (!chatwoot.ENABLED || !chatwoot.READ_STATE_INGRESS_TOKEN || !this.localChatwoot?.enabled) return;
+
+    const messages = (await this.prismaRepository.$queryRaw`
+      SELECT "chatwootMessageId", "chatwootConversationId"
+      FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+      AND "key"->>'remoteJid' = ${remoteJid}
+      AND ("key"->>'fromMe')::boolean = false
+      AND "messageTimestamp" <= ${readTimestamp}
+      AND "chatwootMessageId" IS NOT NULL
+      AND "chatwootConversationId" IS NOT NULL
+      ORDER BY "messageTimestamp" DESC, "chatwootMessageId" DESC
+      LIMIT 1
+    `) as { chatwootMessageId: number; chatwootConversationId: number }[];
+    const message = messages[0];
+    if (!message) return;
+
+    const sourceCursor = buildWhatsAppReadCursor({
+      instanceId: this.instanceId,
+      remoteJid,
+      readTimestamp,
+      chatwootMessageId: message.chatwootMessageId,
+    });
+    const cacheKey = `chatwoot:owner-read:${sourceCursor}`;
+    if (await this.baileysCache.get(cacheKey)) return;
+
+    try {
+      const result = await this.chatwootService.externalRead(
+        { instanceName: this.instance.name, instanceId: this.instanceId },
+        {
+          conversationId: message.chatwootConversationId,
+          messageId: message.chatwootMessageId,
+          sourceCursor,
+        },
+      );
+      if (!result) return;
+
+      await this.baileysCache.set(cacheKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
+      this.logger.info(
+        `WhatsApp owner read forwarded: remoteJid=${remoteJid} conversation=${message.chatwootConversationId} ` +
+          `message=${message.chatwootMessageId} ownersUpdated=${result.owners_updated ?? 0} ` +
+          `ownersUnchanged=${result.owners_unchanged ?? 0}`,
+      );
+    } catch (error) {
+      this.logger.warn(`Unable to forward WhatsApp owner read for ${remoteJid}: ${formatCaughtError(error)}`);
+    }
   }
 
   private async updateChatUnreadMessages(remoteJid: string): Promise<number> {
