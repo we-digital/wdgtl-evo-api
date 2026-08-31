@@ -21,6 +21,7 @@ export function toHistorySyncInventoryItem(instance: HistorySyncInventoryRecord)
     instanceId: instance.id,
     instanceName: instance.name,
     connectionStatus: instance.connectionStatus,
+    ownerPresent: Boolean(instance.ownerJid),
     ownerFingerprint: createHash('sha256')
       .update(instance.ownerJid ?? '')
       .digest('hex'),

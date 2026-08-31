@@ -295,10 +295,8 @@ class ChatwootImport {
         inbox.id,
       );
       const contentByMessage = this.getImportableHistoryMessages(chatwootService, messagesOrdered);
-      messagesOrdered = filterImportableHistoryMessages(
-        messagesOrdered,
-        existingSourceIds,
-        (message) => contentByMessage.get(message),
+      messagesOrdered = filterImportableHistoryMessages(messagesOrdered, existingSourceIds, (message) =>
+        contentByMessage.get(message),
       );
       if (messagesOrdered.length === 0) {
         if (usesBufferedHistory) this.clearAll(instance);
