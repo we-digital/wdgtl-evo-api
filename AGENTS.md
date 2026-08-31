@@ -16,6 +16,11 @@
 - Test product changes on `staging`, then promote the same source change to
   `main`. Do not merge staging-only runtime experiments into production.
 - Every BBC-related pull request description must mention `@Razario`.
+- GitHub Actions is packaging and deployment transport only. Exactly one
+  source workflow may remain; do not restore upstream lint, test, security,
+  publisher, maintenance, or PR workflows. Agents run focused quality checks
+  locally before push. Follow `docs/we-digital-ci-policy.md` and run
+  `.github/check-we-digital-actions-policy.sh` after every upstream merge.
 
 This document provides comprehensive guidelines for AI agents (Claude, GPT, Cursor, etc.) working with the Evolution API codebase.
 
