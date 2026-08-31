@@ -45,3 +45,22 @@ an update to this policy and the fork ledger in the same commit.
 
 The local checker is deliberately not a GitHub Actions job: an upstream merge
 cannot activate extra automation merely by adding a workflow file.
+
+## Exact runtime reuse and cache
+
+The workflow computes `BUILD_INPUT_SHA` from the Dockerfile, lockfiles, exact
+directories copied into the production image, and the reviewed packaging
+workflow. A successful build publishes both the immutable branch-plus-commit
+tag and a policy-versioned `runtime-v1-<BUILD_INPUT_SHA>` lookup tag.
+
+On a later commit with identical production inputs, the workflow validates the
+lookup image's repository, policy label, input hash, digest, and `linux/amd64`
+manifest, then creates the new immutable commit tag without running Docker
+build. The OCI revision remains the SHA that originally built those identical
+runtime bytes; the downstream deployment contract separately carries and
+validates the current branch and source SHA.
+
+Any missing or ambiguous lookup falls back to a full build. An existing
+commit-specific tag that fails provenance validation is a hard failure and is
+never overwritten. Versioned registry caches are written per branch and read
+from both `main` and `staging`; cache tags are never deployment inputs.

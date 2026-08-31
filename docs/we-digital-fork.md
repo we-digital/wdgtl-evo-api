@@ -30,6 +30,11 @@ tags are never deployment inputs.
 - **Focused regression:** run the local policy checker, `git diff --check`,
   `npm run lint:check`, affected tests, a production image build for Dockerfile
   changes, and stage smoke before promotion.
+- **Build optimization:** the Docker context excludes documentation, policy,
+  and test-only paths; npm downloads and cross-branch BuildKit layers use
+  registry-backed caches. A policy-versioned runtime tag allows an exact
+  validated `BUILD_INPUT_SHA` match to receive a new immutable commit tag
+  without rebuilding identical production bytes.
 
 ## Upstream maintenance
 

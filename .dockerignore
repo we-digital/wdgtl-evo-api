@@ -1,6 +1,13 @@
 .git
+.github
 *Dockerfile*
 *docker-compose*
 .env
+docs
+AGENTS.md
+*.md
+**/*.md
+tests
+test
 node_modules
 dist

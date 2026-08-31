@@ -39,30 +39,142 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Resolve image tag
-        id: tag
+      - name: Resolve build identity
+        id: identity
         run: |
           set -euo pipefail
           [[ "${GITHUB_REF_NAME}" == main || "${GITHUB_REF_NAME}" == staging ]]
           [[ "${GITHUB_SHA}" =~ ^[a-f0-9]{40}$ ]]
-          tag="${GITHUB_REF_NAME}-${GITHUB_SHA}"
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          build_input_sha=$(
+            {
+              printf '%s\n' 'wdgtl-evo-api-runtime-v1' 'linux/amd64'
+              git ls-files -s -- \
+                Dockerfile .dockerignore package.json package-lock.json \
+                tsconfig.json tsup.config.ts src public prisma manager Docker \
+                .env.example runWithProvider.js \
+                .github/workflows/build-and-deploy.yaml
+            } | sha256sum | cut -d ' ' -f 1
+          )
+          [[ "$build_input_sha" =~ ^[a-f0-9]{64}$ ]]
+          echo "build_input_sha=$build_input_sha" >> "$GITHUB_OUTPUT"
+          echo "commit_tag=${GITHUB_REF_NAME}-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "runtime_tag=runtime-v1-${build_input_sha}" >> "$GITHUB_OUTPUT"
+
+      - name: Reuse exact runtime image when available
+        id: reuse
+        env:
+          COMMIT_REF: ghcr.io/we-digital/wdgtl-evo-api:${{ steps.identity.outputs.commit_tag }}
+          RUNTIME_REF: ghcr.io/we-digital/wdgtl-evo-api:${{ steps.identity.outputs.runtime_tag }}
+          BUILD_INPUT_SHA: ${{ steps.identity.outputs.build_input_sha }}
+        run: |
+          set -euo pipefail
+
+          validate_image() {
+            local image_ref=$1 manifest labels digest
+            manifest=$(docker buildx imagetools inspect "$image_ref" --format '{{json .Manifest}}' 2>/dev/null) || return 1
+            labels=$(docker buildx imagetools inspect "$image_ref" --format '{{json .Image.Config.Labels}}' 2>/dev/null) || return 1
+            digest=$(jq -r '.digest // empty' <<<"$manifest")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || return 1
+            jq -e --arg expected "$BUILD_INPUT_SHA" \
+              '."io.we-digital.build-input-sha" == $expected and
+               ."io.we-digital.build-policy" == "evo-runtime-v1"' \
+              <<<"$labels" >/dev/null || return 1
+            jq -e '
+              if has("manifests") then
+                any(.manifests[];
+                  .platform.os == "linux" and .platform.architecture == "amd64")
+              else
+                true
+              end
+            ' <<<"$manifest" >/dev/null || return 1
+            printf '%s\n' "$digest"
+          }
+
+          if commit_digest=$(validate_image "$COMMIT_REF"); then
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$commit_digest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if docker buildx imagetools inspect "$COMMIT_REF" >/dev/null 2>&1; then
+            echo "existing immutable commit tag failed provenance validation" >&2
+            exit 1
+          fi
+
+          if runtime_digest=$(validate_image "$RUNTIME_REF"); then
+            docker buildx imagetools create \
+              --tag "$COMMIT_REF" "$RUNTIME_REF@$runtime_digest" >/dev/null
+            commit_digest=$(validate_image "$COMMIT_REF")
+            echo "reused=true" >> "$GITHUB_OUTPUT"
+            echo "digest=$commit_digest" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "reused=false" >> "$GITHUB_OUTPUT"
 
       - name: Build and push branch image
+        if: steps.reuse.outputs.reused != 'true'
         id: docker_build
         uses: docker/build-push-action@v6
         with:
           context: .
           file: Dockerfile
+          platforms: linux/amd64
           push: true
-          tags: ghcr.io/we-digital/wdgtl-evo-api:${{ steps.tag.outputs.tag }}
-          cache-from: type=gha,scope=wdgtl-evo-api-${{ github.ref_name }}
-          cache-to: type=gha,mode=max,scope=wdgtl-evo-api-${{ github.ref_name }}
+          tags: |
+            ghcr.io/we-digital/wdgtl-evo-api:${{ steps.identity.outputs.commit_tag }}
+            ghcr.io/we-digital/wdgtl-evo-api:${{ steps.identity.outputs.runtime_tag }}
+          build-args: |
+            SOURCE_SHA=${{ github.sha }}
+            BUILD_INPUT_SHA=${{ steps.identity.outputs.build_input_sha }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            io.we-digital.build-input-sha=${{ steps.identity.outputs.build_input_sha }}
+            io.we-digital.build-policy=evo-runtime-v1
+          cache-from: |
+            type=registry,ref=ghcr.io/we-digital/wdgtl-evo-api:buildcache-v1-${{ github.ref_name }}
+            type=registry,ref=ghcr.io/we-digital/wdgtl-evo-api:buildcache-v1-staging
+            type=registry,ref=ghcr.io/we-digital/wdgtl-evo-api:buildcache-v1-main
+          cache-to: type=registry,ref=ghcr.io/we-digital/wdgtl-evo-api:buildcache-v1-${{ github.ref_name }},mode=max
+
+      - name: Verify published runtime image
+        id: verified
+        env:
+          COMMIT_REF: ghcr.io/we-digital/wdgtl-evo-api:${{ steps.identity.outputs.commit_tag }}
+          BUILD_INPUT_SHA: ${{ steps.identity.outputs.build_input_sha }}
+          REUSED_DIGEST: ${{ steps.reuse.outputs.digest }}
+          BUILT_DIGEST: ${{ steps.docker_build.outputs.digest }}
+          REUSED: ${{ steps.reuse.outputs.reused }}
+        run: |
+          set -euo pipefail
+          if [[ "$REUSED" == true ]]; then
+            expected_digest=$REUSED_DIGEST
+          else
+            expected_digest=$BUILT_DIGEST
+          fi
+          [[ "$expected_digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          manifest=$(docker buildx imagetools inspect "$COMMIT_REF" --format '{{json .Manifest}}')
+          labels=$(docker buildx imagetools inspect "$COMMIT_REF" --format '{{json .Image.Config.Labels}}')
+          actual_digest=$(jq -r '.digest // empty' <<<"$manifest")
+          [[ "$actual_digest" == "$expected_digest" ]]
+          jq -e --arg expected "$BUILD_INPUT_SHA" \
+            '."io.we-digital.build-input-sha" == $expected and
+             ."io.we-digital.build-policy" == "evo-runtime-v1"' \
+            <<<"$labels" >/dev/null
+          jq -e '
+            if has("manifests") then
+              any(.manifests[];
+                .platform.os == "linux" and .platform.architecture == "amd64")
+            else
+              true
+            end
+          ' <<<"$manifest" >/dev/null
+          echo "digest=$actual_digest" >> "$GITHUB_OUTPUT"
 
       - name: Export immutable image reference
         id: deployref
         env:
-          DIGEST: ${{ steps.docker_build.outputs.digest }}
+          DIGEST: ${{ steps.verified.outputs.digest }}
         run: |
           set -euo pipefail
           [[ "${GITHUB_REF_NAME}" == main || "${GITHUB_REF_NAME}" == staging ]]
