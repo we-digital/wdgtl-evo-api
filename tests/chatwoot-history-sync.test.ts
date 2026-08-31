@@ -177,6 +177,21 @@ test('attributes imported incoming group content to the stored participant', () 
   );
 });
 
+test('rejects non-importable history content before Chatwoot identity creation', () => {
+  const protocolOnly = {
+    ...message({ id: 'protocol-only', remoteJid: '628111@s.whatsapp.net' }),
+    messageType: 'protocolMessage',
+    message: { protocolMessage: { type: 0 } },
+  } as Message;
+  const chatwootService = {
+    getConversationMessage: () => '',
+  } as any;
+
+  const importable = chatwootImport.getImportableHistoryMessages(chatwootService, [protocolOnly]);
+
+  assert.equal(importable.size, 0);
+});
+
 test('accepts only the versioned bounded cached history batch contract', () => {
   const validRequest = {
     contractVersion: '2026-08-01',
