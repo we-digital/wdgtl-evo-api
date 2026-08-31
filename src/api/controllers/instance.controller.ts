@@ -446,6 +446,9 @@ export class InstanceController {
           select: {
             enabled: true,
             importMessages: true,
+            accountId: true,
+            url: true,
+            nameInbox: true,
             updatedAt: true,
           },
         },

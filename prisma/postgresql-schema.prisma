@@ -267,19 +267,21 @@ model Proxy {
 }
 
 model Setting {
-  id              String    @id @default(cuid())
-  rejectCall      Boolean   @default(false) @db.Boolean
-  msgCall         String?   @db.VarChar(100)
-  groupsIgnore    Boolean   @default(false) @db.Boolean
-  alwaysOnline    Boolean   @default(false) @db.Boolean
-  readMessages    Boolean   @default(false) @db.Boolean
-  readStatus      Boolean   @default(false) @db.Boolean
-  syncFullHistory Boolean   @default(false) @db.Boolean
-  wavoipToken     String?   @db.VarChar(100)
-  createdAt       DateTime? @default(now()) @db.Timestamp
-  updatedAt       DateTime  @updatedAt @db.Timestamp
-  Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
-  instanceId      String    @unique
+  id                              String    @id @default(cuid())
+  rejectCall                      Boolean   @default(false) @db.Boolean
+  msgCall                         String?   @db.VarChar(100)
+  groupsIgnore                    Boolean   @default(false) @db.Boolean
+  alwaysOnline                    Boolean   @default(false) @db.Boolean
+  readMessages                    Boolean   @default(false) @db.Boolean
+  readStatus                      Boolean   @default(false) @db.Boolean
+  syncFullHistory                 Boolean   @default(false) @db.Boolean
+  historySyncSourceKey            String?   @db.VarChar(64)
+  historySyncBootstrapCompletedAt DateTime? @db.Timestamp
+  wavoipToken                     String?   @db.VarChar(100)
+  createdAt                       DateTime? @default(now()) @db.Timestamp
+  updatedAt                       DateTime  @updatedAt @db.Timestamp
+  Instance                        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId                      String    @unique
 
   @@index([instanceId])
 }
