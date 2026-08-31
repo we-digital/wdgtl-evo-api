@@ -56,6 +56,7 @@ import {
   shouldEnrichChatwootContacts,
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
+import { requiresFullHistorySync } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
   buildWhatsAppReadCursor,
@@ -265,6 +266,9 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
   private eventProcessingQueue: Promise<void> = Promise.resolve();
+  private shouldRequestFullHistory = false;
+  private forceFullHistoryOnce = false;
+  private clientGeneration = 0;
 
   // Cache TTL constants (in seconds)
   private readonly MESSAGE_CACHE_TTL_SECONDS = 5 * 60; // 5 minutes - avoid duplicate message processing
@@ -345,7 +349,14 @@ export class BaileysStartupService extends ChannelStartupService {
     };
   }
 
-  private async connectionUpdate({ qr, connection, lastDisconnect }: Partial<ConnectionState>) {
+  private async connectionUpdate(
+    { qr, connection, lastDisconnect }: Partial<ConnectionState>,
+    clientGeneration = this.clientGeneration,
+  ) {
+    if (clientGeneration !== this.clientGeneration) {
+      return;
+    }
+
     if (qr) {
       if (this.instance.qrcode.count === this.configService.get<QrCode>('QRCODE').LIMIT) {
         this.sendDataWebhook(Events.QRCODE_UPDATED, {
@@ -479,7 +490,11 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection === 'open') {
+      const previousOwnerJid = this.instance.ownerJid ? jidNormalizedUser(this.instance.ownerJid) : null;
       this.instance.wuid = this.client.user.id.replace(/:\d+/, '');
+      const currentOwnerJid = jidNormalizedUser(this.instance.wuid);
+      const isNewSource = !previousOwnerJid || previousOwnerJid !== currentOwnerJid;
+      this.instance.ownerJid = currentOwnerJid;
       try {
         const profilePic = await this.profilePicture(this.instance.wuid);
         this.instance.profilePictureUrl = profilePic.profilePictureUrl;
@@ -511,13 +526,25 @@ export class BaileysStartupService extends ChannelStartupService {
         },
       });
 
+      if (isNewSource && !this.shouldRequestFullHistory) {
+        this.forceFullHistoryOnce = true;
+        const previousClient = this.client;
+        setTimeout(() => {
+          this.clientGeneration++;
+          previousClient?.ws?.close();
+          this.reloadConnection().catch((error) =>
+            this.logger.error(`Unable to restart a changed source in full-history mode: ${error}`),
+          );
+        }, 1000);
+      }
+
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
         this.chatwootService.eventWhatsapp(
           Events.CONNECTION_UPDATE,
           { instanceName: this.instance.name, instanceId: this.instanceId },
           { instance: this.instance.name, status: 'open' },
         );
-        this.syncChatwootLostMessages();
+        this.syncChatwootLostMessages(isNewSource || this.shouldRequestFullHistory);
       }
 
       this.sendDataWebhook(Events.CONNECTION_UPDATE, {
@@ -589,6 +616,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async createClient(number?: string): Promise<WASocket> {
     this.instance.authState = await this.defineAuthState();
+
+    const storedOwnerJid = this.instance.ownerJid ? jidNormalizedUser(this.instance.ownerJid) : null;
+    const authenticatedOwnerId = this.instance.authState.state.creds.me?.id;
+    const authenticatedOwnerJid = authenticatedOwnerId ? jidNormalizedUser(authenticatedOwnerId) : null;
+    this.shouldRequestFullHistory =
+      this.forceFullHistoryOnce || requiresFullHistorySync(storedOwnerJid, authenticatedOwnerJid);
+    this.forceFullHistoryOnce = false;
+    this.logger.info(
+      `WhatsApp history strategy: ${this.shouldRequestFullHistory ? 'full for a new source' : 'incremental for an existing source'}`,
+    );
 
     const session = this.configService.get<ConfigSessionPhone>('CONFIG_SESSION_PHONE');
 
@@ -671,7 +708,7 @@ export class BaileysStartupService extends ChannelStartupService {
       qrTimeout: 45_000,
       emitOwnEvents: false,
       shouldIgnoreJid: (jid) => {
-        if (this.localSettings.syncFullHistory && isJidGroup(jid)) {
+        if (this.shouldRequestFullHistory && isJidGroup(jid)) {
           return false;
         }
 
@@ -681,7 +718,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         return isGroupJid || isBroadcast || isNewsletter;
       },
-      syncFullHistory: this.localSettings.syncFullHistory,
+      syncFullHistory: this.shouldRequestFullHistory,
       shouldSyncHistoryMessage: (msg: proto.Message.IHistorySyncNotification) => {
         return this.historySyncNotification(msg);
       },
@@ -709,13 +746,15 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.endSession = false;
 
+    this.clientGeneration++;
+    const clientGeneration = this.clientGeneration;
     this.client = makeWASocket(socketConfig);
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
     }
 
-    this.eventHandler();
+    this.eventHandler(clientGeneration);
 
     this.client.ws.on('CB:call', (packet) => {
       console.log('CB:call', packet);
@@ -1889,7 +1928,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
   };
 
-  private eventHandler() {
+  private eventHandler(clientGeneration = this.clientGeneration) {
     this.client.ev.process(async (events) => {
       this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
         try {
@@ -1917,7 +1956,7 @@ export class BaileysStartupService extends ChannelStartupService {
             }
 
             if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update']);
+              this.connectionUpdate(events['connection.update'], clientGeneration);
             }
 
             if (events['creds.update']) {
@@ -2060,7 +2099,10 @@ export class BaileysStartupService extends ChannelStartupService {
 
       if (msg.progress === 100) {
         setTimeout(() => {
-          this.chatwootService.importHistoryMessages(instance);
+          this.chatwootService
+            .importHistoryMessages(instance)
+            .then(() => this.chatwootService.syncLostMessages(instance))
+            .catch((error) => this.logger.error(`Unable to finalize full Chatwoot history sync: ${error}`));
         }, 10000);
       }
     }
@@ -2070,8 +2112,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private isSyncNotificationFromUsedSyncType(msg: proto.Message.IHistorySyncNotification) {
     return (
-      (this.localSettings.syncFullHistory && msg?.syncType === 2) ||
-      (!this.localSettings.syncFullHistory && msg?.syncType === 3)
+      (this.shouldRequestFullHistory && msg?.syncType === 2) || (!this.shouldRequestFullHistory && msg?.syncType === 3)
     );
   }
 
@@ -4828,19 +4869,21 @@ export class BaileysStartupService extends ChannelStartupService {
     return group?.subject || group?.Name || null;
   }
 
-  private async syncChatwootLostMessages() {
+  private async syncChatwootLostMessages(awaitFullHistory = false) {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-      this.chatwootService
-        .syncLostMessages({ instanceName: this.instance.name })
-        .then(() => this.chatwootService.reconcileStoredLidContacts({ instanceName: this.instance.name }))
-        .catch((error) => this.logger.error(`Unable to run startup Chatwoot history reconciliation: ${error}`));
+      if (!awaitFullHistory) {
+        this.chatwootService
+          .syncLostMessages({ instanceName: this.instance.name })
+          .then(() => this.chatwootService.reconcileStoredLidContacts({ instanceName: this.instance.name }))
+          .catch((error) => this.logger.error(`Unable to run startup Chatwoot history reconciliation: ${error}`));
+      }
 
       // Generate ID for this cron task and store in cache
       const cronId = cuid();
       const cronKey = `chatwoot:syncLostMessages`;
       await this.chatwootService.getCache()?.hSet(cronKey, this.instance.name, cronId);
 
-      const task = cron.schedule('0,30 * * * *', async () => {
+      const task = cron.schedule('*/30 * * * * *', async () => {
         // Check ID before executing (only if cache is available)
         const cache = this.chatwootService.getCache();
         if (cache) {

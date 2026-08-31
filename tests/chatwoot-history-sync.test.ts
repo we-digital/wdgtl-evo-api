@@ -4,10 +4,12 @@ import test from 'node:test';
 import {
   chatwootInboxCacheKey,
   dedupeHistoryMessagesBySourceId,
+  filterImportableHistoryMessages,
   historyRecoveryDestination,
   matchesHistoryRecoveryDestination,
   normalizeStoredHistoryMessages,
   prepareStoredHistoryRecoveryMessage,
+  requiresFullHistorySync,
   resolveProviderClientContext,
   selectUniqueChatwootInbox,
   toCanonicalHistoryJid,
@@ -63,6 +65,27 @@ test('deduplicates stored history rows by canonical Chatwoot source id', () => {
 
   assert.deepEqual(result.messages, [first, unique]);
   assert.equal(result.duplicateMessages, 1);
+});
+
+test('filters existing and unsupported history before any identity can be materialized', () => {
+  const existing = message({ id: 'existing', remoteJid: '628111@s.whatsapp.net' });
+  const unsupported = {
+    ...message({ id: 'unsupported', remoteJid: '628222@s.whatsapp.net' }),
+    message: { protocolMessage: { type: 0 } },
+  } as Message;
+  const importable = message({ id: 'importable', remoteJid: '628333@s.whatsapp.net' });
+  const duplicate = message({ id: 'WAID:importable', remoteJid: '628444@s.whatsapp.net' });
+
+  const selected = filterImportableHistoryMessages(
+    [existing, unsupported, importable, duplicate],
+    new Set(['WAID:existing']),
+    (candidate) => ((candidate.message as any)?.conversation ? 'content' : ''),
+  );
+
+  assert.deepEqual(selected, [importable]);
+  assert.deepEqual(Array.from(chatwootImport.createMessagesMapByIdentity(selected).keys()), [
+    '628333@s.whatsapp.net',
+  ]);
 });
 
 test('reuses stored LID mappings and skips groups and unresolved LIDs', async () => {
@@ -127,6 +150,13 @@ test('canonicalizes device-specific phone and LID identities', () => {
   assert.equal(toCanonicalHistoryJid('628123:7@s.whatsapp.net'), '628123@s.whatsapp.net');
   assert.equal(toCanonicalHistoryJid('222:7@lid'), '222@lid');
   assert.equal(toCanonicalHistoryJid('123-456@g.us'), '123-456@g.us');
+});
+
+test('requests full history only for a new or changed authenticated source', () => {
+  assert.equal(requiresFullHistorySync(null, '628111@s.whatsapp.net'), true);
+  assert.equal(requiresFullHistorySync('628111@s.whatsapp.net', null), false);
+  assert.equal(requiresFullHistorySync('628111@s.whatsapp.net', '628222@s.whatsapp.net'), true);
+  assert.equal(requiresFullHistorySync('628111:7@s.whatsapp.net', '628111@s.whatsapp.net'), false);
 });
 
 test('attributes imported incoming group content to the stored participant', () => {
