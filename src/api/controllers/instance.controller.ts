@@ -371,7 +371,7 @@ export class InstanceController {
 
       // Fallback for Baileys (uses different mechanism)
       if (state === 'open' || state === 'connecting') {
-        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) instance.clearCacheChatwoot();
+        if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) await instance.clearCacheChatwoot();
 
         instance.client?.ws?.close();
         instance.client?.end(new Error('restart'));
@@ -453,7 +453,7 @@ export class InstanceController {
     const { instance } = await this.connectionState({ instanceName });
     try {
       const waInstances = this.waMonitor.waInstances[instanceName];
-      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) await waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
         await this.logout({ instanceName });
