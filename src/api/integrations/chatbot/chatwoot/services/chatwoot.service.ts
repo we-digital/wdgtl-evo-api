@@ -1470,7 +1470,7 @@ export class ChatwootService {
         }
 
         if (command === 'clearcache') {
-          waInstance.clearCacheChatwoot();
+          await waInstance.clearCacheChatwoot();
           await this.createBotMessage(
             instance,
             i18next.t('cw.inbox.clearCache', {
@@ -3126,7 +3126,7 @@ export class ChatwootService {
       }
 
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
-      waInstance?.clearCacheChatwoot?.();
+      await waInstance?.clearCacheChatwoot?.();
       result.importedMessages = Number(importedMessages);
       result.appliedMessages = appliedSourceIds.size;
       if (scope === 'all' && unresolvedLidMode === 'provisional') {
@@ -3253,7 +3253,7 @@ export class ChatwootService {
           );
         }
         appliedMessages = appliedSourceIds.size;
-        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+        await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
       }
       if (data.scope === 'all' && data.unresolvedLidMode === 'provisional') {
         await this.enableExtendedHistorySync(instance);
@@ -3466,7 +3466,7 @@ export class ChatwootService {
           );
         }
         appliedMessages = appliedSourceIds.size;
-        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+        await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
       }
 
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
