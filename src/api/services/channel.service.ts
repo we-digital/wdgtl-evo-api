@@ -153,6 +153,8 @@ export class ChannelStartupService {
     this.localSettings.readMessages = data?.readMessages;
     this.localSettings.readStatus = data?.readStatus;
     this.localSettings.syncFullHistory = data?.syncFullHistory;
+    this.localSettings.historySyncSourceKey = data?.historySyncSourceKey;
+    this.localSettings.historySyncBootstrapCompletedAt = data?.historySyncBootstrapCompletedAt;
     this.localSettings.wavoipToken = data?.wavoipToken;
   }
 
@@ -288,7 +290,7 @@ export class ChannelStartupService {
 
       Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
 
-      this.clearCacheChatwoot();
+      await this.clearCacheChatwoot();
       return;
     }
 
@@ -316,7 +318,7 @@ export class ChannelStartupService {
 
     Object.assign(this.localChatwoot, { ...data, signDelimiter: data.signMsg ? data.signDelimiter : null });
 
-    this.clearCacheChatwoot();
+    await this.clearCacheChatwoot();
   }
 
   public async findChatwoot(): Promise<ChatwootDto | null> {
@@ -356,8 +358,8 @@ export class ChannelStartupService {
     };
   }
 
-  public clearCacheChatwoot() {
-    this.chatwootService.getCache()?.deleteAll(this.instanceName);
+  public async clearCacheChatwoot() {
+    await this.chatwootService.getCache()?.deleteAll(this.instanceName);
   }
 
   public async loadProxy() {

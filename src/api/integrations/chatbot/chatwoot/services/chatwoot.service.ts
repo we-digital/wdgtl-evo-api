@@ -25,6 +25,12 @@ import {
   toChatwootSourceId,
   uniqueHistoryRecoveryInboxId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import {
+  acquireFullHistoryCapacity,
+  acquireHistoryWriter,
+  enqueueIncrementalHistorySync,
+  tryAcquireHistoryWriter,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -74,8 +80,8 @@ interface ChatwootClientContext {
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
-  private readonly activeStoredHistorySyncs = new Set<string>();
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
+  private readonly historySyncCheckpointKey = 'chatwoot:historySyncCheckpoint';
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -1464,7 +1470,7 @@ export class ChatwootService {
         }
 
         if (command === 'clearcache') {
-          waInstance.clearCacheChatwoot();
+          await waInstance.clearCacheChatwoot();
           await this.createBotMessage(
             instance,
             i18next.t('cw.inbox.clearCache', {
@@ -2646,25 +2652,32 @@ export class ChatwootService {
       return;
     }
 
-    this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
+    const releaseCapacity = await acquireFullHistoryCapacity();
+    const releaseWriter = await acquireHistoryWriter(instance.instanceName);
+    try {
+      this.createBotMessage(instance, i18next.t('cw.import.importingMessages'), 'incoming');
 
-    const provider = await this.getProvider(instance);
-    const inbox = await this.getInbox(instance);
-    if (!provider || !inbox) {
-      this.logger.warn('Chatwoot provider or inbox not found');
-      return null;
+      const provider = await this.getProvider(instance);
+      const inbox = await this.getInbox(instance);
+      if (!provider || !inbox) {
+        this.logger.warn('Chatwoot provider or inbox not found');
+        return null;
+      }
+
+      const totalMessagesImported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+      this.updateContactAvatarInRecentConversations(instance);
+
+      const msg = Number.isInteger(totalMessagesImported)
+        ? i18next.t('cw.import.messagesImported', { totalMessagesImported })
+        : i18next.t('cw.import.messagesException');
+
+      this.createBotMessage(instance, msg, 'incoming');
+
+      return totalMessagesImported;
+    } finally {
+      releaseWriter();
+      releaseCapacity();
     }
-
-    const totalMessagesImported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
-    this.updateContactAvatarInRecentConversations(instance);
-
-    const msg = Number.isInteger(totalMessagesImported)
-      ? i18next.t('cw.import.messagesImported', { totalMessagesImported })
-      : i18next.t('cw.import.messagesException');
-
-    this.createBotMessage(instance, msg, 'incoming');
-
-    return totalMessagesImported;
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {
@@ -2942,11 +2955,7 @@ export class ChatwootService {
       throw new BadRequestException('Chatwoot history import database connection is not configured');
     }
 
-    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
-      throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
-    }
-
-    this.activeStoredHistorySyncs.add(instance.instanceName);
+    const releaseWriter = await acquireHistoryWriter(instance.instanceName);
     try {
       const provider = await this.getProvider(instance);
       if (!provider?.importMessages) {
@@ -3097,9 +3106,10 @@ export class ChatwootService {
       }
 
       const identityNames = await this.getGroupIdentityNames(instance, selectedMessages);
-      chatwootImport.addHistoryIdentityNames(instance, identityNames);
-      this.addHistoryMessages(instance, selectedMessages);
-      const importedMessages = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+      const importedMessages = await chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
+        messages: selectedMessages,
+        identityNames,
+      });
       if (!Number.isInteger(importedMessages)) {
         throw new Error(`Chatwoot history import failed for ${instance.instanceName}`);
       }
@@ -3116,7 +3126,7 @@ export class ChatwootService {
       }
 
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
-      waInstance?.clearCacheChatwoot?.();
+      await waInstance?.clearCacheChatwoot?.();
       result.importedMessages = Number(importedMessages);
       result.appliedMessages = appliedSourceIds.size;
       if (scope === 'all' && unresolvedLidMode === 'provisional') {
@@ -3125,7 +3135,7 @@ export class ChatwootService {
 
       return result;
     } finally {
-      this.activeStoredHistorySyncs.delete(instance.instanceName);
+      releaseWriter();
     }
   }
 
@@ -3136,11 +3146,10 @@ export class ChatwootService {
     if (data.contractVersion !== '2026-08-01' || data.dryRun !== false) {
       throw new BadRequestException('Unsupported Chatwoot cached history batch contract');
     }
-    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
+    const releaseWriter = tryAcquireHistoryWriter(instance.instanceName);
+    if (!releaseWriter) {
       throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
     }
-
-    this.activeStoredHistorySyncs.add(instance.instanceName);
     try {
       const provider = await this.getProvider(instance);
       if (!provider?.importMessages) {
@@ -3225,9 +3234,10 @@ export class ChatwootService {
       let appliedMessages = 0;
       if (importableMessages.length > 0) {
         const identityNames = await this.getGroupIdentityNames(instance, importableMessages);
-        chatwootImport.addHistoryIdentityNames(instance, identityNames);
-        this.addHistoryMessages(instance, importableMessages);
-        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
+          messages: importableMessages,
+          identityNames,
+        });
         if (!Number.isInteger(imported)) {
           throw new Error(`Chatwoot cached history import failed for ${instance.instanceName}`);
         }
@@ -3243,7 +3253,7 @@ export class ChatwootService {
           );
         }
         appliedMessages = appliedSourceIds.size;
-        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+        await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
       }
       if (data.scope === 'all' && data.unresolvedLidMode === 'provisional') {
         await this.enableExtendedHistorySync(instance);
@@ -3269,8 +3279,7 @@ export class ChatwootService {
         processedSourceIds: Array.from(requestedSourceIds),
       };
     } finally {
-      chatwootImport.clearAll(instance);
-      this.activeStoredHistorySyncs.delete(instance.instanceName);
+      releaseWriter();
     }
   }
 
@@ -3318,11 +3327,10 @@ export class ChatwootService {
     if (data.contractVersion !== '2026-08-28' || data.dryRun !== false) {
       throw new BadRequestException('Unsupported Chatwoot destination-aware recovery contract');
     }
-    if (this.activeStoredHistorySyncs.has(instance.instanceName)) {
+    const releaseWriter = tryAcquireHistoryWriter(instance.instanceName);
+    if (!releaseWriter) {
       throw new BadRequestException(`Chatwoot history sync is already running for ${instance.instanceName}`);
     }
-
-    this.activeStoredHistorySyncs.add(instance.instanceName);
     try {
       const provider = await this.getProvider(instance);
       if (!provider?.importMessages) {
@@ -3439,9 +3447,10 @@ export class ChatwootService {
       let appliedSourceIds = new Set<string>();
       if (importableMessages.length > 0) {
         const identityNames = await this.getGroupIdentityNames(instance, importableMessages);
-        chatwootImport.addHistoryIdentityNames(instance, identityNames);
-        this.addHistoryMessages(instance, importableMessages);
-        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider);
+        const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
+          messages: importableMessages,
+          identityNames,
+        });
         if (!Number.isInteger(imported)) {
           throw new Error(`Chatwoot recovery import failed for ${instance.instanceName}`);
         }
@@ -3457,7 +3466,7 @@ export class ChatwootService {
           );
         }
         appliedMessages = appliedSourceIds.size;
-        this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+        await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
       }
 
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
@@ -3517,23 +3526,34 @@ export class ChatwootService {
         outcomes,
       };
     } finally {
-      chatwootImport.clearAll(instance);
-      this.activeStoredHistorySyncs.delete(instance.instanceName);
+      releaseWriter();
     }
   }
 
-  public async syncLostMessages(instance: InstanceDto) {
+  private async incrementalHistorySince(instance: InstanceDto) {
+    const checkpoint = await this.cache.hGet(this.historySyncCheckpointKey, instance.instanceName);
+    const parsedCheckpoint = checkpoint ? dayjs(checkpoint) : null;
+    return parsedCheckpoint?.isValid()
+      ? parsedCheckpoint.subtract(15, 'minutes').toISOString()
+      : dayjs().subtract(6, 'hours').toISOString();
+  }
+
+  public async syncLostMessages(instance: InstanceDto, requestedSince?: string) {
     try {
       if (!this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
         return;
       }
 
       const extendedHistorySync = await this.isExtendedHistorySyncEnabled(instance);
-      return await this.syncStoredHistory(instance, {
-        dryRun: false,
-        since: dayjs().subtract(6, 'hours').toISOString(),
-        scope: extendedHistorySync ? 'all' : 'direct',
-        unresolvedLidMode: extendedHistorySync ? 'provisional' : 'skip',
+      const since = requestedSince || (await this.incrementalHistorySince(instance));
+      await enqueueIncrementalHistorySync(instance.instanceName, since, async (coalescedSince) => {
+        await this.syncStoredHistory(instance, {
+          dryRun: false,
+          since: coalescedSince,
+          scope: extendedHistorySync ? 'all' : 'direct',
+          unresolvedLidMode: extendedHistorySync ? 'provisional' : 'skip',
+        });
+        await this.cache.hSet(this.historySyncCheckpointKey, instance.instanceName, dayjs().toISOString());
       });
     } catch (error) {
       this.logger.error(`Error on incremental Chatwoot history sync: ${formatCaughtError(error)}`);

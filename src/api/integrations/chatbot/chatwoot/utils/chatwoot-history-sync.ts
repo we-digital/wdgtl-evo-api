@@ -175,6 +175,30 @@ export const isLidJid = (remoteJid?: string): remoteJid is string =>
 
 export const isGroupJid = (remoteJid?: string) => Boolean(remoteJid?.endsWith('@g.us'));
 
+export const filterImportableHistoryMessages = <T extends Pick<Message, 'key'>>(
+  messages: T[],
+  existingSourceIds: Set<string>,
+  renderContent: (message: T) => unknown,
+): T[] => {
+  const selected: T[] = [];
+  const seenSourceIds = new Set<string>();
+
+  for (const message of messages) {
+    const key = readKey(message);
+    if (!key.id || !key.remoteJid) continue;
+    if (!isPhoneJid(key.remoteJid) && !isGroupJid(key.remoteJid) && !isLidJid(key.remoteJid)) continue;
+
+    const sourceId = toChatwootSourceId(key.id);
+    if (existingSourceIds.has(sourceId) || seenSourceIds.has(sourceId)) continue;
+    if (!renderContent(message)) continue;
+
+    seenSourceIds.add(sourceId);
+    selected.push(message);
+  }
+
+  return selected;
+};
+
 const toUserLevelJid = (jid: string) => {
   const separator = jid.lastIndexOf('@');
   if (separator < 0) {
@@ -187,6 +211,12 @@ const toUserLevelJid = (jid: string) => {
 
 export const toCanonicalHistoryJid = (remoteJid: string) =>
   isPhoneJid(remoteJid) || isLidJid(remoteJid) ? toUserLevelJid(remoteJid) : remoteJid;
+
+export const requiresFullHistorySync = (storedOwnerJid?: string | null, authenticatedOwnerJid?: string | null) => {
+  if (!storedOwnerJid) return true;
+  if (!authenticatedOwnerJid) return false;
+  return toCanonicalHistoryJid(storedOwnerJid) !== toCanonicalHistoryJid(authenticatedOwnerJid);
+};
 
 const readKey = (message: Pick<Message, 'key'>): StoredMessageKey => (message.key || {}) as StoredMessageKey;
 

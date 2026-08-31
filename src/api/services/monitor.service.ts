@@ -415,7 +415,7 @@ export class WAMonitoringService {
         this.clearDelInstanceTime(instanceName);
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-          this.waInstances[instanceName]?.clearCacheChatwoot();
+          await this.waInstances[instanceName]?.clearCacheChatwoot();
         }
 
         this.cleaningUp(instanceName);

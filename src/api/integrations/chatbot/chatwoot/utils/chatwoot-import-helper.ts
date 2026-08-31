@@ -3,6 +3,7 @@ import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
 import {
+  filterImportableHistoryMessages,
   isGroupJid,
   isLidJid,
   isPhoneJid,
@@ -39,6 +40,11 @@ type HistoryIdentity = firstLastTimestamp & {
 };
 
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
+
+export type HistoryMessageImportOptions = {
+  messages?: Message[];
+  identityNames?: Map<string, string>;
+};
 
 class ChatwootImport {
   private logger = new Logger('ChatwootImport');
@@ -248,7 +254,9 @@ class ChatwootImport {
     chatwootService: ChatwootService,
     inbox: inbox,
     provider: ChatwootModel,
+    options: HistoryMessageImportOptions = {},
   ) {
+    const usesBufferedHistory = options.messages === undefined;
     try {
       const pgClient = postgresClient.getChatwootConnection();
 
@@ -259,8 +267,9 @@ class ChatwootImport {
 
       let totalMessagesImported = 0;
 
-      let messagesOrdered = this.historyMessages.get(instance.instanceName) || [];
+      let messagesOrdered = [...(options.messages || this.historyMessages.get(instance.instanceName) || [])];
       if (messagesOrdered.length === 0) {
+        if (usesBufferedHistory) this.clearAll(instance);
         return 0;
       }
 
@@ -280,6 +289,20 @@ class ChatwootImport {
         return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
+      const existingSourceIds = await this.getExistingSourceIds(
+        messagesOrdered.map((message: any) => message.key.id),
+        undefined,
+        inbox.id,
+      );
+      const contentByMessage = this.getImportableHistoryMessages(chatwootService, messagesOrdered);
+      messagesOrdered = filterImportableHistoryMessages(messagesOrdered, existingSourceIds, (message) =>
+        contentByMessage.get(message),
+      );
+      if (messagesOrdered.length === 0) {
+        if (usesBufferedHistory) this.clearAll(instance);
+        return 0;
+      }
+
       const allMessagesMappedByIdentity = this.createMessagesMapByIdentity(messagesOrdered);
       const identitiesWithTimestamp = new Map<string, firstLastTimestamp>();
       allMessagesMappedByIdentity.forEach((messages: Message[], identityKey: string) => {
@@ -289,14 +312,14 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(
-        messagesOrdered.map((message: any) => message.key.id),
-        undefined,
-        inbox.id,
-      );
-      messagesOrdered = messagesOrdered.filter(
-        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
-      );
+      if (usesBufferedHistory) {
+        const importableIdentities = new Set(allMessagesMappedByIdentity.keys());
+        const importableContacts = (this.historyContacts.get(instance.instanceName) || []).filter((contact) =>
+          importableIdentities.has(toCanonicalHistoryJid(contact.remoteJid)),
+        );
+        this.historyContacts.set(instance.instanceName, importableContacts);
+      }
+
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -309,7 +332,7 @@ class ChatwootImport {
             inbox,
             identitiesWithTimestamp,
             messagesByIdentity,
-            this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
+            options.identityNames || this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
           );
           // inserting messages in chatwoot db
           let sqlValues = '';
@@ -319,15 +342,11 @@ class ChatwootImport {
             const fksChatwoot = fksByIdentity.get(identityKey);
 
             messages.forEach((message) => {
-              if (!message.message) {
-                return;
-              }
-
               if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
                 return;
               }
 
-              const contentMessage = this.getHistoryContentMessage(chatwootService, message);
+              const contentMessage = contentByMessage.get(message);
               if (!contentMessage) {
                 return;
               }
@@ -405,24 +424,20 @@ class ChatwootImport {
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
       }
 
-      this.deleteHistoryMessages(instance);
-      this.deleteRepositoryMessagesCache(instance);
-      this.deleteHistoryIdentityNames(instance);
-
-      const providerData: ChatwootDto = {
-        ...provider,
-        ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
-      };
-
-      this.importHistoryContacts(instance, providerData);
+      if (usesBufferedHistory) {
+        this.deleteHistoryMessages(instance);
+        const providerData: ChatwootDto = {
+          ...provider,
+          ignoreJids: Array.isArray(provider.ignoreJids) ? provider.ignoreJids.map((event) => String(event)) : [],
+        };
+        await this.importHistoryContacts(instance, providerData);
+        this.clearAll(instance);
+      }
 
       return totalMessagesImported;
     } catch (error) {
       this.logger.error(`Error on import history messages: ${error.toString()}`);
-
-      this.deleteHistoryMessages(instance);
-      this.deleteRepositoryMessagesCache(instance);
-      this.deleteHistoryIdentityNames(instance);
+      if (usesBufferedHistory) this.clearAll(instance);
     }
   }
 
@@ -797,6 +812,23 @@ class ChatwootImport {
     const participantLabel = participantPhone ? `${participantPhone} - ${participantName}` : participantName;
 
     return `**${participantLabel}:**\n\n${content}`;
+  }
+
+  public getImportableHistoryMessages(chatwootService: ChatwootService, messages: Message[]) {
+    const contentByMessage = new Map<Message, string>();
+
+    for (const message of messages) {
+      if (!message.message) {
+        continue;
+      }
+
+      const content = this.getHistoryContentMessage(chatwootService, message as unknown as IWebMessageInfo);
+      if (content) {
+        contentByMessage.set(message, content);
+      }
+    }
+
+    return contentByMessage;
   }
 
   public sliceIntoChunks(arr: any[], chunkSize: number) {
