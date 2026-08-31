@@ -56,9 +56,11 @@ jobs:
             } | sha256sum | cut -d ' ' -f 1
           )
           [[ "$build_input_sha" =~ ^[a-f0-9]{64}$ ]]
-          echo "build_input_sha=$build_input_sha" >> "$GITHUB_OUTPUT"
-          echo "commit_tag=${GITHUB_REF_NAME}-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
-          echo "runtime_tag=runtime-v1-${build_input_sha}" >> "$GITHUB_OUTPUT"
+          {
+            echo "build_input_sha=$build_input_sha"
+            echo "commit_tag=${GITHUB_REF_NAME}-${GITHUB_SHA}"
+            echo "runtime_tag=runtime-v1-${build_input_sha}"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Reuse exact runtime image when available
         id: reuse
@@ -213,7 +215,7 @@ jobs:
           [[ "$IMAGE_REF" =~ ^ghcr\.io/we-digital/wdgtl-evo-api:staging-${GITHUB_SHA}@sha256:[a-f0-9]{64}$ ]]
           gh workflow run deploy-stage-evo.yml \
             --repo we-digital/bbc-devops \
-            --ref staging \
+            --ref main \
             --field image_ref="$IMAGE_REF" \
             --field source_ref=staging \
             --field source_sha="$GITHUB_SHA"
