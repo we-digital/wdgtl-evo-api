@@ -294,12 +294,11 @@ class ChatwootImport {
         undefined,
         inbox.id,
       );
+      const contentByMessage = this.getImportableHistoryMessages(chatwootService, messagesOrdered);
       messagesOrdered = filterImportableHistoryMessages(
         messagesOrdered,
         existingSourceIds,
-        (message) =>
-          Boolean(message.message) &&
-          this.getHistoryContentMessage(chatwootService, message as unknown as IWebMessageInfo),
+        (message) => contentByMessage.get(message),
       );
       if (messagesOrdered.length === 0) {
         if (usesBufferedHistory) this.clearAll(instance);
@@ -345,15 +344,11 @@ class ChatwootImport {
             const fksChatwoot = fksByIdentity.get(identityKey);
 
             messages.forEach((message) => {
-              if (!message.message) {
-                return;
-              }
-
               if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
                 return;
               }
 
-              const contentMessage = this.getHistoryContentMessage(chatwootService, message);
+              const contentMessage = contentByMessage.get(message);
               if (!contentMessage) {
                 return;
               }
@@ -819,6 +814,23 @@ class ChatwootImport {
     const participantLabel = participantPhone ? `${participantPhone} - ${participantName}` : participantName;
 
     return `**${participantLabel}:**\n\n${content}`;
+  }
+
+  public getImportableHistoryMessages(chatwootService: ChatwootService, messages: Message[]) {
+    const contentByMessage = new Map<Message, string>();
+
+    for (const message of messages) {
+      if (!message.message) {
+        continue;
+      }
+
+      const content = this.getHistoryContentMessage(chatwootService, message as unknown as IWebMessageInfo);
+      if (content) {
+        contentByMessage.set(message, content);
+      }
+    }
+
+    return contentByMessage;
   }
 
   public sliceIntoChunks(arr: any[], chunkSize: number) {
