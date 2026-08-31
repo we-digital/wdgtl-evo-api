@@ -66,6 +66,10 @@ export class InstanceRouter extends RouterBroker {
 
         return res.status(HttpStatus.OK).json(response);
       })
+      .get(this.routerPath('historySyncInventory/v1', false), ...guards, async (_req, res) => {
+        const response = await instanceController.historySyncInventory();
+        return res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('setPresence'), ...guards, async (req, res) => {
         const response = await this.dataValidate<null>({
           request: req,

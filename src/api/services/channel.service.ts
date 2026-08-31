@@ -153,6 +153,8 @@ export class ChannelStartupService {
     this.localSettings.readMessages = data?.readMessages;
     this.localSettings.readStatus = data?.readStatus;
     this.localSettings.syncFullHistory = data?.syncFullHistory;
+    this.localSettings.historySyncSourceKey = data?.historySyncSourceKey;
+    this.localSettings.historySyncBootstrapCompletedAt = data?.historySyncBootstrapCompletedAt;
     this.localSettings.wavoipToken = data?.wavoipToken;
   }
 

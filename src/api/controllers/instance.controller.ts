@@ -7,7 +7,8 @@ import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
 import { SettingsService } from '@api/services/settings.service';
 import { Events, Integration, wa } from '@api/types/wa.types';
-import { Auth, Chatwoot, ConfigService, HttpServer, WaBusiness } from '@config/env.config';
+import { HISTORY_SYNC_INVENTORY_CONTRACT_VERSION, toHistorySyncInventoryItem } from '@api/utils/history-sync-inventory';
+import { Auth, Chatwoot, ConfigService, Database, HttpServer, WaBusiness } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { BadRequestException, InternalServerErrorException, UnauthorizedException } from '@exceptions';
 import { delay } from 'baileys';
@@ -33,6 +34,7 @@ export class InstanceController {
   ) {}
 
   private readonly logger = new Logger('InstanceController');
+  private readonly historySyncRuntimeId = v4();
 
   public async createInstance(instanceData: InstanceDto) {
     try {
@@ -427,6 +429,39 @@ export class InstanceController {
     const instanceNames = instanceName ? [instanceName] : null;
 
     return this.waMonitor.instanceInfo(instanceNames);
+  }
+
+  public async historySyncInventory() {
+    const clientName = this.configService.get<Database>('DATABASE').CONNECTION.CLIENT_NAME;
+    const instances = await this.prismaRepository.instance.findMany({
+      where: { clientName },
+      select: {
+        id: true,
+        name: true,
+        connectionStatus: true,
+        ownerJid: true,
+        createdAt: true,
+        updatedAt: true,
+        Chatwoot: {
+          select: {
+            enabled: true,
+            importMessages: true,
+            accountId: true,
+            url: true,
+            nameInbox: true,
+            updatedAt: true,
+          },
+        },
+      },
+      orderBy: { name: 'asc' },
+    });
+
+    return {
+      contractVersion: HISTORY_SYNC_INVENTORY_CONTRACT_VERSION,
+      runtimeId: this.historySyncRuntimeId,
+      observedAt: new Date().toISOString(),
+      instances: instances.map(toHistorySyncInventoryItem),
+    };
   }
 
   public async setPresence({ instanceName }: InstanceDto, data: SetPresenceDto) {
