@@ -20,6 +20,7 @@ import {
   chatwootHistoryRecoveryBatchSchema,
   chatwootHistorySyncBatchSchema,
 } from '@api/integrations/chatbot/chatwoot/validate/chatwoot.schema';
+import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { Message } from '@prisma/client';
 import { validate } from 'jsonschema';
@@ -190,6 +191,81 @@ test('rejects non-importable history content before Chatwoot identity creation',
   const importable = chatwootImport.getImportableHistoryMessages(chatwootService, [protocolOnly]);
 
   assert.equal(importable.size, 0);
+});
+
+test('legacy full-history import creates FKs only for identities with importable content', async () => {
+  const unsupportedOnlyInstance = { instanceName: 'unsupported-only-history' } as any;
+  const mixedInstance = { instanceName: 'mixed-history' } as any;
+  const unsupportedOnly = {
+    ...message({ id: 'unsupported-only', remoteJid: '628111@s.whatsapp.net' }),
+    messageType: 'protocolMessage',
+    message: { protocolMessage: { type: 0 } },
+  } as Message;
+  const supported = message({ id: 'supported', remoteJid: '628222@s.whatsapp.net' });
+  const unsupportedMixed = {
+    ...message({ id: 'unsupported-mixed', remoteJid: '628333@s.whatsapp.net' }),
+    messageType: 'protocolMessage',
+    message: { protocolMessage: { type: 0 } },
+  } as Message;
+  const chatwootService = {
+    getConversationMessage: (content: any) => content?.conversation || '',
+  } as any;
+  const inbox = { id: 7 } as any;
+  const provider = { accountId: 1, token: 'token', ignoreJids: [], nameInbox: 'history' } as any;
+  const originalGetConnection = postgresClient.getChatwootConnection;
+  const originalGetChatwootUser = chatwootImport.getChatwootUser;
+  const originalGetExistingSourceIds = chatwootImport.getExistingSourceIds;
+  const originalSelectOrCreateFks = chatwootImport.selectOrCreateFksFromChatwoot;
+  const originalImportHistoryContacts = chatwootImport.importHistoryContacts;
+  const fkIdentityBatches: string[][] = [];
+  const insertedParams: unknown[][] = [];
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      query: async (_sql: string, params: unknown[]) => {
+        insertedParams.push(params);
+        return { rowCount: 1, rows: [] };
+      },
+    })) as any;
+    chatwootImport.getChatwootUser = (async () => ({ user_type: 'User', user_id: 9 })) as any;
+    chatwootImport.getExistingSourceIds = (async () => new Set<string>()) as any;
+    chatwootImport.selectOrCreateFksFromChatwoot = (async (
+      _provider: any,
+      _inbox: any,
+      _timestamps: any,
+      messagesByIdentity: Map<string, Message[]>,
+    ) => {
+      const identities = Array.from(messagesByIdentity.keys());
+      fkIdentityBatches.push(identities);
+      return new Map(
+        identities.map((identity) => [identity, { identity_key: identity, contact_id: '11', conversation_id: '22' }]),
+      );
+    }) as any;
+    chatwootImport.importHistoryContacts = (async () => 0) as any;
+
+    chatwootImport.addHistoryMessages(unsupportedOnlyInstance, [unsupportedOnly]);
+    assert.equal(
+      await chatwootImport.importHistoryMessages(unsupportedOnlyInstance, chatwootService, inbox, provider),
+      0,
+    );
+    assert.deepEqual(fkIdentityBatches, []);
+    assert.deepEqual(insertedParams, []);
+
+    chatwootImport.addHistoryMessages(mixedInstance, [supported, unsupportedMixed]);
+    assert.equal(await chatwootImport.importHistoryMessages(mixedInstance, chatwootService, inbox, provider), 1);
+    assert.deepEqual(fkIdentityBatches, [['628222@s.whatsapp.net']]);
+    assert.equal(insertedParams.length, 1);
+    assert.ok(insertedParams[0].includes('WAID:supported'));
+    assert.ok(!insertedParams[0].includes('WAID:unsupported-mixed'));
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+    chatwootImport.getChatwootUser = originalGetChatwootUser;
+    chatwootImport.getExistingSourceIds = originalGetExistingSourceIds;
+    chatwootImport.selectOrCreateFksFromChatwoot = originalSelectOrCreateFks;
+    chatwootImport.importHistoryContacts = originalImportHistoryContacts;
+    chatwootImport.clearAll(unsupportedOnlyInstance);
+    chatwootImport.clearAll(mixedInstance);
+  }
 });
 
 test('accepts only the versioned bounded cached history batch contract', () => {
