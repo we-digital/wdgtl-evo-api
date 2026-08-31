@@ -1,2 +1,2 @@
 # Reviewed Git blob hash followed by the only allowed workflow path.
-97d5fb45898a616a7199a9e4dba2ee4ee0e6bbd6  .github/workflows/build-and-deploy.yaml
+d976ee2f2b235d83bb45892f80b84ce1a27dcec6  .github/workflows/build-and-deploy.yaml
