@@ -36,6 +36,23 @@ tags are never deployment inputs.
   validated `BUILD_INPUT_SHA` match to receive a new immutable commit tag
   without rebuilding identical production bytes.
 
+## BBC Manager branding
+
+- **Behavior:** the bundled Evolution Manager uses the local Evolution logo
+  and displays `Evo : BBC` as the browser page title.
+- **Source areas:** `manager/dist/index.html` and the bundled Manager assets
+  under `manager/dist/`.
+- **Flags/schema:** no application flag, API contract, or database schema
+  change.
+- **Upstream reapply/conflicts:** an upstream Manager rebuild can replace the
+  committed `dist` output. Reapply the exact page title after every Manager
+  upgrade and confirm that no bundled script overrides `document.title`.
+- **Rollback:** restore the upstream `<title>` value; the Manager runtime and
+  API are otherwise unchanged.
+- **Focused regression:** assert exactly one `<title>Evo : BBC</title>` in the
+  built Manager, package the immutable image, deploy to staging, and verify the
+  browser title on both login and authenticated Manager routes.
+
 ## Upstream maintenance
 
 Keep upstream Git history and reapply the fork as ordinary reviewable commits.
