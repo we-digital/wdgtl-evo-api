@@ -39,19 +39,25 @@ tags are never deployment inputs.
 ## BBC Manager branding
 
 - **Behavior:** the bundled Evolution Manager uses the local Evolution logo
-  and displays `Evo : BBC` as the browser page title.
+  and displays an environment-aware browser page title: `Evo :: BBC :: Stage`
+  on `stage.evo.respon.io` and `Evo :: BBC :: Prod` on `evo.respon.io`.
+  Unknown/local hosts fall back to `Evo :: BBC` instead of being mislabeled as
+  a BBC deployment contour.
 - **Source areas:** `manager/dist/index.html` and the bundled Manager assets
   under `manager/dist/`.
 - **Flags/schema:** no application flag, API contract, or database schema
   change.
 - **Upstream reapply/conflicts:** an upstream Manager rebuild can replace the
-  committed `dist` output. Reapply the exact page title after every Manager
-  upgrade and confirm that no bundled script overrides `document.title`.
+  committed `dist` output. Reapply the exact hostname-to-environment title map
+  after every Manager upgrade and confirm that no bundled script overrides
+  `document.title`.
 - **Rollback:** restore the upstream `<title>` value; the Manager runtime and
   API are otherwise unchanged.
-- **Focused regression:** assert exactly one `<title>Evo : BBC</title>` in the
-  built Manager, package the immutable image, deploy to staging, and verify the
-  browser title on both login and authenticated Manager routes.
+- **Focused regression:** verify the title script maps `stage.evo.respon.io` to
+  `Evo :: BBC :: Stage`, maps `evo.respon.io` to `Evo :: BBC :: Prod`, and keeps
+  the neutral fallback for unknown hosts. Package the immutable image, deploy
+  to staging, and verify the browser title on both login and authenticated
+  Manager routes.
 
 ## Upstream maintenance
 
