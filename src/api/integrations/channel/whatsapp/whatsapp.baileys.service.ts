@@ -67,6 +67,7 @@ import { PrismaRepository, Query } from '@api/repository/repository.service';
 import { chatbotController, waMonitor } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
+import { attachOutboundProvenance, OutboundMessageProvenance } from '@api/types/outbound-provenance';
 import { Events, MessageSubtype, TypeMediaMessage, wa } from '@api/types/wa.types';
 import { createHistorySyncAcquisitionKey, normalizeHistorySyncOwnerJid } from '@api/utils/history-sync-source';
 import { CacheEngine } from '@cache/cacheengine';
@@ -2475,6 +2476,7 @@ export class BaileysStartupService extends ChannelStartupService {
     message: T,
     options?: Options,
     isIntegration = false,
+    provenance?: OutboundMessageProvenance,
   ) {
     const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
 
@@ -2606,7 +2608,7 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
       }
 
-      const messageRaw = this.prepareMessage(messageSent);
+      const messageRaw = attachOutboundProvenance(this.prepareMessage(messageSent), provenance);
 
       const isMedia =
         messageSent?.message?.imageMessage ||
@@ -2810,7 +2812,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   // Send Message Controller
-  public async textMessage(data: SendTextDto, isIntegration = false) {
+  public async textMessage(data: SendTextDto, isIntegration = false, provenance?: OutboundMessageProvenance) {
     const text = data.text;
 
     if (!text || text.trim().length === 0) {
@@ -2829,6 +2831,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mentioned: data?.mentioned,
       },
       isIntegration,
+      provenance,
     );
   }
 

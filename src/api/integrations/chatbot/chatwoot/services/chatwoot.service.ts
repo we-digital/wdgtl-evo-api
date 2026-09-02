@@ -7,6 +7,10 @@ import {
   ChatwootHistorySyncDto,
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
+import {
+  buildChatwootOutboundProvenance,
+  validateChatwootAutoReplyBinding,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildChatwootDeliveryFailureUpdate,
@@ -1443,6 +1447,24 @@ export class ChatwootService {
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       const deliverableOutgoing = isDeliverableChatwootOutgoing(body, chatId);
+      const autoReplyBinding = validateChatwootAutoReplyBinding(body, instance.instanceName);
+
+      if (autoReplyBinding.valid === false) {
+        this.logger.error(
+          JSON.stringify({
+            event: 'chatwoot_auto_reply_route_rejected',
+            reason: autoReplyBinding.reason,
+            instanceName: instance.instanceName,
+            inboxId: body.inbox?.id,
+            messageId: body.id,
+            conversationId: body.conversation?.id,
+          }),
+        );
+        if (deliverableOutgoing && body.conversation?.id) {
+          await this.onSendMessageError(instance, body.conversation.id, body.id, autoReplyBinding.reason);
+        }
+        return { message: 'bot' };
+      }
 
       if (!waInstance) {
         if (deliverableOutgoing && body.conversation?.id) {
@@ -1607,7 +1629,7 @@ export class ChatwootService {
 
             let messageSent: any;
             try {
-              messageSent = await waInstance?.textMessage(data, true);
+              messageSent = await waInstance?.textMessage(data, true, buildChatwootOutboundProvenance(body));
               if (!messageSent) {
                 throw new Error('Message not sent');
               }

@@ -15,6 +15,7 @@ import {
   SendTextDto,
 } from '@api/dto/sendMessage.dto';
 import { WAMonitoringService } from '@api/services/monitor.service';
+import { OutboundMessageProvenance } from '@api/types/outbound-provenance';
 import { BadRequestException } from '@exceptions';
 import { isBase64, isURL } from 'class-validator';
 import emojiRegex from 'emoji-regex';
@@ -35,8 +36,8 @@ export class SendMessageController {
     return await this.waMonitor.waInstances[instanceName].templateMessage(data);
   }
 
-  public async sendText({ instanceName }: InstanceDto, data: SendTextDto) {
-    return await this.waMonitor.waInstances[instanceName].textMessage(data);
+  public async sendText({ instanceName }: InstanceDto, data: SendTextDto, provenance?: OutboundMessageProvenance) {
+    return await this.waMonitor.waInstances[instanceName].textMessage(data, false, provenance);
   }
 
   public async sendMedia({ instanceName }: InstanceDto, data: SendMediaDto, file?: any) {
