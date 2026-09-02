@@ -15,6 +15,7 @@ import {
   SendTextDto,
 } from '@api/dto/sendMessage.dto';
 import { sendMessageController } from '@api/server.module';
+import { resolveOutboundRequestId } from '@api/types/outbound-provenance';
 import {
   audioMessageSchema,
   buttonsMessageSchema,
@@ -52,11 +53,17 @@ export class MessageRouter extends RouterBroker {
         return res.status(HttpStatus.CREATED).json(response);
       })
       .post(this.routerPath('sendText'), ...guards, async (req, res) => {
+        const requestId = resolveOutboundRequestId(req.get('x-request-id'));
         const response = await this.dataValidate<SendTextDto>({
           request: req,
           schema: textMessageSchema,
           ClassRef: SendTextDto,
-          execute: (instance, data) => sendMessageController.sendText(instance, data),
+          execute: (instance, data) =>
+            sendMessageController.sendText(instance, data, {
+              version: 1,
+              origin: 'api',
+              requestId,
+            }),
         });
 
         return res.status(HttpStatus.CREATED).json(response);

@@ -71,13 +71,21 @@ tags are never deployment inputs.
   delivery fails, EVO updates that exact Chatwoot message to `failed` before
   writing the existing private diagnostic note; this preserves the original
   auto-reply intent/cooldown while exposing a correlatable failure outcome.
+  Chatwoot auto replies must also carry a versioned delivery binding with the
+  exact EVO instance and Chatwoot inbox. EVO rejects missing, stale, foreign,
+  or mismatched bindings before calling Baileys and marks the exact Chatwoot
+  message failed. Successful Chatwoot and public `sendText` calls persist a
+  privacy-safe origin and request ID in the stored message `contextInfo`, so a
+  server send is distinguishable from an unbound linked-device `fromMe`
+  message after the fact.
 - **Source areas:**
-  `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts` and
+  `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts`,
+  `chatwoot-auto-reply-binding.ts`, `outbound-provenance.ts`, and
   the message/inbox creation paths and correlated delivery-failure update in
   `chatwoot.service.ts`.
-- **Flags/schema:** no EVO feature flag or database schema change. The marker
-  is additive metadata; Chatwoot owns its separately gated automatic-reply
-  behavior.
+- **Flags/schema:** no EVO feature flag or database schema change. Ingress,
+  delivery binding, and outbound provenance are additive metadata; Chatwoot
+  owns its separately gated automatic-reply behavior.
 - **Upstream reapply/conflicts:** preserve the helper call on both JSON text
   and multipart media forwarding paths when upstream changes Chatwoot payload
   construction. Never infer direct scope from contact names or Chatwoot
@@ -86,9 +94,11 @@ tags are never deployment inputs.
   marker. Chatwoot then classifies new messages as unclassified and must not
   auto-reply, while ordinary message delivery remains available.
 - **Focused regression:** run `npm run test:unit --
-  tests/chatwoot-ingress-scope.test.ts`, `npm run lint:check`, and `npm run
-  build`; staging canary must prove direct/text, direct/media, group, broadcast,
-  unknown, and a failed provider delivery before production promotion.
+  tests/chatwoot-ingress-scope.test.ts tests/chatwoot-auto-reply-binding.test.ts
+  tests/outbound-provenance.test.ts`, `npm run lint:check`, and `npm run build`;
+  staging canary must prove direct/text, direct/media, group, broadcast,
+  unknown, wrong-instance auto-reply rejection, stored provenance, and a
+  failed provider delivery before production promotion.
 
 ## Upstream maintenance
 
