@@ -59,6 +59,37 @@ tags are never deployment inputs.
   to staging, and verify the browser title on both login and authenticated
   Manager routes.
 
+## Chatwoot ingress scope contract
+
+- **Behavior:** every live EVO-to-Chatwoot inbound message includes the
+  versioned `content_attributes.we_digital_ingress` object with provider
+  `evo_whatsapp` and scope `direct`, `group`, `broadcast`, or `unknown`. Text
+  and multipart media paths use the same helper. Unknown identities fail
+  closed; a LID is direct only when its alternate JID is a confirmed
+  `@s.whatsapp.net` identity. Newly created Chatwoot API inboxes also receive
+  provider/version markers in channel `additional_attributes`. When WhatsApp
+  delivery fails, EVO updates that exact Chatwoot message to `failed` before
+  writing the existing private diagnostic note; this preserves the original
+  auto-reply intent/cooldown while exposing a correlatable failure outcome.
+- **Source areas:**
+  `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts` and
+  the message/inbox creation paths and correlated delivery-failure update in
+  `chatwoot.service.ts`.
+- **Flags/schema:** no EVO feature flag or database schema change. The marker
+  is additive metadata; Chatwoot owns its separately gated automatic-reply
+  behavior.
+- **Upstream reapply/conflicts:** preserve the helper call on both JSON text
+  and multipart media forwarding paths when upstream changes Chatwoot payload
+  construction. Never infer direct scope from contact names or Chatwoot
+  conversation shape.
+- **Rollback:** deploying the prior immutable EVO image removes the additive
+  marker. Chatwoot then classifies new messages as unclassified and must not
+  auto-reply, while ordinary message delivery remains available.
+- **Focused regression:** run `npm run test:unit --
+  tests/chatwoot-ingress-scope.test.ts`, `npm run lint:check`, and `npm run
+  build`; staging canary must prove direct/text, direct/media, group, broadcast,
+  unknown, and a failed provider delivery before production promotion.
+
 ## Upstream maintenance
 
 Keep upstream Git history and reapply the fork as ordinary reviewable commits.
