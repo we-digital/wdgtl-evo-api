@@ -40,7 +40,13 @@ import {
   tryAcquireHistoryWriter,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
-import { buildChatwootIngressAttributes } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import {
+  buildChatwootEvoRouteBinding,
+  buildChatwootIngressAttributes,
+  ChatwootEvoRouteBinding,
+  chatwootEvoRouteBindingsEqual,
+  selectChatwootPhysicalReceiverNumber,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -196,6 +202,8 @@ export class ChatwootService {
         data.organization,
         data.logo,
       );
+    } else {
+      await this.getInbox(instance, true);
     }
     return data;
   }
@@ -260,6 +268,7 @@ export class ChatwootService {
     const checkDuplicate = findInbox.payload.map((inbox) => inbox.name).includes(inboxName);
 
     let inboxId: number;
+    let selectedInbox: inbox;
 
     this.logger.log('Creating chatwoot inbox');
     if (!checkDuplicate) {
@@ -268,7 +277,7 @@ export class ChatwootService {
         webhook_url: webhookUrl,
         additional_attributes: {
           we_digital_provider: 'evo_whatsapp',
-          we_digital_provider_contract_version: 1,
+          we_digital_provider_contract_version: 2,
         },
       };
 
@@ -286,6 +295,7 @@ export class ChatwootService {
       }
 
       inboxId = inbox.id;
+      selectedInbox = inbox;
     } else {
       const inbox = findInbox.payload.find((inbox) => inbox.name === inboxName);
 
@@ -295,7 +305,9 @@ export class ChatwootService {
       }
 
       inboxId = inbox.id;
+      selectedInbox = inbox;
     }
+    await this.reconcileChatwootRouteBinding(instance, provider, selectedInbox, true);
     this.logger.log(`Inbox created - inboxId: ${inboxId}`);
 
     if (!this.configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT) {
@@ -955,7 +967,87 @@ export class ChatwootService {
     }
   }
 
-  public async getInbox(instance: InstanceDto): Promise<inbox | null> {
+  private buildEvoRouteBinding(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+  ): ChatwootEvoRouteBinding | null {
+    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const runtimeInstance = waInstance?.instance || {};
+    const ownerJid = runtimeInstance.ownerJid || instance.ownerJid;
+    const receiverNumber = selectChatwootPhysicalReceiverNumber({
+      ownerJid,
+      number: runtimeInstance.number || instance.number,
+    });
+
+    return buildChatwootEvoRouteBinding({
+      inboxId,
+      instanceId: runtimeInstance.id || waInstance?.instanceId || instance.instanceId,
+      instanceName: runtimeInstance.name || instance.instanceName,
+      receiverNumber,
+      signingKey: provider.token,
+    });
+  }
+
+  private inboxRouteBinding(inboxRecord: inbox): ChatwootEvoRouteBinding | null {
+    const additionalAttributes = (inboxRecord as any)?.additional_attributes;
+    const binding = additionalAttributes?.we_digital_route_binding;
+    return binding && typeof binding === 'object' ? (binding as ChatwootEvoRouteBinding) : null;
+  }
+
+  private async reconcileChatwootRouteBinding(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxRecord: inbox,
+    allowRebind: boolean,
+  ): Promise<inbox> {
+    const expectedBinding = this.buildEvoRouteBinding(instance, provider, inboxRecord.id);
+    if (!expectedBinding) {
+      this.logger.warn(`Chatwoot route unavailable for ${instance.instanceName}`);
+      return inboxRecord;
+    }
+
+    const currentBinding = this.inboxRouteBinding(inboxRecord);
+    if (chatwootEvoRouteBindingsEqual(currentBinding, expectedBinding)) return inboxRecord;
+
+    if (currentBinding && !allowRebind) {
+      this.logger.warn(`Chatwoot route changed for ${instance.instanceName}; explicit integration update required`);
+      return inboxRecord;
+    }
+
+    const additionalAttributes = {
+      ...((inboxRecord as any)?.additional_attributes || {}),
+      we_digital_provider: 'evo_whatsapp',
+      we_digital_provider_contract_version: expectedBinding.version,
+      we_digital_route_binding: expectedBinding,
+    };
+
+    try {
+      await axios.patch(
+        `${provider.url}/api/v1/accounts/${provider.accountId}/inboxes/${inboxRecord.id}`,
+        { channel: { additional_attributes: additionalAttributes } },
+        {
+          headers: { 'api-access-token': provider.token },
+          timeout: 20_000,
+        },
+      );
+      return { ...inboxRecord, additional_attributes: additionalAttributes } as inbox;
+    } catch (error) {
+      this.logger.error(`Failed to bind Chatwoot route for ${instance.instanceName}: ${formatCaughtError(error)}`);
+      return inboxRecord;
+    }
+  }
+
+  private async ingressAttributes(instance: InstanceDto, provider: ChatwootModel, messageBody: any) {
+    const inboxRecord = await this.getInbox(instance);
+    const expectedBinding = inboxRecord ? this.buildEvoRouteBinding(instance, provider, inboxRecord.id) : null;
+    const storedBinding = inboxRecord ? this.inboxRouteBinding(inboxRecord) : null;
+    const route = chatwootEvoRouteBindingsEqual(storedBinding, expectedBinding) ? expectedBinding : null;
+
+    return buildChatwootIngressAttributes(messageBody, route);
+  }
+
+  public async getInbox(instance: InstanceDto, allowRebind = false): Promise<inbox | null> {
     const provider = await this.getProvider(instance);
     if (!provider) {
       this.logger.warn('provider not found');
@@ -965,7 +1057,11 @@ export class ChatwootService {
     const cacheKey = chatwootInboxCacheKey(instance.instanceName, provider);
     if (await this.cache.has(cacheKey)) {
       const cachedInbox = (await this.cache.get(cacheKey)) as inbox;
-      if (cachedInbox?.name === provider.nameInbox) return cachedInbox;
+      if (cachedInbox?.name === provider.nameInbox) {
+        const reconciledInbox = await this.reconcileChatwootRouteBinding(instance, provider, cachedInbox, allowRebind);
+        this.cache.set(cacheKey, reconciledInbox);
+        return reconciledInbox;
+      }
       await this.cache.delete(cacheKey);
     }
 
@@ -990,8 +1086,9 @@ export class ChatwootService {
       return null;
     }
 
-    this.cache.set(cacheKey, findByName);
-    return findByName;
+    const reconciledInbox = await this.reconcileChatwootRouteBinding(instance, provider, findByName, allowRebind);
+    this.cache.set(cacheKey, reconciledInbox);
+    return reconciledInbox;
   }
 
   public async createMessage(
@@ -1021,6 +1118,7 @@ export class ChatwootService {
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
+    const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody);
     const message = await client.messages.create({
       accountId: Number(provider.accountId),
       conversationId: conversationId,
@@ -1032,7 +1130,7 @@ export class ChatwootService {
         source_id: sourceId,
         content_attributes: {
           ...replyToIds,
-          ...buildChatwootIngressAttributes(messageBody),
+          ...ingressAttributes,
         },
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
@@ -1161,11 +1259,17 @@ export class ChatwootService {
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
+    if (!provider) {
+      this.logger.warn('provider not found');
+      return null;
+    }
+
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
+      const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody);
       const contentAttributes = JSON.stringify({
         ...replyToIds,
-        ...buildChatwootIngressAttributes(messageBody),
+        ...ingressAttributes,
       });
       data.append('content_attributes', contentAttributes);
     }
@@ -1176,11 +1280,6 @@ export class ChatwootService {
 
     if (sourceId) {
       data.append('source_id', sourceId);
-    }
-
-    if (!provider) {
-      this.logger.warn('provider not found');
-      return null;
     }
 
     const config = {
@@ -1447,7 +1546,16 @@ export class ChatwootService {
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       const deliverableOutgoing = isDeliverableChatwootOutgoing(body, chatId);
-      const autoReplyBinding = validateChatwootAutoReplyBinding(body, instance.instanceName);
+
+      if (!waInstance) {
+        if (deliverableOutgoing && body.conversation?.id) {
+          await this.onSendMessageError(instance, body.conversation.id, body.id, 'Instance not found');
+        }
+        return { message: 'bot' };
+      }
+
+      const expectedRoute = this.buildEvoRouteBinding(instance, provider, body.inbox?.id);
+      const autoReplyBinding = validateChatwootAutoReplyBinding(body, expectedRoute);
 
       if (autoReplyBinding.valid === false) {
         this.logger.error(
@@ -1462,13 +1570,6 @@ export class ChatwootService {
         );
         if (deliverableOutgoing && body.conversation?.id) {
           await this.onSendMessageError(instance, body.conversation.id, body.id, autoReplyBinding.reason);
-        }
-        return { message: 'bot' };
-      }
-
-      if (!waInstance) {
-        if (deliverableOutgoing && body.conversation?.id) {
-          await this.onSendMessageError(instance, body.conversation.id, body.id, 'Instance not found');
         }
         return { message: 'bot' };
       }

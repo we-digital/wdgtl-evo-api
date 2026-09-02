@@ -1,6 +1,11 @@
+import {
+  ChatwootEvoRouteBinding,
+  chatwootEvoRouteBindingsEqual,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { OutboundMessageProvenance } from '@api/types/outbound-provenance';
 
-const CONTRACT_VERSION = 1;
+const CONTRACT_VERSION = 2;
+const PROVENANCE_VERSION = 1;
 
 export type AutoReplyBindingValidation =
   | { protected: false; valid: true }
@@ -8,10 +13,13 @@ export type AutoReplyBindingValidation =
   | {
       protected: true;
       valid: false;
-      reason: 'missing_binding' | 'invalid_contract' | 'provider_mismatch' | 'instance_mismatch' | 'inbox_mismatch';
+      reason: 'missing_binding' | 'invalid_contract' | 'provider_mismatch' | 'route_unavailable' | 'route_mismatch';
     };
 
-export function validateChatwootAutoReplyBinding(body: any, instanceName: string): AutoReplyBindingValidation {
+export function validateChatwootAutoReplyBinding(
+  body: any,
+  expectedRoute: ChatwootEvoRouteBinding | null,
+): AutoReplyBindingValidation {
   const autoReply = body?.content_attributes?.auto_reply;
   if (!autoReply) {
     return { protected: false, valid: true };
@@ -27,11 +35,9 @@ export function validateChatwootAutoReplyBinding(body: any, instanceName: string
   if (binding.provider !== 'evo_whatsapp') {
     return { protected: true, valid: false, reason: 'provider_mismatch' };
   }
-  if (binding.instance_name !== instanceName) {
-    return { protected: true, valid: false, reason: 'instance_mismatch' };
-  }
-  if (Number(binding.inbox_id) !== Number(body?.inbox?.id)) {
-    return { protected: true, valid: false, reason: 'inbox_mismatch' };
+  if (!expectedRoute) return { protected: true, valid: false, reason: 'route_unavailable' };
+  if (!chatwootEvoRouteBindingsEqual(binding, expectedRoute)) {
+    return { protected: true, valid: false, reason: 'route_mismatch' };
   }
 
   return { protected: true, valid: true };
@@ -44,7 +50,7 @@ export function buildChatwootOutboundProvenance(body: any): OutboundMessageProve
   };
 
   return {
-    version: CONTRACT_VERSION,
+    version: PROVENANCE_VERSION,
     origin: 'chatwoot',
     requestId: `chatwoot:${body?.account?.id ?? 'unknown'}:${body?.id ?? 'unknown'}`,
     chatwootMessageId: optionalNumber(body?.id),
