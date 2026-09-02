@@ -8,7 +8,10 @@ import {
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
-import { buildChatwootDeliveryFailureUpdate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import {
+  buildChatwootDeliveryFailureUpdate,
+  isDeliverableChatwootOutgoing,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
@@ -1439,6 +1442,15 @@ export class ChatwootService {
 
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      const deliverableOutgoing = isDeliverableChatwootOutgoing(body, chatId);
+
+      if (!waInstance) {
+        if (deliverableOutgoing && body.conversation?.id) {
+          await this.onSendMessageError(instance, body.conversation.id, body.id, 'Instance not found');
+        }
+        return { message: 'bot' };
+      }
+
       instance.instanceId = waInstance.instanceId;
 
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
@@ -1534,16 +1546,7 @@ export class ChatwootService {
         }
       }
 
-      if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
-          return { message: 'bot' };
-        }
-
-        if (!waInstance && body.conversation?.id) {
-          await this.onSendMessageError(instance, body.conversation?.id, body.id, 'Instance not found');
-          return { message: 'bot' };
-        }
-
+      if (deliverableOutgoing) {
         let formatText: string;
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
