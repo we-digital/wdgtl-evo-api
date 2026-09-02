@@ -8,6 +8,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
+import { buildChatwootDeliveryFailureUpdate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
@@ -1346,7 +1347,7 @@ export class ChatwootService {
     }
   }
 
-  public async onSendMessageError(instance: InstanceDto, conversation: number, error?: any) {
+  public async onSendMessageError(instance: InstanceDto, conversation: number, messageId?: number, error?: any) {
     this.logger.verbose(`onSendMessageError ${JSON.stringify(error)}`);
 
     const context = await this.clientCw(instance);
@@ -1356,8 +1357,20 @@ export class ChatwootService {
     }
     const { client, provider } = context;
 
+    if (messageId) {
+      try {
+        await client.messages.update(
+          buildChatwootDeliveryFailureUpdate(Number(provider.accountId), conversation, messageId) as any,
+        );
+      } catch (statusError) {
+        this.logger.error(
+          `Failed to update Chatwoot delivery status for message ${messageId}: ${formatCaughtError(statusError)}`,
+        );
+      }
+    }
+
     if (error && error?.status === 400 && error?.message[0]?.exists === false) {
-      client.messages.create({
+      await client.messages.create({
         accountId: Number(provider.accountId),
         conversationId: conversation,
         data: {
@@ -1370,7 +1383,7 @@ export class ChatwootService {
       return;
     }
 
-    client.messages.create({
+    await client.messages.create({
       accountId: Number(provider.accountId),
       conversationId: conversation,
       data: {
@@ -1527,7 +1540,7 @@ export class ChatwootService {
         }
 
         if (!waInstance && body.conversation?.id) {
-          this.onSendMessageError(instance, body.conversation?.id, 'Instance not found');
+          await this.onSendMessageError(instance, body.conversation?.id, body.id, 'Instance not found');
           return { message: 'bot' };
         }
 
@@ -1553,15 +1566,17 @@ export class ChatwootService {
                 quoted: await this.getQuotedMessage(body, instance),
               };
 
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                formatText,
-                options,
-              );
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id);
+              let messageSent: any;
+              try {
+                messageSent = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+                if (!messageSent) {
+                  throw new Error('Attachment not sent');
+                }
+              } catch (error) {
+                if (body.conversation?.id) {
+                  await this.onSendMessageError(instance, body.conversation.id, body.id, error);
+                }
+                throw error;
               }
 
               await this.updateChatwootMessageId(
@@ -1612,7 +1627,7 @@ export class ChatwootService {
               );
             } catch (error) {
               if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id, error);
+                await this.onSendMessageError(instance, body.conversation.id, body.id, error);
               }
               throw error;
             }

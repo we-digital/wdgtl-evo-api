@@ -67,10 +67,14 @@ tags are never deployment inputs.
   and multipart media paths use the same helper. Unknown identities fail
   closed; a LID is direct only when its alternate JID is a confirmed
   `@s.whatsapp.net` identity. Newly created Chatwoot API inboxes also receive
-  provider/version markers in channel `additional_attributes`.
+  provider/version markers in channel `additional_attributes`. When WhatsApp
+  delivery fails, EVO updates that exact Chatwoot message to `failed` before
+  writing the existing private diagnostic note; this preserves the original
+  auto-reply intent/cooldown while exposing a correlatable failure outcome.
 - **Source areas:**
   `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts` and
-  the message/inbox creation paths in `chatwoot.service.ts`.
+  the message/inbox creation paths and correlated delivery-failure update in
+  `chatwoot.service.ts`.
 - **Flags/schema:** no EVO feature flag or database schema change. The marker
   is additive metadata; Chatwoot owns its separately gated automatic-reply
   behavior.
@@ -84,7 +88,7 @@ tags are never deployment inputs.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-ingress-scope.test.ts`, `npm run lint:check`, and `npm run
   build`; staging canary must prove direct/text, direct/media, group, broadcast,
-  and unknown outcomes before production promotion.
+  unknown, and a failed provider delivery before production promotion.
 
 ## Upstream maintenance
 
