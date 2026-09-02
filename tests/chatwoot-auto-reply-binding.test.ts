@@ -5,6 +5,17 @@ import {
   buildChatwootOutboundProvenance,
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
+import { buildChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+
+const route = buildChatwootEvoRouteBinding({
+  inboxId: 58,
+  instanceId: 'instance-uuid-p-mila',
+  instanceName: 'p-mila',
+  receiverNumber: '6281111111111',
+  signingKey: 'chatwoot-token',
+});
+
+assert.ok(route);
 
 const body = {
   id: 314,
@@ -13,38 +24,30 @@ const body = {
   conversation: { id: 42 },
   content_attributes: {
     auto_reply: {
-      version: 1,
-      delivery_binding: {
-        version: 1,
-        provider: 'evo_whatsapp',
-        inbox_id: 58,
-        instance_name: 'p-mila',
-      },
+      version: 2,
+      delivery_binding: route,
     },
   },
 };
 
 test('accepts only the exact Chatwoot inbox and EVO instance binding', () => {
-  assert.deepEqual(validateChatwootAutoReplyBinding(body, 'p-mila'), { protected: true, valid: true });
+  assert.deepEqual(validateChatwootAutoReplyBinding(body, route), { protected: true, valid: true });
 
-  assert.deepEqual(validateChatwootAutoReplyBinding(body, 'd-acc'), {
+  assert.deepEqual(validateChatwootAutoReplyBinding(body, { ...route, instance_name: 'd-acc' }), {
     protected: true,
     valid: false,
-    reason: 'instance_mismatch',
+    reason: 'route_mismatch',
   });
-  assert.deepEqual(validateChatwootAutoReplyBinding({ ...body, inbox: { id: 42 } }, 'p-mila'), {
+  assert.deepEqual(validateChatwootAutoReplyBinding(body, { ...route, inbox_id: 42 }), {
     protected: true,
     valid: false,
-    reason: 'inbox_mismatch',
+    reason: 'route_mismatch',
   });
 });
 
 test('fails closed for missing, malformed and foreign auto-reply bindings', () => {
   assert.deepEqual(
-    validateChatwootAutoReplyBinding(
-      { ...body, content_attributes: { auto_reply: { version: 1 } } },
-      'p-mila',
-    ),
+    validateChatwootAutoReplyBinding({ ...body, content_attributes: { auto_reply: { version: 2 } } }, route),
     { protected: true, valid: false, reason: 'missing_binding' },
   );
   assert.deepEqual(
@@ -53,7 +56,7 @@ test('fails closed for missing, malformed and foreign auto-reply bindings', () =
         ...body,
         content_attributes: {
           auto_reply: {
-            version: 1,
+            version: 2,
             delivery_binding: {
               ...body.content_attributes.auto_reply.delivery_binding,
               provider: 'telegram_mtproto',
@@ -61,14 +64,14 @@ test('fails closed for missing, malformed and foreign auto-reply bindings', () =
           },
         },
       },
-      'p-mila',
+      route,
     ),
     { protected: true, valid: false, reason: 'provider_mismatch' },
   );
 });
 
 test('leaves ordinary Chatwoot messages unchanged and builds correlated provenance', () => {
-  assert.deepEqual(validateChatwootAutoReplyBinding({ content_attributes: {} }, 'd-acc'), {
+  assert.deepEqual(validateChatwootAutoReplyBinding({ content_attributes: {} }, null), {
     protected: false,
     valid: true,
   });

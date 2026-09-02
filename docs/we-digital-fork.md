@@ -62,19 +62,26 @@ tags are never deployment inputs.
 ## Chatwoot ingress scope contract
 
 - **Behavior:** every live EVO-to-Chatwoot inbound message includes the
-  versioned `content_attributes.we_digital_ingress` object with provider
-  `evo_whatsapp` and scope `direct`, `group`, `broadcast`, or `unknown`. Text
-  and multipart media paths use the same helper. Unknown identities fail
-  closed; a LID is direct only when its alternate JID is a confirmed
-  `@s.whatsapp.net` identity. Newly created Chatwoot API inboxes also receive
-  provider/version markers in channel `additional_attributes`. When WhatsApp
+  version 2 `content_attributes.we_digital_ingress` object with provider
+  `evo_whatsapp`, inbound/outbound direction, `from_me`, scope `direct`,
+  `group`, `broadcast`, or `unknown`, and a route binding for the exact EVO
+  instance and Chatwoot inbox. The route contains an HMAC fingerprint of the
+  physical receiver number, never the number itself. Text and multipart media
+  paths use the same helper. Unknown identities fail closed; a LID is direct
+  only when its alternate JID is a confirmed `@s.whatsapp.net` identity. EVO
+  reconciles the expected binding into the selected Chatwoot API channel's
+  `additional_attributes` before forwarding an inbound message. A missing
+  binding or a physical-number/instance change fails closed for automatic
+  replies; an existing mismatched binding is replaced only by an explicit
+  Chatwoot integration update. When WhatsApp
   delivery fails, EVO updates that exact Chatwoot message to `failed` before
   writing the existing private diagnostic note; this preserves the original
   auto-reply intent/cooldown while exposing a correlatable failure outcome.
   Chatwoot auto replies must also carry a versioned delivery binding with the
-  exact EVO instance and Chatwoot inbox. EVO rejects missing, stale, foreign,
-  or mismatched bindings before calling Baileys and marks the exact Chatwoot
-  message failed. Successful Chatwoot and public `sendText` calls persist a
+  exact EVO instance, physical receiver fingerprint, and Chatwoot inbox. EVO
+  rebuilds that expected route from the live instance and rejects missing,
+  stale, foreign, or mismatched bindings before calling Baileys, then marks
+  the exact Chatwoot message failed. Successful Chatwoot and public `sendText` calls persist a
   privacy-safe origin and request ID in the stored message `contextInfo`, so a
   server send is distinguishable from an unbound linked-device `fromMe`
   message after the fact.
@@ -84,12 +91,16 @@ tags are never deployment inputs.
   the message/inbox creation paths and correlated delivery-failure update in
   `chatwoot.service.ts`.
 - **Flags/schema:** no EVO feature flag or database schema change. Ingress,
-  delivery binding, and outbound provenance are additive metadata; Chatwoot
-  owns its separately gated automatic-reply behavior.
+  channel route binding, delivery binding, and outbound provenance are
+  additive metadata; Chatwoot owns its separately gated automatic-reply
+  behavior. The Chatwoot API token is used only as the local HMAC key and is
+  never written into the route metadata.
 - **Upstream reapply/conflicts:** preserve the helper call on both JSON text
   and multipart media forwarding paths when upstream changes Chatwoot payload
-  construction. Never infer direct scope from contact names or Chatwoot
-  conversation shape.
+  construction. Preserve fail-closed cached-inbox reconciliation and the
+  explicit-rebind-only rule when instance lifecycle code changes. Never infer
+  direct scope or physical receiver identity from contact names, assignees,
+  agent access, or Chatwoot conversation shape.
 - **Rollback:** deploying the prior immutable EVO image removes the additive
   marker. Chatwoot then classifies new messages as unclassified and must not
   auto-reply, while ordinary message delivery remains available.
@@ -97,8 +108,10 @@ tags are never deployment inputs.
   tests/chatwoot-ingress-scope.test.ts tests/chatwoot-auto-reply-binding.test.ts
   tests/outbound-provenance.test.ts`, `npm run lint:check`, and `npm run build`;
   staging canary must prove direct/text, direct/media, group, broadcast,
-  unknown, wrong-instance auto-reply rejection, stored provenance, and a
-  failed provider delivery before production promotion.
+  unknown, wrong-instance auto-reply rejection, stored provenance, a failed
+  provider delivery, missing route, cross-instance/inbox replay,
+  receiver-fingerprint mismatch, and explicit relink before production
+  promotion.
 
 ## Upstream maintenance
 
