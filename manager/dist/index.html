@@ -2,9 +2,20 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <link rel="icon" type="image/png" href="https://evolution-api.com/files/evo/favicon.svg" />
+    <link rel="icon" type="image/png" href="/images/evolution-logo.png" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Evolution Manager</title>
+    <title>Evo :: BBC</title>
+    <script>
+      (() => {
+        const environmentByHostname = {
+          'evo.respon.io': 'Prod',
+          'stage.evo.respon.io': 'Stage',
+        };
+        const environment = environmentByHostname[window.location.hostname];
+
+        document.title = environment ? `Evo :: BBC :: ${environment}` : 'Evo :: BBC';
+      })();
+    </script>
     <script type="module" crossorigin src="/assets/index-CO3NSIFj.js"></script>
     <link rel="stylesheet" crossorigin href="/assets/index-DsIrum0U.css">
   </head>

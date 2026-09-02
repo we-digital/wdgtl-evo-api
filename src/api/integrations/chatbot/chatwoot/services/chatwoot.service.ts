@@ -9,6 +9,10 @@ import {
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
+  buildChatwootDeliveryFailureUpdate,
+  isDeliverableChatwootOutgoing,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
   dedupeHistoryMessagesBySourceId,
@@ -32,6 +36,7 @@ import {
   tryAcquireHistoryWriter,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { buildChatwootIngressAttributes } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -257,6 +262,10 @@ export class ChatwootService {
       const data = {
         type: 'api',
         webhook_url: webhookUrl,
+        additional_attributes: {
+          we_digital_provider: 'evo_whatsapp',
+          we_digital_provider_contract_version: 1,
+        },
       };
 
       const inbox = await client.inboxes.create({
@@ -1019,6 +1028,7 @@ export class ChatwootService {
         source_id: sourceId,
         content_attributes: {
           ...replyToIds,
+          ...buildChatwootIngressAttributes(messageBody),
         },
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
@@ -1149,13 +1159,11 @@ export class ChatwootService {
 
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
-
-      if (replyToIds.in_reply_to || replyToIds.in_reply_to_external_id) {
-        const content = JSON.stringify({
-          ...replyToIds,
-        });
-        data.append('content_attributes', content);
-      }
+      const contentAttributes = JSON.stringify({
+        ...replyToIds,
+        ...buildChatwootIngressAttributes(messageBody),
+      });
+      data.append('content_attributes', contentAttributes);
     }
 
     if (sourceReplyId) {
@@ -1342,7 +1350,7 @@ export class ChatwootService {
     }
   }
 
-  public async onSendMessageError(instance: InstanceDto, conversation: number, error?: any) {
+  public async onSendMessageError(instance: InstanceDto, conversation: number, messageId?: number, error?: any) {
     this.logger.verbose(`onSendMessageError ${JSON.stringify(error)}`);
 
     const context = await this.clientCw(instance);
@@ -1352,8 +1360,20 @@ export class ChatwootService {
     }
     const { client, provider } = context;
 
+    if (messageId) {
+      try {
+        await client.messages.update(
+          buildChatwootDeliveryFailureUpdate(Number(provider.accountId), conversation, messageId) as any,
+        );
+      } catch (statusError) {
+        this.logger.error(
+          `Failed to update Chatwoot delivery status for message ${messageId}: ${formatCaughtError(statusError)}`,
+        );
+      }
+    }
+
     if (error && error?.status === 400 && error?.message[0]?.exists === false) {
-      client.messages.create({
+      await client.messages.create({
         accountId: Number(provider.accountId),
         conversationId: conversation,
         data: {
@@ -1366,7 +1386,7 @@ export class ChatwootService {
       return;
     }
 
-    client.messages.create({
+    await client.messages.create({
       accountId: Number(provider.accountId),
       conversationId: conversation,
       data: {
@@ -1422,6 +1442,15 @@ export class ChatwootService {
 
       const senderName = body?.conversation?.messages[0]?.sender?.available_name || body?.sender?.name;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      const deliverableOutgoing = isDeliverableChatwootOutgoing(body, chatId);
+
+      if (!waInstance) {
+        if (deliverableOutgoing && body.conversation?.id) {
+          await this.onSendMessageError(instance, body.conversation.id, body.id, 'Instance not found');
+        }
+        return { message: 'bot' };
+      }
+
       instance.instanceId = waInstance.instanceId;
 
       if (body.event === 'message_updated' && body.content_attributes?.deleted) {
@@ -1517,16 +1546,7 @@ export class ChatwootService {
         }
       }
 
-      if (body.message_type === 'outgoing' && body?.conversation?.messages?.length && chatId !== '123456') {
-        if (body?.conversation?.messages[0]?.source_id?.substring(0, 5) === 'WAID:') {
-          return { message: 'bot' };
-        }
-
-        if (!waInstance && body.conversation?.id) {
-          this.onSendMessageError(instance, body.conversation?.id, 'Instance not found');
-          return { message: 'bot' };
-        }
-
+      if (deliverableOutgoing) {
         let formatText: string;
         if (senderName === null || senderName === undefined) {
           formatText = messageReceived;
@@ -1549,15 +1569,17 @@ export class ChatwootService {
                 quoted: await this.getQuotedMessage(body, instance),
               };
 
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                formatText,
-                options,
-              );
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id);
+              let messageSent: any;
+              try {
+                messageSent = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+                if (!messageSent) {
+                  throw new Error('Attachment not sent');
+                }
+              } catch (error) {
+                if (body.conversation?.id) {
+                  await this.onSendMessageError(instance, body.conversation.id, body.id, error);
+                }
+                throw error;
               }
 
               await this.updateChatwootMessageId(
@@ -1608,7 +1630,7 @@ export class ChatwootService {
               );
             } catch (error) {
               if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id, error);
+                await this.onSendMessageError(instance, body.conversation.id, body.id, error);
               }
               throw error;
             }
