@@ -32,6 +32,7 @@ import {
   tryAcquireHistoryWriter,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { buildChatwootIngressAttributes } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -257,6 +258,10 @@ export class ChatwootService {
       const data = {
         type: 'api',
         webhook_url: webhookUrl,
+        additional_attributes: {
+          we_digital_provider: 'evo_whatsapp',
+          we_digital_provider_contract_version: 1,
+        },
       };
 
       const inbox = await client.inboxes.create({
@@ -1019,6 +1024,7 @@ export class ChatwootService {
         source_id: sourceId,
         content_attributes: {
           ...replyToIds,
+          ...buildChatwootIngressAttributes(messageBody),
         },
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
@@ -1149,13 +1155,11 @@ export class ChatwootService {
 
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
-
-      if (replyToIds.in_reply_to || replyToIds.in_reply_to_external_id) {
-        const content = JSON.stringify({
-          ...replyToIds,
-        });
-        data.append('content_attributes', content);
-      }
+      const contentAttributes = JSON.stringify({
+        ...replyToIds,
+        ...buildChatwootIngressAttributes(messageBody),
+      });
+      data.append('content_attributes', contentAttributes);
     }
 
     if (sourceReplyId) {
