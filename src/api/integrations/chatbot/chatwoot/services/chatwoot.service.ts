@@ -45,6 +45,7 @@ import {
   buildChatwootIngressAttributes,
   ChatwootEvoRouteBinding,
   chatwootEvoRouteBindingsEqual,
+  selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -974,10 +975,10 @@ export class ChatwootService {
     const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
     const runtimeInstance = waInstance?.instance || {};
     const ownerJid = runtimeInstance.ownerJid || instance.ownerJid;
-    const receiverNumber =
-      runtimeInstance.number ||
-      instance.number ||
-      (typeof ownerJid === 'string' && ownerJid.endsWith('@s.whatsapp.net') ? ownerJid : null);
+    const receiverNumber = selectChatwootPhysicalReceiverNumber({
+      ownerJid,
+      number: runtimeInstance.number || instance.number,
+    });
 
     return buildChatwootEvoRouteBinding({
       inboxId,

@@ -68,12 +68,17 @@ tags are never deployment inputs.
   instance and Chatwoot inbox. The route contains an HMAC fingerprint of the
   physical receiver number, never the number itself. Text and multipart media
   paths use the same helper. Unknown identities fail closed; a LID is direct
-  only when its alternate JID is a confirmed `@s.whatsapp.net` identity. EVO
+  only when its alternate JID is a confirmed `@s.whatsapp.net` identity.
+  Automatic replies require an explicit boolean `fromMe: false`; a missing or
+  malformed direction is forwarded normally but marked unknown and therefore
+  fails closed for auto-reply eligibility. EVO
   reconciles the expected binding into the selected Chatwoot API channel's
   `additional_attributes` before forwarding an inbound message. A missing
   binding or a physical-number/instance change fails closed for automatic
   replies; an existing mismatched binding is replaced only by an explicit
-  Chatwoot integration update. When WhatsApp
+  Chatwoot integration update. The live phone-form Baileys owner JID is the
+  authoritative receiver; a present LID/non-phone owner fails closed rather
+  than falling back to a possibly stale creation-time number. When WhatsApp
   delivery fails, EVO updates that exact Chatwoot message to `failed` before
   writing the existing private diagnostic note; this preserves the original
   auto-reply intent/cooldown while exposing a correlatable failure outcome.

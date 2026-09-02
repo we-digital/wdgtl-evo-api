@@ -37,6 +37,13 @@ const canonicalReceiverNumber = (value: unknown) => {
   return digits || null;
 };
 
+export const selectChatwootPhysicalReceiverNumber = ({ ownerJid, number }: { ownerJid: unknown; number: unknown }) => {
+  const parsedOwnerJid = readNonEmptyString(ownerJid).toLowerCase();
+  if (parsedOwnerJid) return parsedOwnerJid.endsWith('@s.whatsapp.net') ? parsedOwnerJid : null;
+
+  return readNonEmptyString(number) || null;
+};
+
 export const buildChatwootEvoRouteBinding = ({
   inboxId,
   instanceId,
@@ -114,13 +121,19 @@ export const classifyChatwootIngressScope = (
 export const buildChatwootIngressAttributes = (
   messageBody: { key?: MessageKey } | null | undefined,
   route: ChatwootEvoRouteBinding | null,
-) => ({
-  we_digital_ingress: {
-    version: CHATWOOT_INGRESS_CONTRACT_VERSION,
-    provider: 'evo_whatsapp' as const,
-    scope: classifyChatwootIngressScope(messageBody),
-    direction: messageBody?.key?.fromMe === true ? ('outbound' as const) : ('inbound' as const),
-    from_me: messageBody?.key?.fromMe === true,
-    route,
-  },
-});
+) => {
+  const fromMe = messageBody?.key?.fromMe;
+  const direction =
+    fromMe === false ? ('inbound' as const) : fromMe === true ? ('outbound' as const) : ('unknown' as const);
+
+  return {
+    we_digital_ingress: {
+      version: CHATWOOT_INGRESS_CONTRACT_VERSION,
+      provider: 'evo_whatsapp' as const,
+      scope: classifyChatwootIngressScope(messageBody),
+      direction,
+      from_me: typeof fromMe === 'boolean' ? fromMe : null,
+      route,
+    },
+  };
+};

@@ -6,6 +6,7 @@ import {
   buildChatwootIngressAttributes,
   chatwootEvoRouteBindingsEqual,
   classifyChatwootIngressScope,
+  selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 
 const route = buildChatwootEvoRouteBinding({
@@ -81,4 +82,39 @@ test('marks messages sent by the linked device as outbound', () => {
       route,
     },
   );
+});
+
+test('fails closed when fromMe is missing or malformed', () => {
+  for (const fromMe of [undefined, 'false']) {
+    assert.deepEqual(
+      buildChatwootIngressAttributes({ key: { remoteJid: '628123@s.whatsapp.net', fromMe } }, route)
+        .we_digital_ingress,
+      {
+        version: 2,
+        provider: 'evo_whatsapp',
+        scope: 'direct',
+        direction: 'unknown',
+        from_me: null,
+        route,
+      },
+    );
+  }
+});
+
+test('uses the live phone owner as the physical receiver and never falls back from a LID owner', () => {
+  assert.equal(
+    selectChatwootPhysicalReceiverNumber({
+      ownerJid: '6282222222222@s.whatsapp.net',
+      number: '6281111111111',
+    }),
+    '6282222222222@s.whatsapp.net',
+  );
+  assert.equal(
+    selectChatwootPhysicalReceiverNumber({
+      ownerJid: '123456789@lid',
+      number: '6281111111111',
+    }),
+    null,
+  );
+  assert.equal(selectChatwootPhysicalReceiverNumber({ ownerJid: null, number: '6281111111111' }), '6281111111111');
 });
