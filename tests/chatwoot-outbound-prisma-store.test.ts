@@ -78,7 +78,10 @@ test('increments claim generation and rejects a stale same-worker transport fenc
     chatwootOutboundOperation: {
       findFirst: async () => ({ ...row }),
       updateMany: async ({ where, data }: any) => {
-        if (where.id !== row.id || (where.claimGeneration !== undefined && where.claimGeneration !== row.claimGeneration))
+        if (
+          where.id !== row.id ||
+          (where.claimGeneration !== undefined && where.claimGeneration !== row.claimGeneration)
+        )
           return { count: 0 };
         if (where.state && typeof where.state === 'string' && where.state !== row.state) return { count: 0 };
         if (where.leaseOwner !== undefined && where.leaseOwner !== row.leaseOwner) return { count: 0 };
@@ -154,3 +157,91 @@ test('mixed terminal state exposes only successful frozen mappings as a determin
     { partKey: parts[1].operationKey, partIndex: 0, partCount: 1, sourceId: 'WAID:part-1' },
   ]);
 });
+
+test('authoritative deletion request recovers a previously quarantined frozen set', async () => {
+  const rows = [stored(0, 'quarantined'), stored(1, 'quarantined')];
+  const repository = {
+    chatwootOutboundOperation: {
+      updateMany: async ({ where, data }: any) => {
+        const matching = rows.filter(
+          (row) =>
+            row.instanceId === where.instanceId &&
+            row.chatwootMessageId === where.chatwootMessageId &&
+            row.messageSetHash === where.messageSetHash &&
+            row.state !== where.state.not,
+        );
+        matching.forEach((row) => Object.assign(row, data));
+        return { count: matching.length };
+      },
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore(repository as any);
+
+  await store.requestDeletion(rows[0] as StoredChatwootOutboundOperation);
+
+  assert.ok(rows.every((row) => row.state === 'delete_pending'));
+});
+
+for (const scenario of [
+  {
+    name: 'completion',
+    leaderState: 'callback_pending',
+    siblingState: 'callback_pending',
+    invoke: (store: ChatwootOutboundPrismaStore, leader: StoredChatwootOutboundOperation) =>
+      store.markMessageCompleted(leader, 'same-worker', new Date()),
+  },
+  {
+    name: 'failure',
+    leaderState: 'failure_callback_pending',
+    siblingState: 'failure_callback_pending',
+    invoke: (store: ChatwootOutboundPrismaStore, leader: StoredChatwootOutboundOperation) =>
+      store.markMessageFailed(leader, 'same-worker', new Date()),
+  },
+] as const) {
+  test(`atomically fences message-level ${scenario.name} when the leader lease is reclaimed before mutation`, async () => {
+    const rows: any[] = [
+      { ...stored(0, scenario.leaderState), leaseOwner: 'same-worker', claimGeneration: 1 },
+      { ...stored(1, scenario.siblingState), leaseOwner: null, claimGeneration: 0 },
+    ];
+    let reclaimed = false;
+    const matches = (row: any, where: any) => {
+      if (typeof where.id === 'string' && row.id !== where.id) return false;
+      if (where.id?.not && row.id === where.id.not) return false;
+      if (where.instanceId !== undefined && row.instanceId !== where.instanceId) return false;
+      if (where.chatwootMessageId !== undefined && row.chatwootMessageId !== where.chatwootMessageId) return false;
+      if (where.messageSetHash !== undefined && row.messageSetHash !== where.messageSetHash) return false;
+      if (where.leaseOwner !== undefined && row.leaseOwner !== where.leaseOwner) return false;
+      if (where.claimGeneration !== undefined && row.claimGeneration !== where.claimGeneration) return false;
+      if (typeof where.state === 'string' && row.state !== where.state) return false;
+      if (where.state?.in && !where.state.in.includes(row.state)) return false;
+      return true;
+    };
+    const operations = {
+      count: async ({ where }: any) => rows.filter((row) => matches(row, where)).length,
+      updateMany: async ({ where, data }: any) => {
+        if (!reclaimed) {
+          rows[0].claimGeneration = 2;
+          reclaimed = true;
+        }
+        const matching = rows.filter((row) => matches(row, where));
+        matching.forEach((row) => Object.assign(row, data));
+        return { count: matching.length };
+      },
+    };
+    const repository = {
+      chatwootOutboundOperation: operations,
+      $transaction: async (transaction: (client: any) => Promise<void>) =>
+        transaction({ chatwootOutboundOperation: operations }),
+    };
+    const store = new ChatwootOutboundPrismaStore(repository as any);
+
+    await assert.rejects(
+      () => scenario.invoke(store, { ...rows[0], claimGeneration: 1 } as StoredChatwootOutboundOperation),
+      /OutboundLeaseLost/,
+    );
+
+    assert.equal(rows[0].claimGeneration, 2);
+    assert.equal(rows[0].state, scenario.leaderState);
+    assert.equal(rows[1].state, scenario.siblingState);
+  });
+}

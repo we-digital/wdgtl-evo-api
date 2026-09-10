@@ -305,7 +305,7 @@ class MemoryStore implements ChatwootOutboundStore {
 }
 
 const validHandler = (overrides: Partial<ChatwootOutboundHandler> = {}): ChatwootOutboundHandler => ({
-  validate: async () => true,
+  validate: async () => 'valid',
   isReady: async () => true,
   send: async (operation, onTransportStart) => {
     await onTransportStart();
@@ -548,7 +548,7 @@ test('quarantines a changed origin binding before preparation or callback', asyn
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      validate: async () => false,
+      validate: async () => 'mismatch',
       send: async () => {
         sends += 1;
         throw new Error('should not send');
@@ -728,4 +728,72 @@ test('keeps deletion pending for an uncertain send and never invokes send again'
 
   assert.equal(sends, 0);
   assert.equal(store.operation.state, 'delete_pending');
+});
+
+test('soft-delete before its webhook preserves a deletion claim without callback or resend', async () => {
+  const store = new MemoryStore('callback_pending');
+  store.operation.whatsappMessageId = store.operation.plannedWhatsappMessageId;
+  let sends = 0;
+  let callbacks = 0;
+  let deletions = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      validate: async () => 'deleted',
+      send: async () => {
+        sends += 1;
+        throw new Error('must not resend after authoritative deletion');
+      },
+      confirm: async () => {
+        callbacks += 1;
+      },
+      delete: async () => {
+        deletions += 1;
+        return 'deleted';
+      },
+    }),
+  );
+
+  await queue.runOnce();
+  assert.equal(store.operation.state, 'delete_pending');
+
+  await store.requestDeletion(store.operation);
+  await queue.runOnce();
+
+  assert.equal(store.operation.state, 'deleted');
+  assert.equal(sends, 0);
+  assert.equal(callbacks, 0);
+  assert.equal(deletions, 1);
+});
+
+test('deletion webhook before callback claims deletion without callback or resend', async () => {
+  const store = new MemoryStore('callback_pending');
+  store.operation.whatsappMessageId = store.operation.plannedWhatsappMessageId;
+  let sends = 0;
+  let callbacks = 0;
+  let deletions = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => {
+        sends += 1;
+        throw new Error('must not resend after deletion webhook');
+      },
+      confirm: async () => {
+        callbacks += 1;
+      },
+      delete: async () => {
+        deletions += 1;
+        return 'deleted';
+      },
+    }),
+  );
+
+  await store.requestDeletion(store.operation);
+  await queue.runOnce();
+
+  assert.equal(store.operation.state, 'deleted');
+  assert.equal(sends, 0);
+  assert.equal(callbacks, 0);
+  assert.equal(deletions, 1);
 });

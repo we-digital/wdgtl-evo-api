@@ -200,19 +200,31 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     now: Date,
   ): Promise<void> {
     await this.repository.$transaction(async (transaction) => {
-      await this.assertLeaderLease(operation, workerId, ['callback_pending', 'failure_callback_pending'], transaction);
+      if (operation.partIndex !== 0) throw new Error('Invalid callback leader');
+      const callbackStates: ChatwootOutboundState[] = ['callback_pending', 'failure_callback_pending'];
       const failures = await transaction.chatwootOutboundOperation.count({
         where: this.messageWhere(operation, ['failure_callback_pending']),
       });
-      await transaction.chatwootOutboundOperation.updateMany({
-        where: this.messageWhere(operation, ['callback_pending', 'failure_callback_pending']),
-        data: {
-          state: 'completed',
-          completedAt: now,
-          leaseOwner: null,
-          leaseExpiresAt: null,
-          lastErrorClass: failures > 0 ? 'PartialDelivery' : null,
+      const data = {
+        state: 'completed',
+        completedAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastErrorClass: failures > 0 ? 'PartialDelivery' : null,
+      };
+      const leader = await transaction.chatwootOutboundOperation.updateMany({
+        where: {
+          ...this.messageWhere(operation, callbackStates),
+          id: operation.id,
+          leaseOwner: workerId,
+          claimGeneration: operation.claimGeneration,
         },
+        data,
+      });
+      if (leader.count !== 1) throw new Error('OutboundLeaseLost');
+      await transaction.chatwootOutboundOperation.updateMany({
+        where: { ...this.messageWhere(operation, callbackStates), id: { not: operation.id } },
+        data,
       });
     });
   }
@@ -223,15 +235,26 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     now: Date,
   ): Promise<void> {
     await this.repository.$transaction(async (transaction) => {
-      await this.assertLeaderLease(operation, workerId, 'failure_callback_pending', transaction);
-      await transaction.chatwootOutboundOperation.updateMany({
-        where: this.messageWhere(operation, ['failure_callback_pending']),
-        data: {
-          state: 'failed',
-          completedAt: now,
-          leaseOwner: null,
-          leaseExpiresAt: null,
+      if (operation.partIndex !== 0) throw new Error('Invalid callback leader');
+      const data = {
+        state: 'failed',
+        completedAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      };
+      const leader = await transaction.chatwootOutboundOperation.updateMany({
+        where: {
+          ...this.messageWhere(operation, ['failure_callback_pending']),
+          id: operation.id,
+          leaseOwner: workerId,
+          claimGeneration: operation.claimGeneration,
         },
+        data,
+      });
+      if (leader.count !== 1) throw new Error('OutboundLeaseLost');
+      await transaction.chatwootOutboundOperation.updateMany({
+        where: { ...this.messageWhere(operation, ['failure_callback_pending']), id: { not: operation.id } },
+        data,
       });
     });
   }
@@ -339,7 +362,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         instanceId: operation.instanceId,
         chatwootMessageId: operation.payload.origin.messageId,
         messageSetHash: operation.messageSetHash,
-        state: { notIn: ['deleted', 'quarantined'] },
+        state: { not: 'deleted' },
       },
       data: {
         state: 'delete_pending',
@@ -506,24 +529,6 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       messageSetHash: operation.messageSetHash,
       state: { in: states },
     };
-  }
-
-  private async assertLeaderLease(
-    operation: StoredChatwootOutboundOperation,
-    workerId: string,
-    state: ChatwootOutboundState | ChatwootOutboundState[],
-    repository: Pick<PrismaRepository, 'chatwootOutboundOperation'> = this.repository,
-  ) {
-    if (operation.partIndex !== 0) throw new Error('Invalid callback leader');
-    const owned = await repository.chatwootOutboundOperation.count({
-      where: {
-        id: operation.id,
-        state: Array.isArray(state) ? { in: state } : state,
-        leaseOwner: workerId,
-        claimGeneration: operation.claimGeneration,
-      },
-    });
-    if (owned !== 1) throw new Error('OutboundLeaseLost');
   }
 
   private toStored(candidate: any): StoredChatwootOutboundOperation {

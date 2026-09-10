@@ -17,6 +17,7 @@ export type ChatwootOutboundState =
   | 'failed';
 
 export type ChatwootOutboundPhase = 'prepare' | 'transport' | 'callback';
+export type ChatwootOutboundValidation = 'valid' | 'deleted' | 'mismatch';
 
 export interface ChatwootOutboundOrigin {
   providerId: string;
@@ -145,7 +146,7 @@ export interface ChatwootOutboundHandler {
     operation: StoredChatwootOutboundOperation,
     phase: ChatwootOutboundPhase,
     signal: AbortSignal,
-  ): Promise<boolean>;
+  ): Promise<ChatwootOutboundValidation>;
   isReady(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<boolean>;
   send(
     operation: StoredChatwootOutboundOperation,
@@ -334,9 +335,9 @@ export class ChatwootOutboundQueue {
       return true;
     }
     if (operation.state === 'ambiguous') {
-      let valid: boolean;
+      let validation: ChatwootOutboundValidation;
       try {
-        valid = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+        validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
           this.handler.validate(operation, 'callback', signal),
         );
       } catch (error) {
@@ -349,7 +350,11 @@ export class ChatwootOutboundQueue {
         );
         return true;
       }
-      if (!valid) {
+      if (validation === 'deleted') {
+        await this.store.requestDeletion(operation);
+        return true;
+      }
+      if (validation === 'mismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return true;
       }
@@ -376,22 +381,31 @@ export class ChatwootOutboundQueue {
       return true;
     }
 
-    let valid: boolean;
+    let validation: ChatwootOutboundValidation;
     let ready: boolean;
     try {
-      valid = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+      validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
         this.handler.validate(operation, 'prepare', signal),
       );
-      ready = valid
-        ? await this.withTimeout('OutboundReadinessTimeout', this.timeouts.readiness, (signal) =>
-            this.handler.isReady(operation, signal),
-          )
-        : false;
+      if (validation === 'deleted') {
+        await this.store.requestDeletion(operation);
+        return true;
+      }
+      ready =
+        validation === 'valid'
+          ? await this.withTimeout('OutboundReadinessTimeout', this.timeouts.readiness, (signal) =>
+              this.handler.isReady(operation, signal),
+            )
+          : false;
     } catch (error) {
+      if (errorClass(error) === 'OutboundMessageDeleted') {
+        await this.store.requestDeletion(operation);
+        return true;
+      }
       await this.retryPreparation(operation, errorClass(error));
       return true;
     }
-    if (!valid) {
+    if (validation === 'mismatch') {
       await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
       return true;
     }
@@ -412,11 +426,17 @@ export class ChatwootOutboundQueue {
               error.name = 'OutboundOperationAborted';
               throw error;
             }
-            if (
-              !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-                this.handler.validate(operation, 'transport', signal),
-              ))
-            ) {
+            const transportValidation = await this.withTimeout(
+              'OutboundValidationTimeout',
+              this.timeouts.validation,
+              (signal) => this.handler.validate(operation, 'transport', signal),
+            );
+            if (transportValidation === 'deleted') {
+              const error = new Error('Chatwoot message was deleted before transport');
+              error.name = 'OutboundMessageDeleted';
+              throw error;
+            }
+            if (transportValidation === 'mismatch') {
               const error = new Error('Outbound binding changed before transport');
               error.name = 'OutboundBindingMismatch';
               throw error;
@@ -452,7 +472,9 @@ export class ChatwootOutboundQueue {
     } catch (error) {
       const classified = errorClass(error);
       const nextAttemptAt = new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1));
-      if (classified === 'OutboundBindingMismatch') {
+      if (classified === 'OutboundMessageDeleted') {
+        await this.store.requestDeletion(operation);
+      } else if (classified === 'OutboundBindingMismatch') {
         await this.store.quarantineMessage(operation, this.workerId, classified);
       } else if (transportStarted) {
         await this.store.scheduleAmbiguous(
@@ -501,11 +523,14 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      if (
-        !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-          this.handler.validate(operation, 'callback', signal),
-        ))
-      ) {
+      const validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+        this.handler.validate(operation, 'callback', signal),
+      );
+      if (validation === 'deleted') {
+        await this.store.requestDeletion(operation);
+        return;
+      }
+      if (validation === 'mismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
       }
@@ -514,6 +539,10 @@ export class ChatwootOutboundQueue {
       );
       await this.store.markMessageCompleted(operation, this.workerId, new Date());
     } catch (error) {
+      if (errorClass(error) === 'OutboundMessageDeleted') {
+        await this.store.requestDeletion(operation);
+        return;
+      }
       if (errorClass(error) === 'OutboundBindingMismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
@@ -551,11 +580,14 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      if (
-        !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-          this.handler.validate(operation, 'callback', signal),
-        ))
-      ) {
+      const validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+        this.handler.validate(operation, 'callback', signal),
+      );
+      if (validation === 'deleted') {
+        await this.store.requestDeletion(operation);
+        return;
+      }
+      if (validation === 'mismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
       }
@@ -571,6 +603,10 @@ export class ChatwootOutboundQueue {
         await this.store.markMessageFailed(operation, this.workerId, new Date());
       }
     } catch (error) {
+      if (errorClass(error) === 'OutboundMessageDeleted') {
+        await this.store.requestDeletion(operation);
+        return;
+      }
       if (errorClass(error) === 'OutboundBindingMismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;

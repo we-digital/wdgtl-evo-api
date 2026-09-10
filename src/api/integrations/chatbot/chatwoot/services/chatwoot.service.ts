@@ -1531,6 +1531,12 @@ export class ChatwootService {
     return error;
   }
 
+  private outboundMessageDeleted() {
+    const error = new Error('Chatwoot outbound message was authoritatively deleted');
+    error.name = 'OutboundMessageDeleted';
+    return error;
+  }
+
   private async outboundInstance(operation: StoredChatwootOutboundOperation): Promise<InstanceDto | null> {
     const stored = await this.prismaRepository.instance.findUnique({
       where: { id: operation.instanceId },
@@ -1573,6 +1579,7 @@ export class ChatwootService {
     operation: StoredChatwootOutboundOperation,
     signal: AbortSignal,
     expectedDeleted = false,
+    allowAuthoritativeDeletion = false,
   ) {
     const instance = await this.outboundInstance(operation);
     if (!instance) return null;
@@ -1619,19 +1626,22 @@ export class ChatwootService {
       signal,
     );
     const currentMessage = unwrapChatwootPayload(exactMessageResponse);
-    if (
-      !validatesCurrentChatwootOutboundSnapshot({
-        operation,
-        provider,
-        currentInbox,
-        conversation,
-        currentMessage,
-        expectedRoute,
-        currentRoute: this.inboxRouteBinding(currentInbox),
-        expectedDeleted,
-      })
-    )
-      return null;
+    const snapshot = {
+      operation,
+      provider,
+      currentInbox,
+      conversation,
+      currentMessage,
+      expectedRoute,
+      currentRoute: this.inboxRouteBinding(currentInbox),
+    };
+    const exact = validatesCurrentChatwootOutboundSnapshot({ ...snapshot, expectedDeleted });
+    const authoritativelyDeleted =
+      !expectedDeleted &&
+      allowAuthoritativeDeletion &&
+      !exact &&
+      validatesCurrentChatwootOutboundSnapshot({ ...snapshot, expectedDeleted: true });
+    if (!exact && !authoritativelyDeleted) return null;
 
     return {
       instance,
@@ -1641,6 +1651,7 @@ export class ChatwootService {
       currentInbox,
       conversation,
       currentMessage,
+      authoritativelyDeleted,
     };
   }
 
@@ -1648,13 +1659,16 @@ export class ChatwootService {
     operation: StoredChatwootOutboundOperation,
     phase: ChatwootOutboundPhase,
     signal: AbortSignal,
-  ): Promise<boolean> {
+  ): Promise<'valid' | 'deleted' | 'mismatch'> {
     void phase;
-    return Boolean(await this.currentOutboundContext(operation, signal));
+    const context = await this.currentOutboundContext(operation, signal, false, true);
+    if (!context) return 'mismatch';
+    return context.authoritativelyDeleted ? 'deleted' : 'valid';
   }
 
   private async isOutboundReady(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<boolean> {
-    const context = await this.currentOutboundContext(operation, signal);
+    const context = await this.currentOutboundContext(operation, signal, false, true);
+    if (context?.authoritativelyDeleted) throw this.outboundMessageDeleted();
     return context?.waInstance?.connectionStatus?.state === 'open';
   }
 
@@ -1663,8 +1677,9 @@ export class ChatwootService {
     onTransportStart: () => Promise<void>,
     signal: AbortSignal,
   ): Promise<{ whatsappMessageId: string; result: unknown }> {
-    const context = await this.currentOutboundContext(operation, signal);
+    const context = await this.currentOutboundContext(operation, signal, false, true);
     if (!context) throw this.outboundBindingMismatch();
+    if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { instance, waInstance } = context;
 
     const payload = operation.payload;
@@ -1733,8 +1748,9 @@ export class ChatwootService {
   ) {
     const { origin } = operation.payload;
     for (const callbackPart of callbackParts) {
-      const context = await this.currentOutboundContext(operation, signal);
+      const context = await this.currentOutboundContext(operation, signal, false, true);
       if (!context) throw this.outboundBindingMismatch();
+      if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
       const update = buildChatwootDeliverySuccessUpdate(
         origin.accountId,
         origin.conversationId,
@@ -1772,8 +1788,9 @@ export class ChatwootService {
   }
 
   private async failQueuedOutbound(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
-    const context = await this.currentOutboundContext(operation, signal);
+    const context = await this.currentOutboundContext(operation, signal, false, true);
     if (!context) throw this.outboundBindingMismatch();
+    if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { origin } = operation.payload;
     const response: any = await this.awaitCancelable(
       context.client.messages.update(
