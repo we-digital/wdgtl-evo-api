@@ -1,5 +1,6 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
+import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/whatsapp/media-message-metadata';
 import {
   ChatwootDto,
   ChatwootHistoryRecoveryBatchDto,
@@ -1431,20 +1432,17 @@ export class ChatwootService {
     provenance?: OutboundMessageProvenance,
   ) {
     try {
-      const parsedMedia = path.parse(decodeURIComponent(media));
-      let mimeType = mimeTypes.lookup(parsedMedia?.ext) || '';
-      let fileName = parsedMedia?.name + parsedMedia?.ext;
-
-      if (!mimeType) {
-        const parts = media.split('/');
-        fileName = decodeURIComponent(parts[parts.length - 1]);
-
+      const metadata = await resolveChatwootAttachmentMetadata(media, async () => {
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
           signal: options?.signal,
         });
-        mimeType = response.headers['content-type'];
-      }
+        return response.headers['content-type'];
+      });
+      const fileName = metadata.fileName || 'document';
+      const mimeType = metadata.mimetype || '';
+
+      const parsedMedia = path.parse(fileName);
 
       let type = 'document';
 

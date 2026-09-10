@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   formatMediaPreparationErrorLog,
+  resolveChatwootAttachmentMetadata,
   resolveMediaMessageMetadata,
   sanitizeMediaFileName,
 } from '@api/integrations/channel/whatsapp/media-message-metadata';
@@ -29,6 +30,24 @@ test('uses a validated response MIME for an extensionless URL path', () => {
   });
 
   assert.deepEqual(metadata, { fileName: 'download', mimetype: 'application/pdf' });
+});
+
+test('the Chatwoot attachment metadata chain excludes signed URL metadata and retains response MIME', async () => {
+  const downloadContentType = async () => 'application/pdf; charset=binary';
+  const metadata = await Promise.all(
+    [
+      'https://cdn.example.test/download?signature=QUERYSECRET',
+      'https://cdn.example.test/download#fragment/PATHFRAGMENTSECRET',
+      'https://cdn.example.test/archive.unknown?signature=QUERYSECRET#FRAGMENTSECRET',
+    ].map((mediaUrl) => resolveChatwootAttachmentMetadata(mediaUrl, downloadContentType)),
+  );
+
+  assert.deepEqual(metadata, [
+    { fileName: 'download', mimetype: 'application/pdf' },
+    { fileName: 'download', mimetype: 'application/pdf' },
+    { fileName: 'archive.unknown', mimetype: 'application/pdf' },
+  ]);
+  assert.doesNotMatch(JSON.stringify(metadata), /QUERYSECRET|PATHFRAGMENTSECRET|FRAGMENTSECRET/);
 });
 
 test('sanitizes malicious URL and local basenames without changing ordinary local filenames', () => {

@@ -24,8 +24,12 @@ duplicate WhatsApp messages.
   captured at enqueue and revalidated from the authoritative enabled provider
   row plus the live Chatwoot inbox, route metadata, conversation, current
   destination and message at preparation, immediately before transport, and
-  before callback. Reassignment, rename, deletion, or any other mismatch
-  quarantines the complete message and never sends or retries it.
+  before callback. Reassignment, rename, or any other binding mismatch
+  quarantines the complete message and never sends or retries it. An
+  authoritative `deleted=true` snapshot is handled separately: the complete
+  frozen set moves to `delete_pending`, including recovery of a previously
+  quarantined matching set, and confirmed WhatsApp parts are deleted without
+  resending.
 - Validation reads one exact message through the bounded inbox-scoped endpoint
   `GET /accounts/:account/inboxes/:inbox/conversations/:conversation/messages/:message`.
   EVO unwraps production `{ meta, payload }` responses, accepts Chatwoot's

@@ -15,6 +15,8 @@ type MediaMessageMetadata = {
   mimetype?: string;
 };
 
+type MediaResponseContentTypeLoader = () => Promise<unknown>;
+
 type MediaPreparationLogEvent = 'whatsapp_media_duration_error' | 'whatsapp_media_prepare_error';
 
 const MAX_FILE_NAME_LENGTH = 180;
@@ -94,6 +96,23 @@ export const resolveMediaMessageMetadata = ({
     fileName: safeFileName,
     mimetype: resolvedMimeType,
   };
+};
+
+export const resolveChatwootAttachmentMetadata = async (
+  mediaUrl: string,
+  loadResponseContentType: MediaResponseContentTypeLoader,
+): Promise<MediaMessageMetadata> => {
+  const urlMetadata = resolveMediaMessageMetadata({
+    mediaType: 'document',
+    mediaUrl,
+  });
+  if (urlMetadata.mimetype) return urlMetadata;
+
+  return resolveMediaMessageMetadata({
+    mediaType: 'document',
+    mediaUrl,
+    responseContentType: await loadResponseContentType(),
+  });
 };
 
 export const formatMediaPreparationErrorLog = (event: MediaPreparationLogEvent, error: unknown): string => {
