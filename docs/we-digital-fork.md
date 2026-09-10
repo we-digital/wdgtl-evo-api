@@ -118,6 +118,91 @@ tags are never deployment inputs.
   receiver-fingerprint mismatch, and explicit relink before production
   promotion.
 
+## Durable Chatwoot API-inbox outbound delivery
+
+- **Behavior:** validated Chatwoot outgoing webhooks are transactionally
+  recorded as one durable operation per text/attachment part before HTTP 202.
+  Only the exact top-level `message_created` payload is used; deletion of a
+  retained message atomically stops its frozen set and removes every confirmed
+  WhatsApp part before clearing that part's local mapping. Stable numeric attachment IDs are sorted to
+  make part identities independent of webhook array order, and the exact
+  content/origin/part set is frozen by hash plus database uniqueness.
+  A database-leased worker sends each part with a deterministic planned
+  WhatsApp ID. Preparation failures retry before transport; failures after the
+  persisted `sending` boundary become `ambiguous` and reconcile by exact ID
+  without blind resend. Preparation is bounded to six attempts and then emits
+  one exact message-level failure callback without invoking transport. The
+  captured provider/account/inbox/conversation/message/contact origin and the
+  live physical receiver/instance binding, authoritative enabled provider row,
+  inbox ID/name and route metadata, current conversation/message relationship,
+  and destination are revalidated at enqueue, preparation, transport and
+  callback; reassignment, rename, deletion, or mismatch quarantines the whole message.
+  Multipart callback begins only after all parts resolve. The leader PATCHes
+  every part in canonical order with its stable operation key, index, count and
+  raw WAID. EVO validates Chatwoot's exact contract-version-1 acknowledgement
+  and complete accumulated source-ID mapping for each response. Chatwoot picks
+  part 0 as canonical `source_id`; EVO keeps every part WAID durable. Partial
+  callback success is replayed idempotently from part 0 after outage/restart,
+  never repeats WhatsApp transport, and marks the whole message completed only
+  after all acknowledgements succeed. Conflicting mappings fail closed. The
+  callback response must also acknowledge the exact message ID and valid status
+  (or exact `failed` status). Mixed terminal multipart outcomes preserve the
+  exact successful mappings as `PartialDelivery` without resending. Validation,
+  readiness, media/send and callback work have abortable time budgets; only a
+  pre-transport timeout may retry. Feature-off preserves the legacy source-ID
+  path for new messages while retained ledger rows prevent replay across
+  rollback/cutover.
+  The live message check uses the bounded inbox-scoped exact-message contract
+  and production `{meta,payload}` shape, including numeric outgoing enum `1`,
+  rather than a recent-message list. Provider-delivery PATCHes use actual
+  `application/json` with a nested three-key object. Persistent per-claim
+  generations fence every lease mutation, and Baileys rechecks abort after the
+  awaited transport boundary. Deletion requires an authoritative live
+  `deleted=true` snapshot; the callback-outage window is handled through the
+  deterministic planned WAID and exact retained `contextInfo` provenance
+  without accepting conflicting top-level mappings. Signed attachment names
+  are derived only from a decoded, sanitized URL pathname, never credentials,
+  query parameters, or fragments. A validated download response MIME remains
+  authoritative when the safe filename has no recognized extension.
+  Media-preparation logs retain only the bounded error class, while binding
+  and abort errors pass through.
+- **Source areas:** `chatwoot-outbound-queue.ts`,
+  `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
+  router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
+  existing message-ID option and `media-message-metadata.ts`,
+  provider Prisma schemas/migrations, and
+  `docs/operations/chatwoot-outbound-delivery.md`.
+- **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` and
+  `CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY` default to false. The
+  additive `ChatwootOutboundOperation` table and claim-generation fence are present in PostgreSQL,
+  PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
+- **Upstream reapply/conflicts:** preserve the database transition immediately
+  before the first Baileys transport call, the deterministic message ID on
+  text/audio/media, exact-current-message selection, route validation before
+  enqueue, every per-part `provider_delivery` acknowledgement, API-only live
+  source-ID confirmation, and fail-closed treatment of expired `sending`
+  leases. Never collapse multipart to a primary-only callback, move media
+  preparation behind the sending boundary, remove retained-ledger cutover or
+  deletion coordination, wrap `OutboundBindingMismatch` in an adapter error,
+  or log operation payloads/customer identifiers.
+- **Rollback:** establish an explicit ingress cutoff, then enable drain-only
+  while async remains enabled, reject new ingress, and wait for active states
+  to drain. Reconcile `ambiguous` only by
+  exact planned WAID and investigate `quarantined`; never reset or blindly
+  resend either. Disable async on the compatible ledger-aware image only after
+  every accepted operation is terminal. Deploy the prior immutable image only
+  after additionally proving that no queued upstream webhook, retry, or
+  redelivery can cross the cutoff; otherwise roll forward. Keep the additive
+  table and rows.
+- **Focused regression:** run `npm run test:unit --
+  tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
+  tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
+  tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts`,
+  generate Prisma for PostgreSQL and
+  MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
+  text, media, multipart, duplicate webhook, callback retry, pre-send failure,
+  process restart and deliberate ambiguous reconciliation before promotion.
+
 ## Upstream maintenance
 
 Keep upstream Git history and reapply the fork as ordinary reviewable commits.
