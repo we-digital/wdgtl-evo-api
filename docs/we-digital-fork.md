@@ -152,6 +152,16 @@ tags are never deployment inputs.
   pre-transport timeout may retry. Feature-off preserves the legacy source-ID
   path for new messages while retained ledger rows prevent replay across
   rollback/cutover.
+  The live message check uses the bounded inbox-scoped exact-message contract
+  and production `{meta,payload}` shape, including numeric outgoing enum `1`,
+  rather than a recent-message list. Provider-delivery PATCHes use actual
+  `application/json` with a nested three-key object. Persistent per-claim
+  generations fence every lease mutation, and Baileys rechecks abort after the
+  awaited transport boundary. Deletion requires an authoritative live
+  `deleted=true` snapshot; the callback-outage window is handled through the
+  deterministic planned WAID and exact retained `contextInfo` provenance
+  without accepting conflicting top-level mappings. Media-preparation logs
+  retain only the error class, while binding and abort errors pass through.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -160,7 +170,7 @@ tags are never deployment inputs.
   `docs/operations/chatwoot-outbound-delivery.md`.
 - **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` and
   `CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY` default to false. The
-  additive `ChatwootOutboundOperation` table is present in PostgreSQL,
+  additive `ChatwootOutboundOperation` table and claim-generation fence are present in PostgreSQL,
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
   before the first Baileys transport call, the deterministic message ID on

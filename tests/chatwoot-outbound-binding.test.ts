@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { validatesCurrentChatwootOutboundSnapshot } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
+import {
+  validatesCurrentChatwootOutboundSnapshot,
+  validatesLocalChatwootDeletionBinding,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 
 const route = {
@@ -43,6 +46,7 @@ const operation = {
   preparationAttempts: 0,
   sendAttempts: 0,
   callbackAttempts: 0,
+  claimGeneration: 1,
 } as StoredChatwootOutboundOperation;
 const provider = {
   id: 'provider-1',
@@ -61,17 +65,28 @@ const conversation = {
   meta: { sender: { phone_number: '+628123' } },
   contact_inbox: { source_id: 'source-1' },
 };
-const messages = [{ id: 314, conversation_id: 42, message_type: 'outgoing', content_attributes: {} }];
+const currentMessage = {
+  contract_version: 1,
+  account_id: 7,
+  inbox_id: 58,
+  conversation_id: 42,
+  message_id: 314,
+  message_type: 1,
+  message_type_name: 'outgoing',
+  deleted: false,
+  destination: '628123',
+  contact_inbox_source_id: 'source-1',
+  route: { inbox_name: 'WA - Test', channel_type: 'Channel::Api', binding: route },
+};
 const validate = (overrides: Record<string, unknown> = {}) =>
   validatesCurrentChatwootOutboundSnapshot({
     operation,
     provider,
     currentInbox,
     conversation,
-    messages,
+    currentMessage,
     expectedRoute: route,
     currentRoute: route,
-    requireMessage: true,
     ...overrides,
   });
 
@@ -84,6 +99,38 @@ test('rejects provider disable, inbox rename, reassignment, destination change a
   assert.equal(validate({ currentInbox: { ...currentInbox, name: 'Renamed' } }), false);
   assert.equal(validate({ conversation: { ...conversation, inbox_id: 59 } }), false);
   assert.equal(validate({ conversation: { ...conversation, meta: { sender: { phone_number: '+628999' } } } }), false);
-  assert.equal(validate({ messages: [{ ...messages[0], content_attributes: { deleted: true } }] }), false);
-  assert.equal(validate({ messages: [] }), false);
+  assert.equal(validate({ currentMessage: { ...currentMessage, deleted: true } }), false);
+  assert.equal(validate({ currentMessage: null }), false);
+});
+
+test('accepts deletion only when the authoritative exact message reports deleted', () => {
+  assert.equal(validate({ currentMessage: { ...currentMessage, deleted: true }, expectedDeleted: true }), true);
+  assert.equal(validate({ expectedDeleted: true }), false);
+});
+
+test('allows callback-outage deletion only with exact retained provenance and no conflicting mapping', () => {
+  const message = {
+    chatwootMessageId: null,
+    chatwootInboxId: null,
+    chatwootConversationId: null,
+    contextInfo: {
+      weDigitalOutbound: {
+        version: 1,
+        origin: 'chatwoot',
+        requestId: operation.operationKey,
+        chatwootMessageId: 314,
+        chatwootInboxId: 58,
+        chatwootConversationId: 42,
+      },
+    },
+  };
+  assert.equal(validatesLocalChatwootDeletionBinding(message, operation), true);
+  assert.equal(
+    validatesLocalChatwootDeletionBinding({ ...message, chatwootConversationId: 43 }, operation),
+    false,
+  );
+  assert.equal(
+    validatesLocalChatwootDeletionBinding({ ...message, contextInfo: { weDigitalOutbound: {} } }, operation),
+    false,
+  );
 });

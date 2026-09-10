@@ -60,6 +60,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   preparationAttempts: number;
   sendAttempts: number;
   callbackAttempts: number;
+  claimGeneration: number;
 }
 
 export interface ChatwootOutboundMessageStatus {
@@ -72,10 +73,11 @@ export interface ChatwootOutboundMessageStatus {
 export interface ChatwootOutboundStore {
   recoverExpired(now: Date): Promise<void>;
   claim(workerId: string, now: Date, leaseExpiresAt: Date): Promise<StoredChatwootOutboundOperation | null>;
-  markSending(id: string, workerId: string, now: Date): Promise<boolean>;
+  markSending(id: string, workerId: string, claimGeneration: number, now: Date): Promise<boolean>;
   markCallbackPending(
     id: string,
     workerId: string,
+    claimGeneration: number,
     whatsappMessageId: string,
     result: unknown,
     now: Date,
@@ -88,15 +90,51 @@ export interface ChatwootOutboundStore {
   ): Promise<void>;
   markMessageCompleted(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
   markMessageFailed(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
-  schedulePending(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
-  deferCallback(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
-  scheduleCallback(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
-  scheduleFailureCallback(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
-  scheduleAmbiguous(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
+  schedulePending(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  deferCallback(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  scheduleCallback(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  scheduleFailureCallback(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  scheduleAmbiguous(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
   quarantineMessage(operation: StoredChatwootOutboundOperation, workerId: string, errorClass: string): Promise<void>;
   requestDeletion(operation: StoredChatwootOutboundOperation): Promise<void>;
   markDeleted(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
-  scheduleDeletion(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
+  scheduleDeletion(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
   hasRetainedMessage(instanceId: string, messageId: number): Promise<boolean>;
   messageStatus(operation: StoredChatwootOutboundOperation): Promise<ChatwootOutboundMessageStatus>;
   findSentMessageId(operation: StoredChatwootOutboundOperation): Promise<string | null>;
@@ -305,6 +343,7 @@ export class ChatwootOutboundQueue {
         await this.store.scheduleAmbiguous(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
           errorClass(error),
         );
@@ -316,12 +355,20 @@ export class ChatwootOutboundQueue {
       }
       const reconciledMessageId = await this.store.findSentMessageId(operation);
       if (reconciledMessageId) {
-        await this.store.markCallbackPending(operation.id, this.workerId, reconciledMessageId, null, new Date());
+        await this.store.markCallbackPending(
+          operation.id,
+          this.workerId,
+          operation.claimGeneration,
+          reconciledMessageId,
+          null,
+          new Date(),
+        );
         await this.confirm(operation);
       } else {
         await this.store.scheduleAmbiguous(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
           'AwaitingExactWhatsappMessage',
         );
@@ -360,6 +407,11 @@ export class ChatwootOutboundQueue {
           operation,
           async () => {
             if (transportStarted) return;
+            if (signal.aborted) {
+              const error = new Error('Outbound operation aborted before transport fencing');
+              error.name = 'OutboundOperationAborted';
+              throw error;
+            }
             if (
               !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
                 this.handler.validate(operation, 'transport', signal),
@@ -369,7 +421,17 @@ export class ChatwootOutboundQueue {
               error.name = 'OutboundBindingMismatch';
               throw error;
             }
-            const sendStarted = await this.store.markSending(operation.id, this.workerId, new Date());
+            if (signal.aborted) {
+              const error = new Error('Outbound operation aborted before transport fencing');
+              error.name = 'OutboundOperationAborted';
+              throw error;
+            }
+            const sendStarted = await this.store.markSending(
+              operation.id,
+              this.workerId,
+              operation.claimGeneration,
+              new Date(),
+            );
             if (!sendStarted) throw new Error('OutboundLeaseLost');
             transportStarted = true;
           },
@@ -381,6 +443,7 @@ export class ChatwootOutboundQueue {
       await this.store.markCallbackPending(
         operation.id,
         this.workerId,
+        operation.claimGeneration,
         sent.whatsappMessageId,
         sent.result,
         new Date(),
@@ -392,7 +455,13 @@ export class ChatwootOutboundQueue {
       if (classified === 'OutboundBindingMismatch') {
         await this.store.quarantineMessage(operation, this.workerId, classified);
       } else if (transportStarted) {
-        await this.store.scheduleAmbiguous(operation.id, this.workerId, nextAttemptAt, classified);
+        await this.store.scheduleAmbiguous(
+          operation.id,
+          this.workerId,
+          operation.claimGeneration,
+          nextAttemptAt,
+          classified,
+        );
       } else {
         await this.retryPreparation(operation, classified);
       }
@@ -409,6 +478,7 @@ export class ChatwootOutboundQueue {
     await this.store.schedulePending(
       operation.id,
       this.workerId,
+      operation.claimGeneration,
       new Date(Date.now() + outboundRetryDelayMs(operation.preparationAttempts + 1)),
       classified,
     );
@@ -425,6 +495,7 @@ export class ChatwootOutboundQueue {
         await this.store.deferCallback(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
           'AwaitingMessageParts',
         );
@@ -450,6 +521,7 @@ export class ChatwootOutboundQueue {
       await this.store.scheduleCallback(
         operation.id,
         this.workerId,
+        operation.claimGeneration,
         new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
         errorClass(error),
       );
@@ -463,6 +535,7 @@ export class ChatwootOutboundQueue {
         await this.store.deferCallback(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
           'AwaitingFailureCallbackLeader',
         );
@@ -472,6 +545,7 @@ export class ChatwootOutboundQueue {
         await this.store.deferCallback(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
           'AwaitingMessageParts',
         );
@@ -504,6 +578,7 @@ export class ChatwootOutboundQueue {
       await this.store.scheduleFailureCallback(
         operation.id,
         this.workerId,
+        operation.claimGeneration,
         new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
         errorClass(error),
       );
@@ -521,6 +596,7 @@ export class ChatwootOutboundQueue {
         await this.store.scheduleDeletion(
           operation.id,
           this.workerId,
+          operation.claimGeneration,
           new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
           'AwaitingExactWhatsappMessage',
         );
@@ -533,6 +609,7 @@ export class ChatwootOutboundQueue {
       await this.store.scheduleDeletion(
         operation.id,
         this.workerId,
+        operation.claimGeneration,
         new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
         errorClass(error),
       );

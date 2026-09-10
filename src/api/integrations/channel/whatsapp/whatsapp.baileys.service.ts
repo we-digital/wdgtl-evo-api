@@ -2345,6 +2345,11 @@ export class BaileysStartupService extends ChannelStartupService {
       throw error;
     }
     await beforeTransport?.();
+    if (signal?.aborted) {
+      const error = new Error('Outbound operation aborted after transport fencing');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
 
     if (message['viewOnceMessage']) {
       const m = generateWAMessageFromContent(sender, message, {
@@ -2948,6 +2953,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private async prepareMediaMessage(mediaMessage: MediaMessage) {
     try {
+      this.throwIfOutboundAborted(mediaMessage.signal);
       const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
 
       let mediaInput: any;
@@ -2970,18 +2976,37 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const response = await axios.get(mediaMessage.media, config);
+          this.throwIfOutboundAborted(mediaMessage.signal);
           imageBuffer = Buffer.from(response.data, 'binary');
         } else {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
         }
 
         mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
+        this.throwIfOutboundAborted(mediaMessage.signal);
         mediaMessage.fileName ??= 'image.jpg';
         mediaMessage.mimetype = 'image/jpeg';
       } else {
-        mediaInput = isURL(mediaMessage.media)
-          ? { url: mediaMessage.media }
-          : Buffer.from(mediaMessage.media, 'base64');
+        if (isURL(mediaMessage.media)) {
+          let config: any = { responseType: 'arraybuffer', signal: mediaMessage.signal };
+          if (this.localProxy?.enabled) {
+            config = {
+              ...config,
+              httpsAgent: makeProxyAgent({
+                host: this.localProxy.host,
+                port: this.localProxy.port,
+                protocol: this.localProxy.protocol,
+                username: this.localProxy.username,
+                password: this.localProxy.password,
+              }),
+            };
+          }
+          const response = await axios.get(mediaMessage.media, config);
+          this.throwIfOutboundAborted(mediaMessage.signal);
+          mediaInput = Buffer.from(response.data, 'binary');
+        } else {
+          mediaInput = Buffer.from(mediaMessage.media, 'base64');
+        }
       }
 
       const prepareMedia = await prepareWAMessageMedia(
@@ -2990,6 +3015,7 @@ export class BaileysStartupService extends ChannelStartupService {
         } as any,
         { upload: this.client.waUploadToServer },
       );
+      this.throwIfOutboundAborted(mediaMessage.signal);
 
       const mediaType = mediaMessage.mediatype + 'Message';
 
@@ -3031,6 +3057,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const response = await axios.get(mediaMessage.media, config);
+          this.throwIfOutboundAborted(mediaMessage.signal);
 
           mimetype = response.headers['content-type'];
         }
@@ -3064,8 +3091,10 @@ export class BaileysStartupService extends ChannelStartupService {
           this.logger.verbose(`Video duration: ${duration} seconds`);
           prepareMedia[mediaType].seconds = duration;
         } catch (error) {
-          this.logger.error('Error getting video duration:');
-          this.logger.error(error);
+          if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
+          this.logger.error(
+            JSON.stringify({ event: 'whatsapp_media_duration_error', errorClass: error?.name || 'Error' }),
+          );
           throw new Error(`Failed to get video duration: ${error.message}`);
         }
       }
@@ -3091,9 +3120,18 @@ export class BaileysStartupService extends ChannelStartupService {
         { userJid: this.instance.wuid },
       );
     } catch (error) {
-      this.logger.error(error);
-      throw new InternalServerErrorException(error?.toString() || error);
+      this.throwIfOutboundAborted(mediaMessage.signal);
+      if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
+      this.logger.error(JSON.stringify({ event: 'whatsapp_media_prepare_error', errorClass: error?.name || 'Error' }));
+      throw new InternalServerErrorException('Failed to prepare media message');
     }
+  }
+
+  private throwIfOutboundAborted(signal?: AbortSignal): void {
+    if (!signal?.aborted) return;
+    const error = new Error('Outbound operation aborted during media preparation');
+    error.name = 'OutboundOperationAborted';
+    throw error;
   }
 
   private async convertToWebP(image: string): Promise<Buffer> {
@@ -3311,7 +3349,8 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
-  public async processAudio(audio: string): Promise<Buffer> {
+  public async processAudio(audio: string, signal?: AbortSignal): Promise<Buffer> {
+    this.throwIfOutboundAborted(signal);
     const audioConverterConfig = this.configService.get<AudioConverter>('AUDIO_CONVERTER');
     if (audioConverterConfig.API_URL) {
       this.logger.verbose('Using audio converter API');
@@ -3325,7 +3364,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
       const { data } = await axios.post(audioConverterConfig.API_URL, formData, {
         headers: { ...formData.getHeaders(), apikey: audioConverterConfig.API_KEY },
+        signal,
       });
+      this.throwIfOutboundAborted(signal);
 
       if (!data.audio) {
         throw new InternalServerErrorException('Failed to convert audio');
@@ -3342,9 +3383,10 @@ export class BaileysStartupService extends ChannelStartupService {
         parsedURL.searchParams.set('timestamp', timestamp.toString());
         const url = parsedURL.toString();
 
-        const config: any = { responseType: 'stream' };
+        const config: any = { responseType: 'stream', signal };
 
         const response = await axios.get(url, config);
+        this.throwIfOutboundAborted(signal);
         inputAudioStream = response.data.pipe(new PassThrough());
       } else {
         const audioBuffer = Buffer.from(audio, 'base64');
@@ -3360,6 +3402,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
         outputAudioStream.on('data', (chunk) => chunks.push(chunk));
         outputAudioStream.on('end', () => {
+          if (signal?.aborted) {
+            const error = new Error('Outbound operation aborted during audio preparation');
+            error.name = 'OutboundOperationAborted';
+            reject(error);
+            return;
+          }
           const outputBuffer = Buffer.concat(chunks);
           resolve(outputBuffer);
         });
@@ -3435,7 +3483,15 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (data?.encoding) {
-      const convert = await this.processAudio(mediaData.audio);
+      let convert: Buffer;
+      try {
+        convert = await this.processAudio(mediaData.audio, data.signal);
+      } catch (error) {
+        this.throwIfOutboundAborted(data.signal);
+        if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
+        throw error;
+      }
+      this.throwIfOutboundAborted(data.signal);
 
       if (Buffer.isBuffer(convert)) {
         const result = this.sendMessageWithTyping<AnyMessageContent>(

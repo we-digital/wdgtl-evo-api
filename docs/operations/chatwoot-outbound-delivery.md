@@ -26,6 +26,11 @@ duplicate WhatsApp messages.
   destination and message at preparation, immediately before transport, and
   before callback. Reassignment, rename, deletion, or any other mismatch
   quarantines the complete message and never sends or retries it.
+- Validation reads one exact message through the bounded inbox-scoped endpoint
+  `GET /accounts/:account/inboxes/:inbox/conversations/:conversation/messages/:message`.
+  EVO unwraps production `{ meta, payload }` responses, accepts Chatwoot's
+  numeric outgoing enum (`message_type=1`) and compatible
+  `message_type_name=outgoing`, and never substitutes a latest-message list.
 - The unique operation key covers the EVO instance, exact message-set hash and
   stable part identity. A database uniqueness constraint freezes one exact
   part set per `instance + Chatwoot message`; a replay with changed content,
@@ -45,6 +50,10 @@ duplicate WhatsApp messages.
 - The operation becomes `sending` in the database immediately before the
   Baileys transport call. A failure or restart after that transition becomes
   `ambiguous` and never causes a blind resend.
+- Every claim increments a persistent generation. Every lease-owned state
+  change includes that generation in its predicate, so a timed-out attempt
+  that finishes during a later claim cannot move the row. Baileys also
+  rechecks the abort signal after the awaited transport fence.
 - Ambiguous operations reconcile only against the exact planned WhatsApp ID in
   the EVO `Message` table. When found, the worker continues with the Chatwoot
   callback; when absent, it remains ambiguous for operator visibility.
@@ -54,6 +63,9 @@ duplicate WhatsApp messages.
   operation key as `part_key` plus the zero-based `part_index` and immutable
   `part_count` (maximum 100). Chatwoot retains every mapping and chooses part
   zero as the message's canonical `source_id` only after all parts confirm.
+  The PATCH is actual `application/json`; `provider_delivery` is a nested
+  object with exactly `part_key`, `part_index`, and `part_count`, never a
+  multipart/FormData string.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.
@@ -75,6 +87,11 @@ duplicate WhatsApp messages.
   synchronous path, but a retained ledger row always wins: an already accepted
   or completed message cannot replay through synchronous transport during
   cutover or rollback.
+- Deletion requires the same authoritative exact-message snapshot to report
+  `deleted=true`. In the send-success/callback-outage window, EVO validates the
+  deterministic planned WAID against exact retained `contextInfo` provenance
+  when the top-level Chatwoot mapping fields are still null. Any populated
+  conflicting mapping remains a binding mismatch.
 - Logs contain only state/error classes and aggregate counts. Do not log the
   payload, phone/JID, body, media URL, route binding or customer identifiers.
 
@@ -87,7 +104,8 @@ database claim still prevents concurrent workers from taking the same row.
 ## Additive schema and deployment
 
 Apply the provider-specific migration before enabling the flag. It adds only
-`ChatwootOutboundOperation`, its indexes and an `Instance` foreign key. No
+`ChatwootOutboundOperation`, its indexes, an `Instance` foreign key, and the
+additive claim-generation fence. No
 existing table or row is rewritten. PostgreSQL, PgBouncer schema generation
 and MySQL are kept equivalent.
 

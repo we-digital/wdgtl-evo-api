@@ -38,3 +38,22 @@ export function attachOutboundProvenance<T extends { contextInfo?: unknown }>(
     },
   };
 }
+
+export function matchesChatwootOutboundProvenance(
+  contextInfo: unknown,
+  expected: Required<
+    Pick<OutboundMessageProvenance, 'requestId' | 'chatwootMessageId' | 'chatwootInboxId' | 'chatwootConversationId'>
+  >,
+): boolean {
+  if (!contextInfo || typeof contextInfo !== 'object' || Array.isArray(contextInfo)) return false;
+  const provenance = (contextInfo as any).weDigitalOutbound;
+  return Boolean(
+    provenance &&
+      provenance.version === 1 &&
+      provenance.origin === 'chatwoot' &&
+      provenance.requestId === expected.requestId &&
+      Number(provenance.chatwootMessageId) === expected.chatwootMessageId &&
+      Number(provenance.chatwootInboxId) === expected.chatwootInboxId &&
+      Number(provenance.chatwootConversationId) === expected.chatwootConversationId,
+  );
+}

@@ -53,8 +53,15 @@ import {
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
+  getExactChatwootMessage,
+  unwrapChatwootCollection,
+  unwrapChatwootPayload,
+  updateChatwootMessageJson,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
+import {
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
+  validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-prisma-store';
 import {
@@ -1464,6 +1471,7 @@ export class ChatwootService {
           quoted: options?.quoted,
           messageId: options?.messageId,
           beforeTransport: options?.beforeTransport,
+          signal: options?.signal,
         };
 
         sendTelemetry('/message/sendWhatsAppAudio');
@@ -1482,11 +1490,13 @@ export class ChatwootService {
         number: number,
         mediatype: type as any,
         fileName: fileName,
+        mimetype: mimeType || undefined,
         media: media,
         delay: 1200,
         quoted: options?.quoted,
         messageId: options?.messageId,
         beforeTransport: options?.beforeTransport,
+        signal: options?.signal,
       };
 
       sendTelemetry('/message/sendMedia');
@@ -1499,6 +1509,11 @@ export class ChatwootService {
 
       return messageSent;
     } catch (error) {
+      if (options?.signal?.aborted) {
+        const aborted = new Error('Outbound operation aborted during attachment preparation');
+        aborted.name = 'OutboundOperationAborted';
+        throw aborted;
+      }
       this.logger.error(
         JSON.stringify({ event: 'chatwoot_attachment_send_error', errorClass: error?.name || 'Error' }),
       );
@@ -1527,12 +1542,28 @@ export class ChatwootService {
   private async awaitCancelable<T>(request: Promise<T> & { cancel?: () => void }, signal: AbortSignal): Promise<T> {
     if (signal.aborted) {
       request.cancel?.();
-      throw new Error('OutboundOperationAborted');
+      const error = new Error('Outbound operation aborted');
+      error.name = 'OutboundOperationAborted';
+      throw error;
     }
     const cancel = () => request.cancel?.();
     signal.addEventListener('abort', cancel, { once: true });
     try {
-      return await request;
+      let result: T;
+      try {
+        result = await request;
+      } catch (error) {
+        if (!signal.aborted) throw error;
+        const aborted = new Error('Outbound operation aborted');
+        aborted.name = 'OutboundOperationAborted';
+        throw aborted;
+      }
+      if (signal.aborted) {
+        const error = new Error('Outbound operation aborted');
+        error.name = 'OutboundOperationAborted';
+        throw error;
+      }
+      return result;
     } finally {
       signal.removeEventListener('abort', cancel);
     }
@@ -1541,7 +1572,7 @@ export class ChatwootService {
   private async currentOutboundContext(
     operation: StoredChatwootOutboundOperation,
     signal: AbortSignal,
-    requireMessage = true,
+    expectedDeleted = false,
   ) {
     const instance = await this.outboundInstance(operation);
     if (!instance) return null;
@@ -1569,30 +1600,35 @@ export class ChatwootService {
       client.inboxes.list({ accountId: origin.accountId }) as any,
       signal,
     );
-    const currentInbox = Array.isArray(inboxResponse?.payload)
-      ? inboxResponse.payload.find((candidate: any) => Number(candidate?.id) === origin.inboxId)
-      : null;
-    const conversation: any = await this.awaitCancelable(
+    const currentInbox = unwrapChatwootCollection(inboxResponse).find(
+      (candidate: any) => Number(candidate?.id) === origin.inboxId,
+    );
+    const conversationResponse: any = await this.awaitCancelable(
       client.conversations.get({ accountId: origin.accountId, conversationId: origin.conversationId }) as any,
       signal,
     );
-    let messages: any[] | undefined;
-    if (requireMessage) {
-      messages = await this.awaitCancelable(
-        client.messages.list({ accountId: origin.accountId, conversationId: origin.conversationId }) as any,
-        signal,
-      );
-    }
+    const conversation = unwrapChatwootPayload(conversationResponse);
+    const exactMessageResponse = await this.awaitCancelable(
+      getExactChatwootMessage(
+        this.getClientCwConfig(provider),
+        origin.accountId,
+        origin.inboxId,
+        origin.conversationId,
+        origin.messageId,
+      ) as any,
+      signal,
+    );
+    const currentMessage = unwrapChatwootPayload(exactMessageResponse);
     if (
       !validatesCurrentChatwootOutboundSnapshot({
         operation,
         provider,
         currentInbox,
         conversation,
-        messages: Array.isArray(messages) ? messages : undefined,
+        currentMessage,
         expectedRoute,
         currentRoute: this.inboxRouteBinding(currentInbox),
-        requireMessage,
+        expectedDeleted,
       })
     )
       return null;
@@ -1602,6 +1638,9 @@ export class ChatwootService {
       waInstance,
       provider,
       client,
+      currentInbox,
+      conversation,
+      currentMessage,
     };
   }
 
@@ -1696,15 +1735,20 @@ export class ChatwootService {
     for (const callbackPart of callbackParts) {
       const context = await this.currentOutboundContext(operation, signal);
       if (!context) throw this.outboundBindingMismatch();
+      const update = buildChatwootDeliverySuccessUpdate(
+        origin.accountId,
+        origin.conversationId,
+        origin.messageId,
+        callbackPart.sourceId,
+        callbackPart,
+      );
       const response: any = await this.awaitCancelable(
-        context.client.messages.update(
-          buildChatwootDeliverySuccessUpdate(
-            origin.accountId,
-            origin.conversationId,
-            origin.messageId,
-            callbackPart.sourceId,
-            callbackPart,
-          ) as any,
+        updateChatwootMessageJson(
+          this.getClientCwConfig(context.provider),
+          update.accountId,
+          update.conversationId,
+          update.messageId,
+          update.data,
         ) as any,
         signal,
       );
@@ -1750,7 +1794,7 @@ export class ChatwootService {
     operation: StoredChatwootOutboundOperation,
     signal: AbortSignal,
   ): Promise<'deleted' | 'waiting'> {
-    const context = await this.currentOutboundContext(operation, signal, false);
+    const context = await this.currentOutboundContext(operation, signal, true);
     if (!context) throw this.outboundBindingMismatch();
     const sourceId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
     if (!sourceId) return operation.sendAttempts === 0 ? 'deleted' : 'waiting';
@@ -1770,13 +1814,12 @@ export class ChatwootService {
     ) {
       return 'waiting';
     }
-    if (
-      message.chatwootMessageId !== operation.payload.origin.messageId ||
-      message.chatwootInboxId !== operation.payload.origin.inboxId ||
-      message.chatwootConversationId !== operation.payload.origin.conversationId
-    )
-      throw this.outboundBindingMismatch();
-    if (signal.aborted) throw new Error('OutboundOperationAborted');
+    if (!validatesLocalChatwootDeletionBinding(message, operation)) throw this.outboundBindingMismatch();
+    if (signal.aborted) {
+      const error = new Error('Outbound operation aborted before deletion transport');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
     await context.waInstance.client.sendMessage(key.remoteJid, { delete: key });
     return 'deleted';
   }
@@ -1807,6 +1850,28 @@ export class ChatwootService {
       formattedText,
       origin,
     });
+    const validationOperation: StoredChatwootOutboundOperation = {
+      ...parts[0],
+      id: 'enqueue-validation',
+      instanceId: instance.instanceId,
+      chatwootMessageId: origin.messageId,
+      chatwootInboxId: origin.inboxId,
+      chatwootConversationId: origin.conversationId,
+      state: 'pending',
+      preparationAttempts: 0,
+      sendAttempts: 0,
+      callbackAttempts: 0,
+      claimGeneration: 0,
+    };
+    const validationController = new AbortController();
+    const validationTimer = setTimeout(() => validationController.abort(), 20_000);
+    let liveContext;
+    try {
+      liveContext = await this.currentOutboundContext(validationOperation, validationController.signal);
+    } finally {
+      clearTimeout(validationTimer);
+    }
+    if (!liveContext) throw this.outboundBindingMismatch();
     await this.outboundStore.enqueue(
       instance.instanceId,
       Number(body.id),
@@ -1917,14 +1982,9 @@ export class ChatwootService {
       if (isChatwootMessageDeletion(body)) {
         const retained = await this.outboundStore.retainedOperations(instance.instanceId, Number(body.id));
         if (retained.length > 0) {
-          const currentProvider = await this.prismaRepository.chatwoot.findUnique({
-            where: { instanceId: instance.instanceId },
-          });
           const candidateDeletionChatId = chatwootOutboundDestination(body.conversation);
           const exactOrigin = retained.every(
             (operation) =>
-              currentProvider?.enabled === true &&
-              currentProvider.id === operation.payload.origin.providerId &&
               Number(body.account?.id) === operation.payload.origin.accountId &&
               Number(body.inbox?.id) === operation.payload.origin.inboxId &&
               Number(body.conversation?.id) === operation.payload.origin.conversationId &&
@@ -1932,10 +1992,65 @@ export class ChatwootService {
               candidateDeletionChatId === operation.payload.chatId,
           );
           if (!exactOrigin) throw this.outboundBindingMismatch();
+          const deletionController = new AbortController();
+          const deletionTimer = setTimeout(() => deletionController.abort(), 20_000);
+          let deletionContext;
+          try {
+            deletionContext = await this.currentOutboundContext(retained[0], deletionController.signal, true);
+          } finally {
+            clearTimeout(deletionTimer);
+          }
+          if (!deletionContext) throw this.outboundBindingMismatch();
           await this.outboundStore.requestDeletion(retained[0]);
           this.outboundQueue.wake();
           return { accepted: true, deletion: true, operationCount: retained.length };
         }
+        const liveProvider = await this.prismaRepository.chatwoot.findUnique({
+          where: { instanceId: instance.instanceId },
+        });
+        const deletionRoute = liveProvider
+          ? this.buildEvoRouteBinding(instance, liveProvider, Number(body.inbox?.id))
+          : null;
+        if (!liveProvider?.enabled || !deletionRoute) throw this.outboundBindingMismatch();
+        const deletionOrigin: ChatwootOutboundOrigin = {
+          providerId: liveProvider.id,
+          baseUrl: this.normalizeChatwootBaseUrl(liveProvider.url),
+          accountId: Number(body.account?.id),
+          inboxId: Number(body.inbox?.id),
+          conversationId: Number(body.conversation?.id),
+          messageId: Number(body.id),
+          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+          inboxName: liveProvider.nameInbox,
+          routeBinding: deletionRoute,
+        };
+        const syntheticDeletion: StoredChatwootOutboundOperation = {
+          id: 'deletion-validation',
+          operationKey: 'deletion-validation',
+          messageSetHash: 'deletion-validation',
+          instanceId: instance.instanceId,
+          chatwootMessageId: deletionOrigin.messageId,
+          chatwootInboxId: deletionOrigin.inboxId,
+          chatwootConversationId: deletionOrigin.conversationId,
+          partIdentity: 'deletion-validation',
+          partIndex: 0,
+          partCount: 1,
+          plannedWhatsappMessageId: 'deletion-validation',
+          state: 'delete_pending',
+          payload: { chatId: chatwootOutboundDestination(body.conversation), text: null, origin: deletionOrigin },
+          preparationAttempts: 0,
+          sendAttempts: 0,
+          callbackAttempts: 0,
+          claimGeneration: 0,
+        };
+        const deletionController = new AbortController();
+        const deletionTimer = setTimeout(() => deletionController.abort(), 20_000);
+        let deletionContext;
+        try {
+          deletionContext = await this.currentOutboundContext(syntheticDeletion, deletionController.signal, true);
+        } finally {
+          clearTimeout(deletionTimer);
+        }
+        if (!deletionContext) throw this.outboundBindingMismatch();
         const message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
@@ -1945,6 +2060,13 @@ export class ChatwootService {
 
         if (message) {
           const key = message.key as WAMessageKey;
+          if (
+            message.chatwootInboxId !== deletionOrigin.inboxId ||
+            message.chatwootConversationId !== deletionOrigin.conversationId ||
+            !key?.remoteJid ||
+            !this.outboundRemoteJidMatches(syntheticDeletion.payload.chatId, key.remoteJid)
+          )
+            throw this.outboundBindingMismatch();
 
           await waInstance?.client.sendMessage(key.remoteJid, { delete: key });
 

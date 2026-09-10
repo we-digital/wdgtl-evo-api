@@ -1,3 +1,8 @@
+import {
+  isChatwootOutgoingMessageType,
+  unwrapChatwootPayload,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
+
 export const buildChatwootDeliveryFailureUpdate = (accountId: number, conversationId: number, messageId: number) => ({
   accountId,
   conversationId,
@@ -46,7 +51,11 @@ export const isChatwootDeliverySuccessAcknowledged = (
   messageId: number,
   whatsappMessageId: string,
 ): boolean => {
-  const acknowledgement = response as { id?: unknown; source_id?: unknown; status?: unknown } | null;
+  const acknowledgement = unwrapChatwootPayload(response) as {
+    id?: unknown;
+    source_id?: unknown;
+    status?: unknown;
+  } | null;
   return (
     Number(acknowledgement?.id) === messageId &&
     acknowledgement?.source_id === whatsappMessageId &&
@@ -75,7 +84,7 @@ export const isChatwootProviderDeliveryAcknowledged = (
   expectedParts: ChatwootProviderDeliveryPart[],
 ): boolean => {
   if (!isCanonicalProviderPartSet(expectedParts)) return false;
-  const acknowledgement = response as {
+  const acknowledgement = unwrapChatwootPayload(response) as {
     id?: unknown;
     source_id?: unknown;
     status?: unknown;
@@ -152,7 +161,7 @@ export const isChatwootProviderDeliveryAcknowledged = (
 };
 
 export const isChatwootDeliveryFailureAcknowledged = (response: unknown, messageId: number): boolean => {
-  const acknowledgement = response as { id?: unknown; status?: unknown } | null;
+  const acknowledgement = unwrapChatwootPayload(response) as { id?: unknown; status?: unknown } | null;
   return Number(acknowledgement?.id) === messageId && acknowledgement?.status === 'failed';
 };
 
@@ -161,7 +170,7 @@ export const isChatwootMessageDeletion = (body: any): boolean =>
 
 export const isDeliverableChatwootOutgoing = (body: any, chatId: string): boolean =>
   body?.event === 'message_created' &&
-  body?.message_type === 'outgoing' &&
+  isChatwootOutgoingMessageType(body?.message_type) &&
   Number.isSafeInteger(Number(body?.id)) &&
   Number(body.id) > 0 &&
   chatId !== '123456' &&

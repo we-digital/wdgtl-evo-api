@@ -184,6 +184,7 @@ class MemoryStore implements ChatwootOutboundStore {
       preparationAttempts: 0,
       sendAttempts: state === 'ambiguous' ? 1 : 0,
       callbackAttempts: 0,
+      claimGeneration: 0,
     };
   }
 
@@ -199,19 +200,20 @@ class MemoryStore implements ChatwootOutboundStore {
     ) {
       return null;
     }
-    const claimed = { ...this.operation };
+    this.operation.claimGeneration += 1;
     if (this.operation.state === 'pending') this.operation.state = 'preparing';
-    return claimed;
+    return { ...this.operation };
   }
 
-  async markSending() {
-    if (this.operation.state !== 'preparing') return false;
+  async markSending(_id?: string, _workerId?: string, claimGeneration?: number) {
+    if (this.operation.state !== 'preparing' || claimGeneration !== this.operation.claimGeneration) return false;
     this.operation.state = 'sending';
     this.operation.sendAttempts += 1;
     return true;
   }
 
-  async markCallbackPending(_id: string, _workerId: string, whatsappMessageId: string) {
+  async markCallbackPending(_id: string, _workerId: string, claimGeneration: number, whatsappMessageId: string) {
+    if (claimGeneration !== this.operation.claimGeneration) throw new Error('OutboundLeaseLost');
     this.operation.state = 'callback_pending';
     this.operation.whatsappMessageId = whatsappMessageId;
   }
@@ -660,6 +662,51 @@ test('times out pre-transport preparation without allowing a late transport star
   assert.equal(transports, 0);
   assert.equal(store.operation.state, 'pending');
   assert.equal(store.operation.sendAttempts, 0);
+});
+
+test('fences two stale timed-out claims across the exact three-attempt race', async () => {
+  const store = new MemoryStore();
+  const releases: Array<() => void> = [];
+  const entered: Array<Promise<void>> = [];
+  const enteredResolvers: Array<() => void> = [];
+  for (let index = 0; index < 3; index += 1) {
+    entered.push(new Promise<void>((resolve) => enteredResolvers.push(resolve)));
+  }
+  let attempts = 0;
+  let transports = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, onTransportStart) => {
+        const attempt = attempts++;
+        enteredResolvers[attempt]();
+        if (attempt < 2) await new Promise<void>((resolve) => releases.push(resolve));
+        await onTransportStart();
+        transports += 1;
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+    1,
+    1_000,
+    { validation: 100, readiness: 100, send: 5, callback: 100 },
+  );
+
+  await queue.runOnce();
+  const second = queue.runOnce();
+  await entered[1];
+  releases[0]();
+  await second;
+  const third = queue.runOnce();
+  await entered[2];
+  releases[1]();
+  await third;
+  await new Promise<void>((resolve) => setImmediate(resolve));
+
+  assert.equal(attempts, 3);
+  assert.equal(transports, 1);
+  assert.equal(store.operation.sendAttempts, 1);
+  assert.equal(store.operation.state, 'completed');
+  assert.equal(store.operation.claimGeneration, 3);
 });
 
 test('keeps deletion pending for an uncertain send and never invokes send again', async () => {

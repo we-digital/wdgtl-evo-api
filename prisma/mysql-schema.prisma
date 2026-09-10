@@ -262,6 +262,7 @@ model ChatwootOutboundOperation {
   nextAttemptAt            DateTime  @default(now()) @db.Timestamp
   leaseOwner               String?   @db.VarChar(100)
   leaseExpiresAt           DateTime? @db.Timestamp
+  claimGeneration          Int       @default(0) @db.Int
   sendStartedAt            DateTime? @db.Timestamp
   sentAt                   DateTime? @db.Timestamp
   completedAt              DateTime? @db.Timestamp

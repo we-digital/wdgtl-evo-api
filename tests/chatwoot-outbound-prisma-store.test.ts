@@ -56,6 +56,50 @@ const stored = (partIndex: number, state: string, whatsappMessageId?: string) =>
   preparationAttempts: 0,
   sendAttempts: whatsappMessageId ? 1 : 0,
   callbackAttempts: 0,
+  claimGeneration: 0,
+});
+
+test('increments claim generation and rejects a stale same-worker transport fence', async () => {
+  const row: any = {
+    ...stored(0, 'pending'),
+    operationKey: parts[0].operationKey,
+    messageSetHash: parts[0].messageSetHash,
+    partIdentity: parts[0].partIdentity,
+    partIndex: 0,
+    partCount: 2,
+    plannedWhatsappMessageId: parts[0].plannedWhatsappMessageId,
+    payload: parts[0].payload,
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    nextAttemptAt: new Date(0),
+    createdAt: new Date(0),
+  };
+  const repository = {
+    chatwootOutboundOperation: {
+      findFirst: async () => ({ ...row }),
+      updateMany: async ({ where, data }: any) => {
+        if (where.id !== row.id || (where.claimGeneration !== undefined && where.claimGeneration !== row.claimGeneration))
+          return { count: 0 };
+        if (where.state && typeof where.state === 'string' && where.state !== row.state) return { count: 0 };
+        if (where.leaseOwner !== undefined && where.leaseOwner !== row.leaseOwner) return { count: 0 };
+        const { claimGeneration, sendAttempts, ...scalars } = data;
+        Object.assign(row, scalars);
+        if (claimGeneration?.increment) row.claimGeneration += claimGeneration.increment;
+        if (sendAttempts?.increment) row.sendAttempts += sendAttempts.increment;
+        return { count: 1 };
+      },
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore(repository as any);
+  const first = await store.claim('same-worker', new Date(), new Date(Date.now() + 1_000));
+  Object.assign(row, { state: 'pending', leaseOwner: null, leaseExpiresAt: null });
+  const second = await store.claim('same-worker', new Date(), new Date(Date.now() + 1_000));
+
+  assert.equal(first?.claimGeneration, 1);
+  assert.equal(second?.claimGeneration, 2);
+  assert.equal(await store.markSending(row.id, 'same-worker', first!.claimGeneration, new Date()), false);
+  assert.equal(await store.markSending(row.id, 'same-worker', second!.claimGeneration, new Date()), true);
+  assert.equal(row.sendAttempts, 1);
 });
 
 test('changed frozen-set replay atomically quarantines every retained operation', async () => {

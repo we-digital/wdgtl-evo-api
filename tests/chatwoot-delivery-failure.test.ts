@@ -112,6 +112,10 @@ test('accepts exact partial and complete provider acknowledgements independent o
     },
   };
   assert.equal(isChatwootProviderDeliveryAcknowledged(complete, 314, providerParts[0], providerParts), true);
+  assert.equal(
+    isChatwootProviderDeliveryAcknowledged({ meta: { scoped: true }, payload: complete }, 314, providerParts[0], providerParts),
+    true,
+  );
 });
 
 test('rejects provider acknowledgement conflicts and incomplete single-part confirmation', () => {
@@ -172,6 +176,7 @@ test('identifies only deliverable outgoing webhooks for missing-instance failure
   };
 
   assert.equal(isDeliverableChatwootOutgoing(outgoing, '628123@s.whatsapp.net'), true);
+  assert.equal(isDeliverableChatwootOutgoing({ ...outgoing, message_type: 1 }, '628123@s.whatsapp.net'), true);
   assert.equal(
     isDeliverableChatwootOutgoing(
       { ...outgoing, source_id: 'WAID:internal' },

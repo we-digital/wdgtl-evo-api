@@ -1,5 +1,7 @@
 import { chatwootEvoRouteBindingsEqual } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import { isChatwootOutgoingMessageType } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
 import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
+import { matchesChatwootOutboundProvenance } from '@api/types/outbound-provenance';
 import { Chatwoot as ChatwootModel } from '@prisma/client';
 
 export const chatwootOutboundDestination = (conversation: any): string =>
@@ -10,10 +12,10 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
   provider: ChatwootModel;
   currentInbox: any;
   conversation: any;
-  messages?: any[];
+  currentMessage?: any;
   expectedRoute: unknown;
   currentRoute: unknown;
-  requireMessage: boolean;
+  expectedDeleted?: boolean;
 }): boolean => {
   const { operation, provider, currentInbox, conversation } = params;
   const { origin } = operation.payload;
@@ -46,13 +48,48 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       conversation?.last_non_activity_message?.conversation?.contact_inbox?.source_id;
     if (currentSourceId && currentSourceId !== origin.contactInboxSourceId) return false;
   }
-  if (!params.requireMessage) return true;
-  const currentMessage = params.messages?.find((candidate: any) => Number(candidate?.id) === origin.messageId);
+  const currentMessage = params.currentMessage;
   return Boolean(
     currentMessage &&
-      currentMessage.message_type === 'outgoing' &&
-      currentMessage?.content_attributes?.deleted !== true &&
-      (currentMessage.conversation_id === undefined ||
-        Number(currentMessage.conversation_id) === origin.conversationId),
+      Number(currentMessage.contract_version) === 1 &&
+      Number(currentMessage.account_id) === origin.accountId &&
+      Number(currentMessage.inbox_id) === origin.inboxId &&
+      Number(currentMessage.conversation_id) === origin.conversationId &&
+      Number(currentMessage.message_id) === origin.messageId &&
+      isChatwootOutgoingMessageType(currentMessage.message_type_name ?? currentMessage.message_type) &&
+      currentMessage.deleted === (params.expectedDeleted ?? false) &&
+      currentMessage.destination === operation.payload.chatId &&
+      (!origin.contactInboxSourceId || currentMessage.contact_inbox_source_id === origin.contactInboxSourceId) &&
+      currentMessage.route?.inbox_name === origin.inboxName &&
+      currentMessage.route?.channel_type === 'Channel::Api' &&
+      chatwootEvoRouteBindingsEqual(currentMessage.route?.binding, origin.routeBinding),
+  );
+};
+
+export const validatesLocalChatwootDeletionBinding = (
+  message: {
+    chatwootMessageId?: number | null;
+    chatwootInboxId?: number | null;
+    chatwootConversationId?: number | null;
+    contextInfo?: unknown;
+  },
+  operation: StoredChatwootOutboundOperation,
+): boolean => {
+  const origin = operation.payload.origin;
+  if (
+    !matchesChatwootOutboundProvenance(message.contextInfo, {
+      requestId: operation.operationKey,
+      chatwootMessageId: origin.messageId,
+      chatwootInboxId: origin.inboxId,
+      chatwootConversationId: origin.conversationId,
+    })
+  )
+    return false;
+  const topLevelMappings = [message.chatwootMessageId, message.chatwootInboxId, message.chatwootConversationId];
+  if (topLevelMappings.every((value) => value === null || value === undefined)) return true;
+  return (
+    message.chatwootMessageId === origin.messageId &&
+    message.chatwootInboxId === origin.inboxId &&
+    message.chatwootConversationId === origin.conversationId
   );
 };
