@@ -96,7 +96,7 @@ export class ChatwootRouter extends RouterBroker {
           execute: (instance, data) => chatwootController.receiveWebhook(instance, data),
         });
 
-        res.status(HttpStatus.OK).json(response);
+        res.status((response as any)?.accepted ? HttpStatus.ACCEPTED : HttpStatus.OK).json(response);
       });
   }
 

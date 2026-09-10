@@ -321,6 +321,7 @@ export type QrCode = { LIMIT: number; COLOR: string };
 export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64: boolean };
 export type Chatwoot = {
   ENABLED: boolean;
+  OUTBOUND_ASYNC_ENABLED: boolean;
   MANAGED_HISTORY_RECONCILIATION: boolean;
   MESSAGE_DELETE: boolean;
   MESSAGE_READ: boolean;
@@ -821,6 +822,7 @@ export class ConfigService {
       },
       CHATWOOT: {
         ENABLED: process.env?.CHATWOOT_ENABLED === 'true',
+        OUTBOUND_ASYNC_ENABLED: process.env?.CHATWOOT_OUTBOUND_ASYNC_ENABLED === 'true',
         MANAGED_HISTORY_RECONCILIATION: process.env?.CHATWOOT_MANAGED_HISTORY_RECONCILIATION_ENABLED === 'true',
         MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'true',
         MESSAGE_READ: process.env.CHATWOOT_MESSAGE_READ === 'true',

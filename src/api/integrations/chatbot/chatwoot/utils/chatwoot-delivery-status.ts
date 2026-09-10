@@ -8,6 +8,22 @@ export const buildChatwootDeliveryFailureUpdate = (accountId: number, conversati
   },
 });
 
+export const buildChatwootDeliverySuccessUpdate = (
+  accountId: number,
+  conversationId: number,
+  messageId: number,
+  whatsappMessageId: string,
+) => ({
+  accountId,
+  conversationId,
+  messageId,
+  data: {
+    status: 'sent',
+    source_id: whatsappMessageId,
+    external_error: null,
+  },
+});
+
 export const isDeliverableChatwootOutgoing = (body: any, chatId: string): boolean =>
   body?.message_type === 'outgoing' &&
   Boolean(body?.conversation?.messages?.length) &&

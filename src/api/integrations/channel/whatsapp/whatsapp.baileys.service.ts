@@ -2320,6 +2320,7 @@ export class BaileysStartupService extends ChannelStartupService {
     messageId?: string,
     ephemeralExpiration?: number,
     contextInfo?: any,
+    beforeTransport?: () => Promise<void>,
     // participants?: GroupParticipant[],
   ) {
     sender = sender.toLowerCase();
@@ -2339,6 +2340,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
     // NOTE: NÃO DEVEMOS GERAR O messageId AQUI, SOMENTE SE VIER INFORMADO POR PARAMETRO. A GERAÇÃO ANTERIOR IMPEDE O WZAP DE IDENTIFICAR A SOURCE.
     if (messageId) option.messageId = messageId;
+
+    await beforeTransport?.();
 
     if (message['viewOnceMessage']) {
       const m = generateWAMessageFromContent(sender, message, {
@@ -2576,9 +2579,10 @@ export class BaileysStartupService extends ChannelStartupService {
           mentions,
           linkPreview,
           quoted,
-          null,
+          options?.messageId,
           group?.ephemeralDuration,
           // group?.participants,
+          options?.beforeTransport,
         );
       } else {
         contextInfo = {
@@ -2598,9 +2602,10 @@ export class BaileysStartupService extends ChannelStartupService {
           mentions,
           linkPreview,
           quoted,
-          null,
+          options?.messageId,
           undefined,
           contextInfo,
+          options?.beforeTransport,
         );
       }
 
@@ -2829,6 +2834,8 @@ export class BaileysStartupService extends ChannelStartupService {
         linkPreview: data?.linkPreview,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
+        beforeTransport: data?.beforeTransport,
       },
       isIntegration,
       provenance,
@@ -3165,7 +3172,12 @@ export class BaileysStartupService extends ChannelStartupService {
     return result;
   }
 
-  public async mediaMessage(data: SendMediaDto, file?: any, isIntegration = false) {
+  public async mediaMessage(
+    data: SendMediaDto,
+    file?: any,
+    isIntegration = false,
+    provenance?: OutboundMessageProvenance,
+  ) {
     const mediaData: SendMediaDto = { ...data };
 
     if (file) mediaData.media = file.buffer.toString('base64');
@@ -3181,8 +3193,11 @@ export class BaileysStartupService extends ChannelStartupService {
         quoted: data?.quoted,
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
+        messageId: data?.messageId,
+        beforeTransport: data?.beforeTransport,
       },
       isIntegration,
+      provenance,
     );
 
     return mediaSent;
@@ -3390,7 +3405,12 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async audioWhatsapp(data: SendAudioDto, file?: any, isIntegration = false) {
+  public async audioWhatsapp(
+    data: SendAudioDto,
+    file?: any,
+    isIntegration = false,
+    provenance?: OutboundMessageProvenance,
+  ) {
     const mediaData: SendAudioDto = { ...data };
 
     if (file?.buffer) {
@@ -3411,8 +3431,14 @@ export class BaileysStartupService extends ChannelStartupService {
         const result = this.sendMessageWithTyping<AnyMessageContent>(
           data.number,
           { audio: convert, ptt: true, mimetype: 'audio/ogg; codecs=opus' },
-          { presence: 'recording', delay: data?.delay },
+          {
+            presence: 'recording',
+            delay: data?.delay,
+            messageId: data?.messageId,
+            beforeTransport: data?.beforeTransport,
+          },
           isIntegration,
+          provenance,
         );
 
         return result;
@@ -3428,8 +3454,14 @@ export class BaileysStartupService extends ChannelStartupService {
         ptt: true,
         mimetype: 'audio/ogg; codecs=opus',
       },
-      { presence: 'recording', delay: data?.delay },
+      {
+        presence: 'recording',
+        delay: data?.delay,
+        messageId: data?.messageId,
+        beforeTransport: data?.beforeTransport,
+      },
       isIntegration,
+      provenance,
     );
   }
 

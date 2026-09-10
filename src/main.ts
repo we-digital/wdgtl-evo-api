@@ -5,7 +5,7 @@ import '@utils/instrumentSentry';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { eventManager, waMonitor } from '@api/server.module';
+import { chatwootService, eventManager, waMonitor } from '@api/server.module';
 import {
   Auth,
   configService,
@@ -28,6 +28,7 @@ import { join } from 'path';
 
 async function initWA() {
   await waMonitor.loadInstance();
+  await chatwootService.startOutboundWorker();
 }
 
 async function bootstrap() {
@@ -162,6 +163,10 @@ async function bootstrap() {
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);
   });
+
+  const stopOutboundWorker = () => chatwootService.stopOutboundWorker();
+  process.once('SIGINT', stopOutboundWorker);
+  process.once('SIGTERM', stopOutboundWorker);
 
   onUnexpectedError();
 }

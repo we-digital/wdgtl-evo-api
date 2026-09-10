@@ -81,7 +81,7 @@ export const templateController = new TemplateController(templateService);
 const proxyService = new ProxyService(waMonitor);
 export const proxyController = new ProxyController(proxyService, waMonitor);
 
-const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
+export const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
 export const chatwootController = new ChatwootController(chatwootService, configService);
 
 const settingsService = new SettingsService(waMonitor);

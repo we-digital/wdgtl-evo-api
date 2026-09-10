@@ -111,6 +111,7 @@ model Instance {
   N8nSetting              N8nSetting[]
   Evoai                   Evoai[]
   EvoaiSetting            EvoaiSetting?
+  ChatwootOutbound        ChatwootOutboundOperation[]
 }
 
 model Session {
@@ -236,6 +237,38 @@ model Chatwoot {
   updatedAt               DateTime  @updatedAt @db.Timestamp
   Instance                Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId              String    @unique
+}
+
+model ChatwootOutboundOperation {
+  id                       String    @id @default(cuid())
+  operationKey             String    @unique @db.VarChar(64)
+  instanceId               String
+  chatwootMessageId        Int       @db.Integer
+  chatwootInboxId          Int       @db.Integer
+  chatwootConversationId   Int       @db.Integer
+  partIdentity             String    @db.VarChar(64)
+  partIndex                Int       @db.Integer
+  plannedWhatsappMessageId String    @db.VarChar(32)
+  whatsappMessageId        String?   @db.VarChar(100)
+  state                    String    @default("pending") @db.VarChar(32)
+  payload                  Json      @db.JsonB
+  result                   Json?     @db.JsonB
+  sendAttempts             Int       @default(0) @db.Integer
+  callbackAttempts         Int       @default(0) @db.Integer
+  nextAttemptAt            DateTime  @default(now()) @db.Timestamp
+  leaseOwner               String?   @db.VarChar(100)
+  leaseExpiresAt           DateTime? @db.Timestamp
+  sendStartedAt            DateTime? @db.Timestamp
+  sentAt                   DateTime? @db.Timestamp
+  completedAt              DateTime? @db.Timestamp
+  lastErrorClass           String?   @db.VarChar(100)
+  createdAt                DateTime  @default(now()) @db.Timestamp
+  updatedAt                DateTime  @updatedAt @db.Timestamp
+  Instance                 Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@unique([instanceId, chatwootMessageId, partIdentity])
+  @@index([state, nextAttemptAt])
+  @@index([instanceId, chatwootMessageId])
 }
 
 model Label {

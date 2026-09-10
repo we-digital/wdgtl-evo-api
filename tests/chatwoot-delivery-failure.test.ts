@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   buildChatwootDeliveryFailureUpdate,
+  buildChatwootDeliverySuccessUpdate,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 
@@ -14,6 +15,19 @@ test('builds a correlated failed status update for the exact Chatwoot message', 
     data: {
       status: 'failed',
       external_error: 'EVO WhatsApp delivery failed',
+    },
+  });
+});
+
+test('confirms a live send with the raw WhatsApp message id and clears only the stale transport error', () => {
+  assert.deepEqual(buildChatwootDeliverySuccessUpdate(7, 42, 314, '3EB0ABC'), {
+    accountId: 7,
+    conversationId: 42,
+    messageId: 314,
+    data: {
+      status: 'sent',
+      source_id: '3EB0ABC',
+      external_error: null,
     },
   });
 });

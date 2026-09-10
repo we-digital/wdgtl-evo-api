@@ -118,6 +118,39 @@ tags are never deployment inputs.
   receiver-fingerprint mismatch, and explicit relink before production
   promotion.
 
+## Durable Chatwoot API-inbox outbound delivery
+
+- **Behavior:** validated Chatwoot outgoing webhooks are transactionally
+  recorded as one durable operation per text/attachment part before HTTP 202.
+  A database-leased worker sends each part with a deterministic planned
+  WhatsApp ID. Preparation failures retry before transport; failures after the
+  persisted `sending` boundary become `ambiguous` and reconcile by exact ID
+  without blind resend. Chatwoot callback retries use the API message PATCH,
+  preserve the raw WhatsApp ID `source_id`, and never repeat WhatsApp delivery.
+- **Source areas:** `chatwoot-outbound-queue.ts`,
+  `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
+  router/controller startup wiring, Baileys' existing message-ID option,
+  provider Prisma schemas/migrations, and
+  `docs/operations/chatwoot-outbound-delivery.md`.
+- **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` defaults to false. The
+  additive `ChatwootOutboundOperation` table is present in PostgreSQL,
+  PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
+- **Upstream reapply/conflicts:** preserve the database transition immediately
+  before the first Baileys transport call, the deterministic message ID on
+  text/audio/media, exact-current-message selection, route validation before
+  enqueue, API-only live `source_id` confirmation, and fail-closed treatment of
+  expired `sending` leases. Never move media preparation behind the sending
+  boundary or log operation payloads/customer identifiers.
+- **Rollback:** disable the flag and deploy the prior immutable image. Keep the
+  additive table and its rows. Never reset `ambiguous` to `pending`; a future
+  worker must reconcile it by exact planned WhatsApp ID.
+- **Focused regression:** run `npm run test:unit --
+  tests/chatwoot-outbound-queue.test.ts tests/chatwoot-delivery-failure.test.ts
+  tests/chatwoot-auto-reply-binding.test.ts`, generate Prisma for PostgreSQL and
+  MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
+  text, media, multipart, duplicate webhook, callback retry, pre-send failure,
+  process restart and deliberate ambiguous reconciliation before promotion.
+
 ## Upstream maintenance
 
 Keep upstream Git history and reapply the fork as ordinary reviewable commits.
