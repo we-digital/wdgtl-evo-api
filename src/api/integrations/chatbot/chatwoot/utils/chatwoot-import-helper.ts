@@ -220,11 +220,13 @@ class ChatwootImport {
         return existingSourceIdsSet;
       }
 
-      // Ensure all sourceIds are consistently prefixed with 'WAID:' as required by downstream systems and database queries.
-      const formattedSourceIds = sourceIds.map(toChatwootSourceId);
+      const canonicalSourceIds = [...new Set(sourceIds.map(toChatwootSourceId))];
+      const sourceIdAliases = [
+        ...new Set(canonicalSourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)])),
+      ];
       const pgClient = postgresClient.getChatwootConnection();
 
-      const params: Array<string[] | number> = [formattedSourceIds];
+      const params: Array<string[] | number> = [sourceIdAliases];
       const filters = ['source_id = ANY($1)'];
       if (conversationId) {
         params.push(conversationId);
@@ -238,14 +240,19 @@ class ChatwootImport {
       const query = `SELECT source_id FROM messages WHERE ${filters.join(' AND ')}`;
 
       const result = await pgClient.query(query, params);
+      const requestedCanonicalSourceIds = new Set(canonicalSourceIds);
       for (const row of result.rows) {
-        existingSourceIdsSet.add(row.source_id);
+        if (typeof row.source_id !== 'string') continue;
+        const canonicalSourceId = toChatwootSourceId(row.source_id);
+        if (requestedCanonicalSourceIds.has(canonicalSourceId)) {
+          existingSourceIdsSet.add(canonicalSourceId);
+        }
       }
 
       return existingSourceIdsSet;
     } catch (error) {
-      this.logger.error(`Error on getExistingSourceIds: ${error.toString()}`);
-      return new Set<string>();
+      this.logger.error('Error on getExistingSourceIds');
+      throw error;
     }
   }
 
