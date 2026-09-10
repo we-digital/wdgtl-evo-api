@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildBaileysTransportOptions } from '@api/integrations/channel/whatsapp/chatwoot-transport-options';
+import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import {
   buildChatwootOutboundParts,
   ChatwootOutboundHandler,
@@ -118,6 +119,17 @@ test('freezes content into the message-set hash and rejects malformed, deletion,
       }),
     /empty/,
   );
+  assert.throws(
+    () =>
+      buildParts({
+        ...webhook,
+        attachments: Array.from({ length: 101 }, (_, index) => ({
+          id: index + 1,
+          data_url: `https://example.invalid/${index + 1}`,
+        })),
+      }),
+    /part limit/,
+  );
 });
 
 test('keeps group and direct transport boundary callbacks in named option fields', async () => {
@@ -147,6 +159,7 @@ class MemoryStore implements ChatwootOutboundStore {
   exactSentMessageId: string | null = null;
   recovered = 0;
   messageReadyOverride: boolean | undefined;
+  callbackPartsOverride: ChatwootProviderDeliveryPart[] | undefined;
 
   constructor(state: ChatwootOutboundState = 'pending') {
     const part = buildParts({ ...webhook, attachments: [] })[0];
@@ -231,12 +244,24 @@ class MemoryStore implements ChatwootOutboundStore {
   }
 
   async messageStatus(): Promise<ChatwootOutboundMessageStatus> {
+    const ready =
+      this.messageReadyOverride ??
+      (this.operation.state === 'callback_pending' && Boolean(this.operation.whatsappMessageId));
     return {
-      ready:
-        this.messageReadyOverride ??
-        (this.operation.state === 'callback_pending' && Boolean(this.operation.whatsappMessageId)),
+      ready,
       leader: true,
-      primaryWhatsappMessageId: this.operation.whatsappMessageId,
+      callbackParts:
+        this.callbackPartsOverride ??
+        (ready
+          ? [
+              {
+                partKey: this.operation.operationKey,
+                partIndex: 0,
+                partCount: 1,
+                sourceId: this.operation.whatsappMessageId,
+              },
+            ]
+          : []),
     };
   }
 
@@ -322,7 +347,7 @@ test('reports a bounded not-ready failure without entering transport', async () 
 test('reconciles a crash after transport start by exact planned WAID without another send', async () => {
   const store = new MemoryStore();
   let sends = 0;
-  let confirmed: string | null = null;
+  let confirmed: ChatwootProviderDeliveryPart[] = [];
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
@@ -332,8 +357,8 @@ test('reconciles a crash after transport start by exact planned WAID without ano
         store.exactSentMessageId = operation.plannedWhatsappMessageId;
         throw new Error('CrashAfterSend');
       },
-      confirm: async (_operation, whatsappMessageId) => {
-        confirmed = whatsappMessageId;
+      confirm: async (_operation, callbackParts) => {
+        confirmed = callbackParts;
       },
     }),
   );
@@ -343,7 +368,14 @@ test('reconciles a crash after transport start by exact planned WAID without ano
   await queue.runOnce();
 
   assert.equal(sends, 1);
-  assert.equal(confirmed, store.operation.plannedWhatsappMessageId);
+  assert.deepEqual(confirmed, [
+    {
+      partKey: store.operation.operationKey,
+      partIndex: 0,
+      partCount: 1,
+      sourceId: store.operation.plannedWhatsappMessageId,
+    },
+  ]);
   assert.equal(store.operation.state, 'completed');
 });
 
@@ -375,7 +407,45 @@ test('retries only the message-level Chatwoot callback after a successful send',
   assert.equal(store.operation.state, 'completed');
 });
 
-test('waits for the complete frozen multipart set before the single message-level callback', async () => {
+test('replays only deterministic multipart callbacks after a partial callback outage', async () => {
+  const store = new MemoryStore('callback_pending');
+  store.operation.whatsappMessageId = store.operation.plannedWhatsappMessageId;
+  store.messageReadyOverride = true;
+  store.operation.partCount = 2;
+  const callbackParts: ChatwootProviderDeliveryPart[] = [
+    { partKey: 'part-0', partIndex: 0, partCount: 2, sourceId: 'WAID:part-0' },
+    { partKey: 'part-1', partIndex: 1, partCount: 2, sourceId: 'WAID:part-1' },
+  ];
+  store.callbackPartsOverride = callbackParts;
+  const callbacks = new Map<string, number>();
+  let callbackRuns = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => {
+        throw new Error('WhatsApp must not run during callback recovery');
+      },
+      confirm: async (_operation, parts) => {
+        callbackRuns += 1;
+        for (const part of parts) {
+          if (callbackRuns === 1 && part.partIndex === 1) throw new Error('ChatwootUnavailable');
+          callbacks.set(part.partKey, (callbacks.get(part.partKey) || 0) + 1);
+        }
+      },
+    }),
+  );
+
+  await queue.runOnce();
+  assert.equal(store.operation.state, 'callback_pending');
+  await queue.runOnce();
+
+  assert.equal(callbackRuns, 2);
+  assert.equal(callbacks.get('part-0'), 2);
+  assert.equal(callbacks.get('part-1'), 1);
+  assert.equal(store.operation.state, 'completed');
+});
+
+test('waits for the complete frozen multipart set before the provider callback sequence', async () => {
   const store = new MemoryStore('callback_pending');
   store.operation.whatsappMessageId = store.operation.plannedWhatsappMessageId;
   store.messageReadyOverride = false;

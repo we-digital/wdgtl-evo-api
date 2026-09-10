@@ -1,5 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { ChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 
 export type ChatwootOutboundState =
@@ -61,7 +62,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
 export interface ChatwootOutboundMessageStatus {
   ready: boolean;
   leader: boolean;
-  primaryWhatsappMessageId?: string;
+  callbackParts: ChatwootProviderDeliveryPart[];
 }
 
 export interface ChatwootOutboundStore {
@@ -100,7 +101,7 @@ export interface ChatwootOutboundHandler {
     operation: StoredChatwootOutboundOperation,
     onTransportStart: () => Promise<void>,
   ): Promise<{ whatsappMessageId: string; result: unknown }>;
-  confirm(operation: StoredChatwootOutboundOperation, whatsappMessageId: string): Promise<void>;
+  confirm(operation: StoredChatwootOutboundOperation, callbackParts: ChatwootProviderDeliveryPart[]): Promise<void>;
   fail(operation: StoredChatwootOutboundOperation): Promise<void>;
 }
 
@@ -161,6 +162,9 @@ export function buildChatwootOutboundParts(params: {
   if (new Set(attachments.map((attachment) => attachment.attachmentId)).size !== attachments.length) {
     throw new Error('Duplicate Chatwoot attachment id');
   }
+  if (attachments.length > MAX_CHATWOOT_OUTBOUND_PARTS) {
+    throw new Error('Chatwoot outbound message exceeds provider part limit');
+  }
   if (attachments.length === 0 && (typeof params.formattedText !== 'string' || params.formattedText.length === 0)) {
     throw new Error('Invalid empty Chatwoot outbound message');
   }
@@ -212,6 +216,7 @@ export const outboundRetryDelayMs = (attempt: number): number =>
   Math.min(300_000, 5_000 * 2 ** Math.max(0, Math.min(attempt - 1, 6)));
 
 export const MAX_OUTBOUND_PREPARATION_ATTEMPTS = 6;
+export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
 
 const errorClass = (error: unknown): string => {
   if (error && typeof error === 'object' && 'name' in error && typeof error.name === 'string')
@@ -349,7 +354,7 @@ export class ChatwootOutboundQueue {
   private async confirm(operation: StoredChatwootOutboundOperation) {
     try {
       const status = await this.store.messageStatus(operation);
-      if (!status.ready || !status.leader || !status.primaryWhatsappMessageId) {
+      if (!status.ready || !status.leader || status.callbackParts.length !== operation.partCount) {
         await this.store.deferCallback(
           operation.id,
           this.workerId,
@@ -362,7 +367,7 @@ export class ChatwootOutboundQueue {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
       }
-      await this.handler.confirm(operation, status.primaryWhatsappMessageId);
+      await this.handler.confirm(operation, status.callbackParts);
       await this.store.markMessageCompleted(operation, this.workerId, new Date());
     } catch (error) {
       if (errorClass(error) === 'OutboundBindingMismatch') {

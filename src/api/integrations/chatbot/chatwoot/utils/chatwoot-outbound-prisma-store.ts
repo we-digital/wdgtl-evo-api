@@ -278,7 +278,6 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   public async messageStatus(operation: StoredChatwootOutboundOperation): Promise<ChatwootOutboundMessageStatus> {
     const operations = await this.messageOperations(operation.instanceId, operation.payload.origin.messageId);
     this.assertStoredMessageSet(operations, operation.messageSetHash, operation.partCount);
-    const primary = operations.find((candidate) => candidate.partIndex === 0);
     const successReady = operations.every(
       (candidate) =>
         ['callback_pending', 'completed'].includes(candidate.state) &&
@@ -288,7 +287,14 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     return {
       ready: successReady,
       leader: operation.partIndex === 0,
-      primaryWhatsappMessageId: successReady ? primary?.whatsappMessageId : undefined,
+      callbackParts: successReady
+        ? operations.map((candidate) => ({
+            partKey: candidate.operationKey,
+            partIndex: candidate.partIndex,
+            partCount: candidate.partCount,
+            sourceId: candidate.whatsappMessageId,
+          }))
+        : [],
     };
   }
 

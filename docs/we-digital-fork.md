@@ -134,11 +134,16 @@ tags are never deployment inputs.
   captured provider/account/inbox/conversation/message/contact origin and the
   live physical receiver/instance binding are revalidated at enqueue,
   preparation, transport and callback; mismatch quarantines the whole message.
-  Multipart has one callback after all parts resolve: part 0's raw WAID is the
-  Chatwoot `source_id`, while all part WAIDs remain durable in EVO. The callback
-  response must acknowledge the exact message ID, source ID and monotonic
-  `sent|delivered|read` status (or exact `failed` status). Callback retries never
-  repeat WhatsApp delivery. Feature-off preserves the legacy source-ID path.
+  Multipart callback begins only after all parts resolve. The leader PATCHes
+  every part in canonical order with its stable operation key, index, count and
+  raw WAID. EVO validates Chatwoot's exact contract-version-1 acknowledgement
+  and complete accumulated source-ID mapping for each response. Chatwoot picks
+  part 0 as canonical `source_id`; EVO keeps every part WAID durable. Partial
+  callback success is replayed idempotently from part 0 after outage/restart,
+  never repeats WhatsApp transport, and marks the whole message completed only
+  after all acknowledgements succeed. Conflicting mappings fail closed. The
+  callback response must also acknowledge the exact message ID and valid status
+  (or exact `failed` status). Feature-off preserves the legacy source-ID path.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -152,9 +157,11 @@ tags are never deployment inputs.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
   before the first Baileys transport call, the deterministic message ID on
   text/audio/media, exact-current-message selection, route validation before
-  enqueue, API-only live `source_id` confirmation, and fail-closed treatment of
-  expired `sending` leases. Never move media preparation behind the sending
-  boundary or log operation payloads/customer identifiers.
+  enqueue, every per-part `provider_delivery` acknowledgement, API-only live
+  source-ID confirmation, and fail-closed treatment of expired `sending`
+  leases. Never collapse multipart to a primary-only callback, move media
+  preparation behind the sending boundary, or log operation payloads/customer
+  identifiers.
 - **Rollback:** first enable drain-only while async remains enabled, reject new
   ingress, and wait for active states to drain. Reconcile `ambiguous` only by
   exact planned WAID and investigate `quarantined`; never reset or blindly

@@ -15,9 +15,10 @@ import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/util
 import {
   buildChatwootDeliveryFailureUpdate,
   buildChatwootDeliverySuccessUpdate,
+  ChatwootProviderDeliveryPart,
   isChatwootDeliveryFailureAcknowledged,
-  isChatwootDeliverySuccessAcknowledged,
   isChatwootMessageDeletion,
+  isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import {
@@ -127,7 +128,7 @@ export class ChatwootService {
       validate: (operation, phase) => this.validateOutboundBinding(operation, phase),
       isReady: (operation) => this.isOutboundReady(operation),
       send: (operation, onTransportStart) => this.sendQueuedOutbound(operation, onTransportStart),
-      confirm: (operation, whatsappMessageId) => this.confirmQueuedOutbound(operation, whatsappMessageId),
+      confirm: (operation, callbackParts) => this.confirmQueuedOutbound(operation, callbackParts),
       fail: (operation) => this.failQueuedOutbound(operation),
     });
   }
@@ -1629,32 +1630,40 @@ export class ChatwootService {
     };
   }
 
-  private async confirmQueuedOutbound(operation: StoredChatwootOutboundOperation, whatsappMessageId: string) {
-    const context = await this.currentOutboundContext(operation);
-    if (!context) throw this.outboundBindingMismatch();
+  private async confirmQueuedOutbound(
+    operation: StoredChatwootOutboundOperation,
+    callbackParts: ChatwootProviderDeliveryPart[],
+  ) {
     const { origin } = operation.payload;
-    const response: any = await context.client.messages.update(
-      buildChatwootDeliverySuccessUpdate(
-        origin.accountId,
-        origin.conversationId,
-        origin.messageId,
-        whatsappMessageId,
-      ) as any,
-    );
-    if (!isChatwootDeliverySuccessAcknowledged(response, origin.messageId, whatsappMessageId)) {
-      throw new Error('ChatwootSuccessCallbackNotAcknowledged');
+    for (const callbackPart of callbackParts) {
+      const context = await this.currentOutboundContext(operation);
+      if (!context) throw this.outboundBindingMismatch();
+      const response: any = await context.client.messages.update(
+        buildChatwootDeliverySuccessUpdate(
+          origin.accountId,
+          origin.conversationId,
+          origin.messageId,
+          callbackPart.sourceId,
+          callbackPart,
+        ) as any,
+      );
+      if (!isChatwootProviderDeliveryAcknowledged(response, origin.messageId, callbackPart, callbackParts)) {
+        const error = new Error('Chatwoot provider-delivery callback was not acknowledged');
+        error.name = 'ChatwootProviderDeliveryCallbackNotAcknowledged';
+        throw error;
+      }
+      const persisted = await this.persistLocalChatwootMessageBinding(
+        callbackPart.sourceId,
+        {
+          messageId: origin.messageId,
+          inboxId: origin.inboxId,
+          conversationId: origin.conversationId,
+          contactInboxSourceId: origin.contactInboxSourceId,
+        },
+        context.instance,
+      );
+      if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
-    const persisted = await this.persistLocalChatwootMessageBinding(
-      whatsappMessageId,
-      {
-        messageId: origin.messageId,
-        inboxId: origin.inboxId,
-        conversationId: origin.conversationId,
-        contactInboxSourceId: origin.contactInboxSourceId,
-      },
-      context.instance,
-    );
-    if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
   }
 
   private async failQueuedOutbound(operation: StoredChatwootOutboundOperation) {

@@ -39,16 +39,25 @@ duplicate WhatsApp messages.
 - Ambiguous operations reconcile only against the exact planned WhatsApp ID in
   the EVO `Message` table. When found, the worker continues with the Chatwoot
   callback; when absent, it remains ambiguous for operator visibility.
-- Multipart delivery has exactly one message-level callback after every frozen
-  part has an exact WAID. Chatwoot's single `source_id` receives the primary
-  WAID (part index 0 after stable attachment-ID ordering); the other per-part
-  WAIDs remain in `ChatwootOutboundOperation` for reconciliation and audit.
-- Success callback retries PATCH the existing Chatwoot message with
-  `status=sent`, the raw primary WAID as `source_id`, and `external_error=null`.
-  EVO accepts the callback only when the response contains the exact message
-  `id`, exact `source_id`, and status `sent`, `delivered`, or `read`. A terminal
-  failure callback is accepted only for the exact message ID and `failed`
-  status. Unacknowledged callbacks retry Chatwoot only and never send WhatsApp.
+- Callback starts only after every frozen part has an exact durable WAID. The
+  leader then PATCHes every part in canonical index order with `status=sent`,
+  its raw WAID as `source_id`, and `provider_delivery` containing the stable
+  operation key as `part_key` plus the zero-based `part_index` and immutable
+  `part_count` (maximum 100). Chatwoot retains every mapping and chooses part
+  zero as the message's canonical `source_id` only after all parts confirm.
+- EVO validates each PATCH response: exact message ID, valid message status,
+  contract version 1, exact requested part fields, exact known source-ID
+  mappings, acknowledgement count, and aggregate `message_confirmed` value.
+  A complete response must use the primary WAID and `sent`, `delivered`, or
+  `read`. Mapping order in the response is irrelevant; conflicting or foreign
+  mappings fail closed.
+- If callback part N fails after earlier acknowledgements succeeded, EVO leaves
+  the whole operation `callback_pending`. Retry replays the same canonical
+  callback sequence; Chatwoot treats identical mappings idempotently and the
+  sequence converges after restart or outage. Callback retry never invokes
+  WhatsApp. The whole message becomes `completed` only after every response is
+  acknowledged. A terminal failure callback is accepted only for the exact
+  message ID and `failed` status.
 - With `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`, the legacy synchronous path and
   its source-ID update contract are unchanged.
 - Logs contain only state/error classes and aggregate counts. Do not log the
@@ -79,9 +88,12 @@ Staging sequence:
    callback, connection loss before transport and process restart after send.
 6. Confirm every accepted operation reaches `completed`, or a deliberately
    ambiguous operation stays visible without a second WhatsApp send.
-7. Verify Chatwoot PATCH responses have this minimum shape for success:
-   `{ id: <exact message id>, status: sent|delivered|read, source_id: <primary raw WAID> }`;
-   failure acknowledgement is `{ id: <exact message id>, status: failed }`.
+7. Verify every part PATCH returns `provider_delivery` contract version 1,
+   exact `part_key/index/count`, the exact accumulated `source_ids` mapping and
+   correct `acknowledged_part_count`. The final response must additionally have
+   `message_confirmed=true`, `source_id=<part-zero raw WAID>`, and status
+   `sent|delivered|read`. Failure acknowledgement remains
+   `{ id: <exact message id>, status: failed }`.
 
 Production promotion uses the exact reviewed source change and immutable image
 digest only after the staging evidence is accepted.
