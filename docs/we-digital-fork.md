@@ -171,11 +171,15 @@ tags are never deployment inputs.
   preparation behind the sending boundary, remove retained-ledger cutover or
   deletion coordination, wrap `OutboundBindingMismatch` in an adapter error,
   or log operation payloads/customer identifiers.
-- **Rollback:** first enable drain-only while async remains enabled, reject new
-  ingress, and wait for active states to drain. Reconcile `ambiguous` only by
+- **Rollback:** establish an explicit ingress cutoff, then enable drain-only
+  while async remains enabled, reject new ingress, and wait for active states
+  to drain. Reconcile `ambiguous` only by
   exact planned WAID and investigate `quarantined`; never reset or blindly
-  resend either. Disable async and deploy the prior immutable image only after
-  every accepted operation is terminal. Keep the additive table and rows.
+  resend either. Disable async on the compatible ledger-aware image only after
+  every accepted operation is terminal. Deploy the prior immutable image only
+  after additionally proving that no queued upstream webhook, retry, or
+  redelivery can cross the cutoff; otherwise roll forward. Keep the additive
+  table and rows.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts

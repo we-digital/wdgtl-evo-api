@@ -144,20 +144,27 @@ logs, tickets or Slack.
 Do not disable async ingress while accepted work is still active: that would
 strand durable operations when the old image starts serving synchronously.
 
-1. Keep `CHATWOOT_OUTBOUND_ASYNC_ENABLED=true`, set
+1. Establish and record an explicit ingress cutoff, then keep
+   `CHATWOOT_OUTBOUND_ASYNC_ENABLED=true` and set
    `CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY=true`, and restart the current reviewed
    image. New eligible webhooks receive 503 and therefore are not accepted;
-   the worker continues draining already committed operations.
+   the worker continues draining already committed operations. Do not use
+   `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false` as the ingress fence while Chatwoot
+   can still retry or redeliver a webhook.
 2. Observe aggregate states until no rows remain in `pending`, `preparing`,
    `sending`, `callback_pending`, `failure_callback_pending`, or
    `delete_pending`.
 3. Reconcile every `ambiguous` row only by its exact planned WAID. Investigate
    `quarantined` rows against the captured origin/binding. Neither state may be
    reset to `pending`, deleted, or blindly resent.
-4. Only after all accepted work is terminal, set
-   `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false` and deploy the prior immutable EVO
-   image. Leave the additive table and its rows in place.
-5. Confirm the legacy synchronous source-ID contract and instance connectivity.
+4. Only after all accepted work is terminal may the current compatible image
+   set `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`; its retained-ledger guard must
+   continue rejecting every operation at or before the cutoff.
+5. Deploy the prior immutable EVO image only after additionally proving that no
+   queued upstream webhook, retry, or redelivery can cross that cutoff. If this
+   cannot be proven, keep the compatible image and roll forward. Leave the
+   additive table and its rows in place.
+6. Confirm the legacy synchronous source-ID contract and instance connectivity.
 
 If the current worker cannot drain safely, stop the rollback and repair or
 reconcile it under the current image. Deploying the legacy image is not a queue
