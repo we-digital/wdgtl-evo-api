@@ -160,12 +160,16 @@ tags are never deployment inputs.
   awaited transport boundary. Deletion requires an authoritative live
   `deleted=true` snapshot; the callback-outage window is handled through the
   deterministic planned WAID and exact retained `contextInfo` provenance
-  without accepting conflicting top-level mappings. Media-preparation logs
-  retain only the error class, while binding and abort errors pass through.
+  without accepting conflicting top-level mappings. Signed attachment names
+  are derived only from a decoded, sanitized URL pathname, never credentials,
+  query parameters, or fragments. A validated download response MIME remains
+  authoritative when the safe filename has no recognized extension.
+  Media-preparation logs retain only the bounded error class, while binding
+  and abort errors pass through.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
-  existing message-ID option,
+  existing message-ID option and `media-message-metadata.ts`,
   provider Prisma schemas/migrations, and
   `docs/operations/chatwoot-outbound-delivery.md`.
 - **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` and
@@ -193,7 +197,8 @@ tags are never deployment inputs.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
-  tests/chatwoot-auto-reply-binding.test.ts`, generate Prisma for PostgreSQL and
+  tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts`,
+  generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,
   process restart and deliberate ambiguous reconciliation before promotion.

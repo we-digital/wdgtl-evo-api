@@ -166,6 +166,7 @@ import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
+import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -2957,6 +2958,7 @@ export class BaileysStartupService extends ChannelStartupService {
       const type = mediaMessage.mediatype === 'ptv' ? 'video' : mediaMessage.mediatype;
 
       let mediaInput: any;
+      let responseContentType: unknown;
       if (mediaMessage.mediatype === 'image') {
         let imageBuffer: Buffer;
         if (isURL(mediaMessage.media)) {
@@ -2977,6 +2979,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
           const response = await axios.get(mediaMessage.media, config);
           this.throwIfOutboundAborted(mediaMessage.signal);
+          responseContentType = response.headers?.['content-type'];
           imageBuffer = Buffer.from(response.data, 'binary');
         } else {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
@@ -3003,6 +3006,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
           const response = await axios.get(mediaMessage.media, config);
           this.throwIfOutboundAborted(mediaMessage.signal);
+          responseContentType = response.headers?.['content-type'];
           mediaInput = Buffer.from(response.data, 'binary');
         } else {
           mediaInput = Buffer.from(mediaMessage.media, 'base64');
@@ -3018,50 +3022,15 @@ export class BaileysStartupService extends ChannelStartupService {
       this.throwIfOutboundAborted(mediaMessage.signal);
 
       const mediaType = mediaMessage.mediatype + 'Message';
-
-      if (mediaMessage.mediatype === 'document' && !mediaMessage.fileName) {
-        const regex = new RegExp(/.*\/(.+?)\./);
-        const arrayMatch = regex.exec(mediaMessage.media);
-        mediaMessage.fileName = arrayMatch[1];
-      }
-
-      if (mediaMessage.mediatype === 'image' && !mediaMessage.fileName) {
-        mediaMessage.fileName = 'image.jpg';
-      }
-
-      if (mediaMessage.mediatype === 'video' && !mediaMessage.fileName) {
-        mediaMessage.fileName = 'video.mp4';
-      }
-
-      let mimetype: string | false;
-
-      if (mediaMessage.mimetype) {
-        mimetype = mediaMessage.mimetype;
-      } else {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName);
-
-        if (!mimetype && isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer', signal: mediaMessage.signal };
-
-          if (this.localProxy?.enabled) {
-            config = {
-              ...config,
-              httpsAgent: makeProxyAgent({
-                host: this.localProxy.host,
-                port: this.localProxy.port,
-                protocol: this.localProxy.protocol,
-                username: this.localProxy.username,
-                password: this.localProxy.password,
-              }),
-            };
-          }
-
-          const response = await axios.get(mediaMessage.media, config);
-          this.throwIfOutboundAborted(mediaMessage.signal);
-
-          mimetype = response.headers['content-type'];
-        }
-      }
+      const metadata = resolveMediaMessageMetadata({
+        mediaType: mediaMessage.mediatype,
+        mediaUrl: isURL(mediaMessage.media) ? mediaMessage.media : undefined,
+        fileName: mediaMessage.fileName,
+        mimetype: mediaMessage.mimetype,
+        responseContentType,
+      });
+      mediaMessage.fileName = metadata.fileName;
+      let mimetype = metadata.mimetype;
 
       if (mediaMessage.mediatype === 'ptv') {
         prepareMedia[mediaType] = prepareMedia[type + 'Message'];
@@ -3092,17 +3061,8 @@ export class BaileysStartupService extends ChannelStartupService {
           prepareMedia[mediaType].seconds = duration;
         } catch (error) {
           if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
-          this.logger.error(
-            JSON.stringify({ event: 'whatsapp_media_duration_error', errorClass: error?.name || 'Error' }),
-          );
+          this.logger.error(formatMediaPreparationErrorLog('whatsapp_media_duration_error', error));
           throw new Error(`Failed to get video duration: ${error.message}`);
-        }
-      }
-
-      if (mediaMessage?.fileName) {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName).toString();
-        if (mimetype === 'application/mp4') {
-          mimetype = 'video/mp4';
         }
       }
 
@@ -3122,7 +3082,7 @@ export class BaileysStartupService extends ChannelStartupService {
     } catch (error) {
       this.throwIfOutboundAborted(mediaMessage.signal);
       if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
-      this.logger.error(JSON.stringify({ event: 'whatsapp_media_prepare_error', errorClass: error?.name || 'Error' }));
+      this.logger.error(formatMediaPreparationErrorLog('whatsapp_media_prepare_error', error));
       throw new InternalServerErrorException('Failed to prepare media message');
     }
   }
