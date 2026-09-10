@@ -161,12 +161,8 @@ async function bootstrap() {
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
   initWA().catch((error) => {
-    logger.error('Error loading instances: ' + error);
+    logger.error(JSON.stringify({ event: 'instance_startup_error', errorClass: error?.name || 'Error' }));
   });
-
-  const stopOutboundWorker = () => chatwootService.stopOutboundWorker();
-  process.once('SIGINT', stopOutboundWorker);
-  process.once('SIGTERM', stopOutboundWorker);
 
   onUnexpectedError();
 }

@@ -241,18 +241,21 @@ model Chatwoot {
 
 model ChatwootOutboundOperation {
   id                       String    @id @default(cuid())
-  operationKey             String    @unique @db.VarChar(64)
+  operationKey             String    @unique(map: "Cwo_operation_key_key") @db.VarChar(64)
+  messageSetHash           String    @db.VarChar(64)
   instanceId               String
   chatwootMessageId        Int       @db.Integer
   chatwootInboxId          Int       @db.Integer
   chatwootConversationId   Int       @db.Integer
   partIdentity             String    @db.VarChar(64)
   partIndex                Int       @db.Integer
+  partCount                Int       @db.Integer
   plannedWhatsappMessageId String    @db.VarChar(32)
   whatsappMessageId        String?   @db.VarChar(100)
   state                    String    @default("pending") @db.VarChar(32)
   payload                  Json      @db.JsonB
   result                   Json?     @db.JsonB
+  preparationAttempts      Int       @default(0) @db.Integer
   sendAttempts             Int       @default(0) @db.Integer
   callbackAttempts         Int       @default(0) @db.Integer
   nextAttemptAt            DateTime  @default(now()) @db.Timestamp
@@ -266,9 +269,10 @@ model ChatwootOutboundOperation {
   updatedAt                DateTime  @updatedAt @db.Timestamp
   Instance                 Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
 
-  @@unique([instanceId, chatwootMessageId, partIdentity])
-  @@index([state, nextAttemptAt])
-  @@index([instanceId, chatwootMessageId])
+  @@unique([instanceId, chatwootMessageId, partIdentity], map: "Cwo_instance_message_part_key")
+  @@unique([instanceId, chatwootMessageId, partIndex], map: "Cwo_instance_message_index_key")
+  @@index([state, nextAttemptAt], map: "Cwo_state_next_idx")
+  @@index([instanceId, chatwootMessageId], map: "Cwo_instance_message_idx")
 }
 
 model Label {

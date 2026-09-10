@@ -165,6 +165,7 @@ import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
 import { BaileysMessageProcessor } from './baileysMessage.processor';
+import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -2314,16 +2315,12 @@ export class BaileysStartupService extends ChannelStartupService {
   private async sendMessage(
     sender: string,
     message: any,
-    mentions: any,
-    linkPreview: any,
-    quoted: any,
-    messageId?: string,
-    ephemeralExpiration?: number,
-    contextInfo?: any,
-    beforeTransport?: () => Promise<void>,
+    transport: BaileysTransportOptions,
     // participants?: GroupParticipant[],
   ) {
     sender = sender.toLowerCase();
+
+    const { mentions, linkPreview, quoted, messageId, ephemeralExpiration, contextInfo, beforeTransport } = transport;
 
     const option: any = { quoted };
 
@@ -2576,13 +2573,14 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent = await this.sendMessage(
           sender,
           message,
-          mentions,
-          linkPreview,
-          quoted,
-          options?.messageId,
-          group?.ephemeralDuration,
-          // group?.participants,
-          options?.beforeTransport,
+          buildBaileysTransportOptions({
+            mentions,
+            linkPreview,
+            quoted,
+            messageId: options?.messageId,
+            ephemeralExpiration: group?.ephemeralDuration,
+            beforeTransport: options?.beforeTransport,
+          }),
         );
       } else {
         contextInfo = {
@@ -2599,13 +2597,14 @@ export class BaileysStartupService extends ChannelStartupService {
         messageSent = await this.sendMessage(
           sender,
           message,
-          mentions,
-          linkPreview,
-          quoted,
-          options?.messageId,
-          undefined,
-          contextInfo,
-          options?.beforeTransport,
+          buildBaileysTransportOptions({
+            mentions,
+            linkPreview,
+            quoted,
+            messageId: options?.messageId,
+            contextInfo,
+            beforeTransport: options?.beforeTransport,
+          }),
         );
       }
 

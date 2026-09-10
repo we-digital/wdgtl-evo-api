@@ -122,17 +122,31 @@ tags are never deployment inputs.
 
 - **Behavior:** validated Chatwoot outgoing webhooks are transactionally
   recorded as one durable operation per text/attachment part before HTTP 202.
+  Only the exact top-level `message_created` payload is used; deletion events
+  retain the legacy deletion path. Stable numeric attachment IDs are sorted to
+  make part identities independent of webhook array order, and the exact
+  content/origin/part set is frozen by hash plus database uniqueness.
   A database-leased worker sends each part with a deterministic planned
   WhatsApp ID. Preparation failures retry before transport; failures after the
   persisted `sending` boundary become `ambiguous` and reconcile by exact ID
-  without blind resend. Chatwoot callback retries use the API message PATCH,
-  preserve the raw WhatsApp ID `source_id`, and never repeat WhatsApp delivery.
+  without blind resend. Preparation is bounded to six attempts and then emits
+  one exact message-level failure callback without invoking transport. The
+  captured provider/account/inbox/conversation/message/contact origin and the
+  live physical receiver/instance binding are revalidated at enqueue,
+  preparation, transport and callback; mismatch quarantines the whole message.
+  Multipart has one callback after all parts resolve: part 0's raw WAID is the
+  Chatwoot `source_id`, while all part WAIDs remain durable in EVO. The callback
+  response must acknowledge the exact message ID, source ID and monotonic
+  `sent|delivered|read` status (or exact `failed` status). Callback retries never
+  repeat WhatsApp delivery. Feature-off preserves the legacy source-ID path.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
-  router/controller startup wiring, Baileys' existing message-ID option,
+  router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
+  existing message-ID option,
   provider Prisma schemas/migrations, and
   `docs/operations/chatwoot-outbound-delivery.md`.
-- **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` defaults to false. The
+- **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` and
+  `CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY` default to false. The
   additive `ChatwootOutboundOperation` table is present in PostgreSQL,
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
@@ -141,9 +155,11 @@ tags are never deployment inputs.
   enqueue, API-only live `source_id` confirmation, and fail-closed treatment of
   expired `sending` leases. Never move media preparation behind the sending
   boundary or log operation payloads/customer identifiers.
-- **Rollback:** disable the flag and deploy the prior immutable image. Keep the
-  additive table and its rows. Never reset `ambiguous` to `pending`; a future
-  worker must reconcile it by exact planned WhatsApp ID.
+- **Rollback:** first enable drain-only while async remains enabled, reject new
+  ingress, and wait for active states to drain. Reconcile `ambiguous` only by
+  exact planned WAID and investigate `quarantined`; never reset or blindly
+  resend either. Disable async and deploy the prior immutable image only after
+  every accepted operation is terminal. Keep the additive table and rows.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-delivery-failure.test.ts
   tests/chatwoot-auto-reply-binding.test.ts`, generate Prisma for PostgreSQL and
