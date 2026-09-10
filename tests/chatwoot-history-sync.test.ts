@@ -57,6 +57,51 @@ test('normalizes Chatwoot source ids exactly once', () => {
   assert.equal(toChatwootSourceId('WAID:ABC'), 'WAID:ABC');
 });
 
+test('treats exact raw and canonical Chatwoot source ids as the same retained history message', async () => {
+  const originalGetConnection = postgresClient.getChatwootConnection;
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      query: async (sql: string, params: unknown[]) => {
+        queries.push({ sql, params });
+        return {
+          rows: [{ source_id: 'ABC' }, { source_id: 'WAID:DEF' }, { source_id: 'unrequested' }],
+        };
+      },
+    })) as any;
+
+    const existing = await chatwootImport.getExistingSourceIds(['ABC', 'WAID:DEF'], undefined, 42);
+
+    assert.deepEqual(existing, new Set(['WAID:ABC', 'WAID:DEF']));
+    assert.equal(queries.length, 1);
+    assert.deepEqual(queries[0].params, [['WAID:ABC', 'ABC', 'WAID:DEF', 'DEF'], 42]);
+    assert.match(queries[0].sql, /source_id = ANY\(\$1\)/);
+    assert.match(queries[0].sql, /inbox_id = \$2/);
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+  }
+});
+
+test('fails closed when retained Chatwoot source ids cannot be read', async () => {
+  const originalGetConnection = postgresClient.getChatwootConnection;
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      query: async () => {
+        throw new Error('destination unavailable');
+      },
+    })) as any;
+
+    await assert.rejects(
+      chatwootImport.getExistingSourceIds(['ABC'], undefined, 42),
+      /destination unavailable/,
+    );
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+  }
+});
+
 test('deduplicates stored history rows by canonical Chatwoot source id', () => {
   const first = message({ id: 'duplicate', remoteJid: '628111@s.whatsapp.net' });
   const duplicate = message({ id: 'WAID:duplicate', remoteJid: '628222@s.whatsapp.net' });

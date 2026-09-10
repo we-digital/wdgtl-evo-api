@@ -171,7 +171,11 @@ tags are never deployment inputs.
   are not imported back into Chatwoot as a second outgoing message. The ledger
   lookup covers Baileys socket echoes that do not retain custom message
   metadata. Ordinary API sends, inbound messages, and unknown IDs keep their
-  existing event path.
+  existing event path. History recovery treats an exact raw WhatsApp source ID
+  and its `WAID:`-prefixed form as the same retained Chatwoot message, so a
+  later production history pass cannot re-import a successfully delivered
+  live outbound row. Destination lookup failures abort the history batch
+  instead of being interpreted as an empty destination.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -204,7 +208,7 @@ tags are never deployment inputs.
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
   tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
-  tests/outbound-provenance.test.ts`,
+  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts`,
   generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,
