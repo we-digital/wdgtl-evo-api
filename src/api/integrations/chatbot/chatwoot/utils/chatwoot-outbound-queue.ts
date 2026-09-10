@@ -11,6 +11,8 @@ export type ChatwootOutboundState =
   | 'failure_callback_pending'
   | 'completed'
   | 'ambiguous'
+  | 'delete_pending'
+  | 'deleted'
   | 'quarantined'
   | 'failed';
 
@@ -24,6 +26,7 @@ export interface ChatwootOutboundOrigin {
   conversationId: number;
   messageId: number;
   contactInboxSourceId?: string;
+  inboxName: string;
   routeBinding: ChatwootEvoRouteBinding;
 }
 
@@ -62,6 +65,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
 export interface ChatwootOutboundMessageStatus {
   ready: boolean;
   leader: boolean;
+  outcome: 'waiting' | 'success' | 'partial_success' | 'failure';
   callbackParts: ChatwootProviderDeliveryPart[];
 }
 
@@ -90,19 +94,33 @@ export interface ChatwootOutboundStore {
   scheduleFailureCallback(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
   scheduleAmbiguous(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
   quarantineMessage(operation: StoredChatwootOutboundOperation, workerId: string, errorClass: string): Promise<void>;
+  requestDeletion(operation: StoredChatwootOutboundOperation): Promise<void>;
+  markDeleted(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
+  scheduleDeletion(id: string, workerId: string, nextAttemptAt: Date, errorClass: string): Promise<void>;
+  hasRetainedMessage(instanceId: string, messageId: number): Promise<boolean>;
   messageStatus(operation: StoredChatwootOutboundOperation): Promise<ChatwootOutboundMessageStatus>;
   findSentMessageId(operation: StoredChatwootOutboundOperation): Promise<string | null>;
 }
 
 export interface ChatwootOutboundHandler {
-  validate(operation: StoredChatwootOutboundOperation, phase: ChatwootOutboundPhase): Promise<boolean>;
-  isReady(operation: StoredChatwootOutboundOperation): Promise<boolean>;
+  validate(
+    operation: StoredChatwootOutboundOperation,
+    phase: ChatwootOutboundPhase,
+    signal: AbortSignal,
+  ): Promise<boolean>;
+  isReady(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<boolean>;
   send(
     operation: StoredChatwootOutboundOperation,
     onTransportStart: () => Promise<void>,
+    signal: AbortSignal,
   ): Promise<{ whatsappMessageId: string; result: unknown }>;
-  confirm(operation: StoredChatwootOutboundOperation, callbackParts: ChatwootProviderDeliveryPart[]): Promise<void>;
-  fail(operation: StoredChatwootOutboundOperation): Promise<void>;
+  confirm(
+    operation: StoredChatwootOutboundOperation,
+    callbackParts: ChatwootProviderDeliveryPart[],
+    signal: AbortSignal,
+  ): Promise<void>;
+  fail(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<void>;
+  delete(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<'deleted' | 'waiting'>;
 }
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -144,6 +162,7 @@ export function buildChatwootOutboundParts(params: {
     throw new Error('Chatwoot outbound origin mismatch');
   }
   requiredString(params.origin.providerId, 'Chatwoot provider id');
+  requiredString(params.origin.inboxName, 'Chatwoot inbox name');
   const normalizedOrigin = {
     ...params.origin,
     baseUrl: normalizeBaseUrl(requiredString(params.origin.baseUrl, 'Chatwoot base URL')),
@@ -235,6 +254,7 @@ export class ChatwootOutboundQueue {
     private readonly handler: ChatwootOutboundHandler,
     private readonly pollIntervalMs = 1_000,
     private readonly leaseMs = 600_000,
+    private readonly timeouts = { validation: 20_000, readiness: 10_000, send: 120_000, callback: 30_000 },
   ) {}
 
   public async start() {
@@ -271,8 +291,26 @@ export class ChatwootOutboundQueue {
       await this.confirmFailure(operation);
       return true;
     }
+    if (operation.state === 'delete_pending') {
+      await this.delete(operation);
+      return true;
+    }
     if (operation.state === 'ambiguous') {
-      if (!(await this.handler.validate(operation, 'callback'))) {
+      let valid: boolean;
+      try {
+        valid = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+          this.handler.validate(operation, 'callback', signal),
+        );
+      } catch (error) {
+        await this.store.scheduleAmbiguous(
+          operation.id,
+          this.workerId,
+          new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
+          errorClass(error),
+        );
+        return true;
+      }
+      if (!valid) {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return true;
       }
@@ -291,28 +329,53 @@ export class ChatwootOutboundQueue {
       return true;
     }
 
-    if (!(await this.handler.validate(operation, 'prepare'))) {
+    let valid: boolean;
+    let ready: boolean;
+    try {
+      valid = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+        this.handler.validate(operation, 'prepare', signal),
+      );
+      ready = valid
+        ? await this.withTimeout('OutboundReadinessTimeout', this.timeouts.readiness, (signal) =>
+            this.handler.isReady(operation, signal),
+          )
+        : false;
+    } catch (error) {
+      await this.retryPreparation(operation, errorClass(error));
+      return true;
+    }
+    if (!valid) {
       await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
       return true;
     }
-    if (!(await this.handler.isReady(operation))) {
+    if (!ready) {
       await this.retryPreparation(operation, 'WhatsappNotReady');
       return true;
     }
 
     let transportStarted = false;
     try {
-      const sent = await this.handler.send(operation, async () => {
-        if (transportStarted) return;
-        if (!(await this.handler.validate(operation, 'transport'))) {
-          const error = new Error('Outbound binding changed before transport');
-          error.name = 'OutboundBindingMismatch';
-          throw error;
-        }
-        const sendStarted = await this.store.markSending(operation.id, this.workerId, new Date());
-        if (!sendStarted) throw new Error('OutboundLeaseLost');
-        transportStarted = true;
-      });
+      const sent = await this.withTimeout('OutboundSendTimeout', this.timeouts.send, (signal) =>
+        this.handler.send(
+          operation,
+          async () => {
+            if (transportStarted) return;
+            if (
+              !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+                this.handler.validate(operation, 'transport', signal),
+              ))
+            ) {
+              const error = new Error('Outbound binding changed before transport');
+              error.name = 'OutboundBindingMismatch';
+              throw error;
+            }
+            const sendStarted = await this.store.markSending(operation.id, this.workerId, new Date());
+            if (!sendStarted) throw new Error('OutboundLeaseLost');
+            transportStarted = true;
+          },
+          signal,
+        ),
+      );
       if (!transportStarted) throw new Error('TransportNotStarted');
       if (!sent.whatsappMessageId) throw new Error('MissingWhatsappMessageId');
       await this.store.markCallbackPending(
@@ -354,7 +417,11 @@ export class ChatwootOutboundQueue {
   private async confirm(operation: StoredChatwootOutboundOperation) {
     try {
       const status = await this.store.messageStatus(operation);
-      if (!status.ready || !status.leader || status.callbackParts.length !== operation.partCount) {
+      if (
+        !status.ready ||
+        !status.leader ||
+        (status.outcome === 'success' && status.callbackParts.length !== operation.partCount)
+      ) {
         await this.store.deferCallback(
           operation.id,
           this.workerId,
@@ -363,11 +430,17 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      if (!(await this.handler.validate(operation, 'callback'))) {
+      if (
+        !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+          this.handler.validate(operation, 'callback', signal),
+        ))
+      ) {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
       }
-      await this.handler.confirm(operation, status.callbackParts);
+      await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
+        this.handler.confirm(operation, status.callbackParts, signal),
+      );
       await this.store.markMessageCompleted(operation, this.workerId, new Date());
     } catch (error) {
       if (errorClass(error) === 'OutboundBindingMismatch') {
@@ -395,12 +468,34 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      if (!(await this.handler.validate(operation, 'callback'))) {
+      if (!status.ready) {
+        await this.store.deferCallback(
+          operation.id,
+          this.workerId,
+          new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
+          'AwaitingMessageParts',
+        );
+        return;
+      }
+      if (
+        !(await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+          this.handler.validate(operation, 'callback', signal),
+        ))
+      ) {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
         return;
       }
-      await this.handler.fail(operation);
-      await this.store.markMessageFailed(operation, this.workerId, new Date());
+      if (status.outcome === 'partial_success') {
+        await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
+          this.handler.confirm(operation, status.callbackParts, signal),
+        );
+        await this.store.markMessageCompleted(operation, this.workerId, new Date());
+      } else {
+        await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
+          this.handler.fail(operation, signal),
+        );
+        await this.store.markMessageFailed(operation, this.workerId, new Date());
+      }
     } catch (error) {
       if (errorClass(error) === 'OutboundBindingMismatch') {
         await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
@@ -412,6 +507,57 @@ export class ChatwootOutboundQueue {
         new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
         errorClass(error),
       );
+    }
+  }
+
+  private async delete(operation: StoredChatwootOutboundOperation) {
+    try {
+      const outcome = await this.withTimeout('OutboundDeleteTimeout', this.timeouts.callback, (signal) =>
+        this.handler.delete(operation, signal),
+      );
+      if (outcome === 'deleted') {
+        await this.store.markDeleted(operation, this.workerId, new Date());
+      } else {
+        await this.store.scheduleDeletion(
+          operation.id,
+          this.workerId,
+          new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
+          'AwaitingExactWhatsappMessage',
+        );
+      }
+    } catch (error) {
+      if (errorClass(error) === 'OutboundBindingMismatch') {
+        await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
+        return;
+      }
+      await this.store.scheduleDeletion(
+        operation.id,
+        this.workerId,
+        new Date(Date.now() + outboundRetryDelayMs(operation.callbackAttempts + 1)),
+        errorClass(error),
+      );
+    }
+  }
+
+  private async withTimeout<T>(
+    errorName: string,
+    timeoutMs: number,
+    task: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout;
+    const timeout = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        const error = new Error(errorName);
+        error.name = errorName;
+        reject(error);
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([task(controller.signal), timeout]);
+    } finally {
+      clearTimeout(timer!);
     }
   }
 

@@ -3,6 +3,7 @@ import { ProxyDto } from '@api/dto/proxy.dto';
 import { SettingsDto } from '@api/dto/settings.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { toChatwootProviderDto } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-dto';
 import { DifyService } from '@api/integrations/chatbot/dify/services/dify.service';
 import { OpenaiService } from '@api/integrations/chatbot/openai/services/openai.service';
 import { TypebotService } from '@api/integrations/chatbot/typebot/services/typebot.service';
@@ -336,26 +337,7 @@ export class ChannelStartupService {
       return null;
     }
 
-    const ignoreJidsArray = Array.isArray(data.ignoreJids) ? data.ignoreJids.map((event) => String(event)) : [];
-
-    return {
-      enabled: data?.enabled,
-      accountId: data.accountId,
-      token: data.token,
-      url: data.url,
-      nameInbox: data.nameInbox,
-      signMsg: data.signMsg,
-      signDelimiter: data.signDelimiter || null,
-      reopenConversation: data.reopenConversation,
-      conversationPending: data.conversationPending,
-      mergeBrazilContacts: data.mergeBrazilContacts,
-      importContacts: data.importContacts,
-      importMessages: data.importMessages,
-      daysLimitImportMessages: data.daysLimitImportMessages,
-      organization: data.organization,
-      logo: data.logo,
-      ignoreJids: ignoreJidsArray,
-    };
+    return toChatwootProviderDto(data);
   }
 
   public async clearCacheChatwoot() {

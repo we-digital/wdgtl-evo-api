@@ -23,6 +23,7 @@ const origin: ChatwootOutboundOrigin = {
   conversationId: 42,
   messageId: 314,
   contactInboxSourceId: 'opaque-contact',
+  inboxName: 'WA - Test',
   routeBinding: {
     version: 2,
     provider: 'evo_whatsapp',
@@ -74,7 +75,10 @@ test('uses only the exact top-level message and creates attachment identities in
   assert.equal(first.length, 2);
   assert.deepEqual(first, reordered);
   assert.deepEqual(first, changedHistory);
-  assert.deepEqual(first.map((part) => part.payload.attachmentId), [10, 11]);
+  assert.deepEqual(
+    first.map((part) => part.payload.attachmentId),
+    [10, 11],
+  );
   assert.ok(first.every((part) => !part.payload.attachmentUrl.includes('old.jpg')));
   assert.equal(new Set(first.map((part) => part.operationKey)).size, 2);
   assert.ok(first.every((part) => /^WD[A-F0-9]{18}$/.test(part.plannedWhatsappMessageId)));
@@ -85,7 +89,10 @@ test('freezes content into the message-set hash and rejects malformed, deletion,
   const first = buildParts();
   const changed = buildParts({
     ...webhook,
-    attachments: [{ ...webhook.attachments[0], data_url: 'https://example.invalid/changed.pdf' }, webhook.attachments[1]],
+    attachments: [
+      { ...webhook.attachments[0], data_url: 'https://example.invalid/changed.pdf' },
+      webhook.attachments[1],
+    ],
   });
   assert.notEqual(first[0].messageSetHash, changed[0].messageSetHash);
   assert.notEqual(
@@ -98,7 +105,10 @@ test('freezes content into the message-set hash and rejects malformed, deletion,
       origin,
     })[0].messageSetHash,
   );
-  assert.throws(() => buildParts({ ...webhook, event: 'message_updated', content_attributes: { deleted: true } }), /event/);
+  assert.throws(
+    () => buildParts({ ...webhook, event: 'message_updated', content_attributes: { deleted: true } }),
+    /event/,
+  );
   assert.throws(() => buildParts({ ...webhook, id: null }), /message id/);
   assert.throws(
     () => buildParts({ ...webhook, attachments: [{ data_url: 'https://example.invalid/no-id' }] }),
@@ -182,7 +192,11 @@ class MemoryStore implements ChatwootOutboundStore {
   }
 
   async claim(): Promise<StoredChatwootOutboundOperation | null> {
-    if (!['pending', 'callback_pending', 'failure_callback_pending', 'ambiguous'].includes(this.operation.state)) {
+    if (
+      !['pending', 'callback_pending', 'failure_callback_pending', 'ambiguous', 'delete_pending'].includes(
+        this.operation.state,
+      )
+    ) {
       return null;
     }
     const claimed = { ...this.operation };
@@ -243,13 +257,31 @@ class MemoryStore implements ChatwootOutboundStore {
     this.operation.state = 'quarantined';
   }
 
+  async requestDeletion() {
+    this.operation.state = 'delete_pending';
+  }
+
+  async markDeleted() {
+    this.operation.state = 'deleted';
+  }
+
+  async scheduleDeletion() {
+    this.operation.state = 'delete_pending';
+  }
+
+  async hasRetainedMessage() {
+    return true;
+  }
+
   async messageStatus(): Promise<ChatwootOutboundMessageStatus> {
     const ready =
       this.messageReadyOverride ??
-      (this.operation.state === 'callback_pending' && Boolean(this.operation.whatsappMessageId));
+      ((this.operation.state === 'callback_pending' && Boolean(this.operation.whatsappMessageId)) ||
+        this.operation.state === 'failure_callback_pending');
     return {
       ready,
       leader: true,
+      outcome: ready ? (this.operation.state === 'failure_callback_pending' ? 'failure' : 'success') : 'waiting',
       callbackParts:
         this.callbackPartsOverride ??
         (ready
@@ -279,6 +311,7 @@ const validHandler = (overrides: Partial<ChatwootOutboundHandler> = {}): Chatwoo
   },
   confirm: async () => undefined,
   fail: async () => undefined,
+  delete: async () => 'deleted',
   ...overrides,
 });
 
@@ -563,4 +596,89 @@ test('waits for an in-flight operation when the worker is stopped for drain', as
 
   assert.equal(stopped, true);
   assert.equal(store.operation.state, 'completed');
+});
+
+test('completes a mixed multipart outcome with only the delivered mappings and no sibling resend', async () => {
+  const store = new MemoryStore('failure_callback_pending');
+  store.operation.partCount = 2;
+  store.messageReadyOverride = true;
+  store.callbackPartsOverride = [{ partKey: 'sent-part', partIndex: 0, partCount: 1, sourceId: 'WAID:sent' }];
+  store.messageStatus = async () => ({
+    ready: true,
+    leader: true,
+    outcome: 'partial_success',
+    callbackParts: store.callbackPartsOverride,
+  });
+  let sends = 0;
+  let confirmed: ChatwootProviderDeliveryPart[] = [];
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => {
+        sends += 1;
+        throw new Error('must not resend a mixed outcome');
+      },
+      confirm: async (_operation, parts) => {
+        confirmed = parts;
+      },
+    }),
+  );
+
+  await queue.runOnce();
+
+  assert.equal(sends, 0);
+  assert.deepEqual(confirmed, store.callbackPartsOverride);
+  assert.equal(store.operation.state, 'completed');
+});
+
+test('times out pre-transport preparation without allowing a late transport start', async () => {
+  const store = new MemoryStore();
+  let transports = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (_operation, onTransportStart, signal) => {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        if (signal.aborted) {
+          const error = new Error('aborted');
+          error.name = 'OutboundOperationAborted';
+          throw error;
+        }
+        transports += 1;
+        await onTransportStart();
+        throw new Error('unexpected');
+      },
+    }),
+    1,
+    1_000,
+    { validation: 100, readiness: 100, send: 5, callback: 100 },
+  );
+
+  await queue.runOnce();
+  await new Promise((resolve) => setTimeout(resolve, 25));
+
+  assert.equal(transports, 0);
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.sendAttempts, 0);
+});
+
+test('keeps deletion pending for an uncertain send and never invokes send again', async () => {
+  const store = new MemoryStore('delete_pending');
+  store.operation.sendAttempts = 1;
+  let sends = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => {
+        sends += 1;
+        throw new Error('must not send');
+      },
+      delete: async () => 'waiting',
+    }),
+  );
+
+  await queue.runOnce();
+
+  assert.equal(sends, 0);
+  assert.equal(store.operation.state, 'delete_pending');
 });

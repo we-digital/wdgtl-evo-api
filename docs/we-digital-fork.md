@@ -122,8 +122,9 @@ tags are never deployment inputs.
 
 - **Behavior:** validated Chatwoot outgoing webhooks are transactionally
   recorded as one durable operation per text/attachment part before HTTP 202.
-  Only the exact top-level `message_created` payload is used; deletion events
-  retain the legacy deletion path. Stable numeric attachment IDs are sorted to
+  Only the exact top-level `message_created` payload is used; deletion of a
+  retained message atomically stops its frozen set and removes every confirmed
+  WhatsApp part before clearing that part's local mapping. Stable numeric attachment IDs are sorted to
   make part identities independent of webhook array order, and the exact
   content/origin/part set is frozen by hash plus database uniqueness.
   A database-leased worker sends each part with a deterministic planned
@@ -132,8 +133,10 @@ tags are never deployment inputs.
   without blind resend. Preparation is bounded to six attempts and then emits
   one exact message-level failure callback without invoking transport. The
   captured provider/account/inbox/conversation/message/contact origin and the
-  live physical receiver/instance binding are revalidated at enqueue,
-  preparation, transport and callback; mismatch quarantines the whole message.
+  live physical receiver/instance binding, authoritative enabled provider row,
+  inbox ID/name and route metadata, current conversation/message relationship,
+  and destination are revalidated at enqueue, preparation, transport and
+  callback; reassignment, rename, deletion, or mismatch quarantines the whole message.
   Multipart callback begins only after all parts resolve. The leader PATCHes
   every part in canonical order with its stable operation key, index, count and
   raw WAID. EVO validates Chatwoot's exact contract-version-1 acknowledgement
@@ -143,7 +146,12 @@ tags are never deployment inputs.
   never repeats WhatsApp transport, and marks the whole message completed only
   after all acknowledgements succeed. Conflicting mappings fail closed. The
   callback response must also acknowledge the exact message ID and valid status
-  (or exact `failed` status). Feature-off preserves the legacy source-ID path.
+  (or exact `failed` status). Mixed terminal multipart outcomes preserve the
+  exact successful mappings as `PartialDelivery` without resending. Validation,
+  readiness, media/send and callback work have abortable time budgets; only a
+  pre-transport timeout may retry. Feature-off preserves the legacy source-ID
+  path for new messages while retained ledger rows prevent replay across
+  rollback/cutover.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -160,15 +168,17 @@ tags are never deployment inputs.
   enqueue, every per-part `provider_delivery` acknowledgement, API-only live
   source-ID confirmation, and fail-closed treatment of expired `sending`
   leases. Never collapse multipart to a primary-only callback, move media
-  preparation behind the sending boundary, or log operation payloads/customer
-  identifiers.
+  preparation behind the sending boundary, remove retained-ledger cutover or
+  deletion coordination, wrap `OutboundBindingMismatch` in an adapter error,
+  or log operation payloads/customer identifiers.
 - **Rollback:** first enable drain-only while async remains enabled, reject new
   ingress, and wait for active states to drain. Reconcile `ambiguous` only by
   exact planned WAID and investigate `quarantined`; never reset or blindly
   resend either. Disable async and deploy the prior immutable image only after
   every accepted operation is terminal. Keep the additive table and rows.
 - **Focused regression:** run `npm run test:unit --
-  tests/chatwoot-outbound-queue.test.ts tests/chatwoot-delivery-failure.test.ts
+  tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
+  tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
   tests/chatwoot-auto-reply-binding.test.ts`, generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,

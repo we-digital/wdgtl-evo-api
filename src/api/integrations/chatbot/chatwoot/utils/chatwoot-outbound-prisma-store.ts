@@ -8,7 +8,13 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 import { PrismaRepository } from '@api/repository/repository.service';
 
-const ACTIVE_STATES: ChatwootOutboundState[] = ['pending', 'callback_pending', 'failure_callback_pending', 'ambiguous'];
+const ACTIVE_STATES: ChatwootOutboundState[] = [
+  'pending',
+  'callback_pending',
+  'failure_callback_pending',
+  'ambiguous',
+  'delete_pending',
+];
 
 export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   constructor(private readonly repository: PrismaRepository) {}
@@ -23,7 +29,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     if (parts.length === 0) throw new Error('Chatwoot outbound part set is empty');
     const existing = await this.messageOperations(instanceId, messageId);
     if (existing.length > 0) {
-      this.assertFrozenPartSet(existing, parts);
+      if (!this.isExactFrozenPartSet(existing, parts)) {
+        await this.quarantineFrozenSet(instanceId, messageId, 'ChangedFrozenPartSet');
+        throw new Error('Chatwoot outbound part set is already frozen with different content');
+      }
       return;
     }
 
@@ -50,7 +59,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     } catch (error) {
       const afterConflict = await this.messageOperations(instanceId, messageId);
       if (afterConflict.length > 0) {
-        this.assertFrozenPartSet(afterConflict, parts);
+        if (!this.isExactFrozenPartSet(afterConflict, parts)) {
+          await this.quarantineFrozenSet(instanceId, messageId, 'ChangedFrozenPartSet');
+          throw new Error('Chatwoot outbound part set is already frozen with different content');
+        }
         return;
       }
       throw error;
@@ -62,6 +74,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       this.repository.chatwootOutboundOperation.updateMany({
         where: { state: 'preparing', leaseExpiresAt: { lte: now } },
         data: { state: 'pending', leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
+      }),
+      this.repository.chatwootOutboundOperation.updateMany({
+        where: { state: 'delete_pending', leaseExpiresAt: { lte: now } },
+        data: { leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
       }),
       this.repository.chatwootOutboundOperation.updateMany({
         where: { state: 'sending', leaseExpiresAt: { lte: now } },
@@ -141,26 +157,28 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     lastErrorClass: string,
     now: Date,
   ): Promise<void> {
-    const owned = await this.repository.chatwootOutboundOperation.updateMany({
-      where: { id: operation.id, leaseOwner: workerId, state: { in: ['preparing', 'pending'] } },
-      data: { state: 'failure_callback_pending', nextAttemptAt: now, lastErrorClass },
-    });
-    if (owned.count !== 1) throw new Error('OutboundLeaseLost');
-    await this.repository.chatwootOutboundOperation.updateMany({
-      where: {
-        id: { not: operation.id },
-        instanceId: operation.instanceId,
-        chatwootMessageId: operation.payload.origin.messageId,
-        messageSetHash: operation.messageSetHash,
-        state: { in: ['pending', 'preparing', 'callback_pending'] },
-      },
-      data: {
-        state: 'failure_callback_pending',
-        nextAttemptAt: now,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        lastErrorClass,
-      },
+    await this.repository.$transaction(async (transaction) => {
+      const owned = await transaction.chatwootOutboundOperation.updateMany({
+        where: { id: operation.id, leaseOwner: workerId, state: { in: ['preparing', 'pending'] } },
+        data: { state: 'failure_callback_pending', nextAttemptAt: now, lastErrorClass },
+      });
+      if (owned.count !== 1) throw new Error('OutboundLeaseLost');
+      await transaction.chatwootOutboundOperation.updateMany({
+        where: {
+          id: { not: operation.id },
+          instanceId: operation.instanceId,
+          chatwootMessageId: operation.payload.origin.messageId,
+          messageSetHash: operation.messageSetHash,
+          state: { in: ['pending', 'preparing'] },
+        },
+        data: {
+          state: 'failure_callback_pending',
+          nextAttemptAt: now,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastErrorClass,
+        },
+      });
     });
   }
 
@@ -169,16 +187,21 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     workerId: string,
     now: Date,
   ): Promise<void> {
-    await this.assertLeaderLease(operation, workerId, 'callback_pending');
-    await this.repository.chatwootOutboundOperation.updateMany({
-      where: this.messageWhere(operation, ['callback_pending']),
-      data: {
-        state: 'completed',
-        completedAt: now,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-        lastErrorClass: null,
-      },
+    await this.repository.$transaction(async (transaction) => {
+      await this.assertLeaderLease(operation, workerId, ['callback_pending', 'failure_callback_pending'], transaction);
+      const failures = await transaction.chatwootOutboundOperation.count({
+        where: this.messageWhere(operation, ['failure_callback_pending']),
+      });
+      await transaction.chatwootOutboundOperation.updateMany({
+        where: this.messageWhere(operation, ['callback_pending', 'failure_callback_pending']),
+        data: {
+          state: 'completed',
+          completedAt: now,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastErrorClass: failures > 0 ? 'PartialDelivery' : null,
+        },
+      });
     });
   }
 
@@ -187,15 +210,17 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     workerId: string,
     now: Date,
   ): Promise<void> {
-    await this.assertLeaderLease(operation, workerId, 'failure_callback_pending');
-    await this.repository.chatwootOutboundOperation.updateMany({
-      where: this.messageWhere(operation, ['failure_callback_pending']),
-      data: {
-        state: 'failed',
-        completedAt: now,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-      },
+    await this.repository.$transaction(async (transaction) => {
+      await this.assertLeaderLease(operation, workerId, 'failure_callback_pending', transaction);
+      await transaction.chatwootOutboundOperation.updateMany({
+        where: this.messageWhere(operation, ['failure_callback_pending']),
+        data: {
+          state: 'failed',
+          completedAt: now,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        },
+      });
     });
   }
 
@@ -265,6 +290,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         'callback_pending',
         'failure_callback_pending',
         'ambiguous',
+        'delete_pending',
       ]),
       data: {
         state: 'quarantined',
@@ -275,23 +301,105 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
+  public async requestDeletion(operation: StoredChatwootOutboundOperation): Promise<void> {
+    await this.repository.chatwootOutboundOperation.updateMany({
+      where: {
+        instanceId: operation.instanceId,
+        chatwootMessageId: operation.payload.origin.messageId,
+        messageSetHash: operation.messageSetHash,
+        state: { notIn: ['deleted', 'quarantined'] },
+      },
+      data: {
+        state: 'delete_pending',
+        nextAttemptAt: new Date(),
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastErrorClass: null,
+      },
+    });
+  }
+
+  public async markDeleted(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void> {
+    await this.repository.$transaction(async (transaction) => {
+      const updated = await transaction.chatwootOutboundOperation.updateMany({
+        where: { id: operation.id, state: 'delete_pending', leaseOwner: workerId },
+        data: {
+          state: 'deleted',
+          completedAt: now,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastErrorClass: null,
+        },
+      });
+      if (updated.count !== 1) throw new Error('OutboundLeaseLost');
+      const sourceId = operation.whatsappMessageId || operation.plannedWhatsappMessageId;
+      if (operation.sendAttempts > 0) {
+        await transaction.message.deleteMany({
+          where: {
+            instanceId: operation.instanceId,
+            chatwootMessageId: operation.payload.origin.messageId,
+            chatwootInboxId: operation.payload.origin.inboxId,
+            chatwootConversationId: operation.payload.origin.conversationId,
+            key: { path: ['id'], equals: sourceId },
+          },
+        });
+      }
+    });
+  }
+
+  public async scheduleDeletion(
+    id: string,
+    workerId: string,
+    nextAttemptAt: Date,
+    lastErrorClass: string,
+  ): Promise<void> {
+    await this.schedule(id, workerId, 'delete_pending', nextAttemptAt, lastErrorClass, {
+      callbackAttempts: { increment: 1 },
+    });
+  }
+
+  public async hasRetainedMessage(instanceId: string, messageId: number): Promise<boolean> {
+    return (
+      (await this.repository.chatwootOutboundOperation.count({
+        where: { instanceId, chatwootMessageId: messageId },
+      })) > 0
+    );
+  }
+
+  public async retainedOperations(instanceId: string, messageId: number): Promise<StoredChatwootOutboundOperation[]> {
+    return (await this.messageOperations(instanceId, messageId)).map((operation) => this.toStored(operation));
+  }
+
   public async messageStatus(operation: StoredChatwootOutboundOperation): Promise<ChatwootOutboundMessageStatus> {
     const operations = await this.messageOperations(operation.instanceId, operation.payload.origin.messageId);
     this.assertStoredMessageSet(operations, operation.messageSetHash, operation.partCount);
-    const successReady = operations.every(
+    const waiting = operations.some((candidate) =>
+      ['pending', 'preparing', 'sending', 'ambiguous', 'delete_pending'].includes(candidate.state),
+    );
+    const successes = operations.filter(
       (candidate) =>
         ['callback_pending', 'completed'].includes(candidate.state) &&
         typeof candidate.whatsappMessageId === 'string' &&
         candidate.whatsappMessageId.length > 0,
     );
+    const failures = operations.filter((candidate) => ['failure_callback_pending', 'failed'].includes(candidate.state));
+    const ready = !waiting && successes.length + failures.length === operations.length;
+    const outcome = !ready
+      ? 'waiting'
+      : successes.length === operations.length
+        ? 'success'
+        : successes.length > 0
+          ? 'partial_success'
+          : 'failure';
     return {
-      ready: successReady,
+      ready,
       leader: operation.partIndex === 0,
-      callbackParts: successReady
-        ? operations.map((candidate) => ({
+      outcome,
+      callbackParts: ready
+        ? successes.map((candidate, partIndex) => ({
             partKey: candidate.operationKey,
-            partIndex: candidate.partIndex,
-            partCount: candidate.partCount,
+            partIndex,
+            partCount: successes.length,
             sourceId: candidate.whatsappMessageId,
           }))
         : [],
@@ -317,7 +425,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
-  private assertFrozenPartSet(existing: any[], parts: ChatwootOutboundPart[]) {
+  private isExactFrozenPartSet(existing: any[], parts: ChatwootOutboundPart[]): boolean {
     const expectedHash = parts[0].messageSetHash;
     const exact =
       existing.length === parts.length &&
@@ -330,7 +438,19 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           operation.partIdentity === parts[index].partIdentity &&
           operation.plannedWhatsappMessageId === parts[index].plannedWhatsappMessageId,
       );
-    if (!exact) throw new Error('Chatwoot outbound part set is already frozen with different content');
+    return exact;
+  }
+
+  private async quarantineFrozenSet(instanceId: string, messageId: number, lastErrorClass: string) {
+    await this.repository.chatwootOutboundOperation.updateMany({
+      where: { instanceId, chatwootMessageId: messageId },
+      data: {
+        state: 'quarantined',
+        lastErrorClass,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      },
+    });
   }
 
   private assertStoredMessageSet(existing: any[], messageSetHash: string, partCount: number) {
@@ -356,11 +476,12 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   private async assertLeaderLease(
     operation: StoredChatwootOutboundOperation,
     workerId: string,
-    state: ChatwootOutboundState,
+    state: ChatwootOutboundState | ChatwootOutboundState[],
+    repository: Pick<PrismaRepository, 'chatwootOutboundOperation'> = this.repository,
   ) {
     if (operation.partIndex !== 0) throw new Error('Invalid callback leader');
-    const owned = await this.repository.chatwootOutboundOperation.count({
-      where: { id: operation.id, state, leaseOwner: workerId },
+    const owned = await repository.chatwootOutboundOperation.count({
+      where: { id: operation.id, state: Array.isArray(state) ? { in: state } : state, leaseOwner: workerId },
     });
     if (owned !== 1) throw new Error('OutboundLeaseLost');
   }

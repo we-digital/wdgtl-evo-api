@@ -6,6 +6,7 @@ export interface BaileysTransportOptions {
   ephemeralExpiration?: number;
   contextInfo?: any;
   beforeTransport?: () => Promise<void>;
+  signal?: AbortSignal;
 }
 
 export const buildBaileysTransportOptions = (options: BaileysTransportOptions): BaileysTransportOptions => ({
@@ -16,4 +17,5 @@ export const buildBaileysTransportOptions = (options: BaileysTransportOptions): 
   ephemeralExpiration: options.ephemeralExpiration,
   contextInfo: options.contextInfo,
   beforeTransport: options.beforeTransport,
+  signal: options.signal,
 });

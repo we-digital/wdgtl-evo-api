@@ -2320,7 +2320,8 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     sender = sender.toLowerCase();
 
-    const { mentions, linkPreview, quoted, messageId, ephemeralExpiration, contextInfo, beforeTransport } = transport;
+    const { mentions, linkPreview, quoted, messageId, ephemeralExpiration, contextInfo, beforeTransport, signal } =
+      transport;
 
     const option: any = { quoted };
 
@@ -2338,6 +2339,11 @@ export class BaileysStartupService extends ChannelStartupService {
     // NOTE: NÃO DEVEMOS GERAR O messageId AQUI, SOMENTE SE VIER INFORMADO POR PARAMETRO. A GERAÇÃO ANTERIOR IMPEDE O WZAP DE IDENTIFICAR A SOURCE.
     if (messageId) option.messageId = messageId;
 
+    if (signal?.aborted) {
+      const error = new Error('Outbound operation aborted before transport');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
     await beforeTransport?.();
 
     if (message['viewOnceMessage']) {
@@ -2580,6 +2586,7 @@ export class BaileysStartupService extends ChannelStartupService {
             messageId: options?.messageId,
             ephemeralExpiration: group?.ephemeralDuration,
             beforeTransport: options?.beforeTransport,
+            signal: options?.signal,
           }),
         );
       } else {
@@ -2604,6 +2611,7 @@ export class BaileysStartupService extends ChannelStartupService {
             messageId: options?.messageId,
             contextInfo,
             beforeTransport: options?.beforeTransport,
+            signal: options?.signal,
           }),
         );
       }
@@ -2746,7 +2754,8 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return messageRaw;
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(JSON.stringify({ event: 'whatsapp_send_error', errorClass: error?.name || 'Error' }));
+      if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
       throw new BadRequestException(error.toString());
     }
   }
@@ -2835,6 +2844,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mentioned: data?.mentioned,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        signal: data?.signal,
       },
       isIntegration,
       provenance,
@@ -2944,7 +2954,7 @@ export class BaileysStartupService extends ChannelStartupService {
       if (mediaMessage.mediatype === 'image') {
         let imageBuffer: Buffer;
         if (isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
+          let config: any = { responseType: 'arraybuffer', signal: mediaMessage.signal };
 
           if (this.localProxy?.enabled) {
             config = {
@@ -3005,7 +3015,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mimetype = mimeTypes.lookup(mediaMessage.fileName);
 
         if (!mimetype && isURL(mediaMessage.media)) {
-          let config: any = { responseType: 'arraybuffer' };
+          let config: any = { responseType: 'arraybuffer', signal: mediaMessage.signal };
 
           if (this.localProxy?.enabled) {
             config = {
@@ -3194,6 +3204,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mentioned: data?.mentioned,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        signal: data?.signal,
       },
       isIntegration,
       provenance,
@@ -3435,6 +3446,7 @@ export class BaileysStartupService extends ChannelStartupService {
             delay: data?.delay,
             messageId: data?.messageId,
             beforeTransport: data?.beforeTransport,
+            signal: data?.signal,
           },
           isIntegration,
           provenance,
@@ -3458,6 +3470,7 @@ export class BaileysStartupService extends ChannelStartupService {
         delay: data?.delay,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        signal: data?.signal,
       },
       isIntegration,
       provenance,

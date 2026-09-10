@@ -13,19 +13,24 @@ duplicate WhatsApp messages.
 
 - Enable with `CHATWOOT_OUTBOUND_ASYNC_ENABLED=true`. The default is `false`.
 - Only an exact top-level `message_created` outgoing payload is eligible.
-  Conversation-history messages and deletion events never enter this queue;
-  the existing deletion handler remains synchronous. Every attachment needs a
+  Conversation-history messages never enter this queue. A deletion for a
+  retained message atomically moves its complete frozen set to
+  `delete_pending`, which prevents later transport and lets the worker delete
+  every confirmed WhatsApp part before its local mapping is removed. Every attachment needs a
   stable numeric Chatwoot attachment ID. Parts are ordered by that ID, so
   webhook array order cannot change their identities.
-- The full origin (provider ID/base URL, account, inbox, conversation, message
+- The full origin (provider ID/base URL, account, inbox ID/name, conversation, message
   and contact-inbox source) and the physical EVO receiver/instance binding are
-  captured at enqueue and revalidated from the live provider at preparation,
-  immediately before transport, and before callback. A mismatch quarantines
-  the complete message and never sends or retries it.
+  captured at enqueue and revalidated from the authoritative enabled provider
+  row plus the live Chatwoot inbox, route metadata, conversation, current
+  destination and message at preparation, immediately before transport, and
+  before callback. Reassignment, rename, deletion, or any other mismatch
+  quarantines the complete message and never sends or retries it.
 - The unique operation key covers the EVO instance, exact message-set hash and
   stable part identity. A database uniqueness constraint freezes one exact
   part set per `instance + Chatwoot message`; a replay with changed content,
-  attachments or origin fails closed. HTTP 202 is returned only after the
+  attachments or origin atomically quarantines every retained part and fails
+  closed. HTTP 202 is returned only after the
   whole frozen set commits in one transaction.
 - Each part receives a deterministic planned WhatsApp message ID. Baileys gets
   that ID through its supported `messageId` send option.
@@ -33,6 +38,10 @@ duplicate WhatsApp messages.
   in `preparing`. A failure there is proven pre-transport and may retry with
   bounded backoff. Six failed preparation attempts are terminal and trigger an
   exact message-level `failed` callback; they never invoke WhatsApp transport.
+- Live validation, readiness, media preparation/send and Chatwoot callbacks
+  have cancellable time budgets. Timeout before transport consumes a bounded
+  preparation attempt; timeout after the durable `sending` transition is
+  ambiguous and can only reconcile by exact planned WAID.
 - The operation becomes `sending` in the database immediately before the
   Baileys transport call. A failure or restart after that transition becomes
   `ambiguous` and never causes a blind resend.
@@ -58,8 +67,14 @@ duplicate WhatsApp messages.
   WhatsApp. The whole message becomes `completed` only after every response is
   acknowledged. A terminal failure callback is accepted only for the exact
   message ID and `failed` status.
-- With `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`, the legacy synchronous path and
-  its source-ID update contract are unchanged.
+- If one multipart sibling ends in a confirmed pre-send failure while another
+  has an exact WAID, the worker atomically completes the message as
+  `PartialDelivery`, publishes only the confirmed mappings, and never resends
+  or discards the delivered sibling.
+- With `CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`, new messages retain the legacy
+  synchronous path, but a retained ledger row always wins: an already accepted
+  or completed message cannot replay through synchronous transport during
+  cutover or rollback.
 - Logs contain only state/error classes and aggregate counts. Do not log the
   payload, phone/JID, body, media URL, route binding or customer identifiers.
 
@@ -134,7 +149,8 @@ strand durable operations when the old image starts serving synchronously.
    image. New eligible webhooks receive 503 and therefore are not accepted;
    the worker continues draining already committed operations.
 2. Observe aggregate states until no rows remain in `pending`, `preparing`,
-   `sending`, `callback_pending`, or `failure_callback_pending`.
+   `sending`, `callback_pending`, `failure_callback_pending`, or
+   `delete_pending`.
 3. Reconcile every `ambiguous` row only by its exact planned WAID. Investigate
    `quarantined` rows against the captured origin/binding. Neither state may be
    reset to `pending`, deleted, or blindly resent.
