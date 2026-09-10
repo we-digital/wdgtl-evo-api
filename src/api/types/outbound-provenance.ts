@@ -62,29 +62,51 @@ type ChatwootOutboundMessageIdLookup = (whatsappMessageId: string) => Promise<bo
 
 interface ChatwootOutboundMessageIdRepository {
   chatwootOutboundOperation: {
-    findFirst(args: {
+    findMany(args: {
       where: {
         instanceId: string;
         OR: Array<{ plannedWhatsappMessageId?: string; whatsappMessageId?: string }>;
       };
-      select: { id: true };
-    }): Promise<{ id: string } | null>;
+      select: {
+        instanceId: true;
+        plannedWhatsappMessageId: true;
+        whatsappMessageId: true;
+      };
+    }): Promise<
+      Array<{
+        instanceId: string;
+        plannedWhatsappMessageId: string;
+        whatsappMessageId: string | null;
+      }>
+    >;
   };
 }
 
 export async function isRetainedChatwootOutboundMessageId(
   repository: ChatwootOutboundMessageIdRepository,
-  instanceId: string,
+  instanceId: unknown,
   whatsappMessageId: string,
 ): Promise<boolean> {
-  const operation = await repository.chatwootOutboundOperation.findFirst({
+  if (typeof instanceId !== 'string' || instanceId.length === 0 || instanceId.length > 100 || /\s/.test(instanceId)) {
+    return false;
+  }
+
+  const operations = await repository.chatwootOutboundOperation.findMany({
     where: {
       instanceId,
       OR: [{ plannedWhatsappMessageId: whatsappMessageId }, { whatsappMessageId }],
     },
-    select: { id: true },
+    select: {
+      instanceId: true,
+      plannedWhatsappMessageId: true,
+      whatsappMessageId: true,
+    },
   });
-  return operation !== null;
+  return operations.some(
+    (operation) =>
+      operation.instanceId === instanceId &&
+      (operation.plannedWhatsappMessageId === whatsappMessageId || operation.whatsappMessageId === whatsappMessageId),
+  );
 }
 
 export async function isChatwootOutboundEcho(
@@ -98,6 +120,16 @@ export async function isChatwootOutboundEcho(
     contextInfo?: unknown;
   };
   if (candidate.key?.fromMe !== true) return false;
+
+  const whatsappMessageId = candidate.key?.id;
+  if (
+    typeof whatsappMessageId !== 'string' ||
+    whatsappMessageId.length === 0 ||
+    whatsappMessageId.length > 100 ||
+    /\s/.test(whatsappMessageId)
+  ) {
+    return false;
+  }
 
   const provenance =
     candidate.contextInfo && typeof candidate.contextInfo === 'object' && !Array.isArray(candidate.contextInfo)
@@ -119,14 +151,7 @@ export async function isChatwootOutboundEcho(
   );
   if (hasCompleteProvenance) return true;
 
-  const whatsappMessageId = candidate.key?.id;
-  if (
-    typeof whatsappMessageId !== 'string' ||
-    whatsappMessageId.length === 0 ||
-    whatsappMessageId.length > 100 ||
-    /\s/.test(whatsappMessageId) ||
-    !isKnownChatwootOutboundMessageId
-  ) {
+  if (!isKnownChatwootOutboundMessageId) {
     return false;
   }
 

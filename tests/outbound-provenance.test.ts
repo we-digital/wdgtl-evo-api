@@ -56,7 +56,7 @@ test('stores provenance alongside existing message context without replacing it'
 
 test('suppresses a complete locally-originated Chatwoot outbound echo without a ledger lookup', async () => {
   const echo = {
-    key: { fromMe: true },
+    key: { fromMe: true, id: 'WDDE7D150B1147822490' },
     contextInfo: {
       weDigitalOutbound: {
         version: 1,
@@ -70,9 +70,9 @@ test('suppresses a complete locally-originated Chatwoot outbound echo without a 
   };
 
   let lookups = 0;
-  const lookup = async () => {
+  const lookup = async (whatsappMessageId: string) => {
     lookups += 1;
-    return true;
+    return whatsappMessageId === 'WDDE7D150B1147822490';
   };
 
   assert.equal(await isChatwootOutboundEcho(echo, lookup), true);
@@ -82,16 +82,21 @@ test('suppresses a complete locally-originated Chatwoot outbound echo without a 
     await isChatwootOutboundEcho(
       {
         ...echo,
+        key: { fromMe: true, id: 'unknown-api-send' },
         contextInfo: { weDigitalOutbound: { ...echo.contextInfo.weDigitalOutbound, origin: 'api' } },
       },
       lookup,
     ),
     false,
   );
+  assert.equal(await isChatwootOutboundEcho({ ...echo, key: { fromMe: true, id: ['bad'] } }, lookup), false);
+  assert.equal(await isChatwootOutboundEcho({ ...echo, key: { fromMe: true, id: 'bad id' } }, lookup), false);
+  assert.equal(await isChatwootOutboundEcho({ ...echo, key: { fromMe: true, id: 'x'.repeat(101) } }, lookup), false);
   assert.equal(
     await isChatwootOutboundEcho(
       {
         ...echo,
+        key: { fromMe: true, id: 'unknown-api-send' },
         contextInfo: { weDigitalOutbound: { ...echo.contextInfo.weDigitalOutbound, chatwootMessageId: '314' } },
       },
       lookup,
@@ -119,9 +124,15 @@ test('looks up both planned and actual WhatsApp IDs inside the exact instance', 
   const queries: unknown[] = [];
   const repository = {
     chatwootOutboundOperation: {
-      findFirst: async (query: unknown) => {
+      findMany: async (query: unknown) => {
         queries.push(query);
-        return { id: 'operation-1' };
+        return [
+          {
+            instanceId: 'instance-1',
+            plannedWhatsappMessageId: 'WDDE7D150B1147822490',
+            whatsappMessageId: null,
+          },
+        ];
       },
     },
   };
@@ -133,7 +144,38 @@ test('looks up both planned and actual WhatsApp IDs inside the exact instance', 
         instanceId: 'instance-1',
         OR: [{ plannedWhatsappMessageId: 'WDDE7D150B1147822490' }, { whatsappMessageId: 'WDDE7D150B1147822490' }],
       },
-      select: { id: true },
+      select: {
+        instanceId: true,
+        plannedWhatsappMessageId: true,
+        whatsappMessageId: true,
+      },
     },
   ]);
+});
+
+test('requires byte-exact instance and WAID matches despite a case-insensitive database candidate set', async () => {
+  let lookups = 0;
+  const repository = {
+    chatwootOutboundOperation: {
+      findMany: async () => {
+        lookups += 1;
+        return [
+          {
+            instanceId: 'INSTANCE-1',
+            plannedWhatsappMessageId: 'wdde7d150b1147822490',
+            whatsappMessageId: '3eb0abcdef',
+          },
+        ];
+      },
+    },
+  };
+
+  assert.equal(await isRetainedChatwootOutboundMessageId(repository, 'instance-1', 'WDDE7D150B1147822490'), false);
+  assert.equal(await isRetainedChatwootOutboundMessageId(repository, 'instance-1', '3EB0ABCDEF'), false);
+  assert.equal(lookups, 2);
+
+  assert.equal(await isRetainedChatwootOutboundMessageId(repository, undefined, 'WDDE7D150B1147822490'), false);
+  assert.equal(await isRetainedChatwootOutboundMessageId(repository, '', 'WDDE7D150B1147822490'), false);
+  assert.equal(await isRetainedChatwootOutboundMessageId(repository, 'bad instance', 'WDDE7D150B1147822490'), false);
+  assert.equal(lookups, 2);
 });

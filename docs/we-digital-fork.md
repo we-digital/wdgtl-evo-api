@@ -167,7 +167,7 @@ tags are never deployment inputs.
   Media-preparation logs retain only the bounded error class, while binding
   and abort errors pass through. Locally generated `send.message` or
   `messages.upsert` echoes that carry complete Chatwoot outbound provenance, or
-  whose exact WhatsApp ID is retained in the durable Chatwoot outbound ledger,
+  whose byte-exact WhatsApp ID and instance ID are retained in the durable Chatwoot outbound ledger,
   are not imported back into Chatwoot as a second outgoing message. The ledger
   lookup covers Baileys socket echoes that do not retain custom message
   metadata. Ordinary API sends, inbound messages, and unknown IDs keep their
