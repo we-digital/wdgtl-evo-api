@@ -76,7 +76,11 @@ import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/uti
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
-import { OutboundMessageProvenance } from '@api/types/outbound-provenance';
+import {
+  isChatwootOutboundEcho,
+  isRetainedChatwootOutboundMessageId,
+  OutboundMessageProvenance,
+} from '@api/types/outbound-provenance';
 import { Events } from '@api/types/wa.types';
 import { Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
 import { Logger } from '@config/logger.config';
@@ -2764,6 +2768,18 @@ export class ChatwootService {
 
       if (!waInstance) {
         this.logger.warn('wa instance not found');
+        return null;
+      }
+
+      if (
+        (event === 'messages.upsert' || event === 'send.message') &&
+        (await isChatwootOutboundEcho(body, (whatsappMessageId) =>
+          isRetainedChatwootOutboundMessageId(this.prismaRepository, instance.instanceId, whatsappMessageId),
+        ))
+      ) {
+        this.logger.info(
+          JSON.stringify({ event: 'chatwoot_outbound_echo_suppressed', instanceId: instance.instanceId }),
+        );
         return null;
       }
 

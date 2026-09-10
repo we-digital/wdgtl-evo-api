@@ -165,7 +165,13 @@ tags are never deployment inputs.
   query parameters, or fragments. A validated download response MIME remains
   authoritative when the safe filename has no recognized extension.
   Media-preparation logs retain only the bounded error class, while binding
-  and abort errors pass through.
+  and abort errors pass through. Locally generated `send.message` or
+  `messages.upsert` echoes that carry complete Chatwoot outbound provenance, or
+  whose exact WhatsApp ID is retained in the durable Chatwoot outbound ledger,
+  are not imported back into Chatwoot as a second outgoing message. The ledger
+  lookup covers Baileys socket echoes that do not retain custom message
+  metadata. Ordinary API sends, inbound messages, and unknown IDs keep their
+  existing event path.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -197,7 +203,8 @@ tags are never deployment inputs.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
-  tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts`,
+  tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
+  tests/outbound-provenance.test.ts`,
   generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,
