@@ -274,6 +274,8 @@ model ChatwootOutboundOperation {
   @@unique([instanceId, chatwootMessageId, partIndex], map: "Cwo_instance_message_index_key")
   @@index([state, nextAttemptAt], map: "Cwo_state_next_idx")
   @@index([instanceId, chatwootMessageId], map: "Cwo_instance_message_idx")
+  @@index([instanceId, plannedWhatsappMessageId], map: "Cwo_instance_planned_waid_idx")
+  @@index([instanceId, whatsappMessageId], map: "Cwo_instance_actual_waid_idx")
 }
 
 model Label {
