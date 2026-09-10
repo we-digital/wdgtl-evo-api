@@ -111,6 +111,7 @@ model Instance {
   Evoai                   Evoai[]
   EvoaiSetting            EvoaiSetting?
   Pusher                  Pusher?
+  ChatwootOutbound        ChatwootOutboundOperation[]
 }
 
 model Session {
@@ -237,6 +238,43 @@ model Chatwoot {
   updatedAt               DateTime  @updatedAt @db.Timestamp
   Instance                Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId              String    @unique
+}
+
+model ChatwootOutboundOperation {
+  id                       String    @id @default(cuid())
+  operationKey             String    @unique(map: "Cwo_operation_key_key") @db.VarChar(64)
+  messageSetHash           String    @db.VarChar(64)
+  instanceId               String
+  chatwootMessageId        Int       @db.Int
+  chatwootInboxId          Int       @db.Int
+  chatwootConversationId   Int       @db.Int
+  partIdentity             String    @db.VarChar(64)
+  partIndex                Int       @db.Int
+  partCount                Int       @db.Int
+  plannedWhatsappMessageId String    @db.VarChar(32)
+  whatsappMessageId        String?   @db.VarChar(100)
+  state                    String    @default("pending") @db.VarChar(32)
+  payload                  Json      @db.Json
+  result                   Json?     @db.Json
+  preparationAttempts      Int       @default(0) @db.Int
+  sendAttempts             Int       @default(0) @db.Int
+  callbackAttempts         Int       @default(0) @db.Int
+  nextAttemptAt            DateTime  @default(now()) @db.Timestamp
+  leaseOwner               String?   @db.VarChar(100)
+  leaseExpiresAt           DateTime? @db.Timestamp
+  claimGeneration          Int       @default(0) @db.Int
+  sendStartedAt            DateTime? @db.Timestamp
+  sentAt                   DateTime? @db.Timestamp
+  completedAt              DateTime? @db.Timestamp
+  lastErrorClass           String?   @db.VarChar(100)
+  createdAt                DateTime  @default(dbgenerated("CURRENT_TIMESTAMP")) @db.Timestamp
+  updatedAt                DateTime  @updatedAt @db.Timestamp
+  Instance                 Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+
+  @@unique([instanceId, chatwootMessageId, partIdentity], map: "Cwo_instance_message_part_key")
+  @@unique([instanceId, chatwootMessageId, partIndex], map: "Cwo_instance_message_index_key")
+  @@index([state, nextAttemptAt], map: "Cwo_state_next_idx")
+  @@index([instanceId, chatwootMessageId], map: "Cwo_instance_message_idx")
 }
 
 model Label {

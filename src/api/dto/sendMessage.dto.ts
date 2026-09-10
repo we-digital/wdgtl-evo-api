@@ -14,6 +14,9 @@ export class Options {
   mentionsEveryOne?: boolean;
   mentioned?: string[];
   webhookUrl?: string;
+  messageId?: string;
+  beforeTransport?: () => Promise<void>;
+  signal?: AbortSignal;
 }
 
 export class MediaMessage {
@@ -24,6 +27,7 @@ export class MediaMessage {
   fileName?: string;
   // url or base64
   media: string;
+  signal?: AbortSignal;
 }
 
 export class StatusMessage {
@@ -45,6 +49,9 @@ export class Metadata {
   mentioned?: string[];
   encoding?: boolean;
   notConvertSticker?: boolean;
+  messageId?: string;
+  beforeTransport?: () => Promise<void>;
+  signal?: AbortSignal;
 }
 
 export class SendTextDto extends Metadata {
