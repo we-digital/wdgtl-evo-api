@@ -20,6 +20,9 @@ export class ChatwootDto {
   organization?: string;
   logo?: string;
   ignoreJids?: string[];
+  webhookSecret?: string;
+  webhookPreviousSecret?: string;
+  webhookPreviousSecretValidUntil?: string | Date;
 }
 
 export class ChatwootHistorySyncDto {

@@ -75,6 +75,25 @@ test('builds a per-part provider delivery callback without changing the legacy r
   assert.equal('provider_delivery' in buildChatwootDeliverySuccessUpdate(7, 42, 314, 'WAID:single').data, false);
 });
 
+test('binds a provider callback to the exact authoritative snapshot and route', () => {
+  const providerContext = {
+    snapshot_version: 1 as const,
+    snapshot_fingerprint: 'a'.repeat(64),
+    binding: {
+      version: 2,
+      provider: 'evo_whatsapp',
+      inbox_id: 58,
+      instance_id: 'instance-1',
+      instance_name: 'test-instance',
+      receiver_fingerprint: 'b'.repeat(64),
+    },
+  };
+  const update = buildChatwootDeliverySuccessUpdate(7, 42, 314, 'WAID:part-0', providerParts[0], providerContext);
+
+  assert.deepEqual(update.data.provider_context, providerContext);
+  assert.deepEqual(update.data.provider_delivery, { part_key: 'part-0', part_index: 0, part_count: 2 });
+});
+
 test('accepts exact partial and complete provider acknowledgements independent of response mapping order', () => {
   const partial = {
     id: 314,
@@ -113,7 +132,12 @@ test('accepts exact partial and complete provider acknowledgements independent o
   };
   assert.equal(isChatwootProviderDeliveryAcknowledged(complete, 314, providerParts[0], providerParts), true);
   assert.equal(
-    isChatwootProviderDeliveryAcknowledged({ meta: { scoped: true }, payload: complete }, 314, providerParts[0], providerParts),
+    isChatwootProviderDeliveryAcknowledged(
+      { meta: { scoped: true }, payload: complete },
+      314,
+      providerParts[0],
+      providerParts,
+    ),
     true,
   );
 });
@@ -163,7 +187,10 @@ test('rejects provider acknowledgement conflicts and incomplete single-part conf
     ),
     false,
   );
-  assert.equal(isChatwootProviderDeliveryAcknowledged({ ...singleResponse, id: 315 }, 314, exactSingle[0], exactSingle), false);
+  assert.equal(
+    isChatwootProviderDeliveryAcknowledged({ ...singleResponse, id: 315 }, 314, exactSingle[0], exactSingle),
+    false,
+  );
 });
 
 test('identifies only deliverable outgoing webhooks for missing-instance failure reporting', () => {
@@ -178,15 +205,15 @@ test('identifies only deliverable outgoing webhooks for missing-instance failure
   assert.equal(isDeliverableChatwootOutgoing(outgoing, '628123@s.whatsapp.net'), true);
   assert.equal(isDeliverableChatwootOutgoing({ ...outgoing, message_type: 1 }, '628123@s.whatsapp.net'), true);
   assert.equal(
-    isDeliverableChatwootOutgoing(
-      { ...outgoing, source_id: 'WAID:internal' },
-      '628123@s.whatsapp.net',
-    ),
+    isDeliverableChatwootOutgoing({ ...outgoing, source_id: 'WAID:internal' }, '628123@s.whatsapp.net'),
     false,
   );
   assert.equal(isDeliverableChatwootOutgoing({ ...outgoing, message_type: 'incoming' }, '628123'), false);
   assert.equal(
-    isDeliverableChatwootOutgoing({ ...outgoing, event: 'message_updated', content_attributes: { deleted: true } }, '628123'),
+    isDeliverableChatwootOutgoing(
+      { ...outgoing, event: 'message_updated', content_attributes: { deleted: true } },
+      '628123',
+    ),
     false,
   );
   assert.equal(isDeliverableChatwootOutgoing(outgoing, '123456'), false);

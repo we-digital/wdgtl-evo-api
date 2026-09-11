@@ -89,11 +89,27 @@ export class ChatwootRouter extends RouterBroker {
         res.status(HttpStatus.OK).json(response);
       })
       .post(this.routerPath('webhook'), async (req, res) => {
+        const rawBody = Buffer.isBuffer(req.body) ? req.body : undefined;
+        const admission = await chatwootController.authenticateOutboundWebhook(
+          req.params.instanceName,
+          rawBody,
+          req.headers,
+        );
+        if (Buffer.isBuffer(rawBody)) {
+          try {
+            req.body = JSON.parse(rawBody.toString('utf8'));
+          } catch {
+            throw Object.assign(new Error('Invalid Chatwoot webhook JSON'), {
+              name: 'ChatwootWebhookInvalidJson',
+              status: 400,
+            });
+          }
+        }
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: instanceSchema,
           ClassRef: InstanceDto,
-          execute: (instance, data) => chatwootController.receiveWebhook(instance, data),
+          execute: (instance, data) => chatwootController.receiveWebhook(instance, data, admission),
         });
 
         res.status((response as any)?.accepted ? HttpStatus.ACCEPTED : HttpStatus.OK).json(response);
