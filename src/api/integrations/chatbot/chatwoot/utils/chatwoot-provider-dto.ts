@@ -3,6 +3,7 @@ import { Chatwoot as ChatwootModel } from '@prisma/client';
 
 export const toChatwootProviderDto = (data: ChatwootModel): ChatwootDto => ({
   id: data.id,
+  instanceId: data.instanceId,
   enabled: data.enabled,
   accountId: data.accountId ?? undefined,
   token: data.token ?? undefined,
