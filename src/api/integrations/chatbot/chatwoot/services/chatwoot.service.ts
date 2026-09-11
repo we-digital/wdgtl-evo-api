@@ -1872,7 +1872,9 @@ export class ChatwootService {
     const { origin } = operation.payload;
     const instance = await this.outboundInstance(operation);
     const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } });
-    if (!instance || !provider?.enabled || provider.id !== origin.providerId) throw this.outboundBindingMismatch();
+    if (!instance || !this.providerMatchesFrozenOutboundOrigin(provider, origin)) {
+      throw this.outboundBindingMismatch();
+    }
     const expectedRoute = this.buildEvoRouteBinding(instance, provider, origin.inboxId);
     if (!chatwootEvoRouteBindingsEqual(expectedRoute, origin.routeBinding)) throw this.outboundBindingMismatch();
     let providerContext = operation.callbackContext as ChatwootProviderContext | undefined;
@@ -1893,16 +1895,7 @@ export class ChatwootService {
       );
       let response: any;
       try {
-        response = await this.awaitCancelable(
-          updateChatwootMessageJson(
-            this.getClientCwConfig(provider),
-            update.accountId,
-            update.conversationId,
-            update.messageId,
-            update.data,
-          ) as any,
-          signal,
-        );
+        response = await this.updateQueuedOutboundMessage(provider, update, signal);
       } catch (error) {
         this.throwConditionalCallbackOutcome(error);
       }
@@ -1923,6 +1916,38 @@ export class ChatwootService {
       );
       if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
+  }
+
+  private providerMatchesFrozenOutboundOrigin(provider: any, origin: ChatwootOutboundOrigin): boolean {
+    const accountId = Number(provider?.accountId);
+    return Boolean(
+      provider?.enabled === true &&
+        provider?.id === origin.providerId &&
+        typeof provider?.url === 'string' &&
+        typeof provider?.token === 'string' &&
+        provider.token.length > 0 &&
+        Number.isSafeInteger(accountId) &&
+        accountId === origin.accountId &&
+        this.normalizeChatwootBaseUrl(provider.url) === this.normalizeChatwootBaseUrl(origin.baseUrl) &&
+        provider?.nameInbox === origin.inboxName,
+    );
+  }
+
+  private async updateQueuedOutboundMessage(
+    provider: any,
+    update: ReturnType<typeof buildChatwootDeliverySuccessUpdate>,
+    signal: AbortSignal,
+  ): Promise<unknown> {
+    return this.awaitCancelable(
+      updateChatwootMessageJson(
+        this.getClientCwConfig(provider),
+        update.accountId,
+        update.conversationId,
+        update.messageId,
+        update.data,
+      ) as any,
+      signal,
+    );
   }
 
   private validCallbackProviderContext(

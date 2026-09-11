@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import '@api/server.module';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 
 const route = {
   version: 2 as const,
@@ -163,5 +164,110 @@ test('rejects an invalid authenticated route without a reverse Chatwoot failure 
   );
   assert.equal(ledgerReads, 0);
   assert.equal(reverseCallbacks, 0);
+  assert.equal(fixture.reverseReads(), 0);
+});
+
+const queuedOperation = {
+  id: 'operation-1',
+  operationKey: 'operation-key',
+  messageSetHash: 'message-set-hash',
+  instanceId: 'instance-1',
+  chatwootMessageId: 314,
+  chatwootInboxId: 58,
+  chatwootConversationId: 42,
+  partIdentity: 'text',
+  partIndex: 0,
+  partCount: 1,
+  plannedWhatsappMessageId: 'WDTEST',
+  laneKey: 'instance-1:628123',
+  laneSequence: 1n,
+  state: 'callback_pending',
+  payload: {
+    chatId: '628123',
+    text: 'hello',
+    origin: {
+      providerId: 'provider-1',
+      baseUrl: 'https://chatwoot.example.invalid',
+      accountId: 7,
+      inboxId: 58,
+      inboxName: 'WA - Test',
+      conversationId: 42,
+      messageId: 314,
+      contactInboxSourceId: 'source-1',
+      routeBinding: route,
+    },
+  },
+  preparationAttempts: 1,
+  sendAttempts: 1,
+  transportOutcomeUnresolved: false,
+  callbackAttempts: 1,
+  claimGeneration: 1,
+  callbackContext: {
+    snapshot_version: 1,
+    snapshot_fingerprint: 'b'.repeat(64),
+    binding: route,
+  },
+} as StoredChatwootOutboundOperation;
+
+const callbackParts = [{ partKey: 'operation-1', partIndex: 0, partCount: 1, sourceId: 'WDTEST' }];
+
+const callbackFixture = (currentProvider: Record<string, unknown>) => {
+  const fixture = serviceFixture('instance-1');
+  let patchCalls = 0;
+  let bindingWrites = 0;
+  fixture.service.prismaRepository = {
+    instance: { findUnique: async () => ({ id: 'instance-1', name: 'test-instance' }) },
+    chatwoot: { findUnique: async () => currentProvider },
+  };
+  fixture.service.updateQueuedOutboundMessage = async () => {
+    patchCalls += 1;
+    return {
+      id: 314,
+      status: 'sent',
+      source_id: 'WDTEST',
+      provider_delivery: {
+        contract_version: 1,
+        acknowledged: true,
+        message_confirmed: true,
+        part_key: 'operation-1',
+        part_index: 0,
+        part_count: 1,
+        acknowledged_part_count: 1,
+        source_ids: [{ part_key: 'operation-1', part_index: 0, source_id: 'WDTEST' }],
+      },
+    };
+  };
+  fixture.service.persistLocalChatwootMessageBinding = async () => {
+    bindingWrites += 1;
+    return 1;
+  };
+  return { ...fixture, patchCalls: () => patchCalls, bindingWrites: () => bindingWrites };
+};
+
+test('rejects callback when the provider URL, account or inbox drifted from the frozen origin', async () => {
+  for (const changedProvider of [
+    { ...provider, url: 'https://different.example.invalid' },
+    { ...provider, accountId: '8' },
+    { ...provider, nameInbox: 'Different inbox' },
+  ]) {
+    const fixture = callbackFixture(changedProvider);
+
+    await assert.rejects(
+      () => fixture.service.confirmQueuedOutbound(queuedOperation, callbackParts, new AbortController().signal),
+      (error: any) => error?.name === 'OutboundBindingMismatch',
+    );
+    assert.equal(fixture.patchCalls(), 0);
+    assert.equal(fixture.bindingWrites(), 0);
+    assert.equal(fixture.reverseReads(), 0);
+  }
+});
+
+test('accepts the exact frozen provider origin without a reverse Chatwoot read', async () => {
+  const fixture = callbackFixture({ ...provider, url: `${provider.url}/` });
+
+  await fixture.service.confirmQueuedOutbound(queuedOperation, callbackParts, new AbortController().signal);
+
+  assert.equal(fixture.patchCalls(), 1);
+  assert.equal(fixture.bindingWrites(), 1);
   assert.equal(fixture.reverseReads(), 0);
 });
