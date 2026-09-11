@@ -6,6 +6,7 @@ import {
   ChatwootHistorySyncDto,
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { ChatwootOutboundWebhookHeaders } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
 import { Chatwoot, ConfigService, HttpServer } from '@config/env.config';
 import { BadRequestException } from '@exceptions';
 import { isURL } from 'class-validator';
@@ -81,10 +82,18 @@ export class ChatwootController {
     return response;
   }
 
-  public async receiveWebhook(instance: InstanceDto, data: any) {
+  public async receiveWebhook(instance: InstanceDto, data: any, admission?: ChatwootOutboundWebhookHeaders) {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 
-    return this.chatwootService.receiveWebhook(instance, data);
+    return this.chatwootService.receiveWebhook(instance, data, admission);
+  }
+
+  public async authenticateOutboundWebhook(
+    instanceName: string,
+    rawBody: Buffer | undefined,
+    headers: Record<string, string | string[] | undefined>,
+  ) {
+    return this.chatwootService.authenticateOutboundWebhook(instanceName, rawBody, headers);
   }
 
   public async syncHistory(instance: InstanceDto, data: ChatwootHistorySyncDto) {

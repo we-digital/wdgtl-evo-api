@@ -20,12 +20,26 @@ export interface ChatwootProviderDeliveryPart {
   sourceId: string;
 }
 
+export interface ChatwootProviderContext {
+  snapshot_version: 1;
+  snapshot_fingerprint: string;
+  binding: {
+    version: number;
+    provider: string;
+    inbox_id: number;
+    instance_id: string;
+    instance_name: string;
+    receiver_fingerprint: string;
+  };
+}
+
 export const buildChatwootDeliverySuccessUpdate = (
   accountId: number,
   conversationId: number,
   messageId: number,
   whatsappMessageId: string,
   providerPart?: ChatwootProviderDeliveryPart,
+  providerContext?: ChatwootProviderContext,
 ) => ({
   accountId,
   conversationId,
@@ -43,6 +57,7 @@ export const buildChatwootDeliverySuccessUpdate = (
           },
         }
       : {}),
+    ...(providerContext ? { provider_context: providerContext } : {}),
   },
 });
 

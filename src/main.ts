@@ -8,6 +8,7 @@ import { HttpStatus, router } from '@api/routes/index.router';
 import { chatwootService, eventManager, waMonitor } from '@api/server.module';
 import {
   Auth,
+  Chatwoot,
   configService,
   Cors,
   HttpServer,
@@ -23,7 +24,7 @@ import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
 import compression from 'compression';
 import cors from 'cors';
-import express, { json, NextFunction, Request, Response, urlencoded } from 'express';
+import express, { json, NextFunction, raw, Request, Response, urlencoded } from 'express';
 import { join } from 'path';
 
 async function initWA() {
@@ -60,10 +61,15 @@ async function bootstrap() {
       methods: [...configService.get<Cors>('CORS').METHODS],
       credentials: configService.get<Cors>('CORS').CREDENTIALS,
     }),
-    urlencoded({ extended: true, limit: '136mb' }),
-    json({ limit: '136mb' }),
-    compression(),
   );
+  app.use(
+    '/chatwoot/webhook/:instanceName',
+    raw({
+      type: 'application/json',
+      limit: configService.get<Chatwoot>('CHATWOOT').OUTBOUND_WEBHOOK_MAX_BODY_BYTES,
+    }),
+  );
+  app.use(urlencoded({ extended: true, limit: '136mb' }), json({ limit: '136mb' }), compression());
 
   app.set('view engine', 'hbs');
   app.set('views', join(ROOT_DIR, 'views'));

@@ -12,6 +12,16 @@ duplicate WhatsApp messages.
 ## Safety contract
 
 - Enable with `CHATWOOT_OUTBOUND_ASYNC_ENABLED=true`. The default is `false`.
+- Async admission requires `X-Chatwoot-Delivery`, `X-Chatwoot-Timestamp`, and
+  `X-Chatwoot-Signature`. The signature is lowercase hex HMAC-SHA256 over
+  `timestamp + "." + rawBody`, prefixed with `sha256=`. EVO verifies the raw
+  body, replay window, delivery identifier and configured current/overlap
+  secret before JSON parsing or any reverse Chatwoot request. A delivery
+  receipt is committed in the same transaction as a new operation set; a lost
+  HTTP 202 is recovered idempotently, including when Chatwoot retries with a
+  new delivery identifier for the same unchanged message. Missing or
+  cross-instance local socket ownership, ledger reads and admission commits
+  fail non-2xx; none can fall through to the ordinary webhook response.
 - Only an exact top-level `message_created` outgoing payload is eligible.
   Conversation-history messages never enter this queue. A deletion for a
   retained message atomically moves its complete frozen set to
@@ -19,17 +29,26 @@ duplicate WhatsApp messages.
   every confirmed WhatsApp part before its local mapping is removed. Every attachment needs a
   stable numeric Chatwoot attachment ID. Parts are ordered by that ID, so
   webhook array order cannot change their identities.
-- The full origin (provider ID/base URL, account, inbox ID/name, conversation, message
-  and contact-inbox source) and the physical EVO receiver/instance binding are
-  captured at enqueue and revalidated from the authoritative enabled provider
-  row plus the live Chatwoot inbox, route metadata, conversation, current
-  destination and message at preparation, immediately before transport, and
-  before callback. Reassignment, rename, or any other binding mismatch
+- The full origin (provider ID/base URL, account, inbox ID/name, conversation,
+  message, contact and contact-inbox source) and the physical EVO
+  receiver/instance binding are captured at enqueue. One compact authoritative
+  exact-message snapshot validates the route, relationship, destination and
+  message during preparation, and a second fresh snapshot revalidates every
+  mutable delivery field immediately before transport. The callback uses the
+  snapshot fingerprint stored by the transport fence in Chatwoot's conditional
+  PATCH contract; legacy retained rows without that context perform one
+  fail-closed reverse preflight. Reassignment, rename, or any other binding mismatch
   quarantines the complete message and never sends or retries it. An
   authoritative `deleted=true` snapshot is handled separately: the complete
   frozen set moves to `delete_pending`, including recovery of a previously
   quarantined matching set, and confirmed WhatsApp parts are deleted without
   resending.
+- Contact identity comes only from `conversation.meta.sender` and
+  `conversation.contact_inbox`; top-level `sender` is the sending agent or bot
+  and is never frozen as the customer. Numeric contact IDs strengthen new
+  snapshots but remain outside the operation hash so an unchanged pre-upgrade
+  retained row recovers instead of being quarantined. Once present in a stored
+  row, those numeric IDs must match every replay.
 - Validation reads one exact message through the bounded inbox-scoped endpoint
   `GET /accounts/:account/inboxes/:inbox/conversations/:conversation/messages/:message`.
   EVO unwraps production `{ meta, payload }` responses, accepts Chatwoot's
@@ -41,6 +60,10 @@ duplicate WhatsApp messages.
   attachments or origin atomically quarantines every retained part and fails
   closed. HTTP 202 is returned only after the
   whole frozen set commits in one transaction.
+- Admission is local and bounded. It performs no reverse Chatwoot reads, uses a
+  1.5-second transaction budget, rejects an exhausted or over-age nonterminal
+  backlog, records privacy-safe receipt/commit timing, and never returns 202
+  for an uncommitted operation set.
 - Each part receives a deterministic planned WhatsApp message ID. Baileys gets
   that ID through its supported `messageId` send option.
 - Media resolution, recipient validation, quoting and other preparation happen
@@ -70,6 +93,22 @@ duplicate WhatsApp messages.
   The PATCH is actual `application/json`; `provider_delivery` is a nested
   object with exactly `part_key`, `part_index`, and `part_count`, never a
   multipart/FormData string.
+- Transport claims are ordered by durable admitted sequence within the exact
+  `EVO instance + WhatsApp destination` lane, including different Chatwoot
+  conversations sharing that destination. Multipart siblings therefore cannot
+  overlap or reorder. Independent lanes use bounded transport concurrency;
+  callback, reconciliation and deletion claims have separately reserved
+  maintenance capacity, so a callback outage cannot consume every transport
+  slot. A lane releases transport ordering only after a part is durably fenced
+  as sent/callback-pending or reaches a proven pre-transport terminal outcome;
+  ambiguous transport remains lane-blocking. Transport-to-maintenance state
+  transitions clear the transport lease immediately. Claims keyset-page past
+  blocked candidates, and an idle worker waits for its configured poll interval
+  rather than repeatedly querying the database.
+- Quarantine is releasable only when transport provably never started or its
+  result is already durable. A quarantined operation whose transport outcome
+  remains unresolved keeps its destination lane fenced until exact
+  reconciliation or authoritative deletion establishes a terminal result.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.
@@ -102,30 +141,35 @@ duplicate WhatsApp messages.
 Backoff begins at five seconds and is capped at five minutes. Claims use a
 ten-minute database lease. Expired `preparing` leases return to `pending`;
 expired `sending` leases become `ambiguous`; callback leases are reclaimed.
-The deployment contract uses a single application process, while the
-database claim still prevents concurrent workers from taking the same row.
+The database claim generation and durable lane predecessor check prevent
+concurrent processes from taking the same row or overlapping sibling lane
+parts during restart, lease expiry or rolling deployment.
 
 ## Additive schema and deployment
 
-Apply the provider-specific migration before enabling the flag. It adds only
-`ChatwootOutboundOperation`, its indexes, an `Instance` foreign key, and the
-additive claim-generation fence. No
-existing table or row is rewritten. PostgreSQL, PgBouncer schema generation
-and MySQL are kept equivalent.
+Apply the provider-specific migration before enabling the flag. In addition to
+the existing outbound ledger, the latency-control migration adds provider
+webhook secrets, delivery receipts, lane counters/order, callback snapshot
+context and phase timestamps. Existing operation rows receive compatibility
+defaults for lane fields. The migration conservatively marks retained
+`sending`/`ambiguous` rows without a WAID, plus transport-started quarantined
+rows, as unresolved; worker startup reconstructs the same fence for
+mixed-version writes before any claim. No existing row is deleted. PostgreSQL,
+PgBouncer schema generation and MySQL are kept equivalent.
 
 Staging sequence:
 
 1. Deploy the compatible Chatwoot PATCH contract.
-2. Deploy this EVO image with the flag disabled and apply the additive
-   migration.
+2. Preserve the already-enabled staging async flag, deploy this EVO image and
+   apply the additive migration. Do not toggle the flag or replay accepted
+   work during this latency rollout.
 3. Confirm one EVO process, all required instances connected and the queue
    aggregate empty.
-4. Enable the flag for staging and restart the application once.
-5. Exercise text, media, multiple attachments, duplicate webhook, delayed
+4. Exercise text, media, multiple attachments, duplicate webhook, delayed
    callback, connection loss before transport and process restart after send.
-6. Confirm every accepted operation reaches `completed`, or a deliberately
+5. Confirm every accepted operation reaches `completed`, or a deliberately
    ambiguous operation stays visible without a second WhatsApp send.
-7. Verify every part PATCH returns `provider_delivery` contract version 1,
+6. Verify every part PATCH returns `provider_delivery` contract version 1,
    exact `part_key/index/count`, the exact accumulated `source_ids` mapping and
    correct `acknowledged_part_count`. The final response must additionally have
    `message_confirmed=true`, `source_id=<part-zero raw WAID>`, and status
@@ -162,6 +206,13 @@ worker count and HTTP status. Never copy operation payloads or raw IDs into
 logs, tickets or Slack.
 
 ## Rollback
+
+This summary does not replace the coordinated rollback procedure in
+`we-digital/bbc-devops/docs/chatwoot-evo-outbound-latency-recovery-plan.md`.
+That procedure is authoritative for the ingress/redelivery fence, measurable
+settlement of every pre-cutoff admission handler and database transaction,
+the final ledger read, and the repeated drain/reconciliation barrier. Never
+choose a rollback branch from queue depth alone.
 
 Do not disable async ingress while accepted work is still active: that would
 strand durable operations when the old image starts serving synchronously.
