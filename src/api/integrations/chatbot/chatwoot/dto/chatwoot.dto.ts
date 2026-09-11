@@ -2,6 +2,7 @@ import { Constructor } from '@api/integrations/integration.dto';
 
 export class ChatwootDto {
   id?: string;
+  instanceId?: string;
   enabled?: boolean;
   accountId?: string;
   token?: string;
