@@ -128,6 +128,11 @@ interface ChatwootClientContext {
   provider: ChatwootModel;
 }
 
+// Chatwoot's Channel::Api uses Rails has_secure_token, whose default token
+// length is 24 characters. Accept that production shape without weakening the
+// HMAC contract to arbitrary non-empty values.
+const CHATWOOT_WEBHOOK_SECRET_MIN_LENGTH = 24;
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
@@ -190,7 +195,7 @@ export class ChatwootService {
       try {
         const inbox = await this.getInbox({ instanceId: stored.id, instanceName: stored.name }, false);
         const webhookSecret = (inbox as any)?.secret;
-        if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+        if (typeof webhookSecret === 'string' && webhookSecret.length >= CHATWOOT_WEBHOOK_SECRET_MIN_LENGTH) {
           await this.prismaRepository.chatwoot.update({
             where: { instanceId: stored.id },
             data: { webhookSecret },
@@ -345,7 +350,7 @@ export class ChatwootService {
     } else {
       const inbox = await this.getInbox(instance, true);
       const webhookSecret = (inbox as any)?.secret;
-      if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+      if (typeof webhookSecret === 'string' && webhookSecret.length >= CHATWOOT_WEBHOOK_SECRET_MIN_LENGTH) {
         await this.prismaRepository.chatwoot.update({
           where: { instanceId: instance.instanceId },
           data: { webhookSecret },
@@ -457,7 +462,7 @@ export class ChatwootService {
     }
     await this.reconcileChatwootRouteBinding(instance, provider, selectedInbox, true);
     const webhookSecret = (selectedInbox as any)?.secret;
-    if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+    if (typeof webhookSecret === 'string' && webhookSecret.length >= CHATWOOT_WEBHOOK_SECRET_MIN_LENGTH) {
       await this.prismaRepository.chatwoot.update({
         where: { instanceId: instance.instanceId },
         data: { webhookSecret },

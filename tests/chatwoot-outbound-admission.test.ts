@@ -80,6 +80,42 @@ const serviceFixture = (socketInstanceId: string | null) => {
   return { service, reverseReads: () => reverseReads };
 };
 
+test('bootstraps the actual 24-character Chatwoot Channel::Api secret before starting the worker', async () => {
+  const fixture = serviceFixture('instance-1');
+  const productionShapeSecret = 's'.repeat(24);
+  let storedSecret: string | undefined;
+  let cacheDeletes = 0;
+  let workerStarts = 0;
+  fixture.service.prismaRepository = {
+    chatwoot: {
+      findMany: async () => [{ instanceId: 'instance-1' }],
+      update: async ({ data }: any) => {
+        storedSecret = data.webhookSecret;
+      },
+    },
+    instance: {
+      findUnique: async () => ({ id: 'instance-1', name: 'test-instance' }),
+    },
+  };
+  fixture.service.getInbox = async () => ({ secret: productionShapeSecret });
+  fixture.service.cache = {
+    deleteAll: async () => {
+      cacheDeletes += 1;
+    },
+  };
+  fixture.service.outboundQueue = {
+    start: async () => {
+      workerStarts += 1;
+    },
+  };
+
+  await fixture.service.startOutboundWorker();
+
+  assert.equal(storedSecret, productionShapeSecret);
+  assert.equal(cacheDeletes, 1);
+  assert.equal(workerStarts, 1);
+});
+
 test('propagates a retained lost-202 database failure without acknowledging or reverse-reading', async () => {
   const fixture = serviceFixture('instance-1');
   let enqueues = 0;
