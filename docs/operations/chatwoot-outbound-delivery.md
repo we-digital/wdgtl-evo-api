@@ -105,6 +105,10 @@ duplicate WhatsApp messages.
   transitions clear the transport lease immediately. Claims keyset-page past
   blocked candidates, and an idle worker waits for its configured poll interval
   rather than repeatedly querying the database.
+- Quarantine is releasable only when transport provably never started or its
+  result is already durable. A quarantined operation whose transport outcome
+  remains unresolved keeps its destination lane fenced until exact
+  reconciliation or authoritative deletion establishes a terminal result.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.
@@ -153,16 +157,16 @@ PgBouncer schema generation and MySQL are kept equivalent.
 Staging sequence:
 
 1. Deploy the compatible Chatwoot PATCH contract.
-2. Deploy this EVO image with the flag disabled and apply the additive
-   migration.
+2. Preserve the already-enabled staging async flag, deploy this EVO image and
+   apply the additive migration. Do not toggle the flag or replay accepted
+   work during this latency rollout.
 3. Confirm one EVO process, all required instances connected and the queue
    aggregate empty.
-4. Enable the flag for staging and restart the application once.
-5. Exercise text, media, multiple attachments, duplicate webhook, delayed
+4. Exercise text, media, multiple attachments, duplicate webhook, delayed
    callback, connection loss before transport and process restart after send.
-6. Confirm every accepted operation reaches `completed`, or a deliberately
+5. Confirm every accepted operation reaches `completed`, or a deliberately
    ambiguous operation stays visible without a second WhatsApp send.
-7. Verify every part PATCH returns `provider_delivery` contract version 1,
+6. Verify every part PATCH returns `provider_delivery` contract version 1,
    exact `part_key/index/count`, the exact accumulated `source_ids` mapping and
    correct `acknowledged_part_count`. The final response must additionally have
    `message_confirmed=true`, `source_id=<part-zero raw WAID>`, and status

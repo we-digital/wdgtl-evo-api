@@ -11,7 +11,8 @@ ADD COLUMN "webhookReceivedAt" TIMESTAMP,
 ADD COLUMN "messageCreatedAt" TIMESTAMP,
 ADD COLUMN "claimedAt" TIMESTAMP,
 ADD COLUMN "validatedAt" TIMESTAMP,
-ADD COLUMN "callbackStartedAt" TIMESTAMP;
+ADD COLUMN "callbackStartedAt" TIMESTAMP,
+ADD COLUMN "transportOutcomeUnresolved" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ChatwootOutboundOperation" ADD COLUMN "callbackContext" JSONB;
 
 CREATE TABLE "ChatwootOutboundLane" (

@@ -265,6 +265,7 @@ model ChatwootOutboundOperation {
   callbackContext          Json?     @db.Json
   preparationAttempts      Int       @default(0) @db.Int
   sendAttempts             Int       @default(0) @db.Int
+  transportOutcomeUnresolved Boolean @default(false)
   callbackAttempts         Int       @default(0) @db.Int
   nextAttemptAt            DateTime  @default(now()) @db.Timestamp
   leaseOwner               String?   @db.VarChar(100)

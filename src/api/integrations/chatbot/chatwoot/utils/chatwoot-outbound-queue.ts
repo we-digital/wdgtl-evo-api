@@ -64,6 +64,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   whatsappMessageId?: string;
   preparationAttempts: number;
   sendAttempts: number;
+  transportOutcomeUnresolved: boolean;
   callbackAttempts: number;
   claimGeneration: number;
   webhookDeliveryId?: string;
@@ -163,6 +164,20 @@ export interface ChatwootOutboundStore {
     errorClass: string,
   ): Promise<void>;
   scheduleAmbiguous(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  resolveQuarantinedTransport(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    whatsappMessageId: string,
+    now: Date,
+  ): Promise<void>;
+  scheduleQuarantined(
     id: string,
     workerId: string,
     claimGeneration: number,
@@ -440,6 +455,28 @@ export class ChatwootOutboundQueue {
         this.wake();
       } else {
         await this.store.scheduleAmbiguous(
+          operation.id,
+          this.workerId,
+          operation.claimGeneration,
+          new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
+          'AwaitingExactWhatsappMessage',
+        );
+      }
+      return true;
+    }
+    if (operation.state === 'quarantined') {
+      const reconciledMessageId = await this.store.findSentMessageId(operation);
+      if (reconciledMessageId) {
+        await this.store.resolveQuarantinedTransport(
+          operation.id,
+          this.workerId,
+          operation.claimGeneration,
+          reconciledMessageId,
+          new Date(),
+        );
+        this.wake();
+      } else {
+        await this.store.scheduleQuarantined(
           operation.id,
           this.workerId,
           operation.claimGeneration,

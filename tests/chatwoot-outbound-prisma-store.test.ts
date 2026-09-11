@@ -55,6 +55,7 @@ const stored = (partIndex: number, state: string, whatsappMessageId?: string) =>
   whatsappMessageId,
   preparationAttempts: 0,
   sendAttempts: whatsappMessageId ? 1 : 0,
+  transportOutcomeUnresolved: false,
   callbackAttempts: 0,
   claimGeneration: 0,
 });
@@ -332,6 +333,15 @@ const admissionRepository = (seedRows: any[] = []) => {
   const rows = seedRows;
   const receipts = new Map<string, any>();
   const lanes = new Map<string, bigint>();
+  const matchesActive = (row: any, where: any) =>
+    where.state?.in?.includes(row.state) ||
+    where.OR?.some(
+      (condition: any) =>
+        condition.state?.in?.includes(row.state) ||
+        (condition.state === row.state &&
+          (condition.transportOutcomeUnresolved === undefined ||
+            condition.transportOutcomeUnresolved === row.transportOutcomeUnresolved)),
+    );
   const operations = {
     findMany: async ({ where }: any) =>
       rows
@@ -341,10 +351,10 @@ const admissionRepository = (seedRows: any[] = []) => {
             (where.chatwootMessageId === undefined || row.chatwootMessageId === where.chatwootMessageId),
         )
         .sort((left, right) => left.partIndex - right.partIndex),
-    count: async ({ where }: any) => rows.filter((row) => where.state.in.includes(row.state)).length,
+    count: async ({ where }: any) => rows.filter((row) => matchesActive(row, where)).length,
     findFirst: async ({ where }: any) => {
       const active = rows
-        .filter((row) => where.state.in.includes(row.state))
+        .filter((row) => matchesActive(row, where))
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
       return active[0] ? { createdAt: active[0].createdAt } : null;
     },
@@ -439,6 +449,168 @@ test('same delivery identity with changed frozen context quarantines the retaine
   assert.equal(memory.receipts.size, 1);
   assert.ok(memory.rows.every((row) => row.state === 'quarantined'));
   assert.ok(memory.rows.every((row) => row.lastErrorClass === 'ChangedFrozenPartSet'));
+});
+
+test('replay quarantine keeps an unresolved transport lane fenced across workers until exact resolution', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const laneKey = parts[0].laneKey;
+  const frozenParts = parts.map((part) => ({
+    ...part,
+    payload: { ...part.payload, origin: { ...part.payload.origin, contactId: 411 } },
+  }));
+  const changedParts = frozenParts.map((part) => ({
+    ...part,
+    payload: { ...part.payload, origin: { ...part.payload.origin, contactId: 412 } },
+  }));
+  const successorParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 315,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 43 },
+      attachments: [],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'successor',
+    origin: { ...origin, messageId: 315, conversationId: 43, contactId: 412 },
+  });
+  const rows: any[] = [
+    {
+      ...stored(0, 'ambiguous'),
+      ...frozenParts[0],
+      id: 'unresolved-original',
+      laneKey,
+      laneSequence: 1n,
+      sendAttempts: 1,
+      transportOutcomeUnresolved: true,
+      sendStartedAt: new Date(now.getTime() - 100),
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 1_000),
+    },
+    {
+      ...stored(1, 'pending'),
+      ...frozenParts[1],
+      id: 'pre-transport-sibling',
+      laneKey,
+      laneSequence: 1n,
+      transportOutcomeUnresolved: false,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 1_000),
+    },
+    {
+      ...stored(0, 'pending'),
+      ...successorParts[0],
+      id: 'successor',
+      chatwootMessageId: 315,
+      chatwootConversationId: 43,
+      laneKey,
+      laneSequence: 2n,
+      transportOutcomeUnresolved: false,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      nextAttemptAt: now,
+      createdAt: now,
+    },
+  ];
+  const matches = (row: any, where: any): boolean => {
+    if (!where) return true;
+    if (where.AND && !where.AND.every((condition: any) => matches(row, condition))) return false;
+    if (where.OR && !where.OR.some((condition: any) => matches(row, condition))) return false;
+    return Object.entries(where).every(([key, expected]: [string, any]) => {
+      if (key === 'AND' || key === 'OR') return true;
+      const actual = row[key];
+      if (expected === null || typeof expected !== 'object' || expected instanceof Date) return actual === expected;
+      if ('in' in expected && !expected.in.includes(actual)) return false;
+      if ('not' in expected && actual === expected.not) return false;
+      if ('lt' in expected && !(actual < expected.lt)) return false;
+      if ('lte' in expected && !(actual <= expected.lte)) return false;
+      if ('gt' in expected && !(actual > expected.gt)) return false;
+      if ('equals' in expected && actual !== expected.equals) return false;
+      return true;
+    });
+  };
+  const operations = {
+    findMany: async ({ where, cursor, skip = 0, take }: any) => {
+      const matching = rows.filter((row) => matches(row, where));
+      const cursorIndex = cursor ? matching.findIndex((row) => row.id === cursor.id) : -1;
+      const start = cursor && cursorIndex >= 0 ? cursorIndex + skip : 0;
+      const selected = typeof take === 'number' ? matching.slice(start, start + take) : matching.slice(start);
+      // Prisma returns detached result objects. Keep the in-memory seam equivalent so
+      // updateMany cannot mutate the already-selected candidate and double-increment
+      // the generation returned by claim().
+      return selected.map((row) => ({ ...row }));
+    },
+    count: async ({ where }: any) => rows.filter((row) => matches(row, where)).length,
+    updateMany: async ({ where, data }: any) => {
+      const matching = rows.filter((row) => matches(row, where));
+      matching.forEach((row) => {
+        const generation = data.claimGeneration?.increment;
+        const previousGeneration = row.claimGeneration ?? 0;
+        Object.assign(row, data);
+        if (generation) row.claimGeneration = previousGeneration + generation;
+      });
+      return { count: matching.length };
+    },
+  };
+  const repository: any = {
+    chatwootOutboundOperation: operations,
+    message: {
+      findFirst: async ({ where }: any) =>
+        where.instanceId === 'instance-1' && where.key?.equals === frozenParts[0].plannedWhatsappMessageId
+          ? { key: { id: frozenParts[0].plannedWhatsappMessageId } }
+          : null,
+    },
+    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundWebhookDelivery: {
+      findUnique: async () => ({
+        deliveryId: 'delivery-314',
+        instanceId: 'instance-1',
+        chatwootMessageId: 314,
+        messageSetHash: frozenParts[0].messageSetHash,
+      }),
+    },
+  };
+  repository.$transaction = async (transaction: (client: any) => Promise<unknown>) => transaction(repository);
+  const store = new ChatwootOutboundPrismaStore(repository);
+
+  await assert.rejects(
+    () => store.enqueue('instance-1', 314, 58, 42, changedParts, admission('delivery-314')),
+    /frozen with different/,
+  );
+  assert.equal(rows[0].state, 'quarantined');
+  assert.equal(rows[0].transportOutcomeUnresolved, true);
+  assert.equal(rows[1].state, 'quarantined');
+  assert.equal(rows[1].transportOutcomeUnresolved, false);
+  assert.equal(await store.claim('transport-worker-1', now, new Date(now.getTime() + 1_000), 'transport'), null);
+  assert.equal(await store.claim('transport-worker-2', now, new Date(now.getTime() + 1_000), 'transport'), null);
+
+  const reconciliation = await store.claim(
+    'maintenance-worker',
+    now,
+    new Date(now.getTime() + 1_000),
+    'maintenance',
+  );
+  assert.equal(reconciliation?.id, 'unresolved-original');
+  const reconciledMessageId = await store.findSentMessageId(reconciliation!);
+  assert.equal(reconciledMessageId, frozenParts[0].plannedWhatsappMessageId);
+  await store.resolveQuarantinedTransport(
+    reconciliation!.id,
+    'maintenance-worker',
+    reconciliation!.claimGeneration,
+    reconciledMessageId!,
+    now,
+  );
+  assert.equal(rows[0].transportOutcomeUnresolved, false);
+  assert.equal(
+    (await store.claim('transport-worker-3', now, new Date(now.getTime() + 1_000), 'transport'))?.id,
+    'successor',
+  );
 });
 
 test('recovers a pre-upgrade retained set when new numeric contact context is present', async () => {
@@ -568,8 +740,9 @@ test('claims independent destinations concurrently but preserves exact same-lane
   const operations = {
     findMany: async () => rows.filter((row) => row.state === 'pending' && !row.leaseOwner),
     count: async ({ where }: any) => {
-      const lane = where.OR?.[0]?.laneKey;
-      const beforeSequence = where.OR?.[0]?.OR?.[0]?.laneSequence?.lt;
+      const ordering = where.AND?.find((condition: any) => condition.OR?.some((item: any) => item.laneKey)) ?? where;
+      const lane = ordering.OR?.[0]?.laneKey;
+      const beforeSequence = ordering.OR?.[0]?.OR?.[0]?.laneSequence?.lt;
       return rows.filter(
         (row) =>
           row.laneKey === lane &&
@@ -621,7 +794,10 @@ test('paginates beyond 64 blocked candidates to claim an independent runnable la
       const start = cursor ? cursorIndex + skip : 0;
       return rows.slice(start, start + take);
     },
-    count: async ({ where }: any) => (String(where.OR?.[0]?.laneKey).startsWith('blocked-') ? 1 : 0),
+    count: async ({ where }: any) => {
+      const ordering = where.AND?.find((condition: any) => condition.OR?.some((item: any) => item.laneKey)) ?? where;
+      return String(ordering.OR?.[0]?.laneKey).startsWith('blocked-') ? 1 : 0;
+    },
     updateMany: async ({ where, data }: any) => {
       const row = rows.find((candidate) => candidate.id === where.id && candidate.state === where.state);
       if (!row) return { count: 0 };
@@ -721,11 +897,12 @@ test('serializes deletion maintenance for sibling parts in the same lane', async
   const operations = {
     findMany: async () => rows.filter((row) => row.state === 'delete_pending' && !row.leaseOwner),
     count: async ({ where }: any) => {
-      const before = where.OR?.[0]?.OR;
+      const ordering = where.AND?.find((condition: any) => condition.OR?.some((item: any) => item.laneKey)) ?? where;
+      const before = ordering.OR?.[0]?.OR;
       return rows.filter(
         (row) =>
           row.state === 'delete_pending' &&
-          row.laneKey === where.OR?.[0]?.laneKey &&
+          row.laneKey === ordering.OR?.[0]?.laneKey &&
           (row.laneSequence < before?.[0]?.laneSequence?.lt ||
             (row.laneSequence === before?.[1]?.laneSequence && row.partIndex < before?.[1]?.partIndex?.lt)),
       ).length;

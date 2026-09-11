@@ -26,6 +26,7 @@ const MAINTENANCE_STATES: ChatwootOutboundState[] = [
   'failure_callback_pending',
   'ambiguous',
   'delete_pending',
+  'quarantined',
 ];
 const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'pending',
@@ -34,6 +35,12 @@ const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'ambiguous',
   'delete_pending',
 ];
+const LANE_BLOCKING_STATE_WHERE = {
+  OR: [{ state: { in: LANE_BLOCKING_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
+};
+const ACTIVE_STATE_WHERE = {
+  OR: [{ state: { in: ACTIVE_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
+};
 
 export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   constructor(private readonly repository: PrismaRepository) {}
@@ -107,9 +114,9 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           return { recovered: true, rejection: null };
         }
         const [activeDepth, oldest] = await Promise.all([
-          transaction.chatwootOutboundOperation.count({ where: { state: { in: ACTIVE_STATES } } }),
+          transaction.chatwootOutboundOperation.count({ where: ACTIVE_STATE_WHERE }),
           transaction.chatwootOutboundOperation.findFirst({
-            where: { state: { in: ACTIVE_STATES } },
+            where: ACTIVE_STATE_WHERE,
             orderBy: { createdAt: 'asc' },
             select: { createdAt: true },
           }),
@@ -186,9 +193,9 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
 
   public async backlog(): Promise<ChatwootOutboundBacklog> {
     const [depth, oldest] = await Promise.all([
-      this.repository.chatwootOutboundOperation.count({ where: { state: { in: ACTIVE_STATES } } }),
+      this.repository.chatwootOutboundOperation.count({ where: ACTIVE_STATE_WHERE }),
       this.repository.chatwootOutboundOperation.findFirst({
-        where: { state: { in: ACTIVE_STATES } },
+        where: ACTIVE_STATE_WHERE,
         orderBy: { createdAt: 'asc' },
         select: { createdAt: true },
       }),
@@ -212,7 +219,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       }),
       this.repository.chatwootOutboundOperation.updateMany({
         where: {
-          state: { in: ['callback_pending', 'failure_callback_pending', 'ambiguous'] },
+          state: { in: ['callback_pending', 'failure_callback_pending', 'ambiguous', 'quarantined'] },
           leaseExpiresAt: { lte: now },
         },
         data: { leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
@@ -245,6 +252,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
                         { state: { in: ['callback_pending', 'failure_callback_pending'] }, partIndex: 0 },
                         { state: 'ambiguous' },
                         { state: 'delete_pending' },
+                        { state: 'quarantined', transportOutcomeUnresolved: true },
                       ],
                     },
                   ]
@@ -331,6 +339,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         callbackContext: providerContext as any,
         sendStartedAt: now,
         sendAttempts: { increment: 1 },
+        transportOutcomeUnresolved: true,
       },
     });
     return updated.count === 1;
@@ -351,6 +360,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         whatsappMessageId,
         result: (result ?? undefined) as any,
         sentAt: now,
+        transportOutcomeUnresolved: false,
         nextAttemptAt: now,
         leaseOwner: null,
         leaseExpiresAt: null,
@@ -526,6 +536,42 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     await this.schedule(id, workerId, claimGeneration, 'ambiguous', nextAttemptAt, lastErrorClass);
   }
 
+  public async resolveQuarantinedTransport(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    whatsappMessageId: string,
+    now: Date,
+  ): Promise<void> {
+    const updated = await this.repository.chatwootOutboundOperation.updateMany({
+      where: {
+        id,
+        state: 'quarantined',
+        transportOutcomeUnresolved: true,
+        leaseOwner: workerId,
+        claimGeneration,
+      },
+      data: {
+        whatsappMessageId,
+        sentAt: now,
+        transportOutcomeUnresolved: false,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      },
+    });
+    if (updated.count !== 1) throw new Error('OutboundLeaseLost');
+  }
+
+  public async scheduleQuarantined(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    lastErrorClass: string,
+  ): Promise<void> {
+    await this.schedule(id, workerId, claimGeneration, 'quarantined', nextAttemptAt, lastErrorClass);
+  }
+
   public async quarantineMessage(
     operation: StoredChatwootOutboundOperation,
     workerId: string,
@@ -594,6 +640,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         data: {
           state: 'deleted',
           completedAt: now,
+          transportOutcomeUnresolved: false,
           leaseOwner: null,
           leaseExpiresAt: null,
           lastErrorClass: null,
@@ -697,10 +744,14 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         (await this.repository.chatwootOutboundOperation.count({
           where: {
             id: { not: candidate.id },
-            state: { in: LANE_BLOCKING_STATES },
-            OR: [
-              { createdAt: { lt: candidate.createdAt } },
-              { createdAt: candidate.createdAt, partIndex: { lt: candidate.partIndex } },
+            AND: [
+              LANE_BLOCKING_STATE_WHERE,
+              {
+                OR: [
+                  { createdAt: { lt: candidate.createdAt } },
+                  { createdAt: candidate.createdAt, partIndex: { lt: candidate.partIndex } },
+                ],
+              },
             ],
           },
         })) > 0
@@ -709,16 +760,20 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     return (
       (await this.repository.chatwootOutboundOperation.count({
         where: {
-          state: { in: LANE_BLOCKING_STATES },
-          OR: [
+          AND: [
+            LANE_BLOCKING_STATE_WHERE,
             {
-              laneKey: candidate.laneKey,
               OR: [
-                { laneSequence: { lt: candidate.laneSequence } },
-                { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
+                {
+                  laneKey: candidate.laneKey,
+                  OR: [
+                    { laneSequence: { lt: candidate.laneSequence } },
+                    { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
+                  ],
+                },
+                { laneKey: '', createdAt: { lte: candidate.createdAt } },
               ],
             },
-            { laneKey: '', createdAt: { lte: candidate.createdAt } },
           ],
         },
       })) > 0
@@ -727,6 +782,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
 
   private async isMaintenanceEligible(candidate: any): Promise<boolean> {
     if (candidate.state === 'ambiguous') return true;
+    if (candidate.state === 'quarantined') return candidate.transportOutcomeUnresolved === true;
     if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate));
     if (!['callback_pending', 'failure_callback_pending'].includes(candidate.state) || candidate.partIndex !== 0) {
       return false;
@@ -807,6 +863,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       payload: candidate.payload as unknown as ChatwootOutboundPayload,
       preparationAttempts: candidate.preparationAttempts,
       sendAttempts: candidate.sendAttempts,
+      transportOutcomeUnresolved: candidate.transportOutcomeUnresolved ?? false,
       callbackAttempts: candidate.callbackAttempts,
       claimGeneration: candidate.claimGeneration,
       webhookDeliveryId: candidate.webhookDeliveryId ?? undefined,

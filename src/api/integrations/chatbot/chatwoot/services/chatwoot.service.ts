@@ -2258,6 +2258,7 @@ export class ChatwootService {
           payload: { chatId: chatwootOutboundDestination(body.conversation), text: null, origin: deletionOrigin },
           preparationAttempts: 0,
           sendAttempts: 0,
+          transportOutcomeUnresolved: false,
           callbackAttempts: 0,
           claimGeneration: 0,
         };
