@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  chatwootOutboundContactIdentity,
   validatesCurrentChatwootOutboundSnapshot,
   validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
@@ -93,6 +94,22 @@ const validate = (overrides: Record<string, unknown> = {}) =>
 
 test('accepts the exact authoritative provider, live route, relationship, destination and message', () => {
   assert.equal(validate(), true);
+});
+
+test('derives outbound contact identity from the conversation instead of the sending agent', () => {
+  const body = {
+    sender: { id: 9001, type: 'user', name: 'Agent' },
+    conversation: {
+      meta: { sender: { id: 411, type: 'contact', identifier: '628123' } },
+      contact_inbox: { id: 733, contact_id: 411, source_id: 'source-1' },
+    },
+  };
+
+  assert.deepEqual(chatwootOutboundContactIdentity(body), {
+    contactInboxSourceId: 'source-1',
+    contactId: 411,
+    contactInboxId: 733,
+  });
 });
 
 test('rejects provider disable, compact-snapshot reassignment, destination change and message deletion', () => {

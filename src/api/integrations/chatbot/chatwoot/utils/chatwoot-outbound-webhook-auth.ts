@@ -4,6 +4,7 @@ export interface ChatwootOutboundWebhookHeaders {
   deliveryId: string;
   timestampSeconds: number;
   receivedAt: Date;
+  routeInstanceId?: string;
 }
 
 export interface ChatwootOutboundWebhookSecrets {

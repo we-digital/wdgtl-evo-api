@@ -19,7 +19,9 @@ duplicate WhatsApp messages.
   secret before JSON parsing or any reverse Chatwoot request. A delivery
   receipt is committed in the same transaction as a new operation set; a lost
   HTTP 202 is recovered idempotently, including when Chatwoot retries with a
-  new delivery identifier for the same unchanged message.
+  new delivery identifier for the same unchanged message. Missing or
+  cross-instance local socket ownership, ledger reads and admission commits
+  fail non-2xx; none can fall through to the ordinary webhook response.
 - Only an exact top-level `message_created` outgoing payload is eligible.
   Conversation-history messages never enter this queue. A deletion for a
   retained message atomically moves its complete frozen set to
@@ -41,6 +43,12 @@ duplicate WhatsApp messages.
   frozen set moves to `delete_pending`, including recovery of a previously
   quarantined matching set, and confirmed WhatsApp parts are deleted without
   resending.
+- Contact identity comes only from `conversation.meta.sender` and
+  `conversation.contact_inbox`; top-level `sender` is the sending agent or bot
+  and is never frozen as the customer. Numeric contact IDs strengthen new
+  snapshots but remain outside the operation hash so an unchanged pre-upgrade
+  retained row recovers instead of being quarantined. Once present in a stored
+  row, those numeric IDs must match every replay.
 - Validation reads one exact message through the bounded inbox-scoped endpoint
   `GET /accounts/:account/inboxes/:inbox/conversations/:conversation/messages/:message`.
   EVO unwraps production `{ meta, payload }` responses, accepts Chatwoot's
@@ -93,7 +101,10 @@ duplicate WhatsApp messages.
   maintenance capacity, so a callback outage cannot consume every transport
   slot. A lane releases transport ordering only after a part is durably fenced
   as sent/callback-pending or reaches a proven pre-transport terminal outcome;
-  ambiguous transport remains lane-blocking.
+  ambiguous transport remains lane-blocking. Transport-to-maintenance state
+  transitions clear the transport lease immediately. Claims keyset-page past
+  blocked candidates, and an idle worker waits for its configured poll interval
+  rather than repeatedly querying the database.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.

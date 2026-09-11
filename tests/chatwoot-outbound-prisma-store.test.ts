@@ -178,7 +178,10 @@ test('mixed terminal state exposes only successful frozen mappings as a determin
 });
 
 test('authoritative deletion request recovers a previously quarantined frozen set', async () => {
-  const rows = [stored(0, 'quarantined'), stored(1, 'quarantined')];
+  const rows = [
+    { ...stored(0, 'quarantined'), leaseOwner: 'transport-worker', leaseExpiresAt: new Date(9_999_999) },
+    { ...stored(1, 'quarantined'), leaseOwner: 'transport-worker', leaseExpiresAt: new Date(9_999_999) },
+  ];
   const repository = {
     chatwootOutboundOperation: {
       updateMany: async ({ where, data }: any) => {
@@ -199,6 +202,49 @@ test('authoritative deletion request recovers a previously quarantined frozen se
   await store.requestDeletion(rows[0] as StoredChatwootOutboundOperation);
 
   assert.ok(rows.every((row) => row.state === 'delete_pending'));
+  assert.ok(rows.every((row) => row.leaseOwner === null && row.leaseExpiresAt === null));
+  assert.ok(rows.every((row) => row.nextAttemptAt instanceof Date));
+});
+
+test('releases transport leases immediately when callback maintenance becomes runnable', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const rows: any[] = [
+    { ...stored(0, 'sending'), leaseOwner: 'transport-worker', leaseExpiresAt: new Date(now.getTime() + 600_000) },
+    { ...stored(1, 'preparing'), leaseOwner: 'transport-worker', leaseExpiresAt: new Date(now.getTime() + 600_000) },
+  ];
+  const matches = (row: any, where: any) =>
+    (!where.id || (typeof where.id === 'string' ? row.id === where.id : row.id !== where.id.not)) &&
+    (!where.instanceId || row.instanceId === where.instanceId) &&
+    (!where.chatwootMessageId || row.chatwootMessageId === where.chatwootMessageId) &&
+    (!where.messageSetHash || row.messageSetHash === where.messageSetHash) &&
+    (!where.leaseOwner || row.leaseOwner === where.leaseOwner) &&
+    (!where.claimGeneration || row.claimGeneration === where.claimGeneration) &&
+    (!where.state || (where.state.in ? where.state.in.includes(row.state) : row.state === where.state));
+  const operations = {
+    updateMany: async ({ where, data }: any) => {
+      const matching = rows.filter((row) => matches(row, where));
+      matching.forEach((row) => Object.assign(row, data));
+      return { count: matching.length };
+    },
+  };
+  const repository = {
+    chatwootOutboundOperation: operations,
+    $transaction: async (transaction: (client: any) => Promise<void>) =>
+      transaction({ chatwootOutboundOperation: operations }),
+  };
+  const store = new ChatwootOutboundPrismaStore(repository as any);
+
+  await store.markCallbackPending(rows[0].id, 'transport-worker', 0, 'WAID:0', null, now);
+  assert.deepEqual(
+    { state: rows[0].state, leaseOwner: rows[0].leaseOwner, leaseExpiresAt: rows[0].leaseExpiresAt, next: rows[0].nextAttemptAt },
+    { state: 'callback_pending', leaseOwner: null, leaseExpiresAt: null, next: now },
+  );
+
+  await store.markFailureCallbackPending(rows[1], 'transport-worker', 'PreparationFailed', now);
+  assert.deepEqual(
+    { state: rows[1].state, leaseOwner: rows[1].leaseOwner, leaseExpiresAt: rows[1].leaseExpiresAt, next: rows[1].nextAttemptAt },
+    { state: 'failure_callback_pending', leaseOwner: null, leaseExpiresAt: null, next: now },
+  );
 });
 
 for (const scenario of [
@@ -361,6 +407,77 @@ test('recovers a lost 202 idempotently and durably reserves every accepted deliv
   assert.equal(memory.rows.length, parts.length);
 });
 
+test('recovers a pre-upgrade retained set when new numeric contact context is present', async () => {
+  const legacyRows = parts.map((part, index) => ({
+    ...stored(index, 'pending'),
+    ...part,
+    createdAt: admission('original-delivery').receivedAt,
+  }));
+  const upgradedParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 314,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 42 },
+      attachments: [
+        { id: 10, data_url: 'https://example.invalid/a' },
+        { id: 11, data_url: 'https://example.invalid/b' },
+      ],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'caption',
+    origin: { ...origin, contactId: 411, contactInboxId: 733 },
+  });
+  const memory = admissionRepository(legacyRows);
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+
+  assert.deepEqual(await store.enqueue('instance-1', 314, 58, 42, upgradedParts, admission('retry-delivery')), {
+    recovered: true,
+  });
+  assert.ok(memory.rows.every((row) => row.state === 'pending'));
+  assert.equal(memory.receipts.size, 1);
+});
+
+test('rejects a changed numeric contact identity after it has been frozen', async () => {
+  const initialParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 314,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 42 },
+      attachments: [
+        { id: 10, data_url: 'https://example.invalid/a' },
+        { id: 11, data_url: 'https://example.invalid/b' },
+      ],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'caption',
+    origin: { ...origin, contactId: 411, contactInboxId: 733 },
+  });
+  const replayParts = initialParts.map((part) => ({
+    ...part,
+    payload: { ...part.payload, origin: { ...part.payload.origin, contactId: 412 } },
+  }));
+  const memory = admissionRepository(
+    initialParts.map((part, index) => ({
+      ...stored(index, 'pending'),
+      ...part,
+      createdAt: admission('original-delivery').receivedAt,
+    })),
+  );
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+
+  await assert.rejects(
+    () => store.enqueue('instance-1', 314, 58, 42, replayParts, admission('changed-contact-delivery')),
+    /frozen with different/,
+  );
+  assert.ok(memory.rows.every((row) => row.state === 'quarantined'));
+});
+
 test('rejects capacity and oldest-age admission while preparing or sending work is still active', async () => {
   const old = new Date('2026-09-11T02:00:00.000Z');
   const memory = admissionRepository([
@@ -440,6 +557,51 @@ test('claims independent destinations concurrently but preserves exact same-lane
   rows[0].state = 'callback_pending';
   const sameLaneNext = await store.claim('worker-2', now, new Date(now.getTime() + 1_000), 'transport');
   assert.equal(sameLaneNext?.id, 'lane-a-2');
+});
+
+test('paginates beyond 64 blocked candidates to claim an independent runnable lane', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const rows: any[] = Array.from({ length: 64 }, (_, index) => ({
+    ...stored(0, 'pending'),
+    id: `blocked-${String(index).padStart(2, '0')}`,
+    laneKey: `blocked-${String(index).padStart(2, '0')}`.padEnd(64, 'x'),
+    laneSequence: 2n,
+    leaseOwner: null,
+    nextAttemptAt: now,
+    createdAt: new Date(now.getTime() + index),
+  }));
+  rows.push({
+    ...stored(0, 'pending'),
+    id: 'runnable-65',
+    laneKey: 'runnable'.padEnd(64, 'x'),
+    laneSequence: 1n,
+    leaseOwner: null,
+    nextAttemptAt: now,
+    createdAt: new Date(now.getTime() + 64),
+  });
+  let pages = 0;
+  const operations = {
+    findMany: async ({ cursor, skip = 0, take }: any) => {
+      pages += 1;
+      const cursorIndex = cursor ? rows.findIndex((row) => row.id === cursor.id) : -1;
+      const start = cursor ? cursorIndex + skip : 0;
+      return rows.slice(start, start + take);
+    },
+    count: async ({ where }: any) => (String(where.OR?.[0]?.laneKey).startsWith('blocked-') ? 1 : 0),
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => candidate.id === where.id && candidate.state === where.state);
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  assert.equal(
+    (await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id,
+    'runnable-65',
+  );
+  assert.equal(pages, 2);
 });
 
 test('reserves callback capacity for a settled multipart leader only', async () => {

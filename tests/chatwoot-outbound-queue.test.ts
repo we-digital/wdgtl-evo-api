@@ -85,6 +85,25 @@ test('uses only the exact top-level message and creates attachment identities in
   assert.ok(first.every((part) => part.messageSetHash === first[0].messageSetHash && part.partCount === 2));
 });
 
+test('keeps pre-upgrade frozen identities stable while retaining new contact snapshot fields', () => {
+  const upgradedOrigin = { ...origin, contactId: 411, contactInboxId: 733 };
+  const legacy = buildParts();
+  const upgraded = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: webhook,
+    chatId: 'opaque-chat',
+    formattedText: 'caption',
+    origin: upgradedOrigin,
+  });
+
+  assert.deepEqual(
+    upgraded.map((part) => ({ key: part.operationKey, hash: part.messageSetHash })),
+    legacy.map((part) => ({ key: part.operationKey, hash: part.messageSetHash })),
+  );
+  assert.ok(upgraded.every((part) => part.payload.origin.contactId === 411));
+  assert.ok(upgraded.every((part) => part.payload.origin.contactInboxId === 733));
+});
+
 test('freezes content into the message-set hash and rejects malformed, deletion, and unstable attachment payloads', () => {
   const first = buildParts();
   const changed = buildParts({
@@ -338,7 +357,7 @@ test('retries a proven pre-transport failure without incrementing send attempts'
     validHandler({ send: async () => Promise.reject(new Error('MediaDownloadFailed')) }),
   );
 
-  await queue.runOnce();
+  await queue.runOnce('transport');
 
   assert.equal(store.operation.state, 'pending');
   assert.equal(store.operation.preparationAttempts, 1);
@@ -359,7 +378,11 @@ test('reports terminal preparation failure after the bounded attempt count witho
     }),
   );
 
-  await queue.runOnce();
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(failures, 0);
+  await queue.runOnce('maintenance');
 
   assert.equal(failures, 1);
   assert.equal(store.operation.state, 'failed');
@@ -385,7 +408,11 @@ test('reports a bounded not-ready failure without entering transport', async () 
     }),
   );
 
-  await queue.runOnce();
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(failures, 0);
+  await queue.runOnce('maintenance');
 
   assert.equal(sends, 0);
   assert.equal(failures, 1);
@@ -578,6 +605,27 @@ test('keeps transport capacity available while a callback worker is blocked', as
   assert.equal(maintenanceStateWhileTransportStarted, 'callback_pending');
   assert.equal(transport.state, 'callback_pending');
   assert.equal(maintenance.state, 'completed');
+});
+
+test('honors the poll interval when both worker classes are idle', async () => {
+  let claims = 0;
+  const store = {
+    recoverExpired: async () => undefined,
+    claim: async () => {
+      claims += 1;
+      return null;
+    },
+  } as unknown as ChatwootOutboundStore;
+  const queue = new ChatwootOutboundQueue(store, validHandler(), 250, 60_000, undefined, {
+    transport: 1,
+    maintenance: 1,
+  });
+
+  await queue.start();
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  await queue.stop();
+
+  assert.equal(claims, 2);
 });
 
 test('replays only deterministic multipart callbacks after a partial callback outage', async () => {

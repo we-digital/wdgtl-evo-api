@@ -7,6 +7,19 @@ import { Chatwoot as ChatwootModel } from '@prisma/client';
 export const chatwootOutboundDestination = (conversation: any): string =>
   conversation?.meta?.sender?.identifier || conversation?.meta?.sender?.phone_number?.replace(/^\+/, '') || '';
 
+const positiveInteger = (value: unknown): number | undefined => {
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number > 0 ? number : undefined;
+};
+
+export const chatwootOutboundContactIdentity = (body: any) => ({
+  contactInboxSourceId: body?.conversation?.contact_inbox?.source_id,
+  contactId:
+    positiveInteger(body?.conversation?.meta?.sender?.id) ??
+    positiveInteger(body?.conversation?.contact_inbox?.contact_id),
+  contactInboxId: positiveInteger(body?.conversation?.contact_inbox?.id),
+});
+
 export const validatesCurrentChatwootOutboundSnapshot = (params: {
   operation: StoredChatwootOutboundOperation;
   provider: ChatwootModel;

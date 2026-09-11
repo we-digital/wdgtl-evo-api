@@ -217,38 +217,43 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     const states =
       workClass === 'transport' ? TRANSPORT_STATES : workClass === 'maintenance' ? MAINTENANCE_STATES : ACTIVE_STATES;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const candidates = await this.repository.chatwootOutboundOperation.findMany({
-        where: {
-          state: { in: states },
-          nextAttemptAt: { lte: now },
-          AND: [
-            { OR: [{ leaseOwner: null }, { leaseExpiresAt: { lte: now } }] },
-            ...(workClass === 'maintenance'
-              ? [
-                  {
-                    OR: [
-                      { state: { in: ['callback_pending', 'failure_callback_pending'] }, partIndex: 0 },
-                      { state: 'delete_pending' },
-                    ],
-                  },
-                ]
-              : []),
-          ],
-        },
-        orderBy: [{ createdAt: 'asc' }, { partIndex: 'asc' }, { id: 'asc' }],
-        ...(workClass === 'transport' ? { distinct: ['laneKey' as const] } : {}),
-        take: 64,
-      });
       let candidate = null;
-      for (const eligible of candidates) {
-        if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible))) {
-          candidate = eligible;
-          break;
+      let cursor: string | undefined;
+      while (!candidate) {
+        const candidates = await this.repository.chatwootOutboundOperation.findMany({
+          where: {
+            state: { in: states },
+            nextAttemptAt: { lte: now },
+            AND: [
+              { OR: [{ leaseOwner: null }, { leaseExpiresAt: { lte: now } }] },
+              ...(workClass === 'maintenance'
+                ? [
+                    {
+                      OR: [
+                        { state: { in: ['callback_pending', 'failure_callback_pending'] }, partIndex: 0 },
+                        { state: 'delete_pending' },
+                      ],
+                    },
+                  ]
+                : []),
+            ],
+          },
+          orderBy: [{ createdAt: 'asc' }, { partIndex: 'asc' }, { id: 'asc' }],
+          ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+          take: 64,
+        });
+        for (const eligible of candidates) {
+          if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible))) {
+            candidate = eligible;
+            break;
+          }
+          if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible))) {
+            candidate = eligible;
+            break;
+          }
         }
-        if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible))) {
-          candidate = eligible;
-          break;
-        }
+        if (candidate || candidates.length < 64) break;
+        cursor = candidates[candidates.length - 1].id;
       }
       if (!candidate) return null;
 
@@ -333,6 +338,9 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         whatsappMessageId,
         result: (result ?? undefined) as any,
         sentAt: now,
+        nextAttemptAt: now,
+        leaseOwner: null,
+        leaseExpiresAt: null,
         lastErrorClass: null,
       },
     });
@@ -353,7 +361,13 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           claimGeneration: operation.claimGeneration,
           state: { in: ['preparing', 'pending'] },
         },
-        data: { state: 'failure_callback_pending', nextAttemptAt: now, lastErrorClass },
+        data: {
+          state: 'failure_callback_pending',
+          nextAttemptAt: now,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastErrorClass,
+        },
       });
       if (owned.count !== 1) throw new Error('OutboundLeaseLost');
       await transaction.chatwootOutboundOperation.updateMany({
@@ -726,9 +740,19 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           operation.partIndex === index &&
           operation.operationKey === parts[index].operationKey &&
           operation.partIdentity === parts[index].partIdentity &&
-          operation.plannedWhatsappMessageId === parts[index].plannedWhatsappMessageId,
+          operation.plannedWhatsappMessageId === parts[index].plannedWhatsappMessageId &&
+          this.retainedContactIdentityMatches(operation.payload?.origin, parts[index].payload.origin),
       );
     return exact;
+  }
+
+  private retainedContactIdentityMatches(existing: any, replay: ChatwootOutboundPayload['origin']): boolean {
+    return (
+      (existing?.contactId === undefined || existing?.contactId === null || existing.contactId === replay.contactId) &&
+      (existing?.contactInboxId === undefined ||
+        existing?.contactInboxId === null ||
+        existing.contactInboxId === replay.contactInboxId)
+    );
   }
 
   private assertStoredMessageSet(existing: any[], messageSetHash: string, partCount: number) {

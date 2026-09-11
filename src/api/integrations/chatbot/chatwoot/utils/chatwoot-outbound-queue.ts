@@ -259,6 +259,17 @@ export function buildChatwootOutboundParts(params: {
     ...params.origin,
     baseUrl: normalizeBaseUrl(requiredString(params.origin.baseUrl, 'Chatwoot base URL')),
   };
+  const hashOrigin = {
+    providerId: normalizedOrigin.providerId,
+    baseUrl: normalizedOrigin.baseUrl,
+    accountId: normalizedOrigin.accountId,
+    inboxId: normalizedOrigin.inboxId,
+    conversationId: normalizedOrigin.conversationId,
+    messageId: normalizedOrigin.messageId,
+    contactInboxSourceId: normalizedOrigin.contactInboxSourceId,
+    inboxName: normalizedOrigin.inboxName,
+    routeBinding: normalizedOrigin.routeBinding,
+  };
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
   const quoted = Number(params.body?.content_attributes?.in_reply_to);
   if (params.body?.attachments !== undefined && !Array.isArray(params.body.attachments)) {
@@ -296,7 +307,10 @@ export function buildChatwootOutboundParts(params: {
       chatId,
       text: params.formattedText,
       quoted: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : null,
-      origin: normalizedOrigin,
+      // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
+      // excluded from the frozen identity so pre-upgrade retained rows replay
+      // against their original operation keys instead of being quarantined.
+      origin: hashOrigin,
       parts: canonicalSet,
     }),
   );
@@ -569,7 +583,7 @@ export class ChatwootOutboundQueue {
   private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string) {
     if (operation.preparationAttempts + 1 >= MAX_OUTBOUND_PREPARATION_ATTEMPTS) {
       await this.store.markFailureCallbackPending(operation, this.workerId, classified, new Date());
-      await this.confirmFailure(operation);
+      this.wake();
       return;
     }
     await this.store.schedulePending(
@@ -774,14 +788,15 @@ export class ChatwootOutboundQueue {
   private fillSlots(workClass: Exclude<ChatwootOutboundWorkClass, 'any'>, limit: number) {
     const activeOfClass = [...this.activeRuns].filter((run: any) => run.workClass === workClass).length;
     for (let index = activeOfClass; index < Math.max(1, limit); index += 1) {
+      let processed = false;
       const run: Promise<void> & { workClass?: string } = this.runOnce(workClass)
-        .then((processed) => {
-          if (processed) this.wake();
+        .then((result) => {
+          processed = result;
         })
         .catch(() => undefined)
         .finally(() => {
           this.activeRuns.delete(run);
-          this.wake();
+          if (processed) this.wake();
         });
       run.workClass = workClass;
       this.activeRuns.add(run);

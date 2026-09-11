@@ -60,6 +60,7 @@ import {
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
 import {
+  chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
   validatesLocalChatwootDeletionBinding,
@@ -233,7 +234,7 @@ export class ChatwootService {
         status: 404,
       });
     }
-    return verifyChatwootOutboundWebhook({
+    const verified = verifyChatwootOutboundWebhook({
       rawBody,
       headers,
       secrets: {
@@ -244,6 +245,7 @@ export class ChatwootService {
       maxAgeMs: config.OUTBOUND_WEBHOOK_MAX_AGE_MS,
       maxBodyBytes: config.OUTBOUND_WEBHOOK_MAX_BODY_BYTES,
     });
+    return { ...verified, routeInstanceId: instance.id };
   }
 
   private pgClient = postgresClient.getChatwootConnection();
@@ -2008,6 +2010,7 @@ export class ChatwootService {
     formattedText: string | null,
     admission: ChatwootOutboundWebhookHeaders,
   ) {
+    const contactIdentity = chatwootOutboundContactIdentity(body);
     const origin: ChatwootOutboundOrigin = {
       providerId: provider.id,
       baseUrl: this.normalizeChatwootBaseUrl(provider.url),
@@ -2015,11 +2018,7 @@ export class ChatwootService {
       inboxId: Number(body.inbox.id),
       conversationId: Number(body.conversation.id),
       messageId: Number(body.id),
-      contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-      contactId: Number.isSafeInteger(Number(body.sender?.id)) ? Number(body.sender.id) : undefined,
-      contactInboxId: Number.isSafeInteger(Number(body.conversation?.contact_inbox?.id))
-        ? Number(body.conversation.contact_inbox.id)
-        : undefined,
+      ...contactIdentity,
       inboxName: provider.nameInbox,
       routeBinding,
     };
@@ -2123,9 +2122,30 @@ export class ChatwootService {
   ) {
     let outboundEnqueueAttempted = false;
     try {
+      const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
+      const candidateChatId =
+        body?.conversation?.meta?.sender?.identifier ||
+        body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
+        '';
+      const deliverableOutgoing = isDeliverableChatwootOutgoing(body, candidateChatId);
+      const asyncDeliverable = outboundConfig.OUTBOUND_ASYNC_ENABLED && deliverableOutgoing;
+      outboundEnqueueAttempted = asyncDeliverable;
+      if (asyncDeliverable && !authenticatedAdmission) {
+        throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
+          name: 'ChatwootWebhookAuthenticationError',
+          status: 401,
+        });
+      }
       const context = await this.clientCw(instance);
 
       if (!context) {
+        if (asyncDeliverable) {
+          outboundEnqueueAttempted = true;
+          throw Object.assign(new Error('Chatwoot outbound local provider binding is unavailable'), {
+            name: 'ChatwootOutboundLocalBindingUnavailable',
+            status: 503,
+          });
+        }
         this.logger.warn('client not found');
         return null;
       }
@@ -2149,15 +2169,23 @@ export class ChatwootService {
         return { message: 'bot' };
       }
 
-      const candidateChatId =
-        body.conversation?.meta?.sender?.identifier ||
-        body.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
-        '';
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
-      if (!waInstance) {
+      const exactAsyncSocketBinding =
+        !asyncDeliverable ||
+        (Boolean(authenticatedAdmission?.routeInstanceId) &&
+          authenticatedAdmission?.routeInstanceId === provider.instanceId &&
+          authenticatedAdmission.routeInstanceId === waInstance?.instanceId);
+      if (!waInstance || !exactAsyncSocketBinding) {
+        if (asyncDeliverable) {
+          outboundEnqueueAttempted = true;
+          throw Object.assign(new Error('Chatwoot outbound local socket binding is unavailable'), {
+            name: 'ChatwootOutboundLocalBindingUnavailable',
+            status: 503,
+          });
+        }
         if (
-          !this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED &&
+          !outboundConfig.OUTBOUND_ASYNC_ENABLED &&
           isDeliverableChatwootOutgoing(body, candidateChatId) &&
           body.conversation?.id
         ) {
@@ -2208,11 +2236,7 @@ export class ChatwootService {
           inboxId: Number(body.inbox?.id),
           conversationId: Number(body.conversation?.id),
           messageId: Number(body.id),
-          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-          contactId: Number.isSafeInteger(Number(body.sender?.id)) ? Number(body.sender.id) : undefined,
-          contactInboxId: Number.isSafeInteger(Number(body.conversation?.contact_inbox?.id))
-            ? Number(body.conversation.contact_inbox.id)
-            : undefined,
+          ...chatwootOutboundContactIdentity(body),
           inboxName: liveProvider.nameInbox,
           routeBinding: deletionRoute,
         };
@@ -2286,8 +2310,6 @@ export class ChatwootService {
         : body.content;
 
       const senderName = body?.sender?.available_name || body?.sender?.name;
-      const deliverableOutgoing = isDeliverableChatwootOutgoing(body, chatId);
-
       const expectedRoute = this.buildEvoRouteBinding(instance, provider, body.inbox?.id);
       const autoReplyBinding = validateChatwootAutoReplyBinding(body, expectedRoute);
 
@@ -2302,6 +2324,11 @@ export class ChatwootService {
             conversationId: body.conversation?.id,
           }),
         );
+        if (asyncDeliverable) {
+          const error = this.outboundBindingMismatch();
+          (error as any).status = 409;
+          throw error;
+        }
         if (deliverableOutgoing && body.conversation?.id) {
           await this.onSendMessageError(instance, body.conversation.id, body.id, autoReplyBinding.reason);
         }
@@ -2316,7 +2343,13 @@ export class ChatwootService {
         return textToConcat.length > 0 ? textToConcat.join(formattedDelimiter) : null;
       };
 
-      if (deliverableOutgoing && (await this.outboundStore.hasRetainedMessage(instance.instanceId, Number(body.id)))) {
+      let retainedMessage = false;
+      if (deliverableOutgoing) {
+        outboundEnqueueAttempted = true;
+        retainedMessage = await this.outboundStore.hasRetainedMessage(instance.instanceId, Number(body.id));
+        if (!retainedMessage && !outboundConfig.OUTBOUND_ASYNC_ENABLED) outboundEnqueueAttempted = false;
+      }
+      if (deliverableOutgoing && retainedMessage) {
         if (!expectedRoute || Number(provider.accountId) !== Number(body.account?.id)) {
           throw this.outboundBindingMismatch();
         }
@@ -2331,20 +2364,15 @@ export class ChatwootService {
             deliveryId: `retained:${instance.instanceId}:${Number(body.id)}`,
             timestampSeconds: Math.floor(Date.now() / 1_000),
             receivedAt: new Date(),
+            routeInstanceId: instance.instanceId,
           },
         );
         return { ...retainedResult, retained: true };
       }
 
-      if (deliverableOutgoing && this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) {
+      if (deliverableOutgoing && outboundConfig.OUTBOUND_ASYNC_ENABLED) {
         outboundEnqueueAttempted = true;
-        if (!authenticatedAdmission) {
-          throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
-            name: 'ChatwootWebhookAuthenticationError',
-            status: 401,
-          });
-        }
-        if (this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_DRAIN_ONLY) {
+        if (outboundConfig.OUTBOUND_ASYNC_DRAIN_ONLY) {
           const error = new Error('Chatwoot outbound async ingress is paused for drain');
           error.name = 'ChatwootOutboundDrainOnly';
           (error as any).status = 503;
