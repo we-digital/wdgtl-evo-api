@@ -15,6 +15,17 @@ ADD COLUMN "callbackStartedAt" TIMESTAMP,
 ADD COLUMN "transportOutcomeUnresolved" BOOLEAN NOT NULL DEFAULT false;
 ALTER TABLE "ChatwootOutboundOperation" ADD COLUMN "callbackContext" JSONB;
 
+UPDATE "ChatwootOutboundOperation"
+SET "transportOutcomeUnresolved" = true
+WHERE "whatsappMessageId" IS NULL
+  AND (
+    "state" IN ('sending', 'ambiguous')
+    OR (
+      "state" = 'quarantined'
+      AND ("sendAttempts" > 0 OR "sendStartedAt" IS NOT NULL)
+    )
+  );
+
 CREATE TABLE "ChatwootOutboundLane" (
   "laneKey" VARCHAR(64) NOT NULL,
   "nextSequence" BIGINT NOT NULL DEFAULT 0,

@@ -60,6 +60,24 @@ const stored = (partIndex: number, state: string, whatsappMessageId?: string) =>
   claimGeneration: 0,
 });
 
+const matchesPrismaWhere = (row: any, where: any): boolean => {
+  if (!where) return true;
+  if (where.AND && !where.AND.every((condition: any) => matchesPrismaWhere(row, condition))) return false;
+  if (where.OR && !where.OR.some((condition: any) => matchesPrismaWhere(row, condition))) return false;
+  return Object.entries(where).every(([key, expected]: [string, any]) => {
+    if (key === 'AND' || key === 'OR') return true;
+    const actual = row[key];
+    if (expected === null || typeof expected !== 'object' || expected instanceof Date) return actual === expected;
+    if ('in' in expected && !expected.in.includes(actual)) return false;
+    if ('not' in expected && actual === expected.not) return false;
+    if ('lt' in expected && !(actual < expected.lt)) return false;
+    if ('lte' in expected && !(actual <= expected.lte)) return false;
+    if ('gt' in expected && !(actual > expected.gt)) return false;
+    if ('equals' in expected && actual !== expected.equals) return false;
+    return true;
+  });
+};
+
 test('increments claim generation and rejects a stale same-worker transport fence', async () => {
   const row: any = {
     ...stored(0, 'pending'),
@@ -451,6 +469,89 @@ test('same delivery identity with changed frozen context quarantines the retaine
   assert.ok(memory.rows.every((row) => row.lastErrorClass === 'ChangedFrozenPartSet'));
 });
 
+test('reconstructs migration-defaulted unresolved transport fences before worker claims', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const past = new Date(now.getTime() - 1_000);
+  const future = new Date(now.getTime() + 1_000);
+  const rows: any[] = [
+    {
+      id: 'active-sending',
+      state: 'sending',
+      sendAttempts: 1,
+      sendStartedAt: past,
+      whatsappMessageId: null,
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: future,
+    },
+    {
+      id: 'expired-sending',
+      state: 'sending',
+      sendAttempts: 1,
+      sendStartedAt: past,
+      whatsappMessageId: null,
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: past,
+    },
+    {
+      id: 'ambiguous',
+      state: 'ambiguous',
+      sendAttempts: 1,
+      sendStartedAt: past,
+      whatsappMessageId: null,
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: null,
+    },
+    {
+      id: 'transport-started-quarantine',
+      state: 'quarantined',
+      sendAttempts: 1,
+      sendStartedAt: past,
+      whatsappMessageId: null,
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: null,
+    },
+    {
+      id: 'pretransport-quarantine',
+      state: 'quarantined',
+      sendAttempts: 0,
+      sendStartedAt: null,
+      whatsappMessageId: null,
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: null,
+    },
+    {
+      id: 'resolved-callback',
+      state: 'callback_pending',
+      sendAttempts: 1,
+      sendStartedAt: past,
+      whatsappMessageId: 'exact-waid',
+      transportOutcomeUnresolved: false,
+      leaseExpiresAt: null,
+    },
+  ];
+  const repository: any = {
+    chatwootOutboundOperation: {
+      updateMany: async ({ where, data }: any) => {
+        const selected = rows.filter((row) => matchesPrismaWhere(row, where));
+        selected.forEach((row) => Object.assign(row, data));
+        return { count: selected.length };
+      },
+    },
+  };
+  repository.$transaction = async (operations: Promise<unknown>[]) => Promise.all(operations);
+
+  await new ChatwootOutboundPrismaStore(repository).recoverExpired(now);
+
+  assert.equal(rows.find((row) => row.id === 'active-sending').transportOutcomeUnresolved, true);
+  assert.equal(rows.find((row) => row.id === 'active-sending').state, 'sending');
+  assert.equal(rows.find((row) => row.id === 'expired-sending').transportOutcomeUnresolved, true);
+  assert.equal(rows.find((row) => row.id === 'expired-sending').state, 'ambiguous');
+  assert.equal(rows.find((row) => row.id === 'ambiguous').transportOutcomeUnresolved, true);
+  assert.equal(rows.find((row) => row.id === 'transport-started-quarantine').transportOutcomeUnresolved, true);
+  assert.equal(rows.find((row) => row.id === 'pretransport-quarantine').transportOutcomeUnresolved, false);
+  assert.equal(rows.find((row) => row.id === 'resolved-callback').transportOutcomeUnresolved, false);
+});
+
 test('replay quarantine keeps an unresolved transport lane fenced across workers until exact resolution', async () => {
   const now = new Date('2026-09-11T03:00:00.000Z');
   const laneKey = parts[0].laneKey;
@@ -484,7 +585,10 @@ test('replay quarantine keeps an unresolved transport lane fenced across workers
       laneKey,
       laneSequence: 1n,
       sendAttempts: 1,
-      transportOutcomeUnresolved: true,
+      whatsappMessageId: null,
+      // Migration defaults and mixed-version writes can initially retain false;
+      // enqueue must reconstruct the transport-start fence before quarantine.
+      transportOutcomeUnresolved: false,
       sendStartedAt: new Date(now.getTime() - 100),
       leaseOwner: null,
       leaseExpiresAt: null,
@@ -518,23 +622,7 @@ test('replay quarantine keeps an unresolved transport lane fenced across workers
       createdAt: now,
     },
   ];
-  const matches = (row: any, where: any): boolean => {
-    if (!where) return true;
-    if (where.AND && !where.AND.every((condition: any) => matches(row, condition))) return false;
-    if (where.OR && !where.OR.some((condition: any) => matches(row, condition))) return false;
-    return Object.entries(where).every(([key, expected]: [string, any]) => {
-      if (key === 'AND' || key === 'OR') return true;
-      const actual = row[key];
-      if (expected === null || typeof expected !== 'object' || expected instanceof Date) return actual === expected;
-      if ('in' in expected && !expected.in.includes(actual)) return false;
-      if ('not' in expected && actual === expected.not) return false;
-      if ('lt' in expected && !(actual < expected.lt)) return false;
-      if ('lte' in expected && !(actual <= expected.lte)) return false;
-      if ('gt' in expected && !(actual > expected.gt)) return false;
-      if ('equals' in expected && actual !== expected.equals) return false;
-      return true;
-    });
-  };
+  const matches = matchesPrismaWhere;
   const operations = {
     findMany: async ({ where, cursor, skip = 0, take }: any) => {
       const matching = rows.filter((row) => matches(row, where));

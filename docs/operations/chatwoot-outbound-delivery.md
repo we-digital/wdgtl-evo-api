@@ -151,7 +151,10 @@ Apply the provider-specific migration before enabling the flag. In addition to
 the existing outbound ledger, the latency-control migration adds provider
 webhook secrets, delivery receipts, lane counters/order, callback snapshot
 context and phase timestamps. Existing operation rows receive compatibility
-defaults for lane fields; no existing row is deleted or rewritten. PostgreSQL,
+defaults for lane fields. The migration conservatively marks retained
+`sending`/`ambiguous` rows without a WAID, plus transport-started quarantined
+rows, as unresolved; worker startup reconstructs the same fence for
+mixed-version writes before any claim. No existing row is deleted. PostgreSQL,
 PgBouncer schema generation and MySQL are kept equivalent.
 
 Staging sequence:

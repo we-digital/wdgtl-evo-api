@@ -76,6 +76,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
             });
           }
           if (receipt.messageSetHash !== parts[0].messageSetHash || !this.isExactFrozenPartSet(existing, parts)) {
+            await this.preserveUnresolvedTransportFence(transaction, instanceId, messageId);
             await transaction.chatwootOutboundOperation.updateMany({
               where: { instanceId, chatwootMessageId: messageId },
               data: {
@@ -91,6 +92,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         }
         if (existing.length > 0) {
           if (!this.isExactFrozenPartSet(existing, parts)) {
+            await this.preserveUnresolvedTransportFence(transaction, instanceId, messageId);
             await transaction.chatwootOutboundOperation.updateMany({
               where: { instanceId, chatwootMessageId: messageId },
               data: {
@@ -206,6 +208,20 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   public async recoverExpired(now: Date): Promise<void> {
     await this.repository.$transaction([
       this.repository.chatwootOutboundOperation.updateMany({
+        where: {
+          transportOutcomeUnresolved: false,
+          whatsappMessageId: null,
+          OR: [
+            { state: { in: ['sending', 'ambiguous'] } },
+            {
+              state: 'quarantined',
+              OR: [{ sendAttempts: { gt: 0 } }, { sendStartedAt: { not: null } }],
+            },
+          ],
+        },
+        data: { transportOutcomeUnresolved: true },
+      }),
+      this.repository.chatwootOutboundOperation.updateMany({
         where: { state: 'preparing', leaseExpiresAt: { lte: now } },
         data: { state: 'pending', leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
       }),
@@ -215,7 +231,13 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       }),
       this.repository.chatwootOutboundOperation.updateMany({
         where: { state: 'sending', leaseExpiresAt: { lte: now } },
-        data: { state: 'ambiguous', leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
+        data: {
+          state: 'ambiguous',
+          transportOutcomeUnresolved: true,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          nextAttemptAt: now,
+        },
       }),
       this.repository.chatwootOutboundOperation.updateMany({
         where: {
@@ -843,6 +865,29 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       messageSetHash: operation.messageSetHash,
       state: { in: states },
     };
+  }
+
+  private async preserveUnresolvedTransportFence(
+    repository: any,
+    instanceId: string,
+    messageId: number,
+  ): Promise<void> {
+    await repository.chatwootOutboundOperation.updateMany({
+      where: {
+        instanceId,
+        chatwootMessageId: messageId,
+        transportOutcomeUnresolved: false,
+        whatsappMessageId: null,
+        OR: [
+          { state: { in: ['sending', 'ambiguous'] } },
+          {
+            state: 'quarantined',
+            OR: [{ sendAttempts: { gt: 0 } }, { sendStartedAt: { not: null } }],
+          },
+        ],
+      },
+      data: { transportOutcomeUnresolved: true },
+    });
   }
 
   private toStored(candidate: any): StoredChatwootOutboundOperation {
