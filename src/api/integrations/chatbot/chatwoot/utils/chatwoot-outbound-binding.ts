@@ -17,7 +17,7 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
   currentRoute: unknown;
   expectedDeleted?: boolean;
 }): boolean => {
-  const { operation, provider, currentInbox, conversation } = params;
+  const { operation, provider } = params;
   const { origin } = operation.payload;
   if (
     provider.enabled !== true ||
@@ -31,23 +31,10 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
     origin.routeBinding.instance_id !== operation.instanceId ||
     origin.routeBinding.inbox_id !== origin.inboxId ||
     !chatwootEvoRouteBindingsEqual(params.expectedRoute as any, origin.routeBinding) ||
-    !currentInbox ||
-    Number(currentInbox.id) !== origin.inboxId ||
-    currentInbox.name !== origin.inboxName ||
-    !chatwootEvoRouteBindingsEqual(params.currentRoute as any, origin.routeBinding) ||
-    Number(conversation?.id) !== origin.conversationId ||
-    Number(conversation?.account_id) !== origin.accountId ||
-    Number(conversation?.inbox_id) !== origin.inboxId ||
-    chatwootOutboundDestination(conversation) !== operation.payload.chatId
+    !chatwootEvoRouteBindingsEqual(params.currentRoute as any, origin.routeBinding)
   )
     return false;
 
-  if (origin.contactInboxSourceId) {
-    const currentSourceId =
-      conversation?.contact_inbox?.source_id ||
-      conversation?.last_non_activity_message?.conversation?.contact_inbox?.source_id;
-    if (currentSourceId && currentSourceId !== origin.contactInboxSourceId) return false;
-  }
   const currentMessage = params.currentMessage;
   return Boolean(
     currentMessage &&
@@ -60,9 +47,13 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       currentMessage.deleted === (params.expectedDeleted ?? false) &&
       currentMessage.destination === operation.payload.chatId &&
       (!origin.contactInboxSourceId || currentMessage.contact_inbox_source_id === origin.contactInboxSourceId) &&
+      (!origin.contactId || Number(currentMessage.contact_id) === origin.contactId) &&
+      (!origin.contactInboxId || Number(currentMessage.contact_inbox_id) === origin.contactInboxId) &&
       currentMessage.route?.inbox_name === origin.inboxName &&
       currentMessage.route?.channel_type === 'Channel::Api' &&
-      chatwootEvoRouteBindingsEqual(currentMessage.route?.binding, origin.routeBinding),
+      chatwootEvoRouteBindingsEqual(currentMessage.route?.binding, origin.routeBinding) &&
+      Number(currentMessage.outbound_snapshot?.version) === 1 &&
+      /^[a-f0-9]{64}$/.test(String(currentMessage.outbound_snapshot?.fingerprint || '')),
   );
 };
 

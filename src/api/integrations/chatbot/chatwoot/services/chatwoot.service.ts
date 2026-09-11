@@ -16,6 +16,7 @@ import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/util
 import {
   buildChatwootDeliveryFailureUpdate,
   buildChatwootDeliverySuccessUpdate,
+  ChatwootProviderContext,
   ChatwootProviderDeliveryPart,
   isChatwootDeliveryFailureAcknowledged,
   isChatwootMessageDeletion,
@@ -55,7 +56,6 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
   getExactChatwootMessage,
-  unwrapChatwootCollection,
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
@@ -72,6 +72,10 @@ import {
   ChatwootOutboundQueue,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
+import {
+  ChatwootOutboundWebhookHeaders,
+  verifyChatwootOutboundWebhook,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -139,24 +143,107 @@ export class ChatwootService {
     private readonly prismaRepository: PrismaRepository,
     private readonly cache: CacheService,
   ) {
+    const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
     this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository);
-    this.outboundQueue = new ChatwootOutboundQueue(this.outboundStore, {
-      validate: (operation, phase, signal) => this.validateOutboundBinding(operation, phase, signal),
-      isReady: (operation, signal) => this.isOutboundReady(operation, signal),
-      send: (operation, onTransportStart, signal) => this.sendQueuedOutbound(operation, onTransportStart, signal),
-      confirm: (operation, callbackParts, signal) => this.confirmQueuedOutbound(operation, callbackParts, signal),
-      fail: (operation, signal) => this.failQueuedOutbound(operation, signal),
-      delete: (operation, signal) => this.deleteQueuedOutbound(operation, signal),
-    });
+    this.outboundQueue = new ChatwootOutboundQueue(
+      this.outboundStore,
+      {
+        prepare: (operation, signal) => this.prepareQueuedOutbound(operation, signal),
+        validate: (operation, phase, signal) => this.validateOutboundBinding(operation, phase, signal),
+        revalidateTransport: (operation, signal) => this.revalidateQueuedOutboundTransport(operation, signal),
+        isReady: (operation, context, signal) => this.isOutboundReady(operation, context, signal),
+        send: (operation, context, onTransportStart, signal) =>
+          this.sendQueuedOutbound(operation, context, onTransportStart, signal),
+        confirm: (operation, callbackParts, signal) => this.confirmQueuedOutbound(operation, callbackParts, signal),
+        fail: (operation, signal) => this.failQueuedOutbound(operation, signal),
+        delete: (operation, signal) => this.deleteQueuedOutbound(operation, signal),
+        observe: (event, metrics) => this.logger.verbose(JSON.stringify({ event, ...metrics })),
+      },
+      1_000,
+      600_000,
+      undefined,
+      {
+        transport: Math.max(1, Math.min(16, outboundConfig.OUTBOUND_TRANSPORT_CONCURRENCY)),
+        maintenance: Math.max(1, Math.min(8, outboundConfig.OUTBOUND_MAINTENANCE_CONCURRENCY)),
+      },
+    );
   }
 
   public async startOutboundWorker() {
     if (!this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) return;
+    await this.bootstrapOutboundWebhookSecrets();
     await this.outboundQueue.start();
+  }
+
+  private async bootstrapOutboundWebhookSecrets() {
+    const providers = await this.prismaRepository.chatwoot.findMany({
+      where: { enabled: true, webhookSecret: null },
+      select: { instanceId: true },
+    });
+    for (const provider of providers) {
+      const stored = await this.prismaRepository.instance.findUnique({
+        where: { id: provider.instanceId },
+        select: { id: true, name: true },
+      });
+      if (!stored) continue;
+      try {
+        const inbox = await this.getInbox({ instanceId: stored.id, instanceName: stored.name }, false);
+        const webhookSecret = (inbox as any)?.secret;
+        if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+          await this.prismaRepository.chatwoot.update({
+            where: { instanceId: stored.id },
+            data: { webhookSecret },
+          });
+          await this.cache.deleteAll(stored.name);
+        } else {
+          this.logger.error(JSON.stringify({ event: 'chatwoot_outbound_webhook_secret_bootstrap_failed' }));
+        }
+      } catch (error) {
+        this.logger.error(
+          JSON.stringify({
+            event: 'chatwoot_outbound_webhook_secret_bootstrap_failed',
+            errorClass: error instanceof Error ? error.name : 'Error',
+          }),
+        );
+      }
+    }
   }
 
   public async stopOutboundWorker() {
     await this.outboundQueue.stop();
+  }
+
+  public async authenticateOutboundWebhook(
+    instanceName: string,
+    rawBody: Buffer | undefined,
+    headers: Record<string, string | string[] | undefined>,
+  ): Promise<ChatwootOutboundWebhookHeaders | undefined> {
+    const config = this.configService.get<Chatwoot>('CHATWOOT');
+    if (!config.OUTBOUND_ASYNC_ENABLED) return undefined;
+    const instance = await this.prismaRepository.instance.findUnique({
+      where: { name: instanceName },
+      select: { id: true },
+    });
+    const provider = instance
+      ? await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: instance.id } })
+      : null;
+    if (!provider?.enabled) {
+      throw Object.assign(new Error('Chatwoot webhook route is unavailable'), {
+        name: 'ChatwootWebhookRouteUnavailable',
+        status: 404,
+      });
+    }
+    return verifyChatwootOutboundWebhook({
+      rawBody,
+      headers,
+      secrets: {
+        current: provider.webhookSecret || '',
+        previous: provider.webhookPreviousSecret,
+        previousValidUntil: provider.webhookPreviousSecretValidUntil,
+      },
+      maxAgeMs: config.OUTBOUND_WEBHOOK_MAX_AGE_MS,
+      maxBodyBytes: config.OUTBOUND_WEBHOOK_MAX_BODY_BYTES,
+    });
   }
 
   private pgClient = postgresClient.getChatwootConnection();
@@ -254,7 +341,15 @@ export class ChatwootService {
         data.logo,
       );
     } else {
-      await this.getInbox(instance, true);
+      const inbox = await this.getInbox(instance, true);
+      const webhookSecret = (inbox as any)?.secret;
+      if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+        await this.prismaRepository.chatwoot.update({
+          where: { instanceId: instance.instanceId },
+          data: { webhookSecret },
+        });
+        await this.cache.deleteAll(instance.instanceName);
+      }
     }
     return data;
   }
@@ -359,6 +454,14 @@ export class ChatwootService {
       selectedInbox = inbox;
     }
     await this.reconcileChatwootRouteBinding(instance, provider, selectedInbox, true);
+    const webhookSecret = (selectedInbox as any)?.secret;
+    if (typeof webhookSecret === 'string' && webhookSecret.length >= 32) {
+      await this.prismaRepository.chatwoot.update({
+        where: { instanceId: instance.instanceId },
+        data: { webhookSecret },
+      });
+      await this.cache.deleteAll(instance.instanceName);
+    }
     this.logger.log(`Inbox created - inboxId: ${inboxId}`);
 
     if (!this.configService.get<Chatwoot>('CHATWOOT').BOT_CONTACT) {
@@ -1605,18 +1708,6 @@ export class ChatwootService {
     }
 
     const client = new ChatwootClient({ config: this.getClientCwConfig(provider) });
-    const inboxResponse: any = await this.awaitCancelable(
-      client.inboxes.list({ accountId: origin.accountId }) as any,
-      signal,
-    );
-    const currentInbox = unwrapChatwootCollection(inboxResponse).find(
-      (candidate: any) => Number(candidate?.id) === origin.inboxId,
-    );
-    const conversationResponse: any = await this.awaitCancelable(
-      client.conversations.get({ accountId: origin.accountId, conversationId: origin.conversationId }) as any,
-      signal,
-    );
-    const conversation = unwrapChatwootPayload(conversationResponse);
     const exactMessageResponse = await this.awaitCancelable(
       getExactChatwootMessage(
         this.getClientCwConfig(provider),
@@ -1631,11 +1722,11 @@ export class ChatwootService {
     const snapshot = {
       operation,
       provider,
-      currentInbox,
-      conversation,
+      currentInbox: null,
+      conversation: null,
       currentMessage,
       expectedRoute,
-      currentRoute: this.inboxRouteBinding(currentInbox),
+      currentRoute: currentMessage?.route?.binding,
     };
     const exact = validatesCurrentChatwootOutboundSnapshot({ ...snapshot, expectedDeleted });
     const authoritativelyDeleted =
@@ -1650,10 +1741,31 @@ export class ChatwootService {
       waInstance,
       provider,
       client,
-      currentInbox,
-      conversation,
       currentMessage,
       authoritativelyDeleted,
+      providerContext: {
+        snapshot_version: Number(currentMessage.outbound_snapshot.version),
+        snapshot_fingerprint: String(currentMessage.outbound_snapshot.fingerprint),
+        binding: currentMessage.route.binding,
+      },
+    };
+  }
+
+  private async prepareQueuedOutbound(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
+    const context = await this.currentOutboundContext(operation, signal, false, true);
+    if (!context) return { validation: 'mismatch' as const };
+    return {
+      validation: context.authoritativelyDeleted ? ('deleted' as const) : ('valid' as const),
+      context,
+    };
+  }
+
+  private async revalidateQueuedOutboundTransport(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
+    const context = await this.currentOutboundContext(operation, signal, false, true);
+    if (!context) return { validation: 'mismatch' as const };
+    return {
+      validation: context.authoritativelyDeleted ? ('deleted' as const) : ('valid' as const),
+      providerContext: context.providerContext,
     };
   }
 
@@ -1668,18 +1780,25 @@ export class ChatwootService {
     return context.authoritativelyDeleted ? 'deleted' : 'valid';
   }
 
-  private async isOutboundReady(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<boolean> {
-    const context = await this.currentOutboundContext(operation, signal, false, true);
+  private async isOutboundReady(
+    _operation: StoredChatwootOutboundOperation,
+    preparedContext: unknown,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted)
+      throw Object.assign(new Error('Outbound operation aborted'), { name: 'OutboundOperationAborted' });
+    const context = preparedContext as Awaited<ReturnType<ChatwootService['currentOutboundContext']>>;
     if (context?.authoritativelyDeleted) throw this.outboundMessageDeleted();
     return context?.waInstance?.connectionStatus?.state === 'open';
   }
 
   private async sendQueuedOutbound(
     operation: StoredChatwootOutboundOperation,
+    preparedContext: unknown,
     onTransportStart: () => Promise<void>,
     signal: AbortSignal,
   ): Promise<{ whatsappMessageId: string; result: unknown }> {
-    const context = await this.currentOutboundContext(operation, signal, false, true);
+    const context = preparedContext as Awaited<ReturnType<ChatwootService['currentOutboundContext']>>;
     if (!context) throw this.outboundBindingMismatch();
     if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { instance, waInstance } = context;
@@ -1749,27 +1868,42 @@ export class ChatwootService {
     signal: AbortSignal,
   ) {
     const { origin } = operation.payload;
+    const instance = await this.outboundInstance(operation);
+    const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } });
+    if (!instance || !provider?.enabled || provider.id !== origin.providerId) throw this.outboundBindingMismatch();
+    const expectedRoute = this.buildEvoRouteBinding(instance, provider, origin.inboxId);
+    if (!chatwootEvoRouteBindingsEqual(expectedRoute, origin.routeBinding)) throw this.outboundBindingMismatch();
+    let providerContext = operation.callbackContext as ChatwootProviderContext | undefined;
+    if (!this.validCallbackProviderContext(providerContext, origin.routeBinding)) {
+      const legacyContext = await this.currentOutboundContext(operation, signal, false, true);
+      if (!legacyContext) throw this.outboundBindingMismatch();
+      if (legacyContext.authoritativelyDeleted) throw this.outboundMessageDeleted();
+      providerContext = legacyContext.providerContext as ChatwootProviderContext;
+    }
     for (const callbackPart of callbackParts) {
-      const context = await this.currentOutboundContext(operation, signal, false, true);
-      if (!context) throw this.outboundBindingMismatch();
-      if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
       const update = buildChatwootDeliverySuccessUpdate(
         origin.accountId,
         origin.conversationId,
         origin.messageId,
         callbackPart.sourceId,
         callbackPart,
+        providerContext,
       );
-      const response: any = await this.awaitCancelable(
-        updateChatwootMessageJson(
-          this.getClientCwConfig(context.provider),
-          update.accountId,
-          update.conversationId,
-          update.messageId,
-          update.data,
-        ) as any,
-        signal,
-      );
+      let response: any;
+      try {
+        response = await this.awaitCancelable(
+          updateChatwootMessageJson(
+            this.getClientCwConfig(provider),
+            update.accountId,
+            update.conversationId,
+            update.messageId,
+            update.data,
+          ) as any,
+          signal,
+        );
+      } catch (error) {
+        this.throwConditionalCallbackOutcome(error);
+      }
       if (!isChatwootProviderDeliveryAcknowledged(response, origin.messageId, callbackPart, callbackParts)) {
         const error = new Error('Chatwoot provider-delivery callback was not acknowledged');
         error.name = 'ChatwootProviderDeliveryCallbackNotAcknowledged';
@@ -1783,10 +1917,32 @@ export class ChatwootService {
           conversationId: origin.conversationId,
           contactInboxSourceId: origin.contactInboxSourceId,
         },
-        context.instance,
+        instance,
       );
       if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
+  }
+
+  private validCallbackProviderContext(
+    context: ChatwootProviderContext | undefined,
+    binding: ChatwootEvoRouteBinding,
+  ): context is ChatwootProviderContext {
+    return Boolean(
+      context?.snapshot_version === 1 &&
+        /^[a-f0-9]{64}$/.test(context.snapshot_fingerprint) &&
+        chatwootEvoRouteBindingsEqual(context.binding as ChatwootEvoRouteBinding, binding),
+    );
+  }
+
+  private throwConditionalCallbackOutcome(error: unknown): never {
+    const candidate = error as any;
+    const status = Number(candidate?.status ?? candidate?.statusCode ?? candidate?.response?.status);
+    const code = candidate?.body?.error ?? candidate?.response?.data?.error;
+    if (status === 409 && code === 'provider_message_deleted') throw this.outboundMessageDeleted();
+    if (status === 409 && (code === 'provider_binding_changed' || code === 'outbound_snapshot_mismatch')) {
+      throw this.outboundBindingMismatch();
+    }
+    throw error;
   }
 
   private async failQueuedOutbound(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
@@ -1850,6 +2006,7 @@ export class ChatwootService {
     body: any,
     chatId: string,
     formattedText: string | null,
+    admission: ChatwootOutboundWebhookHeaders,
   ) {
     const origin: ChatwootOutboundOrigin = {
       providerId: provider.id,
@@ -1859,6 +2016,10 @@ export class ChatwootService {
       conversationId: Number(body.conversation.id),
       messageId: Number(body.id),
       contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+      contactId: Number.isSafeInteger(Number(body.sender?.id)) ? Number(body.sender.id) : undefined,
+      contactInboxId: Number.isSafeInteger(Number(body.conversation?.contact_inbox?.id))
+        ? Number(body.conversation.contact_inbox.id)
+        : undefined,
       inboxName: provider.nameInbox,
       routeBinding,
     };
@@ -1869,37 +2030,38 @@ export class ChatwootService {
       formattedText,
       origin,
     });
-    const validationOperation: StoredChatwootOutboundOperation = {
-      ...parts[0],
-      id: 'enqueue-validation',
-      instanceId: instance.instanceId,
-      chatwootMessageId: origin.messageId,
-      chatwootInboxId: origin.inboxId,
-      chatwootConversationId: origin.conversationId,
-      state: 'pending',
-      preparationAttempts: 0,
-      sendAttempts: 0,
-      callbackAttempts: 0,
-      claimGeneration: 0,
-    };
-    const validationController = new AbortController();
-    const validationTimer = setTimeout(() => validationController.abort(), 20_000);
-    let liveContext;
-    try {
-      liveContext = await this.currentOutboundContext(validationOperation, validationController.signal);
-    } finally {
-      clearTimeout(validationTimer);
-    }
-    if (!liveContext) throw this.outboundBindingMismatch();
-    await this.outboundStore.enqueue(
+    const createdAtSeconds = Number(body.created_at);
+    const messageCreatedAt =
+      Number.isFinite(createdAtSeconds) && createdAtSeconds > 0 ? new Date(createdAtSeconds * 1_000) : undefined;
+    const receivedAt = admission.receivedAt;
+    const enqueueResult = await this.outboundStore.enqueue(
       instance.instanceId,
       Number(body.id),
       Number(body.inbox.id),
       Number(body.conversation.id),
       parts,
+      {
+        deliveryId: admission.deliveryId,
+        receivedAt,
+        messageCreatedAt,
+        maxBacklog: this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_MAX_BACKLOG,
+        maxOldestAgeMs: this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_MAX_OLDEST_AGE_MS,
+      },
+    );
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_outbound_admitted',
+        recovered: enqueueResult.recovered,
+        operationCount: parts.length,
+        admissionMs: Date.now() - receivedAt.getTime(),
+        backlogDepth: enqueueResult.backlog?.depth ?? null,
+        oldestAgeMs: enqueueResult.backlog?.oldestAt
+          ? Math.max(0, Date.now() - enqueueResult.backlog.oldestAt.getTime())
+          : null,
+      }),
     );
     this.outboundQueue.wake();
-    return { accepted: true, operationCount: parts.length };
+    return { accepted: true, operationCount: parts.length, recovered: enqueueResult.recovered };
   }
 
   public async onSendMessageError(instance: InstanceDto, conversation: number, messageId?: number, error?: any) {
@@ -1954,7 +2116,11 @@ export class ChatwootService {
     });
   }
 
-  public async receiveWebhook(instance: InstanceDto, body: any) {
+  public async receiveWebhook(
+    instance: InstanceDto,
+    body: any,
+    authenticatedAdmission?: ChatwootOutboundWebhookHeaders,
+  ) {
     let outboundEnqueueAttempted = false;
     try {
       const context = await this.clientCw(instance);
@@ -1990,7 +2156,11 @@ export class ChatwootService {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
       if (!waInstance) {
-        if (isDeliverableChatwootOutgoing(body, candidateChatId) && body.conversation?.id) {
+        if (
+          !this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED &&
+          isDeliverableChatwootOutgoing(body, candidateChatId) &&
+          body.conversation?.id
+        ) {
           await this.onSendMessageError(instance, body.conversation.id, body.id, 'Instance not found');
         }
         return { message: 'bot' };
@@ -2039,6 +2209,10 @@ export class ChatwootService {
           conversationId: Number(body.conversation?.id),
           messageId: Number(body.id),
           contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+          contactId: Number.isSafeInteger(Number(body.sender?.id)) ? Number(body.sender.id) : undefined,
+          contactInboxId: Number.isSafeInteger(Number(body.conversation?.contact_inbox?.id))
+            ? Number(body.conversation.contact_inbox.id)
+            : undefined,
           inboxName: liveProvider.nameInbox,
           routeBinding: deletionRoute,
         };
@@ -2054,6 +2228,8 @@ export class ChatwootService {
           partIndex: 0,
           partCount: 1,
           plannedWhatsappMessageId: 'deletion-validation',
+          laneKey: 'deletion-validation',
+          laneSequence: 0n,
           state: 'delete_pending',
           payload: { chatId: chatwootOutboundDestination(body.conversation), text: null, origin: deletionOrigin },
           preparationAttempts: 0,
@@ -2151,12 +2327,23 @@ export class ChatwootService {
           body,
           chatId,
           formatOutboundText(),
+          authenticatedAdmission ?? {
+            deliveryId: `retained:${instance.instanceId}:${Number(body.id)}`,
+            timestampSeconds: Math.floor(Date.now() / 1_000),
+            receivedAt: new Date(),
+          },
         );
         return { ...retainedResult, retained: true };
       }
 
       if (deliverableOutgoing && this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) {
         outboundEnqueueAttempted = true;
+        if (!authenticatedAdmission) {
+          throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
+            name: 'ChatwootWebhookAuthenticationError',
+            status: 401,
+          });
+        }
         if (this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_DRAIN_ONLY) {
           const error = new Error('Chatwoot outbound async ingress is paused for drain');
           error.name = 'ChatwootOutboundDrainOnly';
@@ -2175,6 +2362,7 @@ export class ChatwootService {
           body,
           chatId,
           formatOutboundText(),
+          authenticatedAdmission,
         );
       }
 

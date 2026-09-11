@@ -286,6 +286,11 @@ export class ChannelStartupService {
           organization: data.organization,
           logo: data.logo,
           ignoreJids: data.ignoreJids,
+          webhookSecret: data.webhookSecret,
+          webhookPreviousSecret: data.webhookPreviousSecret,
+          webhookPreviousSecretValidUntil: data.webhookPreviousSecretValidUntil
+            ? new Date(data.webhookPreviousSecretValidUntil)
+            : undefined,
         },
       });
 
@@ -313,6 +318,11 @@ export class ChannelStartupService {
         organization: data.organization,
         logo: data.logo,
         ignoreJids: data.ignoreJids,
+        webhookSecret: data.webhookSecret,
+        webhookPreviousSecret: data.webhookPreviousSecret,
+        webhookPreviousSecretValidUntil: data.webhookPreviousSecretValidUntil
+          ? new Date(data.webhookPreviousSecretValidUntil)
+          : undefined,
         instanceId: this.instanceId,
       },
     });

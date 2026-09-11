@@ -1,17 +1,31 @@
 import {
+  ChatwootOutboundAdmission,
+  ChatwootOutboundBacklog,
   ChatwootOutboundMessageStatus,
   ChatwootOutboundPart,
   ChatwootOutboundPayload,
   ChatwootOutboundState,
   ChatwootOutboundStore,
+  ChatwootOutboundWorkClass,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 import { PrismaRepository } from '@api/repository/repository.service';
 
 const ACTIVE_STATES: ChatwootOutboundState[] = [
   'pending',
+  'preparing',
+  'sending',
   'callback_pending',
   'failure_callback_pending',
+  'ambiguous',
+  'delete_pending',
+];
+const TRANSPORT_STATES: ChatwootOutboundState[] = ['pending', 'ambiguous'];
+const MAINTENANCE_STATES: ChatwootOutboundState[] = ['callback_pending', 'failure_callback_pending', 'delete_pending'];
+const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
+  'pending',
+  'preparing',
+  'sending',
   'ambiguous',
   'delete_pending',
 ];
@@ -25,48 +39,149 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     inboxId: number,
     conversationId: number,
     parts: ChatwootOutboundPart[],
-  ): Promise<void> {
+    admission: ChatwootOutboundAdmission,
+  ): Promise<{ recovered: boolean; backlog?: ChatwootOutboundBacklog }> {
     if (parts.length === 0) throw new Error('Chatwoot outbound part set is empty');
-    const existing = await this.messageOperations(instanceId, messageId);
-    if (existing.length > 0) {
-      if (!this.isExactFrozenPartSet(existing, parts)) {
-        await this.quarantineFrozenSet(instanceId, messageId, 'ChangedFrozenPartSet');
-        throw new Error('Chatwoot outbound part set is already frozen with different content');
-      }
-      return;
-    }
-
-    try {
-      await this.repository.$transaction(
-        parts.map((part) =>
-          this.repository.chatwootOutboundOperation.create({
+    const outcome = await this.repository.$transaction(
+      async (transaction) => {
+        await transaction.chatwootOutboundAdmissionGuard.upsert({
+          where: { id: 1 },
+          create: { id: 1, version: 1, updatedAt: admission.receivedAt },
+          update: { version: { increment: 1 } },
+        });
+        const receipt = await transaction.chatwootOutboundWebhookDelivery.findUnique({
+          where: { deliveryId: admission.deliveryId },
+        });
+        const existing = await transaction.chatwootOutboundOperation.findMany({
+          where: { instanceId, chatwootMessageId: messageId },
+          orderBy: { partIndex: 'asc' },
+        });
+        if (receipt) {
+          if (
+            receipt.instanceId !== instanceId ||
+            receipt.chatwootMessageId !== messageId ||
+            receipt.messageSetHash !== parts[0].messageSetHash ||
+            !this.isExactFrozenPartSet(existing, parts)
+          ) {
+            throw Object.assign(new Error('Chatwoot delivery identifier was replayed for another operation'), {
+              name: 'ChatwootWebhookReplayRejected',
+              status: 409,
+            });
+          }
+          return { recovered: true, rejection: null };
+        }
+        if (existing.length > 0) {
+          if (!this.isExactFrozenPartSet(existing, parts)) {
+            await transaction.chatwootOutboundOperation.updateMany({
+              where: { instanceId, chatwootMessageId: messageId },
+              data: {
+                state: 'quarantined',
+                lastErrorClass: 'ChangedFrozenPartSet',
+                leaseOwner: null,
+                leaseExpiresAt: null,
+              },
+            });
+            return { recovered: false, rejection: 'ChangedFrozenPartSet' as const };
+          }
+          await transaction.chatwootOutboundWebhookDelivery.create({
             data: {
-              operationKey: part.operationKey,
-              messageSetHash: part.messageSetHash,
+              deliveryId: admission.deliveryId,
               instanceId,
               chatwootMessageId: messageId,
-              chatwootInboxId: inboxId,
-              chatwootConversationId: conversationId,
-              partIdentity: part.partIdentity,
-              partIndex: part.partIndex,
-              partCount: part.partCount,
-              plannedWhatsappMessageId: part.plannedWhatsappMessageId,
-              payload: part.payload as any,
+              messageSetHash: parts[0].messageSetHash,
+              receivedAt: admission.receivedAt,
             },
-          }),
-        ),
-      );
-    } catch (error) {
-      const afterConflict = await this.messageOperations(instanceId, messageId);
-      if (afterConflict.length > 0) {
-        if (!this.isExactFrozenPartSet(afterConflict, parts)) {
-          await this.quarantineFrozenSet(instanceId, messageId, 'ChangedFrozenPartSet');
-          throw new Error('Chatwoot outbound part set is already frozen with different content');
+          });
+          return { recovered: true, rejection: null };
         }
-        return;
-      }
-      throw error;
+        const [activeDepth, oldest] = await Promise.all([
+          transaction.chatwootOutboundOperation.count({ where: { state: { in: ACTIVE_STATES } } }),
+          transaction.chatwootOutboundOperation.findFirst({
+            where: { state: { in: ACTIVE_STATES } },
+            orderBy: { createdAt: 'asc' },
+            select: { createdAt: true },
+          }),
+        ]);
+        if (activeDepth + parts.length > admission.maxBacklog) {
+          throw Object.assign(new Error('Chatwoot outbound backlog capacity is exhausted'), {
+            name: 'ChatwootOutboundBacklogExceeded',
+            status: 503,
+          });
+        }
+        if (
+          oldest?.createdAt &&
+          admission.receivedAt.getTime() - oldest.createdAt.getTime() > admission.maxOldestAgeMs
+        ) {
+          throw Object.assign(new Error('Chatwoot outbound backlog is too old'), {
+            name: 'ChatwootOutboundBacklogTooOld',
+            status: 503,
+          });
+        }
+        const lane = await transaction.chatwootOutboundLane.upsert({
+          where: { laneKey: parts[0].laneKey },
+          create: { laneKey: parts[0].laneKey, nextSequence: 1, updatedAt: admission.receivedAt },
+          update: { nextSequence: { increment: 1 } },
+        });
+        await transaction.chatwootOutboundWebhookDelivery.create({
+          data: {
+            deliveryId: admission.deliveryId,
+            instanceId,
+            chatwootMessageId: messageId,
+            messageSetHash: parts[0].messageSetHash,
+            receivedAt: admission.receivedAt,
+          },
+        });
+        await Promise.all(
+          parts.map((part) =>
+            transaction.chatwootOutboundOperation.create({
+              data: {
+                operationKey: part.operationKey,
+                messageSetHash: part.messageSetHash,
+                instanceId,
+                chatwootMessageId: messageId,
+                chatwootInboxId: inboxId,
+                chatwootConversationId: conversationId,
+                webhookDeliveryId: admission.deliveryId,
+                laneKey: part.laneKey,
+                laneSequence: lane.nextSequence,
+                partIdentity: part.partIdentity,
+                partIndex: part.partIndex,
+                partCount: part.partCount,
+                plannedWhatsappMessageId: part.plannedWhatsappMessageId,
+                payload: part.payload as any,
+                webhookReceivedAt: admission.receivedAt,
+                messageCreatedAt: admission.messageCreatedAt,
+              },
+            }),
+          ),
+        );
+        return {
+          recovered: false,
+          rejection: null,
+          backlog: {
+            depth: activeDepth + parts.length,
+            oldestAt: oldest?.createdAt ?? admission.receivedAt,
+          },
+        };
+      },
+      { maxWait: 500, timeout: 1_500 },
+    );
+    if (outcome.rejection === 'ChangedFrozenPartSet') {
+      throw new Error('Chatwoot outbound part set is already frozen with different content');
     }
+    return { recovered: outcome.recovered, ...(outcome.backlog ? { backlog: outcome.backlog } : {}) };
+  }
+
+  public async backlog(): Promise<ChatwootOutboundBacklog> {
+    const [depth, oldest] = await Promise.all([
+      this.repository.chatwootOutboundOperation.count({ where: { state: { in: ACTIVE_STATES } } }),
+      this.repository.chatwootOutboundOperation.findFirst({
+        where: { state: { in: ACTIVE_STATES } },
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+    ]);
+    return { depth, oldestAt: oldest?.createdAt ?? null };
   }
 
   public async recoverExpired(now: Date): Promise<void> {
@@ -97,16 +212,44 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     workerId: string,
     now: Date,
     leaseExpiresAt: Date,
+    workClass: ChatwootOutboundWorkClass = 'any',
   ): Promise<StoredChatwootOutboundOperation | null> {
+    const states =
+      workClass === 'transport' ? TRANSPORT_STATES : workClass === 'maintenance' ? MAINTENANCE_STATES : ACTIVE_STATES;
     for (let attempt = 0; attempt < 3; attempt += 1) {
-      const candidate = await this.repository.chatwootOutboundOperation.findFirst({
+      const candidates = await this.repository.chatwootOutboundOperation.findMany({
         where: {
-          state: { in: ACTIVE_STATES },
+          state: { in: states },
           nextAttemptAt: { lte: now },
-          OR: [{ leaseOwner: null }, { leaseExpiresAt: { lte: now } }],
+          AND: [
+            { OR: [{ leaseOwner: null }, { leaseExpiresAt: { lte: now } }] },
+            ...(workClass === 'maintenance'
+              ? [
+                  {
+                    OR: [
+                      { state: { in: ['callback_pending', 'failure_callback_pending'] }, partIndex: 0 },
+                      { state: 'delete_pending' },
+                    ],
+                  },
+                ]
+              : []),
+          ],
         },
-        orderBy: [{ createdAt: 'asc' }, { partIndex: 'asc' }],
+        orderBy: [{ createdAt: 'asc' }, { partIndex: 'asc' }, { id: 'asc' }],
+        ...(workClass === 'transport' ? { distinct: ['laneKey' as const] } : {}),
+        take: 64,
       });
+      let candidate = null;
+      for (const eligible of candidates) {
+        if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible))) {
+          candidate = eligible;
+          break;
+        }
+        if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible))) {
+          candidate = eligible;
+          break;
+        }
+      }
       if (!candidate) return null;
 
       const claimedState = candidate.state === 'pending' ? 'preparing' : candidate.state;
@@ -121,18 +264,56 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           leaseOwner: workerId,
           leaseExpiresAt,
           claimGeneration: { increment: 1 },
+          claimedAt: now,
         },
       });
       if (claimed.count === 1)
-        return this.toStored({ ...candidate, state: claimedState, claimGeneration: candidate.claimGeneration + 1 });
+        return this.toStored({
+          ...candidate,
+          state: claimedState,
+          claimGeneration: candidate.claimGeneration + 1,
+          claimedAt: now,
+        });
     }
     return null;
   }
 
-  public async markSending(id: string, workerId: string, claimGeneration: number, now: Date): Promise<boolean> {
+  public async markValidated(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void> {
     const updated = await this.repository.chatwootOutboundOperation.updateMany({
       where: { id, state: 'preparing', leaseOwner: workerId, claimGeneration },
-      data: { state: 'sending', sendStartedAt: now, sendAttempts: { increment: 1 } },
+      data: { validatedAt: now },
+    });
+    if (updated.count !== 1) throw new Error('OutboundLeaseLost');
+  }
+
+  public async markCallbackStarted(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void> {
+    const updated = await this.repository.chatwootOutboundOperation.updateMany({
+      where: {
+        id,
+        state: { in: ['callback_pending', 'failure_callback_pending'] },
+        leaseOwner: workerId,
+        claimGeneration,
+      },
+      data: { callbackStartedAt: now },
+    });
+    if (updated.count !== 1) throw new Error('OutboundLeaseLost');
+  }
+
+  public async markSending(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    providerContext: unknown,
+    now: Date,
+  ): Promise<boolean> {
+    const updated = await this.repository.chatwootOutboundOperation.updateMany({
+      where: { id, state: 'preparing', leaseOwner: workerId, claimGeneration },
+      data: {
+        state: 'sending',
+        callbackContext: providerContext as any,
+        sendStartedAt: now,
+        sendAttempts: { increment: 1 },
+      },
     });
     return updated.count === 1;
   }
@@ -483,6 +664,57 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
+  private async hasLanePredecessor(candidate: any): Promise<boolean> {
+    if (!candidate.laneKey || BigInt(candidate.laneSequence ?? 0) <= 0n) {
+      return (
+        (await this.repository.chatwootOutboundOperation.count({
+          where: {
+            id: { not: candidate.id },
+            state: { in: LANE_BLOCKING_STATES },
+            OR: [
+              { createdAt: { lt: candidate.createdAt } },
+              { createdAt: candidate.createdAt, partIndex: { lt: candidate.partIndex } },
+            ],
+          },
+        })) > 0
+      );
+    }
+    return (
+      (await this.repository.chatwootOutboundOperation.count({
+        where: {
+          state: { in: LANE_BLOCKING_STATES },
+          OR: [
+            {
+              laneKey: candidate.laneKey,
+              OR: [
+                { laneSequence: { lt: candidate.laneSequence } },
+                { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
+              ],
+            },
+            { laneKey: '', createdAt: { lte: candidate.createdAt } },
+          ],
+        },
+      })) > 0
+    );
+  }
+
+  private async isMaintenanceEligible(candidate: any): Promise<boolean> {
+    if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate));
+    if (!['callback_pending', 'failure_callback_pending'].includes(candidate.state) || candidate.partIndex !== 0) {
+      return false;
+    }
+    return (
+      (await this.repository.chatwootOutboundOperation.count({
+        where: {
+          instanceId: candidate.instanceId,
+          chatwootMessageId: candidate.chatwootMessageId,
+          messageSetHash: candidate.messageSetHash,
+          state: { in: LANE_BLOCKING_STATES },
+        },
+      })) === 0
+    );
+  }
+
   private isExactFrozenPartSet(existing: any[], parts: ChatwootOutboundPart[]): boolean {
     const expectedHash = parts[0].messageSetHash;
     const exact =
@@ -497,18 +729,6 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           operation.plannedWhatsappMessageId === parts[index].plannedWhatsappMessageId,
       );
     return exact;
-  }
-
-  private async quarantineFrozenSet(instanceId: string, messageId: number, lastErrorClass: string) {
-    await this.repository.chatwootOutboundOperation.updateMany({
-      where: { instanceId, chatwootMessageId: messageId },
-      data: {
-        state: 'quarantined',
-        lastErrorClass,
-        leaseOwner: null,
-        leaseExpiresAt: null,
-      },
-    });
   }
 
   private assertStoredMessageSet(existing: any[], messageSetHash: string, partCount: number) {
@@ -551,6 +771,18 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       sendAttempts: candidate.sendAttempts,
       callbackAttempts: candidate.callbackAttempts,
       claimGeneration: candidate.claimGeneration,
+      webhookDeliveryId: candidate.webhookDeliveryId ?? undefined,
+      laneKey: candidate.laneKey,
+      laneSequence: BigInt(candidate.laneSequence ?? 0),
+      webhookReceivedAt: candidate.webhookReceivedAt ?? undefined,
+      messageCreatedAt: candidate.messageCreatedAt ?? undefined,
+      createdAt: candidate.createdAt ?? undefined,
+      claimedAt: candidate.claimedAt ?? undefined,
+      validatedAt: candidate.validatedAt ?? undefined,
+      sendStartedAt: candidate.sendStartedAt ?? undefined,
+      sentAt: candidate.sentAt ?? undefined,
+      callbackStartedAt: candidate.callbackStartedAt ?? undefined,
+      callbackContext: candidate.callbackContext ?? undefined,
     };
   }
 

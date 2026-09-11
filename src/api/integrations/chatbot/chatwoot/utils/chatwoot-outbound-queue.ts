@@ -18,6 +18,7 @@ export type ChatwootOutboundState =
 
 export type ChatwootOutboundPhase = 'prepare' | 'transport' | 'callback';
 export type ChatwootOutboundValidation = 'valid' | 'deleted' | 'mismatch';
+export type ChatwootOutboundWorkClass = 'transport' | 'maintenance' | 'any';
 
 export interface ChatwootOutboundOrigin {
   providerId: string;
@@ -27,6 +28,8 @@ export interface ChatwootOutboundOrigin {
   conversationId: number;
   messageId: number;
   contactInboxSourceId?: string;
+  contactId?: number;
+  contactInboxId?: number;
   inboxName: string;
   routeBinding: ChatwootEvoRouteBinding;
 }
@@ -47,6 +50,7 @@ export interface ChatwootOutboundPart {
   partIndex: number;
   partCount: number;
   plannedWhatsappMessageId: string;
+  laneKey: string;
   payload: ChatwootOutboundPayload;
 }
 
@@ -62,6 +66,31 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   sendAttempts: number;
   callbackAttempts: number;
   claimGeneration: number;
+  webhookDeliveryId?: string;
+  laneKey: string;
+  laneSequence: bigint;
+  webhookReceivedAt?: Date;
+  messageCreatedAt?: Date;
+  createdAt?: Date;
+  claimedAt?: Date;
+  validatedAt?: Date;
+  sendStartedAt?: Date;
+  sentAt?: Date;
+  callbackStartedAt?: Date;
+  callbackContext?: unknown;
+}
+
+export interface ChatwootOutboundAdmission {
+  deliveryId: string;
+  receivedAt: Date;
+  messageCreatedAt?: Date;
+  maxBacklog: number;
+  maxOldestAgeMs: number;
+}
+
+export interface ChatwootOutboundBacklog {
+  depth: number;
+  oldestAt: Date | null;
 }
 
 export interface ChatwootOutboundMessageStatus {
@@ -73,8 +102,22 @@ export interface ChatwootOutboundMessageStatus {
 
 export interface ChatwootOutboundStore {
   recoverExpired(now: Date): Promise<void>;
-  claim(workerId: string, now: Date, leaseExpiresAt: Date): Promise<StoredChatwootOutboundOperation | null>;
-  markSending(id: string, workerId: string, claimGeneration: number, now: Date): Promise<boolean>;
+  claim(
+    workerId: string,
+    now: Date,
+    leaseExpiresAt: Date,
+    workClass?: ChatwootOutboundWorkClass,
+  ): Promise<StoredChatwootOutboundOperation | null>;
+  backlog(): Promise<ChatwootOutboundBacklog>;
+  markValidated(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void>;
+  markCallbackStarted(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void>;
+  markSending(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    providerContext: unknown,
+    now: Date,
+  ): Promise<boolean>;
   markCallbackPending(
     id: string,
     workerId: string,
@@ -142,14 +185,23 @@ export interface ChatwootOutboundStore {
 }
 
 export interface ChatwootOutboundHandler {
+  prepare(
+    operation: StoredChatwootOutboundOperation,
+    signal: AbortSignal,
+  ): Promise<{ validation: ChatwootOutboundValidation; context?: unknown }>;
   validate(
     operation: StoredChatwootOutboundOperation,
     phase: ChatwootOutboundPhase,
     signal: AbortSignal,
   ): Promise<ChatwootOutboundValidation>;
-  isReady(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<boolean>;
+  revalidateTransport(
+    operation: StoredChatwootOutboundOperation,
+    signal: AbortSignal,
+  ): Promise<{ validation: ChatwootOutboundValidation; providerContext?: unknown }>;
+  isReady(operation: StoredChatwootOutboundOperation, context: unknown, signal: AbortSignal): Promise<boolean>;
   send(
     operation: StoredChatwootOutboundOperation,
+    context: unknown,
     onTransportStart: () => Promise<void>,
     signal: AbortSignal,
   ): Promise<{ whatsappMessageId: string; result: unknown }>;
@@ -160,6 +212,7 @@ export interface ChatwootOutboundHandler {
   ): Promise<void>;
   fail(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<void>;
   delete(operation: StoredChatwootOutboundOperation, signal: AbortSignal): Promise<'deleted' | 'waiting'>;
+  observe?(event: string, metrics: Record<string, number | string | null>): void;
 }
 
 const hash = (value: string) => createHash('sha256').update(value).digest('hex');
@@ -258,6 +311,7 @@ export function buildChatwootOutboundParts(params: {
       partIndex,
       partCount: partSpecs.length,
       plannedWhatsappMessageId: `WD${operationKey.slice(0, 18).toUpperCase()}`,
+      laneKey: hash(`${instanceId}:${chatId}`),
       payload: {
         chatId,
         text: 'attachmentUrl' in part && !params.formattedText ? null : params.formattedText,
@@ -285,7 +339,7 @@ const errorClass = (error: unknown): string => {
 export class ChatwootOutboundQueue {
   private readonly workerId = `chatwoot-outbound-${process.pid}-${randomUUID()}`;
   private timer: NodeJS.Timeout | null = null;
-  private activeRun: Promise<void> | null = null;
+  private readonly activeRuns = new Set<Promise<void>>();
   private stopped = true;
 
   constructor(
@@ -294,6 +348,7 @@ export class ChatwootOutboundQueue {
     private readonly pollIntervalMs = 1_000,
     private readonly leaseMs = 600_000,
     private readonly timeouts = { validation: 20_000, readiness: 10_000, send: 120_000, callback: 30_000 },
+    private readonly concurrency = { transport: 4, maintenance: 2 },
   ) {}
 
   public async start() {
@@ -307,19 +362,19 @@ export class ChatwootOutboundQueue {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    await this.activeRun;
+    await Promise.all(this.activeRuns);
   }
 
   public wake() {
-    if (this.stopped || this.activeRun) return;
+    if (this.stopped) return;
     if (this.timer) clearTimeout(this.timer);
     this.schedule(0);
   }
 
-  public async runOnce(): Promise<boolean> {
+  public async runOnce(workClass: ChatwootOutboundWorkClass = 'any'): Promise<boolean> {
     const now = new Date();
     await this.store.recoverExpired(now);
-    const operation = await this.store.claim(this.workerId, now, new Date(now.getTime() + this.leaseMs));
+    const operation = await this.store.claim(this.workerId, now, new Date(now.getTime() + this.leaseMs), workClass);
     if (!operation) return false;
 
     if (operation.state === 'callback_pending') {
@@ -368,7 +423,7 @@ export class ChatwootOutboundQueue {
           null,
           new Date(),
         );
-        await this.confirm(operation);
+        this.wake();
       } else {
         await this.store.scheduleAmbiguous(
           operation.id,
@@ -383,18 +438,25 @@ export class ChatwootOutboundQueue {
 
     let validation: ChatwootOutboundValidation;
     let ready: boolean;
+    let preparedContext: unknown;
     try {
-      validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-        this.handler.validate(operation, 'prepare', signal),
+      const prepared = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
+        this.handler.prepare(operation, signal),
       );
+      validation = prepared.validation;
+      preparedContext = prepared.context;
       if (validation === 'deleted') {
         await this.store.requestDeletion(operation);
         return true;
       }
+      if (validation === 'valid') {
+        operation.validatedAt = new Date();
+        await this.store.markValidated(operation.id, this.workerId, operation.claimGeneration, operation.validatedAt);
+      }
       ready =
         validation === 'valid'
           ? await this.withTimeout('OutboundReadinessTimeout', this.timeouts.readiness, (signal) =>
-              this.handler.isReady(operation, signal),
+              this.handler.isReady(operation, preparedContext, signal),
             )
           : false;
     } catch (error) {
@@ -415,10 +477,12 @@ export class ChatwootOutboundQueue {
     }
 
     let transportStarted = false;
+    let transportStartedAt: Date | undefined;
     try {
       const sent = await this.withTimeout('OutboundSendTimeout', this.timeouts.send, (signal) =>
         this.handler.send(
           operation,
+          preparedContext,
           async () => {
             if (transportStarted) return;
             if (signal.aborted) {
@@ -426,11 +490,12 @@ export class ChatwootOutboundQueue {
               error.name = 'OutboundOperationAborted';
               throw error;
             }
-            const transportValidation = await this.withTimeout(
+            const transportSnapshot = await this.withTimeout(
               'OutboundValidationTimeout',
               this.timeouts.validation,
-              (signal) => this.handler.validate(operation, 'transport', signal),
+              (signal) => this.handler.revalidateTransport(operation, signal),
             );
+            const transportValidation = transportSnapshot.validation;
             if (transportValidation === 'deleted') {
               const error = new Error('Chatwoot message was deleted before transport');
               error.name = 'OutboundMessageDeleted';
@@ -446,11 +511,13 @@ export class ChatwootOutboundQueue {
               error.name = 'OutboundOperationAborted';
               throw error;
             }
+            transportStartedAt = new Date();
             const sendStarted = await this.store.markSending(
               operation.id,
               this.workerId,
               operation.claimGeneration,
-              new Date(),
+              transportSnapshot.providerContext,
+              transportStartedAt,
             );
             if (!sendStarted) throw new Error('OutboundLeaseLost');
             transportStarted = true;
@@ -460,15 +527,23 @@ export class ChatwootOutboundQueue {
       );
       if (!transportStarted) throw new Error('TransportNotStarted');
       if (!sent.whatsappMessageId) throw new Error('MissingWhatsappMessageId');
+      const sentAt = new Date();
+      operation.sendStartedAt = transportStartedAt;
+      operation.sentAt = sentAt;
       await this.store.markCallbackPending(
         operation.id,
         this.workerId,
         operation.claimGeneration,
         sent.whatsappMessageId,
         sent.result,
-        new Date(),
+        sentAt,
       );
-      await this.confirm(operation);
+      this.handler.observe?.('chatwoot_outbound_transport_sent', {
+        commitToClaimMs: this.duration(operation.createdAt, operation.claimedAt),
+        validationMs: this.duration(operation.claimedAt, operation.validatedAt),
+        transportMs: this.duration(transportStartedAt, sentAt),
+      });
+      this.wake();
     } catch (error) {
       const classified = errorClass(error);
       const nextAttemptAt = new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1));
@@ -523,21 +598,18 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      const validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-        this.handler.validate(operation, 'callback', signal),
+      operation.callbackStartedAt = new Date();
+      await this.store.markCallbackStarted(
+        operation.id,
+        this.workerId,
+        operation.claimGeneration,
+        operation.callbackStartedAt,
       );
-      if (validation === 'deleted') {
-        await this.store.requestDeletion(operation);
-        return;
-      }
-      if (validation === 'mismatch') {
-        await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
-        return;
-      }
       await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
         this.handler.confirm(operation, status.callbackParts, signal),
       );
       await this.store.markMessageCompleted(operation, this.workerId, new Date());
+      this.observeCompletion(operation, 'success');
     } catch (error) {
       if (errorClass(error) === 'OutboundMessageDeleted') {
         await this.store.requestDeletion(operation);
@@ -580,27 +652,25 @@ export class ChatwootOutboundQueue {
         );
         return;
       }
-      const validation = await this.withTimeout('OutboundValidationTimeout', this.timeouts.validation, (signal) =>
-        this.handler.validate(operation, 'callback', signal),
+      operation.callbackStartedAt = new Date();
+      await this.store.markCallbackStarted(
+        operation.id,
+        this.workerId,
+        operation.claimGeneration,
+        operation.callbackStartedAt,
       );
-      if (validation === 'deleted') {
-        await this.store.requestDeletion(operation);
-        return;
-      }
-      if (validation === 'mismatch') {
-        await this.store.quarantineMessage(operation, this.workerId, 'OutboundBindingMismatch');
-        return;
-      }
       if (status.outcome === 'partial_success') {
         await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
           this.handler.confirm(operation, status.callbackParts, signal),
         );
         await this.store.markMessageCompleted(operation, this.workerId, new Date());
+        this.observeCompletion(operation, 'partial_success');
       } else {
         await this.withTimeout('OutboundCallbackTimeout', this.timeouts.callback, (signal) =>
           this.handler.fail(operation, signal),
         );
         await this.store.markMessageFailed(operation, this.workerId, new Date());
+        this.observeCompletion(operation, 'failure');
       }
     } catch (error) {
       if (errorClass(error) === 'OutboundMessageDeleted') {
@@ -674,21 +744,47 @@ export class ChatwootOutboundQueue {
     }
   }
 
+  private duration(start: Date | undefined, end: Date | undefined): number | null {
+    return start && end ? Math.max(0, end.getTime() - start.getTime()) : null;
+  }
+
+  private observeCompletion(operation: StoredChatwootOutboundOperation, outcome: string) {
+    const now = new Date();
+    this.handler.observe?.('chatwoot_outbound_completed', {
+      outcome,
+      messageToReceiptMs: this.duration(operation.messageCreatedAt, operation.webhookReceivedAt),
+      receiptToCommitMs: this.duration(operation.webhookReceivedAt, operation.createdAt),
+      sentToCallbackMs: this.duration(operation.sentAt, now),
+      totalMs: this.duration(operation.messageCreatedAt ?? operation.createdAt, now),
+    });
+  }
+
   private schedule(delayMs: number) {
     if (this.stopped) return;
     this.timer = setTimeout(() => {
       this.timer = null;
-      if (this.stopped || this.activeRun) return;
-      const run = (async () => {
-        const processed = await this.runOnce();
-        this.schedule(processed ? 0 : this.pollIntervalMs);
-      })()
-        .catch(() => this.schedule(this.pollIntervalMs))
-        .finally(() => {
-          if (this.activeRun === run) this.activeRun = null;
-        });
-      this.activeRun = run;
+      if (this.stopped) return;
+      this.fillSlots('transport', this.concurrency.transport);
+      this.fillSlots('maintenance', this.concurrency.maintenance);
+      this.schedule(this.pollIntervalMs);
     }, delayMs);
     this.timer.unref?.();
+  }
+
+  private fillSlots(workClass: Exclude<ChatwootOutboundWorkClass, 'any'>, limit: number) {
+    const activeOfClass = [...this.activeRuns].filter((run: any) => run.workClass === workClass).length;
+    for (let index = activeOfClass; index < Math.max(1, limit); index += 1) {
+      const run: Promise<void> & { workClass?: string } = this.runOnce(workClass)
+        .then((processed) => {
+          if (processed) this.wake();
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          this.activeRuns.delete(run);
+          this.wake();
+        });
+      run.workClass = workClass;
+      this.activeRuns.add(run);
+    }
   }
 }

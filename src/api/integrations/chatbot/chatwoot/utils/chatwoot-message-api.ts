@@ -46,5 +46,10 @@ export const updateChatwootMessageJson = (
     path: { account_id: accountId, conversation_id: conversationId, message_id: messageId },
     body: data,
     mediaType: 'application/json',
-    errors: { 403: 'Access denied', 404: 'Message not found' },
+    errors: {
+      403: 'Access denied',
+      404: 'Message not found',
+      409: 'Conditional provider status rejected',
+      422: 'Conditional provider status invalid',
+    },
   });

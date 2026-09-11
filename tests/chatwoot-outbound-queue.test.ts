@@ -192,6 +192,10 @@ class MemoryStore implements ChatwootOutboundStore {
     this.recovered += 1;
   }
 
+  async backlog() {
+    return { depth: 1, oldestAt: this.operation.createdAt ?? null };
+  }
+
   async claim(): Promise<StoredChatwootOutboundOperation | null> {
     if (
       !['pending', 'callback_pending', 'failure_callback_pending', 'ambiguous', 'delete_pending'].includes(
@@ -203,6 +207,14 @@ class MemoryStore implements ChatwootOutboundStore {
     this.operation.claimGeneration += 1;
     if (this.operation.state === 'pending') this.operation.state = 'preparing';
     return { ...this.operation };
+  }
+
+  async markValidated(_id: string, _workerId: string, _claimGeneration: number, now: Date) {
+    this.operation.validatedAt = now;
+  }
+
+  async markCallbackStarted(_id: string, _workerId: string, _claimGeneration: number, now: Date) {
+    this.operation.callbackStartedAt = now;
   }
 
   async markSending(_id?: string, _workerId?: string, claimGeneration?: number) {
@@ -305,9 +317,11 @@ class MemoryStore implements ChatwootOutboundStore {
 }
 
 const validHandler = (overrides: Partial<ChatwootOutboundHandler> = {}): ChatwootOutboundHandler => ({
+  prepare: async () => ({ validation: 'valid', context: { prepared: true } }),
   validate: async () => 'valid',
+  revalidateTransport: async () => ({ validation: 'valid', providerContext: { snapshot: true } }),
   isReady: async () => true,
-  send: async (operation, onTransportStart) => {
+  send: async (operation, _context, onTransportStart) => {
     await onTransportStart();
     return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
   },
@@ -386,7 +400,7 @@ test('reconciles a crash after transport start by exact planned WAID without ano
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (operation, onTransportStart) => {
+      send: async (operation, _context, onTransportStart) => {
         sends += 1;
         await onTransportStart();
         store.exactSentMessageId = operation.plannedWhatsappMessageId;
@@ -401,6 +415,7 @@ test('reconciles a crash after transport start by exact planned WAID without ano
   await queue.runOnce();
   assert.equal(store.operation.state, 'ambiguous');
   await queue.runOnce();
+  await queue.runOnce('maintenance');
 
   assert.equal(sends, 1);
   assert.deepEqual(confirmed, [
@@ -421,7 +436,7 @@ test('retries only the message-level Chatwoot callback after a successful send',
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (operation, onTransportStart) => {
+      send: async (operation, _context, onTransportStart) => {
         sends += 1;
         await onTransportStart();
         return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
@@ -436,10 +451,133 @@ test('retries only the message-level Chatwoot callback after a successful send',
   await queue.runOnce();
   assert.equal(store.operation.state, 'callback_pending');
   await queue.runOnce();
+  await queue.runOnce('maintenance');
 
   assert.equal(sends, 1);
   assert.equal(callbacks, 2);
   assert.equal(store.operation.state, 'completed');
+});
+
+test('uses exactly two authoritative phases and does not reverse-read before the conditional callback', async () => {
+  const store = new MemoryStore();
+  const calls = { prepare: 0, revalidate: 0, legacyValidate: 0, callback: 0 };
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => {
+        calls.prepare += 1;
+        return { validation: 'valid', context: { prepared: true } };
+      },
+      revalidateTransport: async () => {
+        calls.revalidate += 1;
+        return { validation: 'valid', providerContext: { snapshot: true } };
+      },
+      validate: async () => {
+        calls.legacyValidate += 1;
+        return 'valid';
+      },
+      confirm: async () => {
+        calls.callback += 1;
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  await queue.runOnce('maintenance');
+
+  assert.deepEqual(calls, { prepare: 1, revalidate: 1, legacyValidate: 0, callback: 1 });
+  assert.equal(store.operation.state, 'completed');
+});
+
+test('keeps transport capacity available while a callback worker is blocked', async () => {
+  const transport = new MemoryStore().operation;
+  const maintenance = new MemoryStore('callback_pending').operation;
+  maintenance.id = 'callback-operation';
+  maintenance.whatsappMessageId = maintenance.plannedWhatsappMessageId;
+  let transportClaimed = false;
+  let maintenanceClaimed = false;
+  let releaseCallback: () => void;
+  const callbackReleased = new Promise<void>((resolve) => {
+    releaseCallback = resolve;
+  });
+  let reportCallbackStarted: () => void;
+  const callbackStarted = new Promise<void>((resolve) => {
+    reportCallbackStarted = resolve;
+  });
+  let reportTransportStarted: () => void;
+  const transportStarted = new Promise<void>((resolve) => {
+    reportTransportStarted = resolve;
+  });
+  const store = {
+    recoverExpired: async () => undefined,
+    claim: async (_workerId: string, _now: Date, _lease: Date, workClass: string) => {
+      if (workClass === 'maintenance' && !maintenanceClaimed) {
+        maintenanceClaimed = true;
+        maintenance.claimGeneration += 1;
+        return { ...maintenance };
+      }
+      if (workClass === 'transport' && !transportClaimed) {
+        transportClaimed = true;
+        transport.state = 'preparing';
+        transport.claimGeneration += 1;
+        return { ...transport };
+      }
+      return null;
+    },
+    messageStatus: async () => ({
+      ready: true,
+      leader: true,
+      outcome: 'success',
+      callbackParts: [
+        {
+          partKey: maintenance.operationKey,
+          partIndex: 0,
+          partCount: 1,
+          sourceId: maintenance.whatsappMessageId,
+        },
+      ],
+    }),
+    markCallbackStarted: async () => undefined,
+    markMessageCompleted: async () => {
+      maintenance.state = 'completed';
+    },
+    markValidated: async () => undefined,
+    markSending: async () => true,
+    markCallbackPending: async () => {
+      transport.state = 'callback_pending';
+    },
+  } as unknown as ChatwootOutboundStore;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => {
+        await callbackStarted;
+        return { validation: 'valid', context: {} };
+      },
+      send: async (operation, _context, onTransportStart) => {
+        await onTransportStart();
+        reportTransportStarted();
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+      confirm: async () => {
+        reportCallbackStarted();
+        await callbackReleased;
+      },
+    }),
+    1,
+    60_000,
+    undefined,
+    { transport: 1, maintenance: 1 },
+  );
+
+  await queue.start();
+  await transportStarted;
+  const maintenanceStateWhileTransportStarted = maintenance.state;
+  releaseCallback();
+  await queue.stop();
+  assert.equal(maintenanceStateWhileTransportStarted, 'callback_pending');
+  assert.equal(transport.state, 'callback_pending');
+  assert.equal(maintenance.state, 'completed');
 });
 
 test('replays only deterministic multipart callbacks after a partial callback outage', async () => {
@@ -529,7 +667,7 @@ test('keeps a missing WAID ambiguous after transport start', async () => {
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (_operation, onTransportStart) => {
+      send: async (_operation, _context, onTransportStart) => {
         await onTransportStart();
         return { whatsappMessageId: '', result: null };
       },
@@ -548,7 +686,7 @@ test('quarantines a changed origin binding before preparation or callback', asyn
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      validate: async () => 'mismatch',
+      prepare: async () => ({ validation: 'mismatch' }),
       send: async () => {
         sends += 1;
         throw new Error('should not send');
@@ -575,7 +713,7 @@ test('waits for an in-flight operation when the worker is stopped for drain', as
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (operation, onTransportStart) => {
+      send: async (operation, _context, onTransportStart) => {
         await onTransportStart();
         reportTransportStarted();
         await transportReleased;
@@ -597,7 +735,7 @@ test('waits for an in-flight operation when the worker is stopped for drain', as
   await stopping;
 
   assert.equal(stopped, true);
-  assert.equal(store.operation.state, 'completed');
+  assert.equal(store.operation.state, 'callback_pending');
 });
 
 test('completes a mixed multipart outcome with only the delivered mappings and no sibling resend', async () => {
@@ -639,7 +777,7 @@ test('times out pre-transport preparation without allowing a late transport star
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (_operation, onTransportStart, signal) => {
+      send: async (_operation, _context, onTransportStart, signal) => {
         await new Promise((resolve) => setTimeout(resolve, 20));
         if (signal.aborted) {
           const error = new Error('aborted');
@@ -677,7 +815,7 @@ test('fences two stale timed-out claims across the exact three-attempt race', as
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      send: async (operation, onTransportStart) => {
+      send: async (operation, _context, onTransportStart) => {
         const attempt = attempts++;
         enteredResolvers[attempt]();
         if (attempt < 2) await new Promise<void>((resolve) => releases.push(resolve));
@@ -700,13 +838,14 @@ test('fences two stale timed-out claims across the exact three-attempt race', as
   await entered[2];
   releases[1]();
   await third;
+  await queue.runOnce('maintenance');
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   assert.equal(attempts, 3);
   assert.equal(transports, 1);
   assert.equal(store.operation.sendAttempts, 1);
   assert.equal(store.operation.state, 'completed');
-  assert.equal(store.operation.claimGeneration, 3);
+  assert.equal(store.operation.claimGeneration, 4);
 });
 
 test('keeps deletion pending for an uncertain send and never invokes send again', async () => {
@@ -739,13 +878,14 @@ test('soft-delete before its webhook preserves a deletion claim without callback
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
-      validate: async () => 'deleted',
       send: async () => {
         sends += 1;
         throw new Error('must not resend after authoritative deletion');
       },
       confirm: async () => {
-        callbacks += 1;
+        const error = new Error('deleted before callback');
+        error.name = 'OutboundMessageDeleted';
+        throw error;
       },
       delete: async () => {
         deletions += 1;

@@ -77,6 +77,7 @@ const currentMessage = {
   destination: '628123',
   contact_inbox_source_id: 'source-1',
   route: { inbox_name: 'WA - Test', channel_type: 'Channel::Api', binding: route },
+  outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
 };
 const validate = (overrides: Record<string, unknown> = {}) =>
   validatesCurrentChatwootOutboundSnapshot({
@@ -94,11 +95,14 @@ test('accepts the exact authoritative provider, live route, relationship, destin
   assert.equal(validate(), true);
 });
 
-test('rejects provider disable, inbox rename, reassignment, destination change and message deletion', () => {
+test('rejects provider disable, compact-snapshot reassignment, destination change and message deletion', () => {
   assert.equal(validate({ provider: { ...provider, enabled: false } }), false);
-  assert.equal(validate({ currentInbox: { ...currentInbox, name: 'Renamed' } }), false);
-  assert.equal(validate({ conversation: { ...conversation, inbox_id: 59 } }), false);
-  assert.equal(validate({ conversation: { ...conversation, meta: { sender: { phone_number: '+628999' } } } }), false);
+  assert.equal(
+    validate({ currentMessage: { ...currentMessage, route: { ...currentMessage.route, inbox_name: 'Renamed' } } }),
+    false,
+  );
+  assert.equal(validate({ currentMessage: { ...currentMessage, inbox_id: 59 } }), false);
+  assert.equal(validate({ currentMessage: { ...currentMessage, destination: '628999' } }), false);
   assert.equal(validate({ currentMessage: { ...currentMessage, deleted: true } }), false);
   assert.equal(validate({ currentMessage: null }), false);
 });
@@ -125,10 +129,7 @@ test('allows callback-outage deletion only with exact retained provenance and no
     },
   };
   assert.equal(validatesLocalChatwootDeletionBinding(message, operation), true);
-  assert.equal(
-    validatesLocalChatwootDeletionBinding({ ...message, chatwootConversationId: 43 }, operation),
-    false,
-  );
+  assert.equal(validatesLocalChatwootDeletionBinding({ ...message, chatwootConversationId: 43 }, operation), false);
   assert.equal(
     validatesLocalChatwootDeletionBinding({ ...message, contextInfo: { weDigitalOutbound: {} } }, operation),
     false,

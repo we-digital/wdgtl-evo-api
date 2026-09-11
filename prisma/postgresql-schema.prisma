@@ -215,28 +215,31 @@ model Webhook {
 }
 
 model Chatwoot {
-  id                      String    @id @default(cuid())
-  enabled                 Boolean?  @default(true) @db.Boolean
-  accountId               String?   @db.VarChar(100)
-  token                   String?   @db.VarChar(100)
-  url                     String?   @db.VarChar(500)
-  nameInbox               String?   @db.VarChar(100)
-  signMsg                 Boolean?  @default(false) @db.Boolean
-  signDelimiter           String?   @db.VarChar(100)
-  number                  String?   @db.VarChar(100)
-  reopenConversation      Boolean?  @default(false) @db.Boolean
-  conversationPending     Boolean?  @default(false) @db.Boolean
-  mergeBrazilContacts     Boolean?  @default(false) @db.Boolean
-  importContacts          Boolean?  @default(false) @db.Boolean
-  importMessages          Boolean?  @default(false) @db.Boolean
-  daysLimitImportMessages Int?      @db.Integer
-  organization            String?   @db.VarChar(100)
-  logo                    String?   @db.VarChar(500)
-  ignoreJids              Json?
-  createdAt               DateTime? @default(now()) @db.Timestamp
-  updatedAt               DateTime  @updatedAt @db.Timestamp
-  Instance                Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
-  instanceId              String    @unique
+  id                              String    @id @default(cuid())
+  enabled                         Boolean?  @default(true) @db.Boolean
+  accountId                       String?   @db.VarChar(100)
+  token                           String?   @db.VarChar(100)
+  url                             String?   @db.VarChar(500)
+  nameInbox                       String?   @db.VarChar(100)
+  signMsg                         Boolean?  @default(false) @db.Boolean
+  signDelimiter                   String?   @db.VarChar(100)
+  number                          String?   @db.VarChar(100)
+  reopenConversation              Boolean?  @default(false) @db.Boolean
+  conversationPending             Boolean?  @default(false) @db.Boolean
+  mergeBrazilContacts             Boolean?  @default(false) @db.Boolean
+  importContacts                  Boolean?  @default(false) @db.Boolean
+  importMessages                  Boolean?  @default(false) @db.Boolean
+  daysLimitImportMessages         Int?      @db.Integer
+  organization                    String?   @db.VarChar(100)
+  logo                            String?   @db.VarChar(500)
+  ignoreJids                      Json?
+  webhookSecret                   String?   @db.VarChar(255)
+  webhookPreviousSecret           String?   @db.VarChar(255)
+  webhookPreviousSecretValidUntil DateTime? @db.Timestamp
+  createdAt                       DateTime? @default(now()) @db.Timestamp
+  updatedAt                       DateTime  @updatedAt @db.Timestamp
+  Instance                        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId                      String    @unique
 }
 
 model ChatwootOutboundOperation {
@@ -247,6 +250,9 @@ model ChatwootOutboundOperation {
   chatwootMessageId        Int       @db.Integer
   chatwootInboxId          Int       @db.Integer
   chatwootConversationId   Int       @db.Integer
+  webhookDeliveryId        String?   @db.VarChar(100)
+  laneKey                  String    @default("") @db.VarChar(64)
+  laneSequence             BigInt    @default(0)
   partIdentity             String    @db.VarChar(64)
   partIndex                Int       @db.Integer
   partCount                Int       @db.Integer
@@ -255,6 +261,7 @@ model ChatwootOutboundOperation {
   state                    String    @default("pending") @db.VarChar(32)
   payload                  Json      @db.JsonB
   result                   Json?     @db.JsonB
+  callbackContext          Json?     @db.JsonB
   preparationAttempts      Int       @default(0) @db.Integer
   sendAttempts             Int       @default(0) @db.Integer
   callbackAttempts         Int       @default(0) @db.Integer
@@ -262,6 +269,11 @@ model ChatwootOutboundOperation {
   leaseOwner               String?   @db.VarChar(100)
   leaseExpiresAt           DateTime? @db.Timestamp
   claimGeneration          Int       @default(0) @db.Integer
+  webhookReceivedAt        DateTime? @db.Timestamp
+  messageCreatedAt         DateTime? @db.Timestamp
+  claimedAt                DateTime? @db.Timestamp
+  validatedAt              DateTime? @db.Timestamp
+  callbackStartedAt        DateTime? @db.Timestamp
   sendStartedAt            DateTime? @db.Timestamp
   sentAt                   DateTime? @db.Timestamp
   completedAt              DateTime? @db.Timestamp
@@ -272,10 +284,34 @@ model ChatwootOutboundOperation {
 
   @@unique([instanceId, chatwootMessageId, partIdentity], map: "Cwo_instance_message_part_key")
   @@unique([instanceId, chatwootMessageId, partIndex], map: "Cwo_instance_message_index_key")
+  @@unique([webhookDeliveryId, partIndex], map: "Cwo_delivery_part_key")
   @@index([state, nextAttemptAt], map: "Cwo_state_next_idx")
   @@index([instanceId, chatwootMessageId], map: "Cwo_instance_message_idx")
   @@index([instanceId, plannedWhatsappMessageId], map: "Cwo_instance_planned_waid_idx")
   @@index([instanceId, whatsappMessageId], map: "Cwo_instance_actual_waid_idx")
+  @@index([laneKey, laneSequence, partIndex], map: "Cwo_lane_order_idx")
+}
+
+model ChatwootOutboundLane {
+  laneKey      String   @id @db.VarChar(64)
+  nextSequence BigInt   @default(0)
+  updatedAt    DateTime @updatedAt @db.Timestamp
+}
+
+model ChatwootOutboundAdmissionGuard {
+  id        Int      @id
+  version   BigInt   @default(0)
+  updatedAt DateTime @updatedAt @db.Timestamp
+}
+
+model ChatwootOutboundWebhookDelivery {
+  deliveryId        String   @id @db.VarChar(100)
+  instanceId        String
+  chatwootMessageId Int      @db.Integer
+  messageSetHash    String   @db.VarChar(64)
+  receivedAt        DateTime @db.Timestamp
+
+  @@index([instanceId, chatwootMessageId], map: "Cwo_webhook_delivery_message_idx")
 }
 
 model Label {

@@ -76,7 +76,11 @@ test('increments claim generation and rejects a stale same-worker transport fenc
   };
   const repository = {
     chatwootOutboundOperation: {
-      findFirst: async () => ({ ...row }),
+      findMany: async () =>
+        ['pending', 'callback_pending', 'failure_callback_pending', 'ambiguous', 'delete_pending'].includes(row.state)
+          ? [{ ...row }]
+          : [],
+      count: async () => 0,
       updateMany: async ({ where, data }: any) => {
         if (
           where.id !== row.id ||
@@ -100,8 +104,8 @@ test('increments claim generation and rejects a stale same-worker transport fenc
 
   assert.equal(first?.claimGeneration, 1);
   assert.equal(second?.claimGeneration, 2);
-  assert.equal(await store.markSending(row.id, 'same-worker', first!.claimGeneration, new Date()), false);
-  assert.equal(await store.markSending(row.id, 'same-worker', second!.claimGeneration, new Date()), true);
+  assert.equal(await store.markSending(row.id, 'same-worker', first!.claimGeneration, null, new Date()), false);
+  assert.equal(await store.markSending(row.id, 'same-worker', second!.claimGeneration, null, new Date()), true);
   assert.equal(row.sendAttempts, 1);
 });
 
@@ -119,7 +123,13 @@ test('changed frozen-set replay atomically quarantines every retained operation'
         return { count: rows.length };
       },
     },
+    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundWebhookDelivery: {
+      findUnique: async () => null,
+      create: async () => ({}),
+    },
   };
+  (repository as any).$transaction = async (transaction: (client: any) => Promise<unknown>) => transaction(repository);
   const store = new ChatwootOutboundPrismaStore(repository as any);
   const changedParts = buildChatwootOutboundParts({
     instanceId: 'instance-1',
@@ -136,7 +146,16 @@ test('changed frozen-set replay atomically quarantines every retained operation'
     origin,
   });
 
-  await assert.rejects(() => store.enqueue('instance-1', 314, 58, 42, changedParts), /frozen with different/);
+  await assert.rejects(
+    () =>
+      store.enqueue('instance-1', 314, 58, 42, changedParts, {
+        deliveryId: 'delivery-changed',
+        receivedAt: new Date(),
+        maxBacklog: 100,
+        maxOldestAgeMs: 60_000,
+      }),
+    /frozen with different/,
+  );
 
   assert.equal(quarantined, 2);
   assert.ok(rows.every((row) => row.state === 'quarantined' && row.lastErrorClass === 'ChangedFrozenPartSet'));
@@ -245,3 +264,242 @@ for (const scenario of [
     assert.equal(rows[1].state, scenario.siblingState);
   });
 }
+
+const admission = (deliveryId: string, receivedAt = new Date('2026-09-11T03:00:00.000Z')) => ({
+  deliveryId,
+  receivedAt,
+  maxBacklog: 100,
+  maxOldestAgeMs: 60_000,
+});
+
+const admissionRepository = (seedRows: any[] = []) => {
+  const rows = seedRows;
+  const receipts = new Map<string, any>();
+  const lanes = new Map<string, bigint>();
+  const operations = {
+    findMany: async ({ where }: any) =>
+      rows
+        .filter(
+          (row) =>
+            (where.instanceId === undefined || row.instanceId === where.instanceId) &&
+            (where.chatwootMessageId === undefined || row.chatwootMessageId === where.chatwootMessageId),
+        )
+        .sort((left, right) => left.partIndex - right.partIndex),
+    count: async ({ where }: any) => rows.filter((row) => where.state.in.includes(row.state)).length,
+    findFirst: async ({ where }: any) => {
+      const active = rows
+        .filter((row) => where.state.in.includes(row.state))
+        .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
+      return active[0] ? { createdAt: active[0].createdAt } : null;
+    },
+    create: async ({ data }: any) => {
+      const row = {
+        id: `created-${rows.length}`,
+        state: 'pending',
+        nextAttemptAt: data.webhookReceivedAt,
+        preparationAttempts: 0,
+        sendAttempts: 0,
+        callbackAttempts: 0,
+        claimGeneration: 0,
+        createdAt: data.webhookReceivedAt,
+        ...data,
+      };
+      rows.push(row);
+      return row;
+    },
+    updateMany: async ({ where, data }: any) => {
+      const matching = rows.filter(
+        (row) => row.instanceId === where.instanceId && row.chatwootMessageId === where.chatwootMessageId,
+      );
+      matching.forEach((row) => Object.assign(row, data));
+      return { count: matching.length };
+    },
+  };
+  const repository: any = {
+    chatwootOutboundOperation: operations,
+    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundWebhookDelivery: {
+      findUnique: async ({ where }: any) => receipts.get(where.deliveryId) ?? null,
+      create: async ({ data }: any) => {
+        if (receipts.has(data.deliveryId)) throw new Error('duplicate delivery');
+        receipts.set(data.deliveryId, data);
+        return data;
+      },
+    },
+    chatwootOutboundLane: {
+      upsert: async ({ where, create }: any) => {
+        const nextSequence = (lanes.get(where.laneKey) ?? 0n) + 1n;
+        lanes.set(where.laneKey, nextSequence);
+        return { ...create, nextSequence };
+      },
+    },
+  };
+  repository.$transaction = async (transaction: (client: any) => Promise<unknown>) => transaction(repository);
+  return { repository, rows, receipts };
+};
+
+test('recovers a lost 202 idempotently and durably reserves every accepted delivery identifier', async () => {
+  const memory = admissionRepository();
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+
+  const first = await store.enqueue('instance-1', 314, 58, 42, parts, admission('delivery-314'));
+  assert.equal(first.recovered, false);
+  assert.deepEqual(first.backlog, { depth: parts.length, oldestAt: admission('delivery-314').receivedAt });
+  assert.deepEqual(await store.enqueue('instance-1', 314, 58, 42, parts, admission('delivery-314')), {
+    recovered: true,
+  });
+  assert.deepEqual(await store.enqueue('instance-1', 314, 58, 42, parts, admission('delivery-retry')), {
+    recovered: true,
+  });
+
+  assert.equal(memory.rows.length, parts.length);
+  assert.equal(memory.receipts.size, 2);
+  await assert.rejects(
+    () => store.enqueue('different-instance', 999, 58, 42, parts, admission('delivery-retry')),
+    (error: any) => error?.name === 'ChatwootWebhookReplayRejected',
+  );
+  assert.equal(memory.rows.length, parts.length);
+});
+
+test('rejects capacity and oldest-age admission while preparing or sending work is still active', async () => {
+  const old = new Date('2026-09-11T02:00:00.000Z');
+  const memory = admissionRepository([
+    { ...stored(0, 'preparing'), createdAt: old },
+    { ...stored(1, 'sending'), createdAt: old },
+  ]);
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+  const anotherOrigin = { ...origin, messageId: 315, conversationId: 43 };
+  const anotherParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 315,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 43 },
+      attachments: [],
+    },
+    chatId: 'another-destination',
+    formattedText: 'next',
+    origin: anotherOrigin,
+  });
+
+  await assert.rejects(
+    () =>
+      store.enqueue('instance-1', 315, 58, 43, anotherParts, {
+        ...admission('delivery-315'),
+        maxBacklog: 2,
+      }),
+    (error: any) => error?.name === 'ChatwootOutboundBacklogExceeded',
+  );
+  await assert.rejects(
+    () =>
+      store.enqueue('instance-1', 315, 58, 43, anotherParts, {
+        ...admission('delivery-315'),
+        maxBacklog: 100,
+        maxOldestAgeMs: 1_000,
+      }),
+    (error: any) => error?.name === 'ChatwootOutboundBacklogTooOld',
+  );
+  assert.equal(memory.rows.length, 2);
+  assert.equal(memory.receipts.size, 0);
+});
+
+test('claims independent destinations concurrently but preserves exact same-lane predecessor order', async () => {
+  const laneA = 'a'.repeat(64);
+  const laneB = 'b'.repeat(64);
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const rows: any[] = [
+    { ...stored(0, 'preparing'), id: 'lane-a-1', laneKey: laneA, laneSequence: 1n, partIndex: 0, createdAt: now },
+    { ...stored(0, 'pending'), id: 'lane-a-2', laneKey: laneA, laneSequence: 2n, partIndex: 0, createdAt: now },
+    { ...stored(0, 'pending'), id: 'lane-b-1', laneKey: laneB, laneSequence: 1n, partIndex: 0, createdAt: now },
+  ];
+  const operations = {
+    findMany: async () => rows.filter((row) => row.state === 'pending' && !row.leaseOwner),
+    count: async ({ where }: any) => {
+      const lane = where.OR?.[0]?.laneKey;
+      const beforeSequence = where.OR?.[0]?.OR?.[0]?.laneSequence?.lt;
+      return rows.filter(
+        (row) =>
+          row.laneKey === lane &&
+          row.laneSequence < beforeSequence &&
+          ['pending', 'preparing', 'sending', 'ambiguous', 'delete_pending'].includes(row.state),
+      ).length;
+    },
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => candidate.id === where.id && candidate.state === where.state);
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  const independent = await store.claim('worker-1', now, new Date(now.getTime() + 1_000), 'transport');
+  assert.equal(independent?.id, 'lane-b-1');
+  rows[0].state = 'callback_pending';
+  const sameLaneNext = await store.claim('worker-2', now, new Date(now.getTime() + 1_000), 'transport');
+  assert.equal(sameLaneNext?.id, 'lane-a-2');
+});
+
+test('reserves callback capacity for a settled multipart leader only', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const rows: any[] = [
+    { ...stored(0, 'callback_pending', 'WAID:0'), leaseOwner: null, nextAttemptAt: now, createdAt: now },
+    { ...stored(1, 'pending'), leaseOwner: null, nextAttemptAt: now, createdAt: now },
+  ];
+  const operations = {
+    findMany: async () => rows.filter((row) => ['callback_pending', 'failure_callback_pending'].includes(row.state)),
+    count: async () =>
+      rows.filter((row) => ['pending', 'preparing', 'sending', 'ambiguous', 'delete_pending'].includes(row.state))
+        .length,
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => candidate.id === where.id && candidate.state === where.state);
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  assert.equal(await store.claim('callback-worker', now, new Date(now.getTime() + 1_000), 'maintenance'), null);
+  rows[1].state = 'callback_pending';
+  rows[1].whatsappMessageId = 'WAID:1';
+  assert.equal(
+    (await store.claim('callback-worker', now, new Date(now.getTime() + 1_000), 'maintenance'))?.id,
+    'operation-0',
+  );
+});
+
+test('serializes deletion maintenance for sibling parts in the same lane', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const laneKey = 'd'.repeat(64);
+  const rows: any[] = [
+    { ...stored(0, 'delete_pending'), laneKey, laneSequence: 1n, leaseOwner: null, nextAttemptAt: now, createdAt: now },
+    { ...stored(1, 'delete_pending'), laneKey, laneSequence: 1n, leaseOwner: null, nextAttemptAt: now, createdAt: now },
+  ];
+  const operations = {
+    findMany: async () => rows.filter((row) => row.state === 'delete_pending' && !row.leaseOwner),
+    count: async ({ where }: any) => {
+      const before = where.OR?.[0]?.OR;
+      return rows.filter(
+        (row) =>
+          row.state === 'delete_pending' &&
+          row.laneKey === where.OR?.[0]?.laneKey &&
+          (row.laneSequence < before?.[0]?.laneSequence?.lt ||
+            (row.laneSequence === before?.[1]?.laneSequence && row.partIndex < before?.[1]?.partIndex?.lt)),
+      ).length;
+    },
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => candidate.id === where.id && candidate.state === where.state);
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  const leader = await store.claim('delete-worker-1', now, new Date(now.getTime() + 1_000), 'maintenance');
+  assert.equal(leader?.partIndex, 0);
+  assert.equal(await store.claim('delete-worker-2', now, new Date(now.getTime() + 1_000), 'maintenance'), null);
+});
