@@ -200,6 +200,13 @@ logs, tickets or Slack.
 
 ## Rollback
 
+This summary does not replace the coordinated rollback procedure in
+`we-digital/bbc-devops/docs/chatwoot-evo-outbound-latency-recovery-plan.md`.
+That procedure is authoritative for the ingress/redelivery fence, measurable
+settlement of every pre-cutoff admission handler and database transaction,
+the final ledger read, and the repeated drain/reconciliation barrier. Never
+choose a rollback branch from queue depth alone.
+
 Do not disable async ingress while accepted work is still active: that would
 strand durable operations when the old image starts serving synchronously.
 

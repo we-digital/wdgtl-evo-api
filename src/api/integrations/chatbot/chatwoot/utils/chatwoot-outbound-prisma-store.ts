@@ -20,8 +20,13 @@ const ACTIVE_STATES: ChatwootOutboundState[] = [
   'ambiguous',
   'delete_pending',
 ];
-const TRANSPORT_STATES: ChatwootOutboundState[] = ['pending', 'ambiguous'];
-const MAINTENANCE_STATES: ChatwootOutboundState[] = ['callback_pending', 'failure_callback_pending', 'delete_pending'];
+const TRANSPORT_STATES: ChatwootOutboundState[] = ['pending'];
+const MAINTENANCE_STATES: ChatwootOutboundState[] = [
+  'callback_pending',
+  'failure_callback_pending',
+  'ambiguous',
+  'delete_pending',
+];
 const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'pending',
   'preparing',
@@ -57,16 +62,23 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           orderBy: { partIndex: 'asc' },
         });
         if (receipt) {
-          if (
-            receipt.instanceId !== instanceId ||
-            receipt.chatwootMessageId !== messageId ||
-            receipt.messageSetHash !== parts[0].messageSetHash ||
-            !this.isExactFrozenPartSet(existing, parts)
-          ) {
+          if (receipt.instanceId !== instanceId || receipt.chatwootMessageId !== messageId) {
             throw Object.assign(new Error('Chatwoot delivery identifier was replayed for another operation'), {
               name: 'ChatwootWebhookReplayRejected',
               status: 409,
             });
+          }
+          if (receipt.messageSetHash !== parts[0].messageSetHash || !this.isExactFrozenPartSet(existing, parts)) {
+            await transaction.chatwootOutboundOperation.updateMany({
+              where: { instanceId, chatwootMessageId: messageId },
+              data: {
+                state: 'quarantined',
+                lastErrorClass: 'ChangedFrozenPartSet',
+                leaseOwner: null,
+                leaseExpiresAt: null,
+              },
+            });
+            return { recovered: false, rejection: 'ChangedFrozenPartSet' as const };
           }
           return { recovered: true, rejection: null };
         }
@@ -231,6 +243,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
                     {
                       OR: [
                         { state: { in: ['callback_pending', 'failure_callback_pending'] }, partIndex: 0 },
+                        { state: 'ambiguous' },
                         { state: 'delete_pending' },
                       ],
                     },
@@ -713,6 +726,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   }
 
   private async isMaintenanceEligible(candidate: any): Promise<boolean> {
+    if (candidate.state === 'ambiguous') return true;
     if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate));
     if (!['callback_pending', 'failure_callback_pending'].includes(candidate.state) || candidate.partIndex !== 0) {
       return false;
