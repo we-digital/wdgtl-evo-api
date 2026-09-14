@@ -19,9 +19,12 @@ duplicate WhatsApp messages.
   secret before JSON parsing or any reverse Chatwoot request. A delivery
   receipt is committed in the same transaction as a new operation set; a lost
   HTTP 202 is recovered idempotently, including when Chatwoot retries with a
-  new delivery identifier for the same unchanged message. Missing or
-  cross-instance local socket ownership, ledger reads and admission commits
-  fail non-2xx; none can fall through to the ordinary webhook response.
+  new delivery identifier for the same unchanged message. Admission binds the
+  authenticated instance and provider to their current persisted rows; it does
+  not require a local WhatsApp socket. Missing or changed persisted bindings,
+  ledger reads and admission commits fail non-2xx; none can fall through to the
+  ordinary webhook response. Socket ownership and readiness are revalidated by
+  the worker before transport.
 - Only an exact top-level `message_created` outgoing payload is eligible.
   Conversation-history messages never enter this queue. A deletion for a
   retained message atomically moves its complete frozen set to
@@ -74,9 +77,21 @@ duplicate WhatsApp messages.
   have cancellable time budgets. Timeout before transport consumes a bounded
   preparation attempt; timeout after the durable `sending` transition is
   ambiguous and can only reconcile by exact planned WAID.
+- A missing, stale or disconnected local WhatsApp socket is readiness state,
+  not a preparation failure or binding mismatch. The operation remains
+  `pending` with bounded backoff and does not consume its six preparation
+  attempts. The authenticated persisted route remains fail-closed, and the
+  worker sends only after the exact local instance socket is `open`.
 - The operation becomes `sending` in the database immediately before the
   Baileys transport call. A failure or restart after that transition becomes
   `ambiguous` and never causes a blind resend.
+- The signed `message_created` payload must carry Chatwoot's versioned
+  `outbound_snapshot.fingerprint`. EVO freezes that fingerprint with the
+  content/part set and requires an exact locked Chatwoot snapshot match during
+  preparation and again immediately before the transport fence. Edited text,
+  privacy, content attributes, sender signature or attachments are quarantined
+  instead of sending the older durable payload; a missing fingerprint fails
+  closed before enqueue.
 - Every claim increments a persistent generation. Every lease-owned state
   change includes that generation in its predicate, so a timed-out attempt
   that finishes during a later claim cannot move the row. Baileys also

@@ -38,6 +38,7 @@ const operation = {
       accountId: 7,
       inboxId: 58,
       inboxName: 'WA - Test',
+      snapshotFingerprint: 'b'.repeat(64),
       conversationId: 42,
       messageId: 314,
       contactInboxSourceId: 'source-1',
@@ -120,6 +121,15 @@ test('rejects provider disable, compact-snapshot reassignment, destination chang
   );
   assert.equal(validate({ currentMessage: { ...currentMessage, inbox_id: 59 } }), false);
   assert.equal(validate({ currentMessage: { ...currentMessage, destination: '628999' } }), false);
+  assert.equal(
+    validate({
+      currentMessage: {
+        ...currentMessage,
+        outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
+      },
+    }),
+    false,
+  );
   assert.equal(validate({ currentMessage: { ...currentMessage, deleted: true } }), false);
   assert.equal(validate({ currentMessage: null }), false);
 });

@@ -16,6 +16,7 @@ const origin: ChatwootOutboundOrigin = {
   inboxName: 'WA - Test',
   conversationId: 42,
   messageId: 314,
+  snapshotFingerprint: 'b'.repeat(64),
   routeBinding: {
     version: 2,
     provider: 'evo_whatsapp',
@@ -34,6 +35,7 @@ const parts = buildChatwootOutboundParts({
     account: { id: 7 },
     inbox: { id: 58 },
     conversation: { id: 42 },
+    outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
     attachments: [
       { id: 10, data_url: 'https://example.invalid/a' },
       { id: 11, data_url: 'https://example.invalid/b' },
@@ -158,11 +160,12 @@ test('changed frozen-set replay atomically quarantines every retained operation'
       account: { id: 7 },
       inbox: { id: 58 },
       conversation: { id: 42 },
+      outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
       attachments: [{ id: 10, data_url: 'https://example.invalid/changed' }],
     },
     chatId: 'opaque-chat',
     formattedText: 'caption',
-    origin,
+    origin: { ...origin, snapshotFingerprint: 'c'.repeat(64) },
   });
 
   await assert.rejects(
@@ -571,11 +574,18 @@ test('replay quarantine keeps an unresolved transport lane fenced across workers
       account: { id: 7 },
       inbox: { id: 58 },
       conversation: { id: 43 },
+      outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
       attachments: [],
     },
     chatId: 'opaque-chat',
     formattedText: 'successor',
-    origin: { ...origin, messageId: 315, conversationId: 43, contactId: 412 },
+    origin: {
+      ...origin,
+      messageId: 315,
+      conversationId: 43,
+      contactId: 412,
+      snapshotFingerprint: 'c'.repeat(64),
+    },
   });
   const rows: any[] = [
     {
@@ -715,6 +725,7 @@ test('recovers a pre-upgrade retained set when new numeric contact context is pr
       account: { id: 7 },
       inbox: { id: 58 },
       conversation: { id: 42 },
+      outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
       attachments: [
         { id: 10, data_url: 'https://example.invalid/a' },
         { id: 11, data_url: 'https://example.invalid/b' },
@@ -743,6 +754,7 @@ test('rejects a changed numeric contact identity after it has been frozen', asyn
       account: { id: 7 },
       inbox: { id: 58 },
       conversation: { id: 42 },
+      outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
       attachments: [
         { id: 10, data_url: 'https://example.invalid/a' },
         { id: 11, data_url: 'https://example.invalid/b' },
@@ -779,7 +791,12 @@ test('rejects capacity and oldest-age admission while preparing or sending work 
     { ...stored(1, 'sending'), createdAt: old },
   ]);
   const store = new ChatwootOutboundPrismaStore(memory.repository);
-  const anotherOrigin = { ...origin, messageId: 315, conversationId: 43 };
+  const anotherOrigin = {
+    ...origin,
+    messageId: 315,
+    conversationId: 43,
+    snapshotFingerprint: 'c'.repeat(64),
+  };
   const anotherParts = buildChatwootOutboundParts({
     instanceId: 'instance-1',
     body: {
@@ -788,6 +805,7 @@ test('rejects capacity and oldest-age admission while preparing or sending work 
       account: { id: 7 },
       inbox: { id: 58 },
       conversation: { id: 43 },
+      outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
       attachments: [],
     },
     chatId: 'another-destination',

@@ -31,6 +31,7 @@ export interface ChatwootOutboundOrigin {
   contactId?: number;
   contactInboxId?: number;
   inboxName: string;
+  snapshotFingerprint: string;
   routeBinding: ChatwootEvoRouteBinding;
 }
 
@@ -136,6 +137,13 @@ export interface ChatwootOutboundStore {
   markMessageCompleted(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
   markMessageFailed(operation: StoredChatwootOutboundOperation, workerId: string, now: Date): Promise<void>;
   schedulePending(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    errorClass: string,
+  ): Promise<void>;
+  deferPending(
     id: string,
     workerId: string,
     claimGeneration: number,
@@ -270,6 +278,13 @@ export function buildChatwootOutboundParts(params: {
   }
   requiredString(params.origin.providerId, 'Chatwoot provider id');
   requiredString(params.origin.inboxName, 'Chatwoot inbox name');
+  if (
+    Number(params.body?.outbound_snapshot?.version) !== 1 ||
+    !/^[a-f0-9]{64}$/.test(String(params.body?.outbound_snapshot?.fingerprint || '')) ||
+    params.origin.snapshotFingerprint !== params.body.outbound_snapshot.fingerprint
+  ) {
+    throw new Error('Invalid Chatwoot outbound snapshot');
+  }
   const normalizedOrigin = {
     ...params.origin,
     baseUrl: normalizeBaseUrl(requiredString(params.origin.baseUrl, 'Chatwoot base URL')),
@@ -283,6 +298,7 @@ export function buildChatwootOutboundParts(params: {
     messageId: normalizedOrigin.messageId,
     contactInboxSourceId: normalizedOrigin.contactInboxSourceId,
     inboxName: normalizedOrigin.inboxName,
+    snapshotFingerprint: normalizedOrigin.snapshotFingerprint,
     routeBinding: normalizedOrigin.routeBinding,
   };
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
@@ -523,7 +539,7 @@ export class ChatwootOutboundQueue {
       return true;
     }
     if (!ready) {
-      await this.retryPreparation(operation, 'WhatsappNotReady');
+      await this.deferUntilWhatsappReady(operation);
       return true;
     }
 
@@ -610,11 +626,23 @@ export class ChatwootOutboundQueue {
           nextAttemptAt,
           classified,
         );
+      } else if (classified === 'WhatsappNotReady') {
+        await this.deferUntilWhatsappReady(operation);
       } else {
         await this.retryPreparation(operation, classified);
       }
     }
     return true;
+  }
+
+  private async deferUntilWhatsappReady(operation: StoredChatwootOutboundOperation) {
+    await this.store.deferPending(
+      operation.id,
+      this.workerId,
+      operation.claimGeneration,
+      new Date(Date.now() + outboundRetryDelayMs(operation.claimGeneration)),
+      'WhatsappNotReady',
+    );
   }
 
   private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string) {

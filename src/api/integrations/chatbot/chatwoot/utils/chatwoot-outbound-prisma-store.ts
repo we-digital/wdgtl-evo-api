@@ -511,6 +511,16 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
+  public async deferPending(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    nextAttemptAt: Date,
+    lastErrorClass: string,
+  ): Promise<void> {
+    await this.schedule(id, workerId, claimGeneration, 'pending', nextAttemptAt, lastErrorClass);
+  }
+
   public async deferCallback(
     id: string,
     workerId: string,
