@@ -25,6 +25,9 @@ tags are never deployment inputs.
 - **Upstream reapply/conflicts:** remove every workflow introduced by an
   upstream merge, keep the one-file allowlist closed by default, and refresh
   the reviewed workflow blob only after inspecting the exact diff.
+- **Reviewed workflow identity:** blob
+  `4aab8c71a79ead19706891c1f697d0ae755be592` groups build identity outputs and
+  dispatches staging through the authoritative `bbc-devops:main` receiver.
 - **Rollback:** revert the policy commit only together with a conscious review
   of any workflow being restored. Deployment safety checks remain mandatory.
 - **Focused regression:** run the local policy checker, `git diff --check`,
@@ -127,8 +130,16 @@ tags are never deployment inputs.
   WhatsApp part before clearing that part's local mapping. Stable numeric attachment IDs are sorted to
   make part identities independent of webhook array order, and the exact
   content/origin/part set is frozen by hash plus database uniqueness.
+  The signed webhook's authoritative payload fingerprint is frozen with that
+  set and must still equal Chatwoot's locked exact-message fingerprint before
+  transport, so an edit during an unbounded socket outage cannot send stale
+  content.
   A database-leased worker sends each part with a deterministic planned
-  WhatsApp ID. Preparation failures retry before transport; failures after the
+  WhatsApp ID. Signed admission resolves the persisted instance/provider route
+  without requiring a local WhatsApp socket; the exact local socket is checked
+  again before transport. A missing, stale or disconnected socket keeps the
+  operation pending with bounded backoff and does not consume the six
+  preparation attempts. Preparation failures retry before transport; failures after the
   persisted `sending` boundary become `ambiguous` and reconcile by exact ID
   without blind resend. Preparation is bounded to six attempts and then emits
   one exact message-level failure callback without invoking transport. The
@@ -188,7 +199,8 @@ tags are never deployment inputs.
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
   before the first Baileys transport call, the deterministic message ID on
-  text/audio/media, exact-current-message selection, route validation before
+  text/audio/media, persisted authenticated admission during socket outages,
+  non-terminal readiness deferral, exact-current-message selection, route validation before
   enqueue, every per-part `provider_delivery` acknowledgement, API-only live
   source-ID confirmation, and fail-closed treatment of expired `sending`
   leases. Never collapse multipart to a primary-only callback, move media

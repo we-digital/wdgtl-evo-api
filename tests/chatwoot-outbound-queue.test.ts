@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildBaileysTransportOptions } from '@api/integrations/channel/whatsapp/chatwoot-transport-options';
+import { BaileysStartupService } from '@api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import { validatesCurrentChatwootOutboundSnapshot } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import {
   buildChatwootOutboundParts,
   ChatwootOutboundHandler,
@@ -24,6 +26,7 @@ const origin: ChatwootOutboundOrigin = {
   messageId: 314,
   contactInboxSourceId: 'opaque-contact',
   inboxName: 'WA - Test',
+  snapshotFingerprint: 'b'.repeat(64),
   routeBinding: {
     version: 2,
     provider: 'evo_whatsapp',
@@ -50,6 +53,7 @@ const webhook = {
     messages: [{ id: 313, attachments: [{ id: 1, data_url: 'https://example.invalid/old.jpg' }] }],
   },
   content_attributes: { in_reply_to: 99 },
+  outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
 };
 
 const buildParts = (body: any = webhook) =>
@@ -59,6 +63,35 @@ const buildParts = (body: any = webhook) =>
     chatId: 'opaque-chat',
     formattedText: 'caption',
     origin,
+  });
+
+const exactSnapshotMatches = (operation: StoredChatwootOutboundOperation, fingerprint: string) =>
+  validatesCurrentChatwootOutboundSnapshot({
+    operation,
+    provider: {
+      id: origin.providerId,
+      enabled: true,
+      url: origin.baseUrl,
+      accountId: String(origin.accountId),
+      nameInbox: origin.inboxName,
+    } as any,
+    currentInbox: null,
+    conversation: null,
+    currentMessage: {
+      contract_version: 1,
+      account_id: origin.accountId,
+      inbox_id: origin.inboxId,
+      conversation_id: origin.conversationId,
+      message_id: origin.messageId,
+      message_type_name: 'outgoing',
+      deleted: false,
+      destination: 'opaque-chat',
+      contact_inbox_source_id: origin.contactInboxSourceId,
+      route: { inbox_name: origin.inboxName, channel_type: 'Channel::Api', binding: origin.routeBinding },
+      outbound_snapshot: { version: 1, fingerprint },
+    },
+    expectedRoute: origin.routeBinding,
+    currentRoute: origin.routeBinding,
   });
 
 test('uses only the exact top-level message and creates attachment identities independent of array order', () => {
@@ -270,6 +303,10 @@ class MemoryStore implements ChatwootOutboundStore {
     this.operation.preparationAttempts += 1;
   }
 
+  async deferPending() {
+    this.operation.state = 'pending';
+  }
+
   async deferCallback() {}
 
   async scheduleCallback() {
@@ -389,11 +426,10 @@ test('reports terminal preparation failure after the bounded attempt count witho
   assert.equal(store.operation.sendAttempts, 0);
 });
 
-test('reports a bounded not-ready failure without entering transport', async () => {
+test('keeps a not-ready WhatsApp operation pending without consuming preparation attempts', async () => {
   const store = new MemoryStore();
   store.operation.preparationAttempts = MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1;
   let sends = 0;
-  let failures = 0;
   const queue = new ChatwootOutboundQueue(
     store,
     validHandler({
@@ -402,22 +438,201 @@ test('reports a bounded not-ready failure without entering transport', async () 
         sends += 1;
         throw new Error('must not send');
       },
-      fail: async () => {
-        failures += 1;
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(sends, 0);
+  assert.equal(store.operation.preparationAttempts, MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1);
+  assert.equal(store.operation.sendAttempts, 0);
+});
+
+test('sends exactly once after repeated not-ready checks recover', async () => {
+  const store = new MemoryStore();
+  let ready = false;
+  let sends = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      isReady: async () => ready,
+      send: async (operation, _context, onTransportStart) => {
+        sends += 1;
+        await onTransportStart();
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  await queue.runOnce('transport');
+  await queue.runOnce('transport');
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.preparationAttempts, 0);
+  assert.equal(store.operation.sendAttempts, 0);
+
+  ready = true;
+  await queue.runOnce('transport');
+  await queue.runOnce('transport');
+
+  assert.equal(sends, 1);
+  assert.equal(store.operation.state, 'completed');
+  assert.equal(store.operation.preparationAttempts, 0);
+  assert.equal(store.operation.sendAttempts, 1);
+});
+
+test('quarantines a payload fingerprint changed during a disconnected wait without sending', async () => {
+  const store = new MemoryStore();
+  let fingerprint = origin.snapshotFingerprint;
+  let ready = false;
+  let sends = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async (operation) => ({
+        validation: exactSnapshotMatches(operation, fingerprint) ? 'valid' : 'mismatch',
+      }),
+      isReady: async () => ready,
+      send: async () => {
+        sends += 1;
+        throw new Error('must not send');
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  fingerprint = 'c'.repeat(64);
+  ready = true;
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'quarantined');
+  assert.equal(store.operation.sendAttempts, 0);
+  assert.equal(sends, 0);
+});
+
+test('quarantines a payload fingerprint changed between preparation and the transport fence', async () => {
+  const store = new MemoryStore();
+  let fingerprint = origin.snapshotFingerprint;
+  let transportCalls = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async (operation) => ({
+        validation: exactSnapshotMatches(operation, fingerprint) ? 'valid' : 'mismatch',
+      }),
+      revalidateTransport: async (operation) => ({
+        validation: exactSnapshotMatches(operation, fingerprint) ? 'valid' : 'mismatch',
+      }),
+      send: async (operation, _context, onTransportStart) => {
+        fingerprint = 'c'.repeat(64);
+        await onTransportStart();
+        transportCalls += 1;
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
       },
     }),
   );
 
   await queue.runOnce('transport');
 
-  assert.equal(store.operation.state, 'failure_callback_pending');
-  assert.equal(failures, 0);
+  assert.equal(store.operation.state, 'quarantined');
+  assert.equal(store.operation.sendAttempts, 0);
+  assert.equal(transportCalls, 0);
+});
+
+test('defers a socket loss immediately before transport without consuming preparation attempts', async () => {
+  const store = new MemoryStore();
+  let sends = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => {
+        sends += 1;
+        const error = new Error('socket disconnected before transport');
+        error.name = 'WhatsappNotReady';
+        throw error;
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.preparationAttempts, 0);
+  assert.equal(store.operation.sendAttempts, 0);
+  assert.equal(sends, 1);
+});
+
+test('preserves real Baileys readiness errors at the attempt limit and sends exactly once after recovery', async () => {
+  const store = new MemoryStore();
+  store.operation.preparationAttempts = MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1;
+  let socketReady = false;
+  let transports = 0;
+  const wa: any = Object.create(BaileysStartupService.prototype);
+  wa.whatsappNumber = async () => [{ exists: true, jid: '628123@s.whatsapp.net' }];
+  wa.logger = { verbose() {}, debug() {}, error() {} };
+  wa.configService = {
+    get(key: string) {
+      if (key === 'CHATWOOT') return { ENABLED: false };
+      if (key === 'OPENAI') return { ENABLED: false };
+      if (key === 'DATABASE') return { SAVE_DATA: { NEW_MESSAGE: false } };
+      return {};
+    },
+  };
+  wa.localWebhook = { enabled: false };
+  wa.localChatwoot = { enabled: false };
+  wa.prepareMessage = (message: any) => message;
+  wa.sendDataWebhook = () => undefined;
+  wa.sendMessage = async (_sender: string, _message: unknown, transport: { beforeTransport?: () => Promise<void> }) => {
+    await transport.beforeTransport?.();
+    transports += 1;
+    return {
+      key: { id: store.operation.plannedWhatsappMessageId, remoteJid: '628123@s.whatsapp.net', fromMe: true },
+      message: { conversation: 'hello' },
+      messageTimestamp: 1,
+    };
+  };
+
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      revalidateTransport: async () => {
+        if (!socketReady) {
+          const error = new Error('socket disconnected before transport');
+          error.name = 'WhatsappNotReady';
+          throw error;
+        }
+        return { validation: 'valid', providerContext: { snapshot: true } };
+      },
+      send: async (operation, _context, onTransportStart) => {
+        const sent = await wa.textMessage(
+          {
+            number: '628123',
+            text: 'hello',
+            messageId: operation.plannedWhatsappMessageId,
+            beforeTransport: onTransportStart,
+          },
+          true,
+        );
+        return { whatsappMessageId: sent.key.id, result: null };
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.preparationAttempts, MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1);
+  assert.equal(store.operation.sendAttempts, 0);
+  assert.equal(transports, 0);
+
+  socketReady = true;
+  await queue.runOnce('transport');
   await queue.runOnce('maintenance');
 
-  assert.equal(sends, 0);
-  assert.equal(failures, 1);
-  assert.equal(store.operation.state, 'failed');
-  assert.equal(store.operation.sendAttempts, 0);
+  assert.equal(store.operation.state, 'completed');
+  assert.equal(store.operation.preparationAttempts, MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1);
+  assert.equal(store.operation.sendAttempts, 1);
+  assert.equal(transports, 1);
 });
 
 test('reconciles a crash after transport start by exact planned WAID without another send', async () => {

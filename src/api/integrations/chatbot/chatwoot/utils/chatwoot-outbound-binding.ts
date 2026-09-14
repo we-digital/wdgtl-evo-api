@@ -66,7 +66,10 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       currentMessage.route?.channel_type === 'Channel::Api' &&
       chatwootEvoRouteBindingsEqual(currentMessage.route?.binding, origin.routeBinding) &&
       Number(currentMessage.outbound_snapshot?.version) === 1 &&
-      /^[a-f0-9]{64}$/.test(String(currentMessage.outbound_snapshot?.fingerprint || '')),
+      /^[a-f0-9]{64}$/.test(String(origin.snapshotFingerprint || '')) &&
+      /^[a-f0-9]{64}$/.test(String(currentMessage.outbound_snapshot?.fingerprint || '')) &&
+      ((params.expectedDeleted ?? false) ||
+        currentMessage.outbound_snapshot.fingerprint === origin.snapshotFingerprint),
   );
 };
 

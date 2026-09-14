@@ -128,6 +128,10 @@ interface ChatwootClientContext {
   provider: ChatwootModel;
 }
 
+interface AuthenticatedChatwootClientContext extends ChatwootClientContext {
+  instance: InstanceDto;
+}
+
 // Chatwoot's Channel::Api uses Rails has_secure_token, whose default token
 // length is 24 characters. Accept that production shape without weakening the
 // HMAC contract to arbitrary non-empty values.
@@ -250,7 +254,7 @@ export class ChatwootService {
       maxAgeMs: config.OUTBOUND_WEBHOOK_MAX_AGE_MS,
       maxBodyBytes: config.OUTBOUND_WEBHOOK_MAX_BODY_BYTES,
     });
-    return { ...verified, routeInstanceId: instance.id };
+    return { ...verified, routeInstanceId: instance.id, routeProviderId: provider.id };
   }
 
   private pgClient = postgresClient.getChatwootConnection();
@@ -283,6 +287,36 @@ export class ChatwootService {
           config: this.getClientCwConfig(provider),
         }),
     );
+  }
+
+  private async authenticatedClientCw(
+    instance: InstanceDto,
+    admission: ChatwootOutboundWebhookHeaders,
+  ): Promise<AuthenticatedChatwootClientContext | null> {
+    if (!admission.routeInstanceId || !admission.routeProviderId) return null;
+    const storedInstance = await this.prismaRepository.instance.findUnique({
+      where: { id: admission.routeInstanceId },
+      select: { id: true, name: true, ownerJid: true, number: true },
+    });
+    if (!storedInstance || storedInstance.name !== instance.instanceName) return null;
+    const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: storedInstance.id } });
+    if (
+      !provider?.enabled ||
+      provider.id !== admission.routeProviderId ||
+      provider.instanceId !== admission.routeInstanceId
+    )
+      return null;
+
+    return {
+      instance: {
+        instanceId: storedInstance.id,
+        instanceName: storedInstance.name,
+        ownerJid: storedInstance.ownerJid,
+        number: storedInstance.number,
+      },
+      provider,
+      client: new ChatwootClient({ config: this.getClientCwConfig(provider) }),
+    };
   }
 
   public getClientCwConfig(
@@ -1133,7 +1167,9 @@ export class ChatwootService {
     provider: ChatwootModel,
     inboxId: number,
   ): ChatwootEvoRouteBinding | null {
-    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const localWaInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    const waInstance =
+      !instance.instanceId || localWaInstance?.instanceId === instance.instanceId ? localWaInstance : undefined;
     const runtimeInstance = waInstance?.instance || {};
     const ownerJid = runtimeInstance.ownerJid || instance.ownerJid;
     const receiverNumber = selectChatwootPhysicalReceiverNumber({
@@ -1652,9 +1688,16 @@ export class ChatwootService {
   private async outboundInstance(operation: StoredChatwootOutboundOperation): Promise<InstanceDto | null> {
     const stored = await this.prismaRepository.instance.findUnique({
       where: { id: operation.instanceId },
-      select: { id: true, name: true },
+      select: { id: true, name: true, ownerJid: true, number: true },
     });
-    return stored ? { instanceId: stored.id, instanceName: stored.name } : null;
+    return stored
+      ? {
+          instanceId: stored.id,
+          instanceName: stored.name,
+          ownerJid: stored.ownerJid,
+          number: stored.number,
+        }
+      : null;
   }
 
   private async awaitCancelable<T>(request: Promise<T> & { cancel?: () => void }, signal: AbortSignal): Promise<T> {
@@ -1695,8 +1738,8 @@ export class ChatwootService {
   ) {
     const instance = await this.outboundInstance(operation);
     if (!instance) return null;
-    const waInstance = this.waMonitor.waInstances[instance.instanceName];
-    if (!waInstance || waInstance.instanceId !== operation.instanceId) return null;
+    const localWaInstance = this.waMonitor.waInstances[instance.instanceName];
+    const waInstance = localWaInstance?.instanceId === operation.instanceId ? localWaInstance : null;
     const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } });
     if (
       !provider?.id ||
@@ -1770,6 +1813,9 @@ export class ChatwootService {
   private async revalidateQueuedOutboundTransport(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
     const context = await this.currentOutboundContext(operation, signal, false, true);
     if (!context) return { validation: 'mismatch' as const };
+    if (!context.waInstance || context.waInstance.connectionStatus?.state !== 'open') {
+      throw Object.assign(new Error('WhatsApp socket is not ready'), { name: 'WhatsappNotReady' });
+    }
     return {
       validation: context.authoritativelyDeleted ? ('deleted' as const) : ('valid' as const),
       providerContext: context.providerContext,
@@ -1809,6 +1855,13 @@ export class ChatwootService {
     if (!context) throw this.outboundBindingMismatch();
     if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { instance, waInstance } = context;
+    if (
+      !waInstance ||
+      waInstance.instanceId !== operation.instanceId ||
+      waInstance.connectionStatus?.state !== 'open'
+    ) {
+      throw Object.assign(new Error('WhatsApp socket is not ready'), { name: 'WhatsappNotReady' });
+    }
 
     const payload = operation.payload;
     const quoted = await this.getQuotedMessage(
@@ -2050,6 +2103,7 @@ export class ChatwootService {
       messageId: Number(body.id),
       ...contactIdentity,
       inboxName: provider.nameInbox,
+      snapshotFingerprint: String(body.outbound_snapshot?.fingerprint || ''),
       routeBinding,
     };
     const parts = buildChatwootOutboundParts({
@@ -2166,7 +2220,11 @@ export class ChatwootService {
           status: 401,
         });
       }
-      const context = await this.clientCw(instance);
+      const authenticatedContext = asyncDeliverable
+        ? await this.authenticatedClientCw(instance, authenticatedAdmission)
+        : null;
+      if (authenticatedContext) Object.assign(instance, authenticatedContext.instance);
+      const context = authenticatedContext ?? (asyncDeliverable ? null : await this.clientCw(instance));
 
       if (!context) {
         if (asyncDeliverable) {
@@ -2201,12 +2259,12 @@ export class ChatwootService {
 
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
-      const exactAsyncSocketBinding =
+      const exactAsyncStoredBinding =
         !asyncDeliverable ||
         (Boolean(authenticatedAdmission?.routeInstanceId) &&
           authenticatedAdmission?.routeInstanceId === provider.instanceId &&
-          authenticatedAdmission.routeInstanceId === waInstance?.instanceId);
-      if (!waInstance || !exactAsyncSocketBinding) {
+          authenticatedAdmission?.routeProviderId === provider.id);
+      if ((!waInstance && !asyncDeliverable) || !exactAsyncStoredBinding) {
         if (asyncDeliverable) {
           outboundEnqueueAttempted = true;
           throw Object.assign(new Error('Chatwoot outbound local socket binding is unavailable'), {
@@ -2224,7 +2282,7 @@ export class ChatwootService {
         return { message: 'bot' };
       }
 
-      instance.instanceId = waInstance.instanceId;
+      instance.instanceId = asyncDeliverable ? authenticatedAdmission.routeInstanceId : waInstance.instanceId;
 
       if (isChatwootMessageDeletion(body)) {
         const retained = await this.outboundStore.retainedOperations(instance.instanceId, Number(body.id));
@@ -2268,6 +2326,7 @@ export class ChatwootService {
           messageId: Number(body.id),
           ...chatwootOutboundContactIdentity(body),
           inboxName: liveProvider.nameInbox,
+          snapshotFingerprint: String(body.outbound_snapshot?.fingerprint || ''),
           routeBinding: deletionRoute,
         };
         const syntheticDeletion: StoredChatwootOutboundOperation = {
