@@ -2761,7 +2761,12 @@ export class BaileysStartupService extends ChannelStartupService {
       return messageRaw;
     } catch (error) {
       this.logger.error(JSON.stringify({ event: 'whatsapp_send_error', errorClass: error?.name || 'Error' }));
-      if (error?.name === 'OutboundBindingMismatch' || error?.name === 'OutboundOperationAborted') throw error;
+      if (
+        ['OutboundBindingMismatch', 'OutboundMessageDeleted', 'OutboundOperationAborted', 'WhatsappNotReady'].includes(
+          error?.name,
+        )
+      )
+        throw error;
       throw new BadRequestException(error.toString());
     }
   }

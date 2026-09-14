@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import '@api/server.module';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { buildChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 
 const route = {
@@ -35,6 +36,7 @@ const body = {
   inbox: { id: 58 },
   sender: { id: 9001, type: 'user', name: 'Agent' },
   attachments: [],
+  outbound_snapshot: { version: 1, fingerprint: 'b'.repeat(64) },
   conversation: {
     id: 42,
     meta: { sender: { id: 411, type: 'contact', identifier: '628123' } },
@@ -47,6 +49,7 @@ const admission = {
   timestampSeconds: 1_789_020_365,
   receivedAt: new Date('2026-09-11T03:00:00.000Z'),
   routeInstanceId: 'instance-1',
+  routeProviderId: 'provider-1',
 };
 
 const serviceFixture = (socketInstanceId: string | null) => {
@@ -71,6 +74,16 @@ const serviceFixture = (socketInstanceId: string | null) => {
   ) as any;
   service.logger = { error: () => undefined, warn: () => undefined, verbose: () => undefined };
   service.clientCw = async () => ({ provider, client: {} });
+  service.authenticatedClientCw = async () => ({
+    provider,
+    client: {},
+    instance: {
+      instanceId: 'instance-1',
+      instanceName: 'test-instance',
+      ownerJid: '628000@s.whatsapp.net',
+      number: '628000',
+    },
+  });
   service.buildEvoRouteBinding = () => route;
   let reverseReads = 0;
   service.currentOutboundContext = async () => {
@@ -116,6 +129,54 @@ test('bootstraps the actual 24-character Chatwoot Channel::Api secret before sta
   assert.equal(workerStarts, 1);
 });
 
+test('resolves the authenticated admission from persisted instance and provider rows without a socket', async () => {
+  const fixture = serviceFixture(null);
+  delete fixture.service.authenticatedClientCw;
+  fixture.service.prismaRepository = {
+    instance: {
+      findUnique: async () => ({
+        id: 'instance-1',
+        name: 'test-instance',
+        ownerJid: '628000@s.whatsapp.net',
+        number: '628000',
+      }),
+    },
+    chatwoot: { findUnique: async () => provider },
+  };
+
+  const context = await fixture.service.authenticatedClientCw({ instanceName: 'test-instance' }, admission);
+
+  assert.equal(context.provider.id, 'provider-1');
+  assert.deepEqual(context.instance, {
+    instanceId: 'instance-1',
+    instanceName: 'test-instance',
+    ownerJid: '628000@s.whatsapp.net',
+    number: '628000',
+  });
+});
+
+test('ignores a foreign stale local socket when rebuilding the persisted admission route', () => {
+  const fixture = serviceFixture('foreign-instance');
+  delete fixture.service.buildEvoRouteBinding;
+  const instance = {
+    instanceId: 'instance-1',
+    instanceName: 'test-instance',
+    ownerJid: '628000@s.whatsapp.net',
+    number: '628000',
+  };
+
+  assert.deepEqual(
+    fixture.service.buildEvoRouteBinding(instance, provider, 58),
+    buildChatwootEvoRouteBinding({
+      inboxId: 58,
+      instanceId: 'instance-1',
+      instanceName: 'test-instance',
+      receiverNumber: '628000@s.whatsapp.net',
+      signingKey: 'provider-token',
+    }),
+  );
+});
+
 test('propagates a retained lost-202 database failure without acknowledging or reverse-reading', async () => {
   const fixture = serviceFixture('instance-1');
   let enqueues = 0;
@@ -156,24 +217,41 @@ test('returns durable acceptance for a retained lost-202 retry without reverse-r
   assert.equal(fixture.reverseReads(), 0);
 });
 
-test('rejects absent or cross-instance local sockets before ledger admission', async () => {
+test('durably admits from stored bindings while the local socket is absent or stale', async () => {
   for (const socketInstanceId of [null, 'foreign-instance']) {
     const fixture = serviceFixture(socketInstanceId);
     let ledgerReads = 0;
+    let enqueues = 0;
     fixture.service.outboundStore = {
       hasRetainedMessage: async () => {
         ledgerReads += 1;
         return false;
       },
+      enqueue: async () => {
+        enqueues += 1;
+        return { recovered: false };
+      },
     };
+    fixture.service.outboundQueue = { wake: () => undefined };
 
-    await assert.rejects(
-      () => fixture.service.receiveWebhook({ instanceName: 'test-instance' }, body, admission),
-      (error: any) => error?.name === 'ChatwootOutboundLocalBindingUnavailable' && error?.status === 503,
+    assert.deepEqual(
+      await fixture.service.receiveWebhook({ instanceName: 'test-instance' }, body, admission),
+      { accepted: true, operationCount: 1, recovered: false },
     );
-    assert.equal(ledgerReads, 0);
+    assert.equal(ledgerReads, 1);
+    assert.equal(enqueues, 1);
     assert.equal(fixture.reverseReads(), 0);
   }
+});
+
+test('rejects an authenticated provider identity that changed before admission', async () => {
+  const fixture = serviceFixture(null);
+  fixture.service.authenticatedClientCw = async () => null;
+
+  await assert.rejects(
+    () => fixture.service.receiveWebhook({ instanceName: 'test-instance' }, body, admission),
+    (error: any) => error?.name === 'ChatwootOutboundLocalBindingUnavailable' && error?.status === 503,
+  );
 });
 
 test('rejects an invalid authenticated route without a reverse Chatwoot failure callback', async () => {
@@ -201,6 +279,23 @@ test('rejects an invalid authenticated route without a reverse Chatwoot failure 
   assert.equal(ledgerReads, 0);
   assert.equal(reverseCallbacks, 0);
   assert.equal(fixture.reverseReads(), 0);
+});
+
+test('rejects an authenticated outbound event without an authoritative payload fingerprint', async () => {
+  const fixture = serviceFixture('instance-1');
+  fixture.service.outboundStore = {
+    hasRetainedMessage: async () => false,
+    enqueue: async () => {
+      throw new Error('must not enqueue');
+    },
+  };
+  fixture.service.outboundQueue = { wake: () => undefined };
+  const { outbound_snapshot: _snapshot, ...withoutSnapshot } = body;
+
+  await assert.rejects(
+    () => fixture.service.receiveWebhook({ instanceName: 'test-instance' }, withoutSnapshot, admission),
+    /outbound snapshot/,
+  );
 });
 
 const queuedOperation = {

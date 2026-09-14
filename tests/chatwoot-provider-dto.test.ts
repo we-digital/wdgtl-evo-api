@@ -34,11 +34,10 @@ test('findChatwoot mapping returns the authoritative durable provider id used by
   assert.equal(provider?.enabled, true);
   assert.equal(provider?.accountId, row.accountId);
 
-  const authenticatedAdmission = { routeInstanceId: row.instanceId };
-  const waInstance = { instanceId: row.instanceId };
+  const authenticatedAdmission = { routeInstanceId: row.instanceId, routeProviderId: row.id };
   assert.equal(
     authenticatedAdmission.routeInstanceId === provider?.instanceId &&
-      authenticatedAdmission.routeInstanceId === waInstance.instanceId,
+      authenticatedAdmission.routeProviderId === provider?.id,
     true,
   );
 });

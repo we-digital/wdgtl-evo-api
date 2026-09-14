@@ -46,6 +46,12 @@ an update to this policy and the fork ledger in the same commit.
 The local checker is deliberately not a GitHub Actions job: an upstream merge
 cannot activate extra automation merely by adding a workflow file.
 
+The reviewed workflow blob is `4aab8c71a79ead19706891c1f697d0ae755be592`.
+Compared with the preceding allowlisted blob, it only groups the three build
+identity outputs into one append operation and routes the staging receiver
+dispatch through the authoritative `bbc-devops:main` branch. Refresh this hash
+again whenever either behavior changes.
+
 ## Exact runtime reuse and cache
 
 The workflow computes `BUILD_INPUT_SHA` from the Dockerfile, lockfiles, exact
