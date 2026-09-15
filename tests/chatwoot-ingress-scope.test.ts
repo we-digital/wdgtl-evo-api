@@ -6,6 +6,7 @@ import {
   buildChatwootIngressAttributes,
   chatwootEvoRouteBindingsEqual,
   classifyChatwootIngressScope,
+  isChatwootLinkedClientSentEvent,
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 
@@ -84,11 +85,35 @@ test('marks messages sent by the linked device as outbound', () => {
   );
 });
 
+test('marks only linked-client messages.upsert events as client sent', () => {
+  const outgoing = { key: { remoteJid: '628123@s.whatsapp.net', fromMe: true } };
+
+  assert.equal(isChatwootLinkedClientSentEvent('messages.upsert', outgoing), true);
+  assert.equal(isChatwootLinkedClientSentEvent('send.message', outgoing), false);
+  assert.equal(isChatwootLinkedClientSentEvent('messages.edit', outgoing), false);
+  assert.equal(
+    isChatwootLinkedClientSentEvent('messages.upsert', {
+      key: { remoteJid: '628123@s.whatsapp.net', fromMe: false },
+    }),
+    false,
+  );
+
+  assert.deepEqual(buildChatwootIngressAttributes(outgoing, route, true).we_digital_ingress, {
+    version: 2,
+    provider: 'evo_whatsapp',
+    scope: 'direct',
+    direction: 'outbound',
+    from_me: true,
+    client_sent: true,
+    route,
+  });
+  assert.equal('client_sent' in buildChatwootIngressAttributes(outgoing, route).we_digital_ingress, false);
+});
+
 test('fails closed when fromMe is missing or malformed', () => {
   for (const fromMe of [undefined, 'false']) {
     assert.deepEqual(
-      buildChatwootIngressAttributes({ key: { remoteJid: '628123@s.whatsapp.net', fromMe } }, route)
-        .we_digital_ingress,
+      buildChatwootIngressAttributes({ key: { remoteJid: '628123@s.whatsapp.net', fromMe } }, route).we_digital_ingress,
       {
         version: 2,
         provider: 'evo_whatsapp',

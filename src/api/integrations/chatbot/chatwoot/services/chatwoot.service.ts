@@ -52,6 +52,7 @@ import {
   buildChatwootIngressAttributes,
   ChatwootEvoRouteBinding,
   chatwootEvoRouteBindingsEqual,
+  isChatwootLinkedClientSentEvent,
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
@@ -1235,13 +1236,18 @@ export class ChatwootService {
     }
   }
 
-  private async ingressAttributes(instance: InstanceDto, provider: ChatwootModel, messageBody: any) {
+  private async ingressAttributes(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    messageBody: any,
+    clientSent = false,
+  ) {
     const inboxRecord = await this.getInbox(instance);
     const expectedBinding = inboxRecord ? this.buildEvoRouteBinding(instance, provider, inboxRecord.id) : null;
     const storedBinding = inboxRecord ? this.inboxRouteBinding(inboxRecord) : null;
     const route = chatwootEvoRouteBindingsEqual(storedBinding, expectedBinding) ? expectedBinding : null;
 
-    return buildChatwootIngressAttributes(messageBody, route);
+    return buildChatwootIngressAttributes(messageBody, route, clientSent);
   }
 
   public async getInbox(instance: InstanceDto, allowRebind = false): Promise<inbox | null> {
@@ -1302,6 +1308,7 @@ export class ChatwootService {
     messageBody?: any,
     sourceId?: string,
     quotedMsg?: MessageModel,
+    clientSent = false,
   ) {
     const context = await this.clientCw(instance);
 
@@ -1315,7 +1322,7 @@ export class ChatwootService {
 
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
-    const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody);
+    const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody, clientSent);
     const message = await client.messages.create({
       accountId: Number(provider.accountId),
       conversationId: conversationId,
@@ -1434,6 +1441,7 @@ export class ChatwootService {
     sourceId?: string,
     quotedMsg?: MessageModel,
     provider?: ChatwootModel,
+    clientSent = false,
   ) {
     if (sourceId && this.isImportHistoryAvailable()) {
       const messageAlreadySaved = await chatwootImport.getExistingSourceIds([sourceId], conversationId);
@@ -1463,7 +1471,7 @@ export class ChatwootService {
 
     if (messageBody && instance) {
       const replyToIds = await this.getReplyToIds(messageBody, instance);
-      const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody);
+      const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody, clientSent);
       const contentAttributes = JSON.stringify({
         ...replyToIds,
         ...ingressAttributes,
@@ -3130,6 +3138,7 @@ export class ChatwootService {
 
       if (event === 'messages.upsert' || event === 'send.message') {
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
+        const clientSent = isChatwootLinkedClientSentEvent(event, body);
         if (body.key.remoteJid === 'status@broadcast') {
           return;
         }
@@ -3248,6 +3257,7 @@ export class ChatwootService {
               'WAID:' + body.key.id,
               quotedMsg,
               provider,
+              clientSent,
             );
 
             if (!send) {
@@ -3268,6 +3278,7 @@ export class ChatwootService {
               'WAID:' + body.key.id,
               quotedMsg,
               provider,
+              clientSent,
             );
 
             if (!send) {
@@ -3293,6 +3304,7 @@ export class ChatwootService {
               },
               'WAID:' + body.key.id,
               quotedMsg,
+              clientSent,
             );
             if (!send) {
               this.logger.warn('message not sent');
@@ -3338,6 +3350,7 @@ export class ChatwootService {
                 body,
                 'WAID:' + body.key.id,
                 quotedMsg,
+                clientSent,
               );
               if (!send) this.logger.warn('message not sent');
             } else {
@@ -3395,6 +3408,7 @@ export class ChatwootService {
             'WAID:' + body.key.id,
             null,
             provider,
+            clientSent,
           );
 
           if (!send) {
@@ -3431,6 +3445,7 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
+            clientSent,
           );
 
           if (!send) {
@@ -3450,6 +3465,7 @@ export class ChatwootService {
             body,
             'WAID:' + body.key.id,
             quotedMsg,
+            clientSent,
           );
 
           if (!send) {
