@@ -118,9 +118,13 @@ export const classifyChatwootIngressScope = (
   return 'unknown';
 };
 
+export const isChatwootLinkedClientSentEvent = (event: unknown, messageBody: { key?: MessageKey } | null | undefined) =>
+  event === 'messages.upsert' && messageBody?.key?.fromMe === true;
+
 export const buildChatwootIngressAttributes = (
   messageBody: { key?: MessageKey } | null | undefined,
   route: ChatwootEvoRouteBinding | null,
+  clientSent = false,
 ) => {
   const fromMe = messageBody?.key?.fromMe;
   const direction =
@@ -133,6 +137,7 @@ export const buildChatwootIngressAttributes = (
       scope: classifyChatwootIngressScope(messageBody),
       direction,
       from_me: typeof fromMe === 'boolean' ? fromMe : null,
+      ...(clientSent === true ? { client_sent: true as const } : {}),
       route,
     },
   };
