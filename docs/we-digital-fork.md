@@ -187,6 +187,16 @@ tags are never deployment inputs.
   later production history pass cannot re-import a successfully delivered
   live outbound row. Destination lookup failures abort the history batch
   instead of being interpreted as an empty destination.
+  Admission no longer serializes every route through the singleton
+  `ChatwootOutboundAdmissionGuard`. The short transaction first acquires the
+  existing destination lane row, which serializes only messages that share an
+  `instance + WhatsApp destination`; independent lanes commit concurrently.
+  Global backlog depth/age is measured before the transaction and never holds
+  the lane lock or a database connection while scanning. Duplicate receipt and
+  frozen-message checks are repeated after the keyed lane lock, preserving
+  idempotency for a lost HTTP 202. Prisma transaction acquisition and execution
+  budgets are configurable and default to 2 seconds / 5 seconds instead of the
+  previous 500 ms / 1.5 seconds.
 - **Source areas:** `chatwoot-outbound-queue.ts`,
   `chatwoot-outbound-prisma-store.ts`, `chatwoot.service.ts`, the Chatwoot
   router/controller startup wiring, `chatwoot-transport-options.ts`, Baileys'
@@ -195,6 +205,9 @@ tags are never deployment inputs.
   `docs/operations/chatwoot-outbound-delivery.md`.
 - **Flags/schema:** `CHATWOOT_OUTBOUND_ASYNC_ENABLED` and
   `CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY` default to false. The
+  `CHATWOOT_OUTBOUND_ADMISSION_MAX_WAIT_MS` and
+  `CHATWOOT_OUTBOUND_ADMISSION_TIMEOUT_MS` controls default to `2000` and
+  `5000`, and are clamped to bounded safe ranges. The
   additive `ChatwootOutboundOperation` table and claim-generation fence are present in PostgreSQL,
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
