@@ -4005,7 +4005,17 @@ export class BaileysStartupService extends ChannelStartupService {
       const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
+        try {
+          last_message = await this.getLastMessage(number);
+        } catch (error) {
+          if (!(error instanceof NotFoundException)) throw error;
+          // Empty chat / no stored history — still archive with a synthetic lastMessages stub.
+          last_message = {
+            key: { remoteJid: jid, fromMe: false, id: `archive-stub-${Date.now()}` },
+            messageTimestamp: Math.floor(Date.now() / 1000),
+            message: { conversation: '' },
+          } as unknown as LastMessage;
+        }
       } else if (last_message) {
         last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid || number;

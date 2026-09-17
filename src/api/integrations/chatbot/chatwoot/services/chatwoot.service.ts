@@ -3496,7 +3496,7 @@ export class ChatwootService {
       },
       reaction: emoji,
     });
-    return { accepted: true };
+    return { message: 'reacted' };
   }
 
   private getTypeMessage(msg: any) {
