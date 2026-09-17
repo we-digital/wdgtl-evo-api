@@ -114,6 +114,7 @@ import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageM
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
+import { createJid } from '@utils/createJid';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
@@ -2513,6 +2514,12 @@ export class ChatwootService {
         retainedMessage = await this.outboundStore.hasRetainedMessage(instance.instanceId, Number(body.id));
         if (!retainedMessage && !outboundConfig.OUTBOUND_ASYNC_ENABLED) outboundEnqueueAttempted = false;
       }
+      if (deliverableOutgoing && body?.content_attributes?.forwarded) {
+        const nativeForward = await this.trySendNativeForward(waInstance, chatId, body, instance);
+        if (nativeForward) {
+          return { message: 'forwarded', key: nativeForward.key };
+        }
+      }
       if (deliverableOutgoing && retainedMessage) {
         if (!expectedRoute || Number(provider.accountId) !== Number(body.account?.id)) {
           throw this.outboundBindingMismatch();
@@ -2894,6 +2901,87 @@ export class ChatwootService {
     }
 
     return null;
+  }
+
+  /**
+   * Native WhatsApp forward (Baileys `{ forward }`) when Chatwoot marks the
+   * outgoing message as forwarded and the source WA message is in this instance.
+   * Returns null to fall back to content re-send.
+   */
+  private async trySendNativeForward(
+    waInstance: any,
+    chatId: string,
+    body: any,
+    instance: InstanceDto,
+  ): Promise<any | null> {
+    const attrs = body?.content_attributes;
+    if (!attrs?.forwarded) return null;
+
+    const from = attrs.forwarded_from || {};
+    const sourceMessageId = Number(from.message_id);
+    if (!Number.isSafeInteger(sourceMessageId) || sourceMessageId <= 0) return null;
+
+    // Cross-inbox forwards cannot use this session's message store.
+    if (from.same_inbox === false) return null;
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: sourceMessageId,
+        instanceId: instance.instanceId,
+      },
+    });
+
+    const key = stored?.key as WAMessageKey | undefined;
+    const messageContent = stored?.message as WAMessageContent | undefined;
+    if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+      return null;
+    }
+
+    try {
+      const jid = createJid(chatId);
+      const messageSent = await waInstance.client.sendMessage(jid, {
+        forward: { key, message: messageContent },
+        force: true,
+      });
+
+      if (!messageSent) return null;
+
+      if (Long.isLong(messageSent?.messageTimestamp)) {
+        messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+      }
+
+      await this.updateChatwootMessageId(
+        { ...messageSent },
+        {
+          messageId: body.id,
+          inboxId: body.inbox?.id,
+          conversationId: body.conversation?.id,
+          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+        },
+        instance,
+      );
+
+      this.logger.verbose(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_sent',
+          sourceMessageId,
+          targetChatId: chatId,
+          chatwootMessageId: body.id,
+        }),
+      );
+
+      return messageSent;
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_failed',
+          sourceMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+      return null;
+    }
   }
 
   private isMediaMessage(message: any) {
