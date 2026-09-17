@@ -2436,7 +2436,45 @@ export class ChatwootService {
           if (!deletionContext) throw this.outboundBindingMismatch();
           await this.outboundStore.requestDeletion(retained[0]);
           this.outboundQueue.wake();
-          return { accepted: true, deletion: true, operationCount: retained.length };
+
+          const neverSent = retained.every((operation) => Number(operation.sendAttempts || 0) === 0);
+          const mapped = await this.prismaRepository.message.findFirst({
+            where: {
+              chatwootMessageId: body.id,
+              instanceId: instance.instanceId,
+            },
+          });
+
+          // Never reached WA — queue cancel is enough for native-first success.
+          if (neverSent && !mapped) {
+            return { message: 'deleted' };
+          }
+
+          if (!waInstance?.client?.sendMessage) {
+            throw new BadRequestException('WhatsApp instance unavailable for native delete');
+          }
+          if (!mapped) {
+            throw new BadRequestException('WhatsApp message mapping missing for native delete');
+          }
+
+          const retainedKey = mapped.key as WAMessageKey;
+          if (
+            mapped.chatwootInboxId !== Number(body.inbox?.id) ||
+            mapped.chatwootConversationId !== Number(body.conversation?.id) ||
+            !retainedKey?.remoteJid ||
+            !this.outboundRemoteJidMatches(candidateDeletionChatId, retainedKey.remoteJid)
+          ) {
+            throw this.outboundBindingMismatch();
+          }
+
+          await waInstance.client.sendMessage(retainedKey.remoteJid, { delete: retainedKey });
+          await this.prismaRepository.message.deleteMany({
+            where: {
+              instanceId: instance.instanceId,
+              chatwootMessageId: body.id,
+            },
+          });
+          return { message: 'deleted' };
         }
         const liveProvider = await this.prismaRepository.chatwoot.findUnique({
           where: { instanceId: instance.instanceId },
