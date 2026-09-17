@@ -21,6 +21,7 @@ import {
   isChatwootDeliveryFailureAcknowledged,
   isChatwootMessageDeletion,
   isChatwootMessageEdit,
+  isChatwootNativeMuteProbe,
   isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
@@ -2316,6 +2317,22 @@ export class ChatwootService {
         this.cache.delete(keyToDelete);
       }
 
+      if (isChatwootNativeMuteProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native mute');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier ||
+          body?.meta?.sender?.phone_number?.replace('+', '') ||
+          candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native mute');
+        }
+        await this.trySendNativeMute(waInstance, chatId, body);
+        return { message: body.muted ? 'muted' : 'unmuted' };
+      }
+
       if (
         !body?.conversation ||
         body.private ||
@@ -2811,7 +2828,7 @@ export class ChatwootService {
 
       if (outboundEnqueueAttempted) throw error;
       // Native-first edit probe: Chatwoot only applies text after a successful response.
-      if (isChatwootMessageEdit(body)) throw error;
+      if (isChatwootMessageEdit(body) || isChatwootNativeMuteProbe(body)) throw error;
 
       return { message: 'bot' };
     }
@@ -3001,6 +3018,35 @@ export class ChatwootService {
   }
 
   /**
+   * Native WhatsApp mute/unmute (Baileys chatModify) for Chatwoot mute probe.
+   * Works for 1:1 and @g.us groups.
+   */
+  private async trySendNativeMute(waInstance: any, chatId: string, body: any): Promise<void> {
+    const muted = body?.muted === true;
+    const muteUntilMs =
+      typeof body?.mute_until_ms === 'number' && body.mute_until_ms > 0
+        ? body.mute_until_ms
+        : muted
+          ? Date.now() + 100 * 365 * 24 * 60 * 60 * 1000
+          : null;
+
+    if (typeof waInstance?.muteChat === 'function') {
+      await waInstance.muteChat({ number: chatId, mute: muted ? muteUntilMs : null });
+    } else {
+      throw new BadRequestException('WhatsApp mute API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_mute_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        muted,
+      }),
+    );
+  }
+
+  /**
    * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot native_edit_probe.
    * Chatwoot applies local text only after this succeeds.
    */
@@ -3105,6 +3151,67 @@ export class ChatwootService {
     const reactionMessage: ReactionMessage | undefined = msg?.reactionMessage;
 
     return reactionMessage;
+  }
+
+  private async applyNativeChatwootMuteFromWhatsapp(
+    instance: InstanceDto,
+    provider: any,
+    body: { id?: string; muteEndTime?: number | null },
+  ): Promise<void> {
+    const remoteJid = body?.id;
+    if (!remoteJid) return;
+
+    const muteEndRaw = body?.muteEndTime as any;
+    const muteEnd =
+      muteEndRaw == null
+        ? null
+        : typeof muteEndRaw === 'object' && muteEndRaw !== null && typeof muteEndRaw.toNumber === 'function'
+          ? Number(muteEndRaw.toNumber())
+          : Number(muteEndRaw);
+    const muted = muteEnd != null && Number.isFinite(muteEnd) && muteEnd > Date.now();
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: instance.instanceId,
+        key: { path: ['remoteJid'], equals: remoteJid },
+        chatwootConversationId: { not: null },
+      },
+      orderBy: { messageTimestamp: 'desc' },
+    });
+    const conversationId = stored?.chatwootConversationId;
+    if (!conversationId) {
+      this.logger.verbose(
+        JSON.stringify({ event: 'chatwoot_mute_target_missing', remoteJid, muted }),
+      );
+      return;
+    }
+
+    try {
+      await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'POST',
+        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/${muted ? 'mute' : 'unmute'}`,
+        body: { skip_native: true },
+        mediaType: 'application/json',
+      });
+      this.logger.verbose(
+        JSON.stringify({
+          event: 'chatwoot_native_mute_applied',
+          conversationId,
+          remoteJid,
+          muted,
+        }),
+      );
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_mute_apply_failed',
+          conversationId,
+          remoteJid,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
+    }
   }
 
   private async applyNativeChatwootReaction(
@@ -3412,6 +3519,11 @@ export class ChatwootService {
         return null;
       }
       const { client, provider } = context;
+
+      if (event === 'chats.update') {
+        await this.applyNativeChatwootMuteFromWhatsapp(instance, provider, body);
+        return { message: 'ok' };
+      }
 
       const ignoreJids = Array.isArray(provider.ignoreJids)
         ? provider.ignoreJids.filter((jid): jid is string => typeof jid === 'string')

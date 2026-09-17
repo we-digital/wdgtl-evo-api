@@ -889,7 +889,11 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return {
+          remoteJid: chat.id,
+          instanceId: this.instanceId,
+          muteEndTime: (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp ?? null,
+        };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
@@ -899,6 +903,15 @@ export class BaileysStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
           data: { remoteJid: chat.id },
         });
+
+        const muteEnd = (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp;
+        if (chat.id && muteEnd !== undefined && this.localChatwoot?.enabled) {
+          this.chatwootService.eventWhatsapp(
+            'chats.update',
+            { instanceName: this.instanceName, instanceId: this.instanceId } as any,
+            { id: chat.id, muteEndTime: muteEnd },
+          );
+        }
       }
     },
 
@@ -3990,6 +4003,13 @@ export class BaileysStartupService extends ChannelStartupService {
         message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
       });
     }
+  }
+
+  /** Mute / unmute a 1:1 or group chat. `mute` is mute-until ms timestamp, or null to unmute. */
+  public async muteChat(data: { number: string; mute: number | null }) {
+    const jid = createJid(data.number);
+    await this.client.chatModify({ mute: data.mute }, jid);
+    return { chatId: jid, muted: data.mute != null };
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {

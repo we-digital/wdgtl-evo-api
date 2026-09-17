@@ -183,6 +183,10 @@ export const isChatwootDeliveryFailureAcknowledged = (response: unknown, message
 export const isChatwootMessageDeletion = (body: any): boolean =>
   body?.event === 'message_updated' && body?.content_attributes?.deleted === true;
 
+/** Sync probe from Chatwoot mute/unmute (conversation-level, includes groups). */
+export const isChatwootNativeMuteProbe = (body: any): boolean =>
+  body?.event === 'conversation_updated' && body?.native_mute_probe === true;
+
 /** Sync probe from Chatwoot EditService (native-first). Async message_updated after DB write omits the probe. */
 export const isChatwootMessageEdit = (body: any): boolean =>
   body?.event === 'message_updated' &&
