@@ -2514,7 +2514,7 @@ export class ChatwootService {
             },
           });
         }
-        return { message: 'bot' };
+        return { message: 'deleted' };
       }
 
       if (isChatwootMessageEdit(body)) {
@@ -2866,6 +2866,7 @@ export class ChatwootService {
       // Native-first edit probe: Chatwoot only applies text after a successful response.
       if (
         isChatwootMessageEdit(body) ||
+        isChatwootMessageDeletion(body) ||
         isChatwootNativeMuteProbe(body) ||
         isChatwootNativePinProbe(body) ||
         isChatwootNativeArchiveProbe(body) ||
@@ -3013,40 +3014,13 @@ export class ChatwootService {
       return null;
     }
 
+    let messageSent: any;
     try {
       const jid = createJid(chatId);
-      const messageSent = await waInstance.client.sendMessage(jid, {
+      messageSent = await waInstance.client.sendMessage(jid, {
         forward: { key, message: messageContent },
         force: true,
       });
-
-      if (!messageSent) return null;
-
-      if (Long.isLong(messageSent?.messageTimestamp)) {
-        messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
-      }
-
-      await this.updateChatwootMessageId(
-        { ...messageSent },
-        {
-          messageId: body.id,
-          inboxId: body.inbox?.id,
-          conversationId: body.conversation?.id,
-          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-        },
-        instance,
-      );
-
-      this.logger.verbose(
-        JSON.stringify({
-          event: 'chatwoot_native_forward_sent',
-          sourceMessageId,
-          targetChatId: chatId,
-          chatwootMessageId: body.id,
-        }),
-      );
-
-      return messageSent;
     } catch (error) {
       this.logger.warn(
         JSON.stringify({
@@ -3058,6 +3032,46 @@ export class ChatwootService {
       );
       return null;
     }
+
+    if (!messageSent?.key?.id) return null;
+
+    if (Long.isLong(messageSent?.messageTimestamp)) {
+      messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+    }
+
+    try {
+      await this.updateChatwootMessageId(
+        { ...messageSent },
+        {
+          messageId: body.id,
+          inboxId: body.inbox?.id,
+          conversationId: body.conversation?.id,
+          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+        },
+        instance,
+      );
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_map_failed',
+          sourceMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+      // WA already has the forward — return success so caller does not re-send content.
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_forward_sent',
+        sourceMessageId,
+        targetChatId: chatId,
+        chatwootMessageId: body.id,
+      }),
+    );
+
+    return messageSent;
   }
 
   /**
@@ -3306,7 +3320,7 @@ export class ChatwootService {
     };
 
     try {
-      if (hasMuteUpdate && Boolean(current?.muted) !== muted) {
+      if (hasMuteUpdate && (current == null || Boolean(current?.muted) !== muted)) {
         await applyEndpoint(muted ? 'mute' : 'unmute');
         this.logger.verbose(
           JSON.stringify({
@@ -3317,7 +3331,7 @@ export class ChatwootService {
           }),
         );
       }
-      if (hasPinUpdate && Boolean(current?.pinned) !== pinned) {
+      if (hasPinUpdate && (current == null || Boolean(current?.pinned) !== pinned)) {
         await applyEndpoint(pinned ? 'pin' : 'unpin');
         this.logger.verbose(
           JSON.stringify({
@@ -3328,7 +3342,7 @@ export class ChatwootService {
           }),
         );
       }
-      if (hasArchiveUpdate && Boolean(current?.archived) !== archived) {
+      if (hasArchiveUpdate && (current == null || Boolean(current?.archived) !== archived)) {
         await applyEndpoint(archived ? 'archive' : 'unarchive');
         this.logger.verbose(
           JSON.stringify({

@@ -181,7 +181,9 @@ export const isChatwootDeliveryFailureAcknowledged = (response: unknown, message
 };
 
 export const isChatwootMessageDeletion = (body: any): boolean =>
-  body?.event === 'message_updated' && body?.content_attributes?.deleted === true;
+  body?.event === 'message_updated' &&
+  body?.content_attributes?.deleted === true &&
+  body?.content_attributes?.native_delete_probe === true;
 
 /** Sync probe from Chatwoot mute/unmute (conversation-level, includes groups). */
 export const isChatwootNativeMuteProbe = (body: any): boolean =>

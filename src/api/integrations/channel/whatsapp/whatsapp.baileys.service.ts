@@ -913,7 +913,7 @@ export class BaileysStartupService extends ChannelStartupService {
           muteEnd !== undefined || pinned !== undefined || archived !== undefined;
 
         if (chat.id && hasChatStateUpdate && this.localChatwoot?.enabled) {
-          this.chatwootService.eventWhatsapp(
+          await this.chatwootService.eventWhatsapp(
             'chats.update',
             { instanceName: this.instanceName, instanceId: this.instanceId } as any,
             {
@@ -2130,7 +2130,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['chats.update']) {
               const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
+              await this.chatHandle['chats.update'](payload);
             }
 
             if (events['chats.delete']) {
@@ -3969,7 +3969,22 @@ export class BaileysStartupService extends ChannelStartupService {
     const jid = createJid(number);
     const candidates = Array.from(new Set([jid, number].filter(Boolean)));
 
-    for (const remoteJid of candidates) {
+    // When chat id is a phone JID, also try mapped @lid (and vice versa) for store lookup.
+    try {
+      if (typeof (this as any).resolvePhoneJidForLid === 'function' && String(jid).endsWith('@lid')) {
+        const phone = await this.resolvePhoneJidForLid(jid);
+        if (phone) candidates.push(phone);
+      }
+      if (String(jid).endsWith('@s.whatsapp.net') && this.client?.signalRepository?.lidMapping?.getLIDsForPNs) {
+        const mappings = await this.client.signalRepository.lidMapping.getLIDsForPNs([jid]);
+        const lid = mappings?.[0]?.lid;
+        if (lid) candidates.push(lid);
+      }
+    } catch {
+      // Mapping optional — fall through to stored candidates.
+    }
+
+    for (const remoteJid of Array.from(new Set(candidates.filter(Boolean)))) {
       const messages = await this.prismaRepository.message.findMany({
         where: { key: { path: ['remoteJid'], equals: remoteJid }, instanceId: this.instance.id },
         orderBy: { messageTimestamp: 'desc' },
