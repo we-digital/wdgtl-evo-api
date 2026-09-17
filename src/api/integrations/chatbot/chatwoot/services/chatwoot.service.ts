@@ -2465,10 +2465,15 @@ export class ChatwootService {
       }
 
       if (isChatwootMessageEdit(body)) {
-        if (!waInstance) return { message: 'bot' };
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native edit');
+        }
         const chatIdForEdit = candidateChatId;
         const edited = await this.trySendNativeEdit(waInstance, chatIdForEdit, body, instance);
-        return edited ? { message: 'edited', key: edited.key } : { message: 'bot' };
+        if (!edited) {
+          throw new BadRequestException('Native WhatsApp edit failed');
+        }
+        return { message: 'edited', key: edited.key };
       }
 
       const chatId = candidateChatId;
@@ -2805,6 +2810,8 @@ export class ChatwootService {
       );
 
       if (outboundEnqueueAttempted) throw error;
+      // Native-first edit probe: Chatwoot only applies text after a successful response.
+      if (isChatwootMessageEdit(body)) throw error;
 
       return { message: 'bot' };
     }
@@ -2994,8 +3001,8 @@ export class ChatwootService {
   }
 
   /**
-   * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot message_updated
-   * with content_attributes.edited. Falls back to no-op (CW already updated).
+   * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot native_edit_probe.
+   * Chatwoot applies local text only after this succeeds.
    */
   private async trySendNativeEdit(
     waInstance: any,
