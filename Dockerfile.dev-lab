@@ -1,0 +1,9 @@
+FROM node:24.20.0-bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg openssl ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /evolution
+ENV NODE_ENV=development DATABASE_PROVIDER=postgresql
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY prisma ./prisma
+COPY runWithProvider.js ./
+RUN npm run db:generate

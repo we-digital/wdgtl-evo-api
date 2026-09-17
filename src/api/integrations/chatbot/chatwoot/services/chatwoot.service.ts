@@ -425,6 +425,13 @@ export class ChatwootService {
   }
 
   public async create(instance: InstanceDto, data: ChatwootDto) {
+    // The HTTP route contains only instanceName. Resolve the durable ID before
+    // persisting the inbox signing secret; never trust a query-supplied ID.
+    const storedInstance = await this.prismaRepository.instance.findUniqueOrThrow({
+      where: { name: instance.instanceName },
+      select: { id: true },
+    });
+    instance = { ...instance, instanceId: storedInstance.id };
     await this.waMonitor.waInstances[instance.instanceName].setChatwoot(data);
 
     if (data.autoCreate) {
