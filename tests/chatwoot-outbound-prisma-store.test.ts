@@ -376,10 +376,12 @@ const admissionRepository = (seedRows: any[] = []) => {
             (where.chatwootMessageId === undefined || row.chatwootMessageId === where.chatwootMessageId),
         )
         .sort((left, right) => left.partIndex - right.partIndex),
-    count: async ({ where }: any) => rows.filter((row) => matchesActive(row, where)).length,
+    count: async ({ where }: any) =>
+      rows.filter((row) => (where.laneKey === undefined || row.laneKey === where.laneKey) && matchesActive(row, where))
+        .length,
     findFirst: async ({ where }: any) => {
       const active = rows
-        .filter((row) => matchesActive(row, where))
+        .filter((row) => (where.laneKey === undefined || row.laneKey === where.laneKey) && matchesActive(row, where))
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
       return active[0] ? { createdAt: active[0].createdAt } : null;
     },
@@ -790,7 +792,7 @@ test('rejects a changed numeric contact identity after it has been frozen', asyn
   assert.ok(memory.rows.every((row) => row.state === 'quarantined'));
 });
 
-test('rejects capacity and oldest-age admission while preparing or sending work is still active', async () => {
+test('isolates capacity and oldest-age admission by destination lane', async () => {
   const old = new Date('2026-09-11T02:00:00.000Z');
   const memory = admissionRepository([
     { ...stored(0, 'preparing'), createdAt: old },
@@ -819,25 +821,53 @@ test('rejects capacity and oldest-age admission while preparing or sending work 
     origin: anotherOrigin,
   });
 
+  await store.enqueue('instance-1', 315, 58, 43, anotherParts, {
+    ...admission('delivery-315'),
+    maxBacklog: 1,
+    maxOldestAgeMs: 1_000,
+  });
+
+  const sameLaneOrigin = {
+    ...origin,
+    messageId: 316,
+    conversationId: 44,
+    snapshotFingerprint: 'd'.repeat(64),
+  };
+  const sameLaneParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 316,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 44 },
+      outbound_snapshot: { version: 1, fingerprint: 'd'.repeat(64) },
+      attachments: [],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'same lane',
+    origin: sameLaneOrigin,
+  });
+
   await assert.rejects(
     () =>
-      store.enqueue('instance-1', 315, 58, 43, anotherParts, {
-        ...admission('delivery-315'),
+      store.enqueue('instance-1', 316, 58, 44, sameLaneParts, {
+        ...admission('delivery-316-capacity'),
         maxBacklog: 2,
       }),
     (error: any) => error?.name === 'ChatwootOutboundBacklogExceeded',
   );
   await assert.rejects(
     () =>
-      store.enqueue('instance-1', 315, 58, 43, anotherParts, {
-        ...admission('delivery-315'),
+      store.enqueue('instance-1', 316, 58, 44, sameLaneParts, {
+        ...admission('delivery-316-age'),
         maxBacklog: 100,
         maxOldestAgeMs: 1_000,
       }),
     (error: any) => error?.name === 'ChatwootOutboundBacklogTooOld',
   );
-  assert.equal(memory.rows.length, 2);
-  assert.equal(memory.receipts.size, 0);
+  assert.equal(memory.rows.length, 3);
+  assert.equal(memory.receipts.size, 1);
 });
 
 test('claims independent destinations concurrently but preserves exact same-lane predecessor order', async () => {
