@@ -191,8 +191,10 @@ tags are never deployment inputs.
   `ChatwootOutboundAdmissionGuard`. The short transaction first acquires the
   existing destination lane row, which serializes only messages that share an
   `instance + WhatsApp destination`; independent lanes commit concurrently.
-  Global backlog depth/age is measured before the transaction and never holds
-  the lane lock or a database connection while scanning. Duplicate receipt and
+  Backlog depth/age is measured only for that destination lane before the
+  transaction, so a stale or exhausted disconnected instance/destination does
+  not reject another lane. The check never holds the lane lock or a database
+  connection while scanning. Duplicate receipt and
   frozen-message checks are repeated after the keyed lane lock, preserving
   idempotency for a lost HTTP 202. Prisma transaction acquisition and execution
   budgets are configurable and default to 2 seconds / 5 seconds instead of the

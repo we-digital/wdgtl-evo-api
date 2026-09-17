@@ -72,7 +72,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     ]);
     let backlog: ChatwootOutboundBacklog | undefined;
     if (!knownReceipt && knownOperations.length === 0) {
-      backlog = await this.backlog();
+      backlog = await this.backlogForLane(parts[0].laneKey);
       if (backlog.depth + parts.length > admission.maxBacklog) {
         throw Object.assign(new Error('Chatwoot outbound backlog capacity is exhausted'), {
           name: 'ChatwootOutboundBacklogExceeded',
@@ -200,6 +200,19 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       this.repository.chatwootOutboundOperation.count({ where: ACTIVE_STATE_WHERE }),
       this.repository.chatwootOutboundOperation.findFirst({
         where: ACTIVE_STATE_WHERE,
+        orderBy: { createdAt: 'asc' },
+        select: { createdAt: true },
+      }),
+    ]);
+    return { depth, oldestAt: oldest?.createdAt ?? null };
+  }
+
+  private async backlogForLane(laneKey: string): Promise<ChatwootOutboundBacklog> {
+    const where = { laneKey, ...ACTIVE_STATE_WHERE };
+    const [depth, oldest] = await Promise.all([
+      this.repository.chatwootOutboundOperation.count({ where }),
+      this.repository.chatwootOutboundOperation.findFirst({
+        where,
         orderBy: { createdAt: 'asc' },
         select: { createdAt: true },
       }),

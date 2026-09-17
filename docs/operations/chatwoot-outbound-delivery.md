@@ -64,15 +64,16 @@ duplicate WhatsApp messages.
   closed. HTTP 202 is returned only after the
   whole frozen set commits in one transaction.
 - Admission is local and bounded. It performs no reverse Chatwoot reads.
-  Backlog depth/age is checked before the write transaction, so a global scan
-  never occupies the hot commit path. The transaction locks only the exact
+  Backlog depth/age is checked for the exact `instance + WhatsApp destination`
+  lane before the write transaction. A stale or exhausted disconnected lane
+  therefore cannot reject traffic for any other destination. The transaction locks only the exact
   destination lane, repeats duplicate receipt/frozen-message checks under that
   keyed lock, and commits the receipt plus operation set before returning 202.
   Independent destinations therefore admit concurrently. Transaction
   acquisition/execution defaults to 2 seconds / 5 seconds through
   `CHATWOOT_OUTBOUND_ADMISSION_MAX_WAIT_MS` and
   `CHATWOOT_OUTBOUND_ADMISSION_TIMEOUT_MS`; neither a failed commit nor an
-  exhausted/over-age backlog can return 202.
+  exhausted/over-age backlog in that lane can return 202.
 - Each part receives a deterministic planned WhatsApp message ID. Baileys gets
   that ID through its supported `messageId` send option.
 - Media resolution, recipient validation, quoting and other preparation happen
