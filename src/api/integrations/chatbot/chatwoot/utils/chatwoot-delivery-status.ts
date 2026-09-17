@@ -187,6 +187,14 @@ export const isChatwootMessageDeletion = (body: any): boolean =>
 export const isChatwootNativeMuteProbe = (body: any): boolean =>
   body?.event === 'conversation_updated' && body?.native_mute_probe === true;
 
+/** Sync probe from Chatwoot pin/unpin. */
+export const isChatwootNativePinProbe = (body: any): boolean =>
+  body?.event === 'conversation_updated' && body?.native_pin_probe === true;
+
+/** Sync probe from Chatwoot archive/unarchive. */
+export const isChatwootNativeArchiveProbe = (body: any): boolean =>
+  body?.event === 'conversation_updated' && body?.native_archive_probe === true;
+
 /** Sync probe from Chatwoot EditService (native-first). Async message_updated after DB write omits the probe. */
 export const isChatwootMessageEdit = (body: any): boolean =>
   body?.event === 'message_updated' &&

@@ -21,7 +21,9 @@ import {
   isChatwootDeliveryFailureAcknowledged,
   isChatwootMessageDeletion,
   isChatwootMessageEdit,
+  isChatwootNativeArchiveProbe,
   isChatwootNativeMuteProbe,
+  isChatwootNativePinProbe,
   isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
@@ -2333,6 +2335,38 @@ export class ChatwootService {
         return { message: body.muted ? 'muted' : 'unmuted' };
       }
 
+      if (isChatwootNativePinProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native pin');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier ||
+          body?.meta?.sender?.phone_number?.replace('+', '') ||
+          candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native pin');
+        }
+        await this.trySendNativePin(waInstance, chatId, body);
+        return { message: body.pinned ? 'pinned' : 'unpinned' };
+      }
+
+      if (isChatwootNativeArchiveProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native archive');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier ||
+          body?.meta?.sender?.phone_number?.replace('+', '') ||
+          candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native archive');
+        }
+        await this.trySendNativeArchive(waInstance, chatId, body);
+        return { message: body.archived ? 'archived' : 'unarchived' };
+      }
+
       if (
         !body?.conversation ||
         body.private ||
@@ -2828,7 +2862,8 @@ export class ChatwootService {
 
       if (outboundEnqueueAttempted) throw error;
       // Native-first edit probe: Chatwoot only applies text after a successful response.
-      if (isChatwootMessageEdit(body) || isChatwootNativeMuteProbe(body)) throw error;
+      if (isChatwootMessageEdit(body) || isChatwootNativeMuteProbe(body) || isChatwootNativePinProbe(body) || isChatwootNativeArchiveProbe(body))
+        throw error;
 
       return { message: 'bot' };
     }
@@ -3047,6 +3082,48 @@ export class ChatwootService {
   }
 
   /**
+   * Native WhatsApp pin/unpin (Baileys chatModify { pin }) for Chatwoot pin probe.
+   */
+  private async trySendNativePin(waInstance: any, chatId: string, body: any): Promise<void> {
+    const pinned = body?.pinned === true;
+    if (typeof waInstance?.pinChat === 'function') {
+      await waInstance.pinChat({ number: chatId, pin: pinned });
+    } else {
+      throw new BadRequestException('WhatsApp pin API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_pin_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        pinned,
+      }),
+    );
+  }
+
+  /**
+   * Native WhatsApp archive/unarchive (Baileys chatModify { archive }) for Chatwoot archive probe.
+   */
+  private async trySendNativeArchive(waInstance: any, chatId: string, body: any): Promise<void> {
+    const archived = body?.archived === true;
+    if (typeof waInstance?.archiveChat === 'function') {
+      await waInstance.archiveChat({ chat: chatId, archive: archived });
+    } else {
+      throw new BadRequestException('WhatsApp archive API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_archive_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        archived,
+      }),
+    );
+  }
+
+  /**
    * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot native_edit_probe.
    * Chatwoot applies local text only after this succeeds.
    */
@@ -3156,7 +3233,7 @@ export class ChatwootService {
   private async applyNativeChatwootMuteFromWhatsapp(
     instance: InstanceDto,
     provider: any,
-    body: { id?: string; muteEndTime?: number | null },
+    body: { id?: string; muteEndTime?: number | null; pinned?: number | null; archived?: boolean },
   ): Promise<void> {
     const remoteJid = body?.id;
     if (!remoteJid) return;
@@ -3168,7 +3245,16 @@ export class ChatwootService {
         : typeof muteEndRaw === 'object' && muteEndRaw !== null && typeof muteEndRaw.toNumber === 'function'
           ? Number(muteEndRaw.toNumber())
           : Number(muteEndRaw);
+    const hasMuteUpdate = muteEndRaw !== undefined;
     const muted = muteEnd != null && Number.isFinite(muteEnd) && muteEnd > Date.now();
+
+    const hasPinUpdate = body?.pinned !== undefined;
+    const pinned = body?.pinned != null && Number(body.pinned) > 0;
+
+    const hasArchiveUpdate = body?.archived !== undefined;
+    const archived = body?.archived === true;
+
+    if (!hasMuteUpdate && !hasPinUpdate && !hasArchiveUpdate) return;
 
     const stored = await this.prismaRepository.message.findFirst({
       where: {
@@ -3181,30 +3267,59 @@ export class ChatwootService {
     const conversationId = stored?.chatwootConversationId;
     if (!conversationId) {
       this.logger.verbose(
-        JSON.stringify({ event: 'chatwoot_mute_target_missing', remoteJid, muted }),
+        JSON.stringify({ event: 'chatwoot_chat_update_target_missing', remoteJid }),
       );
       return;
     }
 
-    try {
+    const accountId = provider.accountId;
+    const applyEndpoint = async (action: string) => {
       await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
-        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/${muted ? 'mute' : 'unmute'}`,
+        url: `/api/v1/accounts/${accountId}/conversations/${conversationId}/${action}`,
         body: { skip_native: true },
         mediaType: 'application/json',
       });
-      this.logger.verbose(
-        JSON.stringify({
-          event: 'chatwoot_native_mute_applied',
-          conversationId,
-          remoteJid,
-          muted,
-        }),
-      );
+    };
+
+    try {
+      if (hasMuteUpdate) {
+        await applyEndpoint(muted ? 'mute' : 'unmute');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_mute_applied',
+            conversationId,
+            remoteJid,
+            muted,
+          }),
+        );
+      }
+      if (hasPinUpdate) {
+        await applyEndpoint(pinned ? 'pin' : 'unpin');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_pin_applied',
+            conversationId,
+            remoteJid,
+            pinned,
+          }),
+        );
+      }
+      if (hasArchiveUpdate) {
+        await applyEndpoint(archived ? 'archive' : 'unarchive');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_archive_applied',
+            conversationId,
+            remoteJid,
+            archived,
+          }),
+        );
+      }
     } catch (error) {
       this.logger.warn(
         JSON.stringify({
-          event: 'chatwoot_mute_apply_failed',
+          event: 'chatwoot_chat_update_apply_failed',
           conversationId,
           remoteJid,
           errorClass: (error as any)?.name || 'Error',

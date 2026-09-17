@@ -893,6 +893,8 @@ export class BaileysStartupService extends ChannelStartupService {
           remoteJid: chat.id,
           instanceId: this.instanceId,
           muteEndTime: (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp ?? null,
+          pinned: (chat as any).pinned ?? null,
+          archived: (chat as any).archived ?? null,
         };
       });
 
@@ -905,11 +907,21 @@ export class BaileysStartupService extends ChannelStartupService {
         });
 
         const muteEnd = (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp;
-        if (chat.id && muteEnd !== undefined && this.localChatwoot?.enabled) {
+        const pinned = (chat as any).pinned;
+        const archived = (chat as any).archived;
+        const hasChatStateUpdate =
+          muteEnd !== undefined || pinned !== undefined || archived !== undefined;
+
+        if (chat.id && hasChatStateUpdate && this.localChatwoot?.enabled) {
           this.chatwootService.eventWhatsapp(
             'chats.update',
             { instanceName: this.instanceName, instanceId: this.instanceId } as any,
-            { id: chat.id, muteEndTime: muteEnd },
+            {
+              id: chat.id,
+              muteEndTime: muteEnd,
+              pinned,
+              archived,
+            },
           );
         }
       }
@@ -4010,6 +4022,13 @@ export class BaileysStartupService extends ChannelStartupService {
     const jid = createJid(data.number);
     await this.client.chatModify({ mute: data.mute }, jid);
     return { chatId: jid, muted: data.mute != null };
+  }
+
+  /** Pin / unpin a 1:1 or group chat. */
+  public async pinChat(data: { number: string; pin: boolean }) {
+    const jid = createJid(data.number);
+    await this.client.chatModify({ pin: data.pin }, jid);
+    return { chatId: jid, pinned: data.pin };
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {
