@@ -20,6 +20,7 @@ import {
   ChatwootProviderDeliveryPart,
   isChatwootDeliveryFailureAcknowledged,
   isChatwootMessageDeletion,
+  isChatwootMessageEdit,
   isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
@@ -2320,6 +2321,7 @@ export class ChatwootService {
         body.private ||
         (body.event === 'message_updated' &&
           !isChatwootMessageDeletion(body) &&
+          !isChatwootMessageEdit(body) &&
           !isAgentReactionWebhook(body))
       ) {
         return { message: 'bot' };
@@ -2460,6 +2462,13 @@ export class ChatwootService {
           });
         }
         return { message: 'bot' };
+      }
+
+      if (isChatwootMessageEdit(body)) {
+        if (!waInstance) return { message: 'bot' };
+        const chatIdForEdit = candidateChatId;
+        const edited = await this.trySendNativeEdit(waInstance, chatIdForEdit, body, instance);
+        return edited ? { message: 'edited', key: edited.key } : { message: 'bot' };
       }
 
       const chatId = candidateChatId;
@@ -2976,6 +2985,55 @@ export class ChatwootService {
         JSON.stringify({
           event: 'chatwoot_native_forward_failed',
           sourceMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot message_updated
+   * with content_attributes.edited. Falls back to no-op (CW already updated).
+   */
+  private async trySendNativeEdit(
+    waInstance: any,
+    chatId: string,
+    body: any,
+    instance: InstanceDto,
+  ): Promise<any | null> {
+    const text = typeof body?.content === 'string' ? body.content : '';
+    if (!text.trim() || !waInstance?.updateMessage) return null;
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: Number(body.id),
+        instanceId: instance.instanceId,
+      },
+    });
+    const key = stored?.key as WAMessageKey | undefined;
+    if (!key?.id) return null;
+
+    try {
+      const messageSent = await waInstance.updateMessage({
+        number: chatId,
+        key,
+        text,
+      });
+      this.logger.verbose(
+        JSON.stringify({
+          event: 'chatwoot_native_edit_sent',
+          chatwootMessageId: body.id,
+          targetChatId: chatId,
+        }),
+      );
+      return messageSent;
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_edit_failed',
+          chatwootMessageId: body.id,
           errorClass: error?.name || 'Error',
           errorMessage: String(error?.message || error).slice(0, 200),
         }),

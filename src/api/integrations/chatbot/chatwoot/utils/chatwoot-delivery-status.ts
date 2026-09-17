@@ -183,6 +183,12 @@ export const isChatwootDeliveryFailureAcknowledged = (response: unknown, message
 export const isChatwootMessageDeletion = (body: any): boolean =>
   body?.event === 'message_updated' && body?.content_attributes?.deleted === true;
 
+export const isChatwootMessageEdit = (body: any): boolean =>
+  body?.event === 'message_updated' &&
+  body?.content_attributes?.edited === true &&
+  !body?.content_attributes?.deleted &&
+  typeof body?.content === 'string';
+
 export const isDeliverableChatwootOutgoing = (body: any, chatId: string): boolean =>
   body?.event === 'message_created' &&
   isChatwootOutgoingMessageType(body?.message_type) &&
