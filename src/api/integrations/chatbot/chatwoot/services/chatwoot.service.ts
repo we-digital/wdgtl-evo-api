@@ -2488,6 +2488,10 @@ export class ChatwootService {
           clearTimeout(deletionTimer);
         }
         if (!deletionContext) throw this.outboundBindingMismatch();
+        if (!waInstance?.client?.sendMessage) {
+          throw new BadRequestException('WhatsApp instance unavailable for native delete');
+        }
+
         const message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
@@ -2495,25 +2499,28 @@ export class ChatwootService {
           },
         });
 
-        if (message) {
-          const key = message.key as WAMessageKey;
-          if (
-            message.chatwootInboxId !== deletionOrigin.inboxId ||
-            message.chatwootConversationId !== deletionOrigin.conversationId ||
-            !key?.remoteJid ||
-            !this.outboundRemoteJidMatches(syntheticDeletion.payload.chatId, key.remoteJid)
-          )
-            throw this.outboundBindingMismatch();
-
-          await waInstance?.client.sendMessage(key.remoteJid, { delete: key });
-
-          await this.prismaRepository.message.deleteMany({
-            where: {
-              instanceId: instance.instanceId,
-              chatwootMessageId: body.id,
-            },
-          });
+        if (!message) {
+          throw new BadRequestException('WhatsApp message mapping missing for native delete');
         }
+
+        const key = message.key as WAMessageKey;
+        if (
+          message.chatwootInboxId !== deletionOrigin.inboxId ||
+          message.chatwootConversationId !== deletionOrigin.conversationId ||
+          !key?.remoteJid ||
+          !this.outboundRemoteJidMatches(syntheticDeletion.payload.chatId, key.remoteJid)
+        )
+          throw this.outboundBindingMismatch();
+
+        await waInstance.client.sendMessage(key.remoteJid, { delete: key });
+
+        await this.prismaRepository.message.deleteMany({
+          where: {
+            instanceId: instance.instanceId,
+            chatwootMessageId: body.id,
+          },
+        });
+
         return { message: 'deleted' };
       }
 
