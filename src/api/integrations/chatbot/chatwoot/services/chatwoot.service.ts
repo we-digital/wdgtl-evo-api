@@ -83,6 +83,10 @@ import {
   stripWhatsappMentionMarkdown,
   buildWhatsappGroupParticipantSnapshots,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
+import {
+  buildWhatsappReactionActor,
+  isAgentReactionWebhook,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -2313,7 +2317,9 @@ export class ChatwootService {
       if (
         !body?.conversation ||
         body.private ||
-        (body.event === 'message_updated' && !isChatwootMessageDeletion(body))
+        (body.event === 'message_updated' &&
+          !isChatwootMessageDeletion(body) &&
+          !isAgentReactionWebhook(body))
       ) {
         return { message: 'bot' };
       }
@@ -2344,6 +2350,11 @@ export class ChatwootService {
       }
 
       instance.instanceId = asyncDeliverable ? authenticatedAdmission.routeInstanceId : waInstance.instanceId;
+
+      if (isAgentReactionWebhook(body)) {
+        if (!waInstance) return { message: 'bot' };
+        return this.sendWhatsappReactionFromChatwoot(instance, waInstance, body);
+      }
 
       if (isChatwootMessageDeletion(body)) {
         const retained = await this.outboundStore.retainedOperations(instance.instanceId, Number(body.id));
@@ -2943,6 +2954,93 @@ export class ChatwootService {
     return reactionMessage;
   }
 
+  private async applyNativeChatwootReaction(
+    instance: InstanceDto,
+    conversationId: number,
+    body: any,
+    reactionMessage: { key: { id: string }; text?: string },
+  ): Promise<boolean> {
+    const target = await this.getMessageByKeyId(instance, reactionMessage.key.id);
+    if (!target?.chatwootMessageId) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_target_missing',
+          waMessageId: reactionMessage.key.id,
+          conversationId,
+        }),
+      );
+      return false;
+    }
+
+    const context = await this.clientCw(instance);
+    if (!context) return false;
+    const { provider } = context;
+    const actor = buildWhatsappReactionActor(body);
+    const emoji = reactionMessage.text || '';
+
+    try {
+      await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'POST',
+        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages/${target.chatwootMessageId}/react`,
+        body: {
+          emoji,
+          ...actor,
+        },
+        mediaType: 'application/json',
+      });
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_apply_failed',
+          conversationId,
+          messageId: target.chatwootMessageId,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
+      return false;
+    }
+  }
+
+  private async sendWhatsappReactionFromChatwoot(
+    instance: InstanceDto,
+    waInstance: any,
+    body: any,
+  ): Promise<{ message: string } | { accepted: true }> {
+    const reaction = body?.reaction;
+    if (!reaction) return { message: 'bot' };
+
+    const localMessage = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: Number(body.id),
+        instanceId: instance.instanceId,
+      },
+    });
+    const key = localMessage?.key as { id?: string; remoteJid?: string; fromMe?: boolean; participant?: string } | null;
+    if (!key?.id || !key?.remoteJid) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_outbound_key_missing',
+          chatwootMessageId: body.id,
+        }),
+      );
+      return { message: 'bot' };
+    }
+
+    const emoji = reaction.action === 'remove' ? '' : String(reaction.emoji || '');
+    await waInstance.reactionMessage({
+      key: {
+        id: key.id,
+        remoteJid: key.remoteJid,
+        fromMe: Boolean(key.fromMe),
+        participant: key.participant,
+      },
+      reaction: emoji,
+    });
+    return { accepted: true };
+  }
+
   private getTypeMessage(msg: any) {
     const types = {
       conversation: msg.conversation,
@@ -3348,27 +3446,7 @@ export class ChatwootService {
         }
 
         if (reactionMessage) {
-          if (reactionMessage.text) {
-            const send = await this.createMessage(
-              instance,
-              getConversation,
-              reactionMessage.text,
-              messageType,
-              false,
-              [],
-              {
-                message: { extendedTextMessage: { contextInfo: { stanzaId: reactionMessage.key.id } } },
-              },
-              'WAID:' + body.key.id,
-              quotedMsg,
-              clientSent,
-            );
-            if (!send) {
-              this.logger.warn('message not sent');
-              return;
-            }
-          }
-
+          await this.applyNativeChatwootReaction(instance, Number(getConversation), body, reactionMessage);
           return;
         }
 
