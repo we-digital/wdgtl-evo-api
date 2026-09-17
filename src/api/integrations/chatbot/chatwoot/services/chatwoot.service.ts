@@ -78,6 +78,11 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
+import {
+  extractWhatsappMentionJids,
+  stripWhatsappMentionMarkdown,
+  buildWhatsappGroupParticipantSnapshots,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -1130,6 +1135,9 @@ export class ChatwootService {
           if (inboxConversation) {
             this.logger.verbose(`Returning existing conversation ID: ${inboxConversation.id}`);
             this.cache.set(cacheKey, inboxConversation.id, 1800);
+            if (isGroup) {
+              void this.syncWhatsappGroupParticipants(instance, provider, Number(inboxConversation.id), chatId);
+            }
             return inboxConversation.id;
           }
         }
@@ -1155,6 +1163,9 @@ export class ChatwootService {
 
         this.logger.verbose(`New conversation created of ${remoteJid} with ID: ${conversation.id}`);
         this.cache.set(cacheKey, conversation.id, 1800);
+        if (isGroupJid(remoteJid)) {
+          void this.syncWhatsappGroupParticipants(instance, provider, Number(conversation.id), remoteJid);
+        }
         return conversation.id;
       } finally {
         await this.cache.delete(lockKey);
@@ -1163,6 +1174,42 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(`Error in createConversation: ${error}`);
       return null;
+    }
+  }
+
+  private async syncWhatsappGroupParticipants(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    conversationId: number,
+    groupJid: string,
+  ): Promise<void> {
+    try {
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      if (!waInstance?.findParticipants) return;
+      const groupParticipants = await waInstance.findParticipants({ groupJid });
+      const snapshots = buildWhatsappGroupParticipantSnapshots(groupParticipants?.participants || []);
+      if (!snapshots.length) return;
+
+      await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'POST',
+        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/custom_attributes`,
+        body: {
+          merge: true,
+          custom_attributes: {
+            whatsapp_group_participants: snapshots,
+          },
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_group_participants_sync_failed',
+          conversationId,
+          groupJid,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
     }
   }
 
@@ -1909,6 +1956,7 @@ export class ChatwootService {
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
           signal,
+          mentioned: payload.mentioned,
         },
         true,
         provenance,
@@ -2117,12 +2165,14 @@ export class ChatwootService {
       snapshotFingerprint: String(body.outbound_snapshot?.fingerprint || ''),
       routeBinding,
     };
+    const mentioned = extractWhatsappMentionJids(body);
     const parts = buildChatwootOutboundParts({
       instanceId: instance.instanceId,
       body,
       chatId,
       formattedText,
       origin,
+      mentioned: mentioned.length ? mentioned : undefined,
     });
     const createdAtSeconds = Number(body.created_at);
     const messageCreatedAt =
@@ -2402,13 +2452,15 @@ export class ChatwootService {
 
       const chatId = candidateChatId;
       // Chatwoot to Whatsapp
-      const messageReceived = body.content
+      const mentionedJids = extractWhatsappMentionJids(body);
+      const messageReceivedRaw = body.content
         ? body.content
             .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // Substitui * por _
             .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // Substitui ** por *
             .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // Substitui ~~ por ~
             .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
         : body.content;
+      const messageReceived = stripWhatsappMentionMarkdown(messageReceivedRaw);
 
       const senderName = body?.sender?.available_name || body?.sender?.name;
       const expectedRoute = this.buildEvoRouteBinding(instance, provider, body.inbox?.id);
@@ -2586,6 +2638,7 @@ export class ChatwootService {
 
               const options: Options = {
                 quoted: await this.getQuotedMessage(body, instance),
+                mentioned: mentionedJids.length ? mentionedJids : undefined,
               };
 
               let messageSent: any;
@@ -2620,6 +2673,7 @@ export class ChatwootService {
               text: formatText,
               delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
               quoted: await this.getQuotedMessage(body, instance),
+              mentioned: mentionedJids.length ? mentionedJids : undefined,
             };
 
             sendTelemetry('/message/sendText');
