@@ -3966,49 +3966,45 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getLastMessage(number: string) {
-    const where: any = { key: { remoteJid: number }, instanceId: this.instance.id };
+    const jid = createJid(number);
+    const candidates = Array.from(new Set([jid, number].filter(Boolean)));
 
-    const messages = await this.prismaRepository.message.findMany({
-      where,
-      orderBy: { messageTimestamp: 'desc' },
-      take: 1,
-    });
-
-    if (messages.length === 0) {
-      throw new NotFoundException('Messages not found');
-    }
-
-    let lastMessage = messages.pop();
-
-    for (const message of messages) {
-      if (message.messageTimestamp >= lastMessage.messageTimestamp) {
-        lastMessage = message;
+    for (const remoteJid of candidates) {
+      const messages = await this.prismaRepository.message.findMany({
+        where: { key: { path: ['remoteJid'], equals: remoteJid }, instanceId: this.instance.id },
+        orderBy: { messageTimestamp: 'desc' },
+        take: 1,
+      });
+      if (messages.length > 0) {
+        return messages[0] as unknown as LastMessage;
       }
     }
 
-    return lastMessage as unknown as LastMessage;
+    throw new NotFoundException('Messages not found');
   }
 
   public async archiveChat(data: ArchiveChatDto) {
     try {
       let last_message = data.lastMessage;
       let number = data.chat;
+      const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
-        last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
-        number = last_message?.key?.remoteJid;
+        try {
+          last_message = await this.getLastMessage(number);
+        } catch {
+          // Empty chats / missing local history: Baileys still accepts archive with [].
+          last_message = undefined;
+        }
+      } else if (last_message) {
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
+        number = last_message?.key?.remoteJid || number;
       }
 
-      if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
-      }
+      const lastMessages = last_message && Object.keys(last_message).length > 0 ? [last_message] : [];
+      await this.client.chatModify({ archive: data.archive, lastMessages }, jid);
 
-      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, createJid(number));
-
-      return { chatId: number, archived: true };
+      return { chatId: jid, archived: data.archive };
     } catch (error) {
       throw new InternalServerErrorException({
         archived: false,

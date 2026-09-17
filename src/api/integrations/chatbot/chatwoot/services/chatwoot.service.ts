@@ -2862,7 +2862,13 @@ export class ChatwootService {
 
       if (outboundEnqueueAttempted) throw error;
       // Native-first edit probe: Chatwoot only applies text after a successful response.
-      if (isChatwootMessageEdit(body) || isChatwootNativeMuteProbe(body) || isChatwootNativePinProbe(body) || isChatwootNativeArchiveProbe(body))
+      if (
+        isChatwootMessageEdit(body) ||
+        isChatwootNativeMuteProbe(body) ||
+        isChatwootNativePinProbe(body) ||
+        isChatwootNativeArchiveProbe(body) ||
+        isAgentReactionWebhook(body)
+      )
         throw error;
 
       return { message: 'bot' };
@@ -3246,7 +3252,10 @@ export class ChatwootService {
           ? Number(muteEndRaw.toNumber())
           : Number(muteEndRaw);
     const hasMuteUpdate = muteEndRaw !== undefined;
-    const muted = muteEnd != null && Number.isFinite(muteEnd) && muteEnd > Date.now();
+    // Baileys emits muteEndTime in unix seconds; some builds use ms. Normalize to ms.
+    const muteEndMs =
+      muteEnd == null || !Number.isFinite(muteEnd) ? null : muteEnd < 1e11 ? muteEnd * 1000 : muteEnd;
+    const muted = muteEndMs != null && muteEndMs > Date.now();
 
     const hasPinUpdate = body?.pinned !== undefined;
     const pinned = body?.pinned != null && Number(body.pinned) > 0;
@@ -3273,6 +3282,16 @@ export class ChatwootService {
     }
 
     const accountId = provider.accountId;
+    let current: { muted?: boolean; pinned?: boolean; archived?: boolean } | null = null;
+    try {
+      current = await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'GET',
+        url: `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
+      });
+    } catch {
+      current = null;
+    }
+
     const applyEndpoint = async (action: string) => {
       await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
@@ -3283,7 +3302,7 @@ export class ChatwootService {
     };
 
     try {
-      if (hasMuteUpdate) {
+      if (hasMuteUpdate && Boolean(current?.muted) !== muted) {
         await applyEndpoint(muted ? 'mute' : 'unmute');
         this.logger.verbose(
           JSON.stringify({
@@ -3294,7 +3313,7 @@ export class ChatwootService {
           }),
         );
       }
-      if (hasPinUpdate) {
+      if (hasPinUpdate && Boolean(current?.pinned) !== pinned) {
         await applyEndpoint(pinned ? 'pin' : 'unpin');
         this.logger.verbose(
           JSON.stringify({
@@ -3305,7 +3324,7 @@ export class ChatwootService {
           }),
         );
       }
-      if (hasArchiveUpdate) {
+      if (hasArchiveUpdate && Boolean(current?.archived) !== archived) {
         await applyEndpoint(archived ? 'archive' : 'unarchive');
         this.logger.verbose(
           JSON.stringify({
@@ -3360,6 +3379,7 @@ export class ChatwootService {
         body: {
           emoji,
           ...actor,
+          skip_native: true,
         },
         mediaType: 'application/json',
       });
@@ -3400,7 +3420,7 @@ export class ChatwootService {
           chatwootMessageId: body.id,
         }),
       );
-      return { message: 'bot' };
+      throw new BadRequestException('WhatsApp reaction key unavailable');
     }
 
     const emoji = reaction.action === 'remove' ? '' : String(reaction.emoji || '');

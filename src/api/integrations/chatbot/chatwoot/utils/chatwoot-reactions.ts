@@ -23,8 +23,8 @@ export const isAgentReactionWebhook = (body: {
   if (body?.event !== 'message_updated') return false;
   const reaction = body?.reaction;
   if (!reaction || typeof reaction !== 'object') return false;
-  const source = String(reaction.source || '');
-  return source === 'agent' || source === '';
+  // Only explicit agent reactions; empty source must not echo channel→CW→channel.
+  return String(reaction.source || '') === 'agent';
 };
 
 export const buildWhatsappReactionActor = (body: {
