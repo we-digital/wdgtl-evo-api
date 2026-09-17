@@ -248,3 +248,16 @@ After every reviewed upstream merge, compare `.github/workflows`, run the local
 policy checker, and preserve only the explicitly reviewed packaging workflow.
 Do not revive upstream Docker Hub publishers, CodeQL, dependency review, or PR
 quality jobs as part of conflict resolution.
+
+## Local development lab and existing inbox binding
+
+The local Docker lab in `bbc-devops/local/messaging` mounts this worktree using
+`Dockerfile.dev-lab`, runs `tsx watch`, and retains independent database and
+session volumes. It starts from production `db98edeca8eda7c55556207a64dc8d22901dca43`.
+During setup, `POST /chatwoot/set/:instanceName` with `autoCreate=false` returned
+500 because the route provides no `instanceId` when storing the signed webhook
+secret. `ChatwootService.create` now resolves the persisted ID by route name
+before either inbox initialization path and overrides any query-supplied ID.
+Regression cases cover missing and foreign IDs; the live local API verifies
+both existing inbox bindings and durable 24-character signing secrets.
+No production deployment is part of this local change.
