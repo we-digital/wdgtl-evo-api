@@ -144,7 +144,10 @@ test('changed frozen-set replay atomically quarantines every retained operation'
         return { count: rows.length };
       },
     },
-    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundAdmissionGuard: { upsert: async () => assert.fail('singleton admission guard must stay unused') },
+    chatwootOutboundLane: {
+      upsert: async ({ create }: any) => ({ ...create, nextSequence: 1n }),
+    },
     chatwootOutboundWebhookDelivery: {
       findUnique: async () => null,
       create: async () => ({}),
@@ -354,6 +357,7 @@ const admissionRepository = (seedRows: any[] = []) => {
   const rows = seedRows;
   const receipts = new Map<string, any>();
   const lanes = new Map<string, bigint>();
+  const transactionOptions: any[] = [];
   const matchesActive = (row: any, where: any) =>
     where.state?.in?.includes(row.state) ||
     where.OR?.some(
@@ -404,7 +408,7 @@ const admissionRepository = (seedRows: any[] = []) => {
   };
   const repository: any = {
     chatwootOutboundOperation: operations,
-    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundAdmissionGuard: { upsert: async () => assert.fail('singleton admission guard must stay unused') },
     chatwootOutboundWebhookDelivery: {
       findUnique: async ({ where }: any) => receipts.get(where.deliveryId) ?? null,
       create: async ({ data }: any) => {
@@ -421,8 +425,11 @@ const admissionRepository = (seedRows: any[] = []) => {
       },
     },
   };
-  repository.$transaction = async (transaction: (client: any) => Promise<unknown>) => transaction(repository);
-  return { repository, rows, receipts };
+  repository.$transaction = async (transaction: (client: any) => Promise<unknown>, options: any) => {
+    transactionOptions.push(options);
+    return transaction(repository);
+  };
+  return { repository, rows, receipts, transactionOptions };
 };
 
 test('recovers a lost 202 idempotently and durably reserves every accepted delivery identifier', async () => {
@@ -432,6 +439,7 @@ test('recovers a lost 202 idempotently and durably reserves every accepted deliv
   const first = await store.enqueue('instance-1', 314, 58, 42, parts, admission('delivery-314'));
   assert.equal(first.recovered, false);
   assert.deepEqual(first.backlog, { depth: parts.length, oldestAt: admission('delivery-314').receivedAt });
+  assert.deepEqual(memory.transactionOptions[0], { maxWait: 2_000, timeout: 5_000 });
   assert.deepEqual(await store.enqueue('instance-1', 314, 58, 42, parts, admission('delivery-314')), {
     recovered: true,
   });
@@ -664,7 +672,10 @@ test('replay quarantine keeps an unresolved transport lane fenced across workers
           ? { key: { id: frozenParts[0].plannedWhatsappMessageId } }
           : null,
     },
-    chatwootOutboundAdmissionGuard: { upsert: async () => ({}) },
+    chatwootOutboundAdmissionGuard: { upsert: async () => assert.fail('singleton admission guard must stay unused') },
+    chatwootOutboundLane: {
+      upsert: async ({ create }: any) => ({ ...create, nextSequence: 1n }),
+    },
     chatwootOutboundWebhookDelivery: {
       findUnique: async () => ({
         deliveryId: 'delivery-314',
@@ -688,12 +699,7 @@ test('replay quarantine keeps an unresolved transport lane fenced across workers
   assert.equal(await store.claim('transport-worker-1', now, new Date(now.getTime() + 1_000), 'transport'), null);
   assert.equal(await store.claim('transport-worker-2', now, new Date(now.getTime() + 1_000), 'transport'), null);
 
-  const reconciliation = await store.claim(
-    'maintenance-worker',
-    now,
-    new Date(now.getTime() + 1_000),
-    'maintenance',
-  );
+  const reconciliation = await store.claim('maintenance-worker', now, new Date(now.getTime() + 1_000), 'maintenance');
   assert.equal(reconciliation?.id, 'unresolved-original');
   const reconciledMessageId = await store.findSentMessageId(reconciliation!);
   assert.equal(reconciledMessageId, frozenParts[0].plannedWhatsappMessageId);

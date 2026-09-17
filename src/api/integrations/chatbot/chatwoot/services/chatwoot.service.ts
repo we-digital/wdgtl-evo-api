@@ -155,7 +155,10 @@ export class ChatwootService {
     private readonly cache: CacheService,
   ) {
     const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
-    this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository);
+    this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository, {
+      maxWait: Math.max(500, Math.min(30_000, outboundConfig.OUTBOUND_ADMISSION_MAX_WAIT_MS)),
+      timeout: Math.max(1_000, Math.min(60_000, outboundConfig.OUTBOUND_ADMISSION_TIMEOUT_MS)),
+    });
     this.outboundQueue = new ChatwootOutboundQueue(
       this.outboundStore,
       {
