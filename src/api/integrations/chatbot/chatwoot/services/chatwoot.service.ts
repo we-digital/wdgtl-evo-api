@@ -2406,7 +2406,9 @@ export class ChatwootService {
       instance.instanceId = asyncDeliverable ? authenticatedAdmission.routeInstanceId : waInstance.instanceId;
 
       if (isAgentReactionWebhook(body)) {
-        if (!waInstance) return { message: 'bot' };
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native reaction');
+        }
         return this.sendWhatsappReactionFromChatwoot(instance, waInstance, body);
       }
 
@@ -3284,10 +3286,12 @@ export class ChatwootService {
     const accountId = provider.accountId;
     let current: { muted?: boolean; pinned?: boolean; archived?: boolean } | null = null;
     try {
-      current = await chatwootRequest(this.getClientCwConfig(provider), {
+      const raw = await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'GET',
         url: `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
       });
+      // Show endpoint is flat; list-style wrappers use payload — accept both.
+      current = (raw?.payload && typeof raw.payload === 'object' ? raw.payload : raw) as typeof current;
     } catch {
       current = null;
     }

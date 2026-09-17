@@ -3990,22 +3990,21 @@ export class BaileysStartupService extends ChannelStartupService {
       const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
-        try {
-          last_message = await this.getLastMessage(number);
-        } catch {
-          // Empty chats / missing local history: Baileys still accepts archive with [].
-          last_message = undefined;
-        }
+        last_message = await this.getLastMessage(number);
       } else if (last_message) {
         last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid || number;
       }
 
-      const lastMessages = last_message && Object.keys(last_message).length > 0 ? [last_message] : [];
-      await this.client.chatModify({ archive: data.archive, lastMessages }, jid);
+      if (!last_message || Object.keys(last_message).length === 0) {
+        throw new NotFoundException('Last message not found for archive');
+      }
+
+      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, jid);
 
       return { chatId: jid, archived: data.archive };
     } catch (error) {
+      if (error instanceof NotFoundException) throw error;
       throw new InternalServerErrorException({
         archived: false,
         message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
