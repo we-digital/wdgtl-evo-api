@@ -248,3 +248,8 @@ After every reviewed upstream merge, compare `.github/workflows`, run the local
 policy checker, and preserve only the explicitly reviewed packaging workflow.
 Do not revive upstream Docker Hub publishers, CodeQL, dependency review, or PR
 quality jobs as part of conflict resolution.
+
+## Native Chatwoot bridge authentication
+
+- EVO includes `X-Chatwoot-Native-Bridge-Token` from `CHATWOOT_NATIVE_BRIDGE_TOKEN` on its authenticated Chatwoot client. Chatwoot requires this second credential before accepting `skip_native`, channel reaction actors, or other bridge-only parameters.
+- Native-forward ambiguity and archive-key acceptance are shared production helpers imported directly by unit tests; tests must not duplicate these conditions.

@@ -57,6 +57,7 @@ import {
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { isUsableArchiveMessageKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
@@ -909,8 +910,7 @@ export class BaileysStartupService extends ChannelStartupService {
         const muteEnd = (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp;
         const pinned = (chat as any).pinned;
         const archived = (chat as any).archived;
-        const hasChatStateUpdate =
-          muteEnd !== undefined || pinned !== undefined || archived !== undefined;
+        const hasChatStateUpdate = muteEnd !== undefined || pinned !== undefined || archived !== undefined;
 
         if (chat.id && hasChatStateUpdate && this.localChatwoot?.enabled) {
           await this.chatwootService.eventWhatsapp(
@@ -4017,7 +4017,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       // Refuse synthetic / stub keys — WhatsApp archive requires a real stored message.
       const lastKeyId = String((last_message as any)?.key?.id || '');
-      if (!lastKeyId || lastKeyId.startsWith('archive-stub-')) {
+      if (!isUsableArchiveMessageKey(lastKeyId)) {
         throw new NotFoundException('Last message not found for archive');
       }
 

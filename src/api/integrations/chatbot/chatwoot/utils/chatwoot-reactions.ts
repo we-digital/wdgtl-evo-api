@@ -16,10 +16,7 @@ export type ChatwootReactionEvent = {
   source?: string;
 };
 
-export const isAgentReactionWebhook = (body: {
-  event?: string;
-  reaction?: ChatwootReactionEvent | null;
-}): boolean => {
+export const isAgentReactionWebhook = (body: { event?: string; reaction?: ChatwootReactionEvent | null }): boolean => {
   if (body?.event !== 'message_updated') return false;
   const reaction = body?.reaction;
   if (!reaction || typeof reaction !== 'object') return false;
@@ -37,10 +34,7 @@ export const buildWhatsappReactionActor = (body: {
   external_id: string;
   source: string;
 } => {
-  const externalId =
-    body?.key?.participant ||
-    (body?.key?.fromMe ? 'me' : body?.key?.remoteJid) ||
-    'unknown';
+  const externalId = body?.key?.participant || (body?.key?.fromMe ? 'me' : body?.key?.remoteJid) || 'unknown';
   const name = body?.pushName || externalId.split('@')[0] || externalId;
   return {
     actor_type: 'external',

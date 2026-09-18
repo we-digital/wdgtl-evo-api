@@ -5,8 +5,7 @@
  * and content_attributes.channel_mentions: [{ provider, id, display }]
  */
 
-const WHATSAPP_MENTION_MARKDOWN =
-  /\[(@[^\]]+)\]\(mention:\/\/whatsapp\/([^/]+)\/([^)]+)\)/gi;
+const WHATSAPP_MENTION_MARKDOWN = /\[(@[^\]]+)\]\(mention:\/\/whatsapp\/([^/]+)\/([^)]+)\)/gi;
 
 export type ChatwootChannelMention = {
   provider: string;
@@ -83,9 +82,7 @@ export function buildWhatsappGroupParticipantSnapshots(
   return participants.flatMap((participant) => {
     const id = normalizeWhatsappJid(participant.id || '');
     if (!id) return [];
-    const phone = participant.phoneNumber
-      ? String(participant.phoneNumber).replace(/\D/g, '')
-      : id.split('@')[0];
+    const phone = participant.phoneNumber ? String(participant.phoneNumber).replace(/\D/g, '') : id.split('@')[0];
     const snapshot: WhatsappGroupParticipantSnapshot = {
       id,
       name: participant.name?.trim() || phone,
