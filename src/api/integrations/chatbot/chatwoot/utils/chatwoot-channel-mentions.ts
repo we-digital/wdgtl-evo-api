@@ -46,19 +46,20 @@ export function channelMentionsFromAttributes(
 ): ChatwootChannelMention[] {
   const raw = contentAttributes?.channel_mentions;
   if (!Array.isArray(raw)) return [];
-  return raw
-    .map((entry) => {
-      if (!entry || typeof entry !== 'object') return null;
-      const provider = String((entry as any).provider || '');
-      const id = String((entry as any).id || '');
-      if (!provider || !id) return null;
-      return {
-        provider,
-        id,
-        display: (entry as any).display ? String((entry as any).display) : undefined,
-      };
-    })
-    .filter((entry): entry is ChatwootChannelMention => Boolean(entry));
+  return raw.flatMap((entry) => {
+    if (!entry || typeof entry !== 'object') return [];
+    const provider = String((entry as any).provider || '');
+    const id = String((entry as any).id || '');
+    if (!provider || !id) return [];
+    const mention: ChatwootChannelMention = {
+      provider,
+      id,
+    };
+    if ((entry as any).display) {
+      mention.display = String((entry as any).display);
+    }
+    return [mention];
+  });
 }
 
 export function normalizeWhatsappJid(raw: string): string {
@@ -79,18 +80,17 @@ export type WhatsappGroupParticipantSnapshot = {
 export function buildWhatsappGroupParticipantSnapshots(
   participants: Array<{ id?: string; name?: string | null; phoneNumber?: string | null; imgUrl?: string | null }>,
 ): WhatsappGroupParticipantSnapshot[] {
-  return participants
-    .map((participant) => {
-      const id = normalizeWhatsappJid(participant.id || '');
-      if (!id) return null;
-      const phone = participant.phoneNumber
-        ? String(participant.phoneNumber).replace(/\D/g, '')
-        : id.split('@')[0];
-      return {
-        id,
-        name: participant.name?.trim() || phone,
-        phone,
-      };
-    })
-    .filter((entry): entry is WhatsappGroupParticipantSnapshot => Boolean(entry));
+  return participants.flatMap((participant) => {
+    const id = normalizeWhatsappJid(participant.id || '');
+    if (!id) return [];
+    const phone = participant.phoneNumber
+      ? String(participant.phoneNumber).replace(/\D/g, '')
+      : id.split('@')[0];
+    const snapshot: WhatsappGroupParticipantSnapshot = {
+      id,
+      name: participant.name?.trim() || phone,
+      phone,
+    };
+    return [snapshot];
+  });
 }

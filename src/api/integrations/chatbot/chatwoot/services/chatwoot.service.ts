@@ -3067,18 +3067,26 @@ export class ChatwootService {
         force: true,
       });
     } catch (error) {
+      const errorMessage = String(error?.message || error);
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_native_forward_failed',
           sourceMessageId,
           errorClass: error?.name || 'Error',
-          errorMessage: String(error?.message || error).slice(0, 200),
+          errorMessage: errorMessage.slice(0, 200),
         }),
       );
+      // Ambiguous transport failures may mean WA already accepted the forward —
+      // never fall back to content re-send (duplicate risk).
+      if (/timeout|timed?\s*out|ECONNRESET|socket|abort|network/i.test(errorMessage)) {
+        throw new BadRequestException(`Native forward ambiguous failure: ${errorMessage.slice(0, 200)}`);
+      }
       return null;
     }
 
-    if (!messageSent?.key?.id) return null;
+    if (!messageSent?.key?.id) {
+      throw new BadRequestException('Native forward returned empty message key');
+    }
 
     if (Long.isLong(messageSent?.messageTimestamp)) {
       messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
@@ -3350,7 +3358,10 @@ export class ChatwootService {
         url: `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
       });
       // Show endpoint is flat; list-style wrappers use payload — accept both.
-      current = (raw?.payload && typeof raw.payload === 'object' ? raw.payload : raw) as typeof current;
+      const rawAny = raw as { payload?: unknown; muted?: boolean; pinned?: boolean; archived?: boolean } | null;
+      current = (
+        rawAny?.payload && typeof rawAny.payload === 'object' ? rawAny.payload : rawAny
+      ) as typeof current;
     } catch {
       current = null;
     }

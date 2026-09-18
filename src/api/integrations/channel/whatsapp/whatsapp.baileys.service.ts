@@ -4005,23 +4005,19 @@ export class BaileysStartupService extends ChannelStartupService {
       const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
-        try {
-          last_message = await this.getLastMessage(number);
-        } catch (error) {
-          if (!(error instanceof NotFoundException)) throw error;
-          // Empty chat / no stored history — still archive with a synthetic lastMessages stub.
-          last_message = {
-            key: { remoteJid: jid, fromMe: false, id: `archive-stub-${Date.now()}` },
-            messageTimestamp: Math.floor(Date.now() / 1000),
-            message: { conversation: '' },
-          } as unknown as LastMessage;
-        }
+        last_message = await this.getLastMessage(number);
       } else if (last_message) {
         last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
         number = last_message?.key?.remoteJid || number;
       }
 
       if (!last_message || Object.keys(last_message).length === 0) {
+        throw new NotFoundException('Last message not found for archive');
+      }
+
+      // Refuse synthetic / stub keys — WhatsApp archive requires a real stored message.
+      const lastKeyId = String((last_message as any)?.key?.id || '');
+      if (!lastKeyId || lastKeyId.startsWith('archive-stub-')) {
         throw new NotFoundException('Last message not found for archive');
       }
 
