@@ -327,6 +327,8 @@ export type Chatwoot = {
   MESSAGE_DELETE: boolean;
   MESSAGE_READ: boolean;
   READ_STATE_INGRESS_TOKEN: string;
+  NATIVE_BRIDGE_TOKEN: string;
+  TRUSTED_BASE_URL: string;
   OUTBOUND_WEBHOOK_MAX_AGE_MS: number;
   OUTBOUND_WEBHOOK_MAX_BODY_BYTES: number;
   OUTBOUND_MAX_BACKLOG: number;
@@ -837,6 +839,8 @@ export class ConfigService {
         MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'true',
         MESSAGE_READ: process.env.CHATWOOT_MESSAGE_READ === 'true',
         READ_STATE_INGRESS_TOKEN: process.env.CHATWOOT_READ_STATE_INGRESS_TOKEN || '',
+        NATIVE_BRIDGE_TOKEN: process.env.CHATWOOT_NATIVE_BRIDGE_TOKEN || '',
+        TRUSTED_BASE_URL: process.env.CHATWOOT_TRUSTED_BASE_URL || '',
         OUTBOUND_WEBHOOK_MAX_AGE_MS: Number.parseInt(process.env.CHATWOOT_OUTBOUND_WEBHOOK_MAX_AGE_MS) || 300_000,
         OUTBOUND_WEBHOOK_MAX_BODY_BYTES:
           Number.parseInt(process.env.CHATWOOT_OUTBOUND_WEBHOOK_MAX_BODY_BYTES) || 1_048_576,

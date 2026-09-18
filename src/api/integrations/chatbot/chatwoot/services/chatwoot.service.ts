@@ -12,6 +12,11 @@ import {
   buildChatwootOutboundProvenance,
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
+import {
+  buildWhatsappGroupParticipantSnapshots,
+  extractWhatsappMentionJids,
+  stripWhatsappMentionMarkdown,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildChatwootDeliveryFailureUpdate,
@@ -64,6 +69,7 @@ import {
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
+import { isAmbiguousNativeForwardError } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
@@ -83,15 +89,14 @@ import {
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
 import {
-  extractWhatsappMentionJids,
-  stripWhatsappMentionMarkdown,
-  buildWhatsappGroupParticipantSnapshots,
-} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
-import {
   buildWhatsappReactionActor,
   isAgentReactionWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
+import {
+  requireTrustedChatwootUrl,
+  resolveTrustedChatwootBaseUrl,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -115,10 +120,10 @@ import ChatwootClient, {
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
+import { createJid } from '@utils/createJid';
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
-import { createJid } from '@utils/createJid';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
@@ -344,10 +349,39 @@ export class ChatwootService {
       basePath: provider.url,
       with_credentials: true,
       credentials: 'include',
-      headers: { 'api-access-token': provider.token },
+      headers: {
+        'api-access-token': provider.token,
+      },
       nameInbox: provider.nameInbox,
       mergeBrazilContacts: provider.mergeBrazilContacts,
     };
+  }
+
+  private trustedChatwootBaseUrl(provider: ChatwootModel): string | null {
+    const trustedBaseUrl = this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL;
+    return resolveTrustedChatwootBaseUrl(provider.url, trustedBaseUrl);
+  }
+
+  private async privilegedChatwootRequest(
+    provider: ChatwootModel,
+    params: { method: 'POST'; path: string; data: Record<string, unknown> },
+  ): Promise<void> {
+    const config = this.configService.get<Chatwoot>('CHATWOOT');
+    const url = requireTrustedChatwootUrl(provider.url, config.TRUSTED_BASE_URL, params.path);
+    if (!config.NATIVE_BRIDGE_TOKEN) throw new Error('Chatwoot native bridge token is not configured');
+
+    await axios.request({
+      method: params.method,
+      url,
+      data: params.data,
+      headers: {
+        'api-access-token': provider.token,
+        'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      timeout: 20_000,
+      maxRedirects: 0,
+    });
   }
 
   public getCache() {
@@ -367,8 +401,14 @@ export class ChatwootService {
       return null;
     }
 
+    const trustedBaseUrl = this.trustedChatwootBaseUrl(provider);
+    if (!trustedBaseUrl) {
+      this.logger.warn('provider URL is not the operator-controlled Chatwoot destination');
+      return null;
+    }
+
     const request = buildExternalReadRequest({
-      baseUrl: provider.url,
+      baseUrl: trustedBaseUrl,
       accountId: provider.accountId,
       conversationId: params.conversationId,
       messageId: params.messageId,
@@ -378,6 +418,7 @@ export class ChatwootService {
     const response = await axios.post(request.url, request.data, {
       headers: request.headers,
       timeout: 20_000,
+      maxRedirects: 0,
     });
 
     return response.data;
@@ -2325,9 +2366,7 @@ export class ChatwootService {
           throw new BadRequestException('WhatsApp instance unavailable for native mute');
         }
         const chatId =
-          body?.meta?.sender?.identifier ||
-          body?.meta?.sender?.phone_number?.replace('+', '') ||
-          candidateChatId;
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native mute');
         }
@@ -2341,9 +2380,7 @@ export class ChatwootService {
           throw new BadRequestException('WhatsApp instance unavailable for native pin');
         }
         const chatId =
-          body?.meta?.sender?.identifier ||
-          body?.meta?.sender?.phone_number?.replace('+', '') ||
-          candidateChatId;
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native pin');
         }
@@ -2357,9 +2394,7 @@ export class ChatwootService {
           throw new BadRequestException('WhatsApp instance unavailable for native archive');
         }
         const chatId =
-          body?.meta?.sender?.identifier ||
-          body?.meta?.sender?.phone_number?.replace('+', '') ||
-          candidateChatId;
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native archive');
         }
@@ -3078,7 +3113,7 @@ export class ChatwootService {
       );
       // Ambiguous transport failures may mean WA already accepted the forward —
       // never fall back to content re-send (duplicate risk).
-      if (/timeout|timed?\s*out|ECONNRESET|socket|abort|network/i.test(errorMessage)) {
+      if (isAmbiguousNativeForwardError(errorMessage)) {
         throw new BadRequestException(`Native forward ambiguous failure: ${errorMessage.slice(0, 200)}`);
       }
       return null;
@@ -3322,8 +3357,7 @@ export class ChatwootService {
           : Number(muteEndRaw);
     const hasMuteUpdate = muteEndRaw !== undefined;
     // Baileys emits muteEndTime in unix seconds; some builds use ms. Normalize to ms.
-    const muteEndMs =
-      muteEnd == null || !Number.isFinite(muteEnd) ? null : muteEnd < 1e11 ? muteEnd * 1000 : muteEnd;
+    const muteEndMs = muteEnd == null || !Number.isFinite(muteEnd) ? null : muteEnd < 1e11 ? muteEnd * 1000 : muteEnd;
     const muted = muteEndMs != null && muteEndMs > Date.now();
 
     const hasPinUpdate = body?.pinned !== undefined;
@@ -3344,9 +3378,7 @@ export class ChatwootService {
     });
     const conversationId = stored?.chatwootConversationId;
     if (!conversationId) {
-      this.logger.verbose(
-        JSON.stringify({ event: 'chatwoot_chat_update_target_missing', remoteJid }),
-      );
+      this.logger.verbose(JSON.stringify({ event: 'chatwoot_chat_update_target_missing', remoteJid }));
       return;
     }
 
@@ -3359,19 +3391,16 @@ export class ChatwootService {
       });
       // Show endpoint is flat; list-style wrappers use payload — accept both.
       const rawAny = raw as { payload?: unknown; muted?: boolean; pinned?: boolean; archived?: boolean } | null;
-      current = (
-        rawAny?.payload && typeof rawAny.payload === 'object' ? rawAny.payload : rawAny
-      ) as typeof current;
+      current = (rawAny?.payload && typeof rawAny.payload === 'object' ? rawAny.payload : rawAny) as typeof current;
     } catch {
       current = null;
     }
 
     const applyEndpoint = async (action: string) => {
-      await chatwootRequest(this.getClientCwConfig(provider), {
+      await this.privilegedChatwootRequest(provider, {
         method: 'POST',
-        url: `/api/v1/accounts/${accountId}/conversations/${conversationId}/${action}`,
-        body: { skip_native: true },
-        mediaType: 'application/json',
+        path: `/api/v1/accounts/${accountId}/conversations/${conversationId}/${action}`,
+        data: { skip_native: true },
       });
     };
 
@@ -3447,15 +3476,14 @@ export class ChatwootService {
     const emoji = reactionMessage.text || '';
 
     try {
-      await chatwootRequest(this.getClientCwConfig(provider), {
+      await this.privilegedChatwootRequest(provider, {
         method: 'POST',
-        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages/${target.chatwootMessageId}/react`,
-        body: {
+        path: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages/${target.chatwootMessageId}/react`,
+        data: {
           emoji,
           ...actor,
           skip_native: true,
         },
-        mediaType: 'application/json',
       });
       return true;
     } catch (error) {
