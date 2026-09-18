@@ -41,6 +41,8 @@ export interface ChatwootOutboundPayload {
   attachmentId?: number;
   attachmentUrl?: string;
   quotedChatwootMessageId?: number;
+  /** Native WhatsApp mention JIDs for group @notifications */
+  mentioned?: string[];
   origin: ChatwootOutboundOrigin;
 }
 
@@ -259,6 +261,7 @@ export function buildChatwootOutboundParts(params: {
   chatId: string;
   formattedText: string | null;
   origin: ChatwootOutboundOrigin;
+  mentioned?: string[];
 }): ChatwootOutboundPart[] {
   const instanceId = requiredString(params.instanceId, 'EVO instance id');
   const messageId = asRequiredInteger(params.body?.id, 'Chatwoot message id');
@@ -338,6 +341,7 @@ export function buildChatwootOutboundParts(params: {
       chatId,
       text: params.formattedText,
       quoted: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : null,
+      mentioned: Array.isArray(params.mentioned) ? [...params.mentioned].sort() : [],
       // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
       // excluded from the frozen identity so pre-upgrade retained rows replay
       // against their original operation keys instead of being quarantined.
@@ -363,6 +367,7 @@ export function buildChatwootOutboundParts(params: {
         attachmentId: 'attachmentId' in part ? part.attachmentId : undefined,
         attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : undefined,
         quotedChatwootMessageId: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : undefined,
+        mentioned: Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
         origin: normalizedOrigin,
       },
     };

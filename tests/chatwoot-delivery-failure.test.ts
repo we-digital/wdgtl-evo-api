@@ -220,8 +220,12 @@ test('identifies only deliverable outgoing webhooks for missing-instance failure
 });
 
 test('keeps the exact Chatwoot deletion event separate from outbound delivery', () => {
-  const deletion = { event: 'message_updated', content_attributes: { deleted: true } };
+  const deletion = {
+    event: 'message_updated',
+    content_attributes: { deleted: true, native_delete_probe: true },
+  };
   assert.equal(isChatwootMessageDeletion(deletion), true);
-  assert.equal(isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: false } }), false);
+  assert.equal(isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: true } }), false);
+  assert.equal(isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: false, native_delete_probe: true } }), false);
   assert.equal(isDeliverableChatwootOutgoing({ ...deletion, id: 314, message_type: 'outgoing' }, '628123'), false);
 });

@@ -12,6 +12,11 @@ import {
   buildChatwootOutboundProvenance,
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
+import {
+  buildWhatsappGroupParticipantSnapshots,
+  extractWhatsappMentionJids,
+  stripWhatsappMentionMarkdown,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildChatwootDeliveryFailureUpdate,
@@ -20,6 +25,10 @@ import {
   ChatwootProviderDeliveryPart,
   isChatwootDeliveryFailureAcknowledged,
   isChatwootMessageDeletion,
+  isChatwootMessageEdit,
+  isChatwootNativeArchiveProbe,
+  isChatwootNativeMuteProbe,
+  isChatwootNativePinProbe,
   isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
@@ -60,6 +69,7 @@ import {
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
+import { isAmbiguousNativeForwardError } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
@@ -78,7 +88,15 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
+import {
+  buildWhatsappReactionActor,
+  isAgentReactionWebhook,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
+import {
+  requireTrustedChatwootUrl,
+  resolveTrustedChatwootBaseUrl,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -102,6 +120,7 @@ import ChatwootClient, {
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
+import { createJid } from '@utils/createJid';
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -330,10 +349,39 @@ export class ChatwootService {
       basePath: provider.url,
       with_credentials: true,
       credentials: 'include',
-      headers: { 'api-access-token': provider.token },
+      headers: {
+        'api-access-token': provider.token,
+      },
       nameInbox: provider.nameInbox,
       mergeBrazilContacts: provider.mergeBrazilContacts,
     };
+  }
+
+  private trustedChatwootBaseUrl(provider: ChatwootModel): string | null {
+    const trustedBaseUrl = this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL;
+    return resolveTrustedChatwootBaseUrl(provider.url, trustedBaseUrl);
+  }
+
+  private async privilegedChatwootRequest(
+    provider: ChatwootModel,
+    params: { method: 'POST'; path: string; data: Record<string, unknown> },
+  ): Promise<void> {
+    const config = this.configService.get<Chatwoot>('CHATWOOT');
+    const url = requireTrustedChatwootUrl(provider.url, config.TRUSTED_BASE_URL, params.path);
+    if (!config.NATIVE_BRIDGE_TOKEN) throw new Error('Chatwoot native bridge token is not configured');
+
+    await axios.request({
+      method: params.method,
+      url,
+      data: params.data,
+      headers: {
+        'api-access-token': provider.token,
+        'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+        'Content-Type': 'application/json',
+      },
+      timeout: 20_000,
+      maxRedirects: 0,
+    });
   }
 
   public getCache() {
@@ -353,8 +401,14 @@ export class ChatwootService {
       return null;
     }
 
+    const trustedBaseUrl = this.trustedChatwootBaseUrl(provider);
+    if (!trustedBaseUrl) {
+      this.logger.warn('provider URL is not the operator-controlled Chatwoot destination');
+      return null;
+    }
+
     const request = buildExternalReadRequest({
-      baseUrl: provider.url,
+      baseUrl: trustedBaseUrl,
       accountId: provider.accountId,
       conversationId: params.conversationId,
       messageId: params.messageId,
@@ -364,6 +418,7 @@ export class ChatwootService {
     const response = await axios.post(request.url, request.data, {
       headers: request.headers,
       timeout: 20_000,
+      maxRedirects: 0,
     });
 
     return response.data;
@@ -1130,6 +1185,9 @@ export class ChatwootService {
           if (inboxConversation) {
             this.logger.verbose(`Returning existing conversation ID: ${inboxConversation.id}`);
             this.cache.set(cacheKey, inboxConversation.id, 1800);
+            if (isGroup) {
+              void this.syncWhatsappGroupParticipants(instance, provider, Number(inboxConversation.id), chatId);
+            }
             return inboxConversation.id;
           }
         }
@@ -1155,6 +1213,9 @@ export class ChatwootService {
 
         this.logger.verbose(`New conversation created of ${remoteJid} with ID: ${conversation.id}`);
         this.cache.set(cacheKey, conversation.id, 1800);
+        if (isGroupJid(remoteJid)) {
+          void this.syncWhatsappGroupParticipants(instance, provider, Number(conversation.id), remoteJid);
+        }
         return conversation.id;
       } finally {
         await this.cache.delete(lockKey);
@@ -1163,6 +1224,42 @@ export class ChatwootService {
     } catch (error) {
       this.logger.error(`Error in createConversation: ${error}`);
       return null;
+    }
+  }
+
+  private async syncWhatsappGroupParticipants(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    conversationId: number,
+    groupJid: string,
+  ): Promise<void> {
+    try {
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      if (!waInstance?.findParticipants) return;
+      const groupParticipants = await waInstance.findParticipants({ groupJid });
+      const snapshots = buildWhatsappGroupParticipantSnapshots(groupParticipants?.participants || []);
+      if (!snapshots.length) return;
+
+      await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'POST',
+        url: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/custom_attributes`,
+        body: {
+          merge: true,
+          custom_attributes: {
+            whatsapp_group_participants: snapshots,
+          },
+        },
+      });
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_group_participants_sync_failed',
+          conversationId,
+          groupJid,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
     }
   }
 
@@ -1909,6 +2006,7 @@ export class ChatwootService {
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
           signal,
+          mentioned: payload.mentioned,
         },
         true,
         provenance,
@@ -2117,12 +2215,14 @@ export class ChatwootService {
       snapshotFingerprint: String(body.outbound_snapshot?.fingerprint || ''),
       routeBinding,
     };
+    const mentioned = extractWhatsappMentionJids(body);
     const parts = buildChatwootOutboundParts({
       instanceId: instance.instanceId,
       body,
       chatId,
       formattedText,
       origin,
+      mentioned: mentioned.length ? mentioned : undefined,
     });
     const createdAtSeconds = Number(body.created_at);
     const messageCreatedAt =
@@ -2260,10 +2360,55 @@ export class ChatwootService {
         this.cache.delete(keyToDelete);
       }
 
+      if (isChatwootNativeMuteProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native mute');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native mute');
+        }
+        await this.trySendNativeMute(waInstance, chatId, body);
+        return { message: body.muted ? 'muted' : 'unmuted' };
+      }
+
+      if (isChatwootNativePinProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native pin');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native pin');
+        }
+        await this.trySendNativePin(waInstance, chatId, body);
+        return { message: body.pinned ? 'pinned' : 'unpinned' };
+      }
+
+      if (isChatwootNativeArchiveProbe(body)) {
+        const waInstance = this.waMonitor.waInstances[instance.instanceName];
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native archive');
+        }
+        const chatId =
+          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        if (!chatId || chatId === '123456') {
+          throw new BadRequestException('Chat id missing for native archive');
+        }
+        await this.trySendNativeArchive(waInstance, chatId, body);
+        return { message: body.archived ? 'archived' : 'unarchived' };
+      }
+
       if (
         !body?.conversation ||
         body.private ||
-        (body.event === 'message_updated' && !isChatwootMessageDeletion(body))
+        (body.event === 'message_updated' &&
+          !isChatwootMessageDeletion(body) &&
+          !isChatwootMessageEdit(body) &&
+          !isAgentReactionWebhook(body))
       ) {
         return { message: 'bot' };
       }
@@ -2295,6 +2440,13 @@ export class ChatwootService {
 
       instance.instanceId = asyncDeliverable ? authenticatedAdmission.routeInstanceId : waInstance.instanceId;
 
+      if (isAgentReactionWebhook(body)) {
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native reaction');
+        }
+        return this.sendWhatsappReactionFromChatwoot(instance, waInstance, body);
+      }
+
       if (isChatwootMessageDeletion(body)) {
         const retained = await this.outboundStore.retainedOperations(instance.instanceId, Number(body.id));
         if (retained.length > 0) {
@@ -2319,7 +2471,45 @@ export class ChatwootService {
           if (!deletionContext) throw this.outboundBindingMismatch();
           await this.outboundStore.requestDeletion(retained[0]);
           this.outboundQueue.wake();
-          return { accepted: true, deletion: true, operationCount: retained.length };
+
+          const neverSent = retained.every((operation) => Number(operation.sendAttempts || 0) === 0);
+          const mapped = await this.prismaRepository.message.findFirst({
+            where: {
+              chatwootMessageId: body.id,
+              instanceId: instance.instanceId,
+            },
+          });
+
+          // Never reached WA — queue cancel is enough for native-first success.
+          if (neverSent && !mapped) {
+            return { message: 'deleted' };
+          }
+
+          if (!waInstance?.client?.sendMessage) {
+            throw new BadRequestException('WhatsApp instance unavailable for native delete');
+          }
+          if (!mapped) {
+            throw new BadRequestException('WhatsApp message mapping missing for native delete');
+          }
+
+          const retainedKey = mapped.key as WAMessageKey;
+          if (
+            mapped.chatwootInboxId !== Number(body.inbox?.id) ||
+            mapped.chatwootConversationId !== Number(body.conversation?.id) ||
+            !retainedKey?.remoteJid ||
+            !this.outboundRemoteJidMatches(candidateDeletionChatId, retainedKey.remoteJid)
+          ) {
+            throw this.outboundBindingMismatch();
+          }
+
+          await waInstance.client.sendMessage(retainedKey.remoteJid, { delete: retainedKey });
+          await this.prismaRepository.message.deleteMany({
+            where: {
+              instanceId: instance.instanceId,
+              chatwootMessageId: body.id,
+            },
+          });
+          return { message: 'deleted' };
         }
         const liveProvider = await this.prismaRepository.chatwoot.findUnique({
           where: { instanceId: instance.instanceId },
@@ -2371,6 +2561,10 @@ export class ChatwootService {
           clearTimeout(deletionTimer);
         }
         if (!deletionContext) throw this.outboundBindingMismatch();
+        if (!waInstance?.client?.sendMessage) {
+          throw new BadRequestException('WhatsApp instance unavailable for native delete');
+        }
+
         const message = await this.prismaRepository.message.findFirst({
           where: {
             chatwootMessageId: body.id,
@@ -2378,37 +2572,54 @@ export class ChatwootService {
           },
         });
 
-        if (message) {
-          const key = message.key as WAMessageKey;
-          if (
-            message.chatwootInboxId !== deletionOrigin.inboxId ||
-            message.chatwootConversationId !== deletionOrigin.conversationId ||
-            !key?.remoteJid ||
-            !this.outboundRemoteJidMatches(syntheticDeletion.payload.chatId, key.remoteJid)
-          )
-            throw this.outboundBindingMismatch();
-
-          await waInstance?.client.sendMessage(key.remoteJid, { delete: key });
-
-          await this.prismaRepository.message.deleteMany({
-            where: {
-              instanceId: instance.instanceId,
-              chatwootMessageId: body.id,
-            },
-          });
+        if (!message) {
+          throw new BadRequestException('WhatsApp message mapping missing for native delete');
         }
-        return { message: 'bot' };
+
+        const key = message.key as WAMessageKey;
+        if (
+          message.chatwootInboxId !== deletionOrigin.inboxId ||
+          message.chatwootConversationId !== deletionOrigin.conversationId ||
+          !key?.remoteJid ||
+          !this.outboundRemoteJidMatches(syntheticDeletion.payload.chatId, key.remoteJid)
+        )
+          throw this.outboundBindingMismatch();
+
+        await waInstance.client.sendMessage(key.remoteJid, { delete: key });
+
+        await this.prismaRepository.message.deleteMany({
+          where: {
+            instanceId: instance.instanceId,
+            chatwootMessageId: body.id,
+          },
+        });
+
+        return { message: 'deleted' };
+      }
+
+      if (isChatwootMessageEdit(body)) {
+        if (!waInstance) {
+          throw new BadRequestException('WhatsApp instance unavailable for native edit');
+        }
+        const chatIdForEdit = candidateChatId;
+        const edited = await this.trySendNativeEdit(waInstance, chatIdForEdit, body, instance);
+        if (!edited) {
+          throw new BadRequestException('Native WhatsApp edit failed');
+        }
+        return { message: 'edited', key: edited.key };
       }
 
       const chatId = candidateChatId;
       // Chatwoot to Whatsapp
-      const messageReceived = body.content
+      const mentionedJids = extractWhatsappMentionJids(body);
+      const messageReceivedRaw = body.content
         ? body.content
             .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // Substitui * por _
             .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // Substitui ** por *
             .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // Substitui ~~ por ~
             .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
         : body.content;
+      const messageReceived = stripWhatsappMentionMarkdown(messageReceivedRaw);
 
       const senderName = body?.sender?.available_name || body?.sender?.name;
       const expectedRoute = this.buildEvoRouteBinding(instance, provider, body.inbox?.id);
@@ -2449,6 +2660,12 @@ export class ChatwootService {
         outboundEnqueueAttempted = true;
         retainedMessage = await this.outboundStore.hasRetainedMessage(instance.instanceId, Number(body.id));
         if (!retainedMessage && !outboundConfig.OUTBOUND_ASYNC_ENABLED) outboundEnqueueAttempted = false;
+      }
+      if (deliverableOutgoing && body?.content_attributes?.forwarded) {
+        const nativeForward = await this.trySendNativeForward(waInstance, chatId, body, instance);
+        if (nativeForward) {
+          return { message: 'forwarded', key: nativeForward.key };
+        }
       }
       if (deliverableOutgoing && retainedMessage) {
         if (!expectedRoute || Number(provider.accountId) !== Number(body.account?.id)) {
@@ -2586,6 +2803,7 @@ export class ChatwootService {
 
               const options: Options = {
                 quoted: await this.getQuotedMessage(body, instance),
+                mentioned: mentionedJids.length ? mentionedJids : undefined,
               };
 
               let messageSent: any;
@@ -2620,6 +2838,7 @@ export class ChatwootService {
               text: formatText,
               delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
               quoted: await this.getQuotedMessage(body, instance),
+              mentioned: mentionedJids.length ? mentionedJids : undefined,
             };
 
             sendTelemetry('/message/sendText');
@@ -2724,6 +2943,16 @@ export class ChatwootService {
       );
 
       if (outboundEnqueueAttempted) throw error;
+      // Native-first edit probe: Chatwoot only applies text after a successful response.
+      if (
+        isChatwootMessageEdit(body) ||
+        isChatwootMessageDeletion(body) ||
+        isChatwootNativeMuteProbe(body) ||
+        isChatwootNativePinProbe(body) ||
+        isChatwootNativeArchiveProbe(body) ||
+        isAgentReactionWebhook(body)
+      )
+        throw error;
 
       return { message: 'bot' };
     }
@@ -2831,6 +3060,228 @@ export class ChatwootService {
     return null;
   }
 
+  /**
+   * Native WhatsApp forward (Baileys `{ forward }`) when Chatwoot marks the
+   * outgoing message as forwarded and the source WA message is in this instance.
+   * Returns null to fall back to content re-send.
+   */
+  private async trySendNativeForward(
+    waInstance: any,
+    chatId: string,
+    body: any,
+    instance: InstanceDto,
+  ): Promise<any | null> {
+    const attrs = body?.content_attributes;
+    if (!attrs?.forwarded) return null;
+
+    const from = attrs.forwarded_from || {};
+    const sourceMessageId = Number(from.message_id);
+    if (!Number.isSafeInteger(sourceMessageId) || sourceMessageId <= 0) return null;
+
+    // Cross-inbox forwards cannot use this session's message store.
+    if (from.same_inbox === false) return null;
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: sourceMessageId,
+        instanceId: instance.instanceId,
+      },
+    });
+
+    const key = stored?.key as WAMessageKey | undefined;
+    const messageContent = stored?.message as WAMessageContent | undefined;
+    if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+      return null;
+    }
+
+    let messageSent: any;
+    try {
+      const jid = createJid(chatId);
+      messageSent = await waInstance.client.sendMessage(jid, {
+        forward: { key, message: messageContent },
+        force: true,
+      });
+    } catch (error) {
+      const errorMessage = String(error?.message || error);
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_failed',
+          sourceMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: errorMessage.slice(0, 200),
+        }),
+      );
+      // Ambiguous transport failures may mean WA already accepted the forward —
+      // never fall back to content re-send (duplicate risk).
+      if (isAmbiguousNativeForwardError(errorMessage)) {
+        throw new BadRequestException(`Native forward ambiguous failure: ${errorMessage.slice(0, 200)}`);
+      }
+      return null;
+    }
+
+    if (!messageSent?.key?.id) {
+      throw new BadRequestException('Native forward returned empty message key');
+    }
+
+    if (Long.isLong(messageSent?.messageTimestamp)) {
+      messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
+    }
+
+    try {
+      await this.updateChatwootMessageId(
+        { ...messageSent },
+        {
+          messageId: body.id,
+          inboxId: body.inbox?.id,
+          conversationId: body.conversation?.id,
+          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+        },
+        instance,
+      );
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_map_failed',
+          sourceMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+      // WA already has the forward — return success so caller does not re-send content.
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_forward_sent',
+        sourceMessageId,
+        targetChatId: chatId,
+        chatwootMessageId: body.id,
+      }),
+    );
+
+    return messageSent;
+  }
+
+  /**
+   * Native WhatsApp mute/unmute (Baileys chatModify) for Chatwoot mute probe.
+   * Works for 1:1 and @g.us groups.
+   */
+  private async trySendNativeMute(waInstance: any, chatId: string, body: any): Promise<void> {
+    const muted = body?.muted === true;
+    const muteUntilMs =
+      typeof body?.mute_until_ms === 'number' && body.mute_until_ms > 0
+        ? body.mute_until_ms
+        : muted
+          ? Date.now() + 100 * 365 * 24 * 60 * 60 * 1000
+          : null;
+
+    if (typeof waInstance?.muteChat === 'function') {
+      await waInstance.muteChat({ number: chatId, mute: muted ? muteUntilMs : null });
+    } else {
+      throw new BadRequestException('WhatsApp mute API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_mute_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        muted,
+      }),
+    );
+  }
+
+  /**
+   * Native WhatsApp pin/unpin (Baileys chatModify { pin }) for Chatwoot pin probe.
+   */
+  private async trySendNativePin(waInstance: any, chatId: string, body: any): Promise<void> {
+    const pinned = body?.pinned === true;
+    if (typeof waInstance?.pinChat === 'function') {
+      await waInstance.pinChat({ number: chatId, pin: pinned });
+    } else {
+      throw new BadRequestException('WhatsApp pin API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_pin_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        pinned,
+      }),
+    );
+  }
+
+  /**
+   * Native WhatsApp archive/unarchive (Baileys chatModify { archive }) for Chatwoot archive probe.
+   */
+  private async trySendNativeArchive(waInstance: any, chatId: string, body: any): Promise<void> {
+    const archived = body?.archived === true;
+    if (typeof waInstance?.archiveChat === 'function') {
+      await waInstance.archiveChat({ chat: chatId, archive: archived });
+    } else {
+      throw new BadRequestException('WhatsApp archive API unavailable');
+    }
+
+    this.logger.verbose(
+      JSON.stringify({
+        event: 'chatwoot_native_archive_sent',
+        chatwootConversationId: body?.id,
+        targetChatId: chatId,
+        archived,
+      }),
+    );
+  }
+
+  /**
+   * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot native_edit_probe.
+   * Chatwoot applies local text only after this succeeds.
+   */
+  private async trySendNativeEdit(
+    waInstance: any,
+    chatId: string,
+    body: any,
+    instance: InstanceDto,
+  ): Promise<any | null> {
+    const text = typeof body?.content === 'string' ? body.content : '';
+    if (!text.trim() || !waInstance?.updateMessage) return null;
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: Number(body.id),
+        instanceId: instance.instanceId,
+      },
+    });
+    const key = stored?.key as WAMessageKey | undefined;
+    if (!key?.id) return null;
+
+    try {
+      const messageSent = await waInstance.updateMessage({
+        number: chatId,
+        key,
+        text,
+      });
+      this.logger.verbose(
+        JSON.stringify({
+          event: 'chatwoot_native_edit_sent',
+          chatwootMessageId: body.id,
+          targetChatId: chatId,
+        }),
+      );
+      return messageSent;
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_edit_failed',
+          chatwootMessageId: body.id,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+      return null;
+    }
+  }
+
   private isMediaMessage(message: any) {
     const media = [
       'imageMessage',
@@ -2887,6 +3338,204 @@ export class ChatwootService {
     const reactionMessage: ReactionMessage | undefined = msg?.reactionMessage;
 
     return reactionMessage;
+  }
+
+  private async applyNativeChatwootMuteFromWhatsapp(
+    instance: InstanceDto,
+    provider: any,
+    body: { id?: string; muteEndTime?: number | null; pinned?: number | null; archived?: boolean },
+  ): Promise<void> {
+    const remoteJid = body?.id;
+    if (!remoteJid) return;
+
+    const muteEndRaw = body?.muteEndTime as any;
+    const muteEnd =
+      muteEndRaw == null
+        ? null
+        : typeof muteEndRaw === 'object' && muteEndRaw !== null && typeof muteEndRaw.toNumber === 'function'
+          ? Number(muteEndRaw.toNumber())
+          : Number(muteEndRaw);
+    const hasMuteUpdate = muteEndRaw !== undefined;
+    // Baileys emits muteEndTime in unix seconds; some builds use ms. Normalize to ms.
+    const muteEndMs = muteEnd == null || !Number.isFinite(muteEnd) ? null : muteEnd < 1e11 ? muteEnd * 1000 : muteEnd;
+    const muted = muteEndMs != null && muteEndMs > Date.now();
+
+    const hasPinUpdate = body?.pinned !== undefined;
+    const pinned = body?.pinned != null && Number(body.pinned) > 0;
+
+    const hasArchiveUpdate = body?.archived !== undefined;
+    const archived = body?.archived === true;
+
+    if (!hasMuteUpdate && !hasPinUpdate && !hasArchiveUpdate) return;
+
+    const stored = await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: instance.instanceId,
+        key: { path: ['remoteJid'], equals: remoteJid },
+        chatwootConversationId: { not: null },
+      },
+      orderBy: { messageTimestamp: 'desc' },
+    });
+    const conversationId = stored?.chatwootConversationId;
+    if (!conversationId) {
+      this.logger.verbose(JSON.stringify({ event: 'chatwoot_chat_update_target_missing', remoteJid }));
+      return;
+    }
+
+    const accountId = provider.accountId;
+    let current: { muted?: boolean; pinned?: boolean; archived?: boolean } | null = null;
+    try {
+      const raw = await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'GET',
+        url: `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
+      });
+      // Show endpoint is flat; list-style wrappers use payload — accept both.
+      const rawAny = raw as { payload?: unknown; muted?: boolean; pinned?: boolean; archived?: boolean } | null;
+      current = (rawAny?.payload && typeof rawAny.payload === 'object' ? rawAny.payload : rawAny) as typeof current;
+    } catch {
+      current = null;
+    }
+
+    const applyEndpoint = async (action: string) => {
+      await this.privilegedChatwootRequest(provider, {
+        method: 'POST',
+        path: `/api/v1/accounts/${accountId}/conversations/${conversationId}/${action}`,
+        data: { skip_native: true },
+      });
+    };
+
+    try {
+      if (hasMuteUpdate && (current == null || Boolean(current?.muted) !== muted)) {
+        await applyEndpoint(muted ? 'mute' : 'unmute');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_mute_applied',
+            conversationId,
+            remoteJid,
+            muted,
+          }),
+        );
+      }
+      if (hasPinUpdate && (current == null || Boolean(current?.pinned) !== pinned)) {
+        await applyEndpoint(pinned ? 'pin' : 'unpin');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_pin_applied',
+            conversationId,
+            remoteJid,
+            pinned,
+          }),
+        );
+      }
+      if (hasArchiveUpdate && (current == null || Boolean(current?.archived) !== archived)) {
+        await applyEndpoint(archived ? 'archive' : 'unarchive');
+        this.logger.verbose(
+          JSON.stringify({
+            event: 'chatwoot_native_archive_applied',
+            conversationId,
+            remoteJid,
+            archived,
+          }),
+        );
+      }
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_chat_update_apply_failed',
+          conversationId,
+          remoteJid,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
+    }
+  }
+
+  private async applyNativeChatwootReaction(
+    instance: InstanceDto,
+    conversationId: number,
+    body: any,
+    reactionMessage: { key: { id: string }; text?: string },
+  ): Promise<boolean> {
+    const target = await this.getMessageByKeyId(instance, reactionMessage.key.id);
+    if (!target?.chatwootMessageId) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_target_missing',
+          waMessageId: reactionMessage.key.id,
+          conversationId,
+        }),
+      );
+      return false;
+    }
+
+    const context = await this.clientCw(instance);
+    if (!context) return false;
+    const { provider } = context;
+    const actor = buildWhatsappReactionActor(body);
+    const emoji = reactionMessage.text || '';
+
+    try {
+      await this.privilegedChatwootRequest(provider, {
+        method: 'POST',
+        path: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages/${target.chatwootMessageId}/react`,
+        data: {
+          emoji,
+          ...actor,
+          skip_native: true,
+        },
+      });
+      return true;
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_apply_failed',
+          conversationId,
+          messageId: target.chatwootMessageId,
+          errorClass: (error as any)?.name || 'Error',
+          message: (error as any)?.message,
+        }),
+      );
+      return false;
+    }
+  }
+
+  private async sendWhatsappReactionFromChatwoot(
+    instance: InstanceDto,
+    waInstance: any,
+    body: any,
+  ): Promise<{ message: string } | { accepted: true }> {
+    const reaction = body?.reaction;
+    if (!reaction) return { message: 'bot' };
+
+    const localMessage = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: Number(body.id),
+        instanceId: instance.instanceId,
+      },
+    });
+    const key = localMessage?.key as { id?: string; remoteJid?: string; fromMe?: boolean; participant?: string } | null;
+    if (!key?.id || !key?.remoteJid) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_reaction_outbound_key_missing',
+          chatwootMessageId: body.id,
+        }),
+      );
+      throw new BadRequestException('WhatsApp reaction key unavailable');
+    }
+
+    const emoji = reaction.action === 'remove' ? '' : String(reaction.emoji || '');
+    await waInstance.reactionMessage({
+      key: {
+        id: key.id,
+        remoteJid: key.remoteJid,
+        fromMe: Boolean(key.fromMe),
+        participant: key.participant,
+      },
+      reaction: emoji,
+    });
+    return { message: 'reacted' };
   }
 
   private getTypeMessage(msg: any) {
@@ -3108,6 +3757,11 @@ export class ChatwootService {
       }
       const { client, provider } = context;
 
+      if (event === 'chats.update') {
+        await this.applyNativeChatwootMuteFromWhatsapp(instance, provider, body);
+        return { message: 'ok' };
+      }
+
       const ignoreJids = Array.isArray(provider.ignoreJids)
         ? provider.ignoreJids.filter((jid): jid is string => typeof jid === 'string')
         : [];
@@ -3294,27 +3948,7 @@ export class ChatwootService {
         }
 
         if (reactionMessage) {
-          if (reactionMessage.text) {
-            const send = await this.createMessage(
-              instance,
-              getConversation,
-              reactionMessage.text,
-              messageType,
-              false,
-              [],
-              {
-                message: { extendedTextMessage: { contextInfo: { stanzaId: reactionMessage.key.id } } },
-              },
-              'WAID:' + body.key.id,
-              quotedMsg,
-              clientSent,
-            );
-            if (!send) {
-              this.logger.warn('message not sent');
-              return;
-            }
-          }
-
+          await this.applyNativeChatwootReaction(instance, Number(getConversation), body, reactionMessage);
           return;
         }
 

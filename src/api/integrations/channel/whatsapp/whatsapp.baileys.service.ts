@@ -57,6 +57,7 @@ import {
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { isUsableArchiveMessageKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
@@ -889,7 +890,13 @@ export class BaileysStartupService extends ChannelStartupService {
       >[],
     ) => {
       const chatsRaw = chats.map((chat) => {
-        return { remoteJid: chat.id, instanceId: this.instanceId };
+        return {
+          remoteJid: chat.id,
+          instanceId: this.instanceId,
+          muteEndTime: (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp ?? null,
+          pinned: (chat as any).pinned ?? null,
+          archived: (chat as any).archived ?? null,
+        };
       });
 
       this.sendDataWebhook(Events.CHATS_UPDATE, chatsRaw);
@@ -899,6 +906,24 @@ export class BaileysStartupService extends ChannelStartupService {
           where: { instanceId: this.instanceId, remoteJid: chat.id, name: chat.name },
           data: { remoteJid: chat.id },
         });
+
+        const muteEnd = (chat as any).muteEndTime ?? (chat as any).muteEndTimestamp;
+        const pinned = (chat as any).pinned;
+        const archived = (chat as any).archived;
+        const hasChatStateUpdate = muteEnd !== undefined || pinned !== undefined || archived !== undefined;
+
+        if (chat.id && hasChatStateUpdate && this.localChatwoot?.enabled) {
+          await this.chatwootService.eventWhatsapp(
+            'chats.update',
+            { instanceName: this.instanceName, instanceId: this.instanceId } as any,
+            {
+              id: chat.id,
+              muteEndTime: muteEnd,
+              pinned,
+              archived,
+            },
+          );
+        }
       }
     },
 
@@ -2105,7 +2130,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['chats.update']) {
               const payload = events['chats.update'];
-              this.chatHandle['chats.update'](payload);
+              await this.chatHandle['chats.update'](payload);
             }
 
             if (events['chats.delete']) {
@@ -3941,55 +3966,85 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   public async getLastMessage(number: string) {
-    const where: any = { key: { remoteJid: number }, instanceId: this.instance.id };
+    const jid = createJid(number);
+    const candidates = Array.from(new Set([jid, number].filter(Boolean)));
 
-    const messages = await this.prismaRepository.message.findMany({
-      where,
-      orderBy: { messageTimestamp: 'desc' },
-      take: 1,
-    });
-
-    if (messages.length === 0) {
-      throw new NotFoundException('Messages not found');
+    // When chat id is a phone JID, also try mapped @lid (and vice versa) for store lookup.
+    try {
+      if (typeof (this as any).resolvePhoneJidForLid === 'function' && String(jid).endsWith('@lid')) {
+        const phone = await this.resolvePhoneJidForLid(jid);
+        if (phone) candidates.push(phone);
+      }
+      if (String(jid).endsWith('@s.whatsapp.net') && this.client?.signalRepository?.lidMapping?.getLIDsForPNs) {
+        const mappings = await this.client.signalRepository.lidMapping.getLIDsForPNs([jid]);
+        const lid = mappings?.[0]?.lid;
+        if (lid) candidates.push(lid);
+      }
+    } catch {
+      // Mapping optional — fall through to stored candidates.
     }
 
-    let lastMessage = messages.pop();
-
-    for (const message of messages) {
-      if (message.messageTimestamp >= lastMessage.messageTimestamp) {
-        lastMessage = message;
+    for (const remoteJid of Array.from(new Set(candidates.filter(Boolean)))) {
+      const messages = await this.prismaRepository.message.findMany({
+        where: { key: { path: ['remoteJid'], equals: remoteJid }, instanceId: this.instance.id },
+        orderBy: { messageTimestamp: 'desc' },
+        take: 1,
+      });
+      if (messages.length > 0) {
+        return messages[0] as unknown as LastMessage;
       }
     }
 
-    return lastMessage as unknown as LastMessage;
+    throw new NotFoundException('Messages not found');
   }
 
   public async archiveChat(data: ArchiveChatDto) {
     try {
       let last_message = data.lastMessage;
       let number = data.chat;
+      const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
         last_message = await this.getLastMessage(number);
-      } else {
-        last_message = data.lastMessage;
-        last_message.messageTimestamp = last_message?.messageTimestamp ?? Date.now();
-        number = last_message?.key?.remoteJid;
+      } else if (last_message) {
+        last_message.messageTimestamp = last_message?.messageTimestamp ?? Math.floor(Date.now() / 1000);
+        number = last_message?.key?.remoteJid || number;
       }
 
       if (!last_message || Object.keys(last_message).length === 0) {
-        throw new NotFoundException('Last message not found');
+        throw new NotFoundException('Last message not found for archive');
       }
 
-      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, createJid(number));
+      // Refuse synthetic / stub keys — WhatsApp archive requires a real stored message.
+      const lastKeyId = String((last_message as any)?.key?.id || '');
+      if (!isUsableArchiveMessageKey(lastKeyId)) {
+        throw new NotFoundException('Last message not found for archive');
+      }
 
-      return { chatId: number, archived: true };
+      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, jid);
+
+      return { chatId: jid, archived: data.archive };
     } catch (error) {
+      if (error instanceof NotFoundException) throw error;
       throw new InternalServerErrorException({
         archived: false,
         message: ['An error occurred while archiving the chat. Open a calling.', error.toString()],
       });
     }
+  }
+
+  /** Mute / unmute a 1:1 or group chat. `mute` is mute-until ms timestamp, or null to unmute. */
+  public async muteChat(data: { number: string; mute: number | null }) {
+    const jid = createJid(data.number);
+    await this.client.chatModify({ mute: data.mute }, jid);
+    return { chatId: jid, muted: data.mute != null };
+  }
+
+  /** Pin / unpin a 1:1 or group chat. */
+  public async pinChat(data: { number: string; pin: boolean }) {
+    const jid = createJid(data.number);
+    await this.client.chatModify({ pin: data.pin }, jid);
+    return { chatId: jid, pinned: data.pin };
   }
 
   public async markChatUnread(data: MarkChatUnreadDto) {
