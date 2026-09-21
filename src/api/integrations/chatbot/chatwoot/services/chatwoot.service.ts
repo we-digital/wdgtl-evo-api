@@ -69,7 +69,10 @@ import {
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
-import { isAmbiguousNativeForwardError } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
+import {
+  isAmbiguousNativeForwardError,
+  shouldAttemptNativeForward,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
@@ -3085,8 +3088,7 @@ export class ChatwootService {
     const sourceMessageId = Number(from.message_id);
     if (!Number.isSafeInteger(sourceMessageId) || sourceMessageId <= 0) return null;
 
-    // Cross-inbox forwards cannot use this session's message store.
-    if (from.same_inbox === false) return null;
+    if (!shouldAttemptNativeForward(from)) return null;
 
     const stored = await this.prismaRepository.message.findFirst({
       where: {
