@@ -61,11 +61,14 @@ test('fast-acks inbound message_created echoes without loading Chatwoot client',
   const fixture = serviceFixture();
 
   assert.deepEqual(
-    await fixture.service.receiveWebhook({ instanceName: 'test-instance' }, {
-      ...baseBody,
-      message_type: 'incoming',
-      source_id: 'WAID:inbound-1',
-    }),
+    await fixture.service.receiveWebhook(
+      { instanceName: 'test-instance' },
+      {
+        ...baseBody,
+        message_type: 'incoming',
+        source_id: 'WAID:inbound-1',
+      },
+    ),
     { message: 'ignored' },
   );
   assert.equal(fixture.clientCwCalls(), 0);
@@ -75,11 +78,14 @@ test('fast-acks already-bridged outgoing message_created without loading Chatwoo
   const fixture = serviceFixture();
 
   assert.deepEqual(
-    await fixture.service.receiveWebhook({ instanceName: 'test-instance' }, {
-      ...baseBody,
-      message_type: 'outgoing',
-      source_id: 'WAID:already-sent',
-    }),
+    await fixture.service.receiveWebhook(
+      { instanceName: 'test-instance' },
+      {
+        ...baseBody,
+        message_type: 'outgoing',
+        source_id: 'WAID:already-sent',
+      },
+    ),
     { message: 'ignored' },
   );
   assert.equal(fixture.clientCwCalls(), 0);

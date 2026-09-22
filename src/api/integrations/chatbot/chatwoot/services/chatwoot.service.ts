@@ -988,11 +988,7 @@ export class ChatwootService {
     const isGroup = remoteJid.endsWith('@g.us');
     const isLid = !isGroup && (body.key.addressingMode === 'lid' || isLidJid(remoteJid));
     let phoneNumber: string | undefined =
-      isLid && !isGroup
-        ? typeof body.key.remoteJidAlt === 'string'
-          ? body.key.remoteJidAlt
-          : undefined
-        : remoteJid;
+      isLid && !isGroup ? (typeof body.key.remoteJidAlt === 'string' ? body.key.remoteJidAlt : undefined) : remoteJid;
 
     // Baileys sometimes omits remoteJidAlt for LID chats. Resolve PN when possible;
     // otherwise keep a provisional @lid identity so ingress does not drop the message.
@@ -1000,9 +996,7 @@ export class ChatwootService {
       const lidJid = isLidJid(remoteJid) ? remoteJid : phoneNumber;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       const resolved =
-        lidJid && waInstance?.resolvePhoneJidForLid
-          ? await waInstance.resolvePhoneJidForLid(lidJid)
-          : null;
+        lidJid && waInstance?.resolvePhoneJidForLid ? await waInstance.resolvePhoneJidForLid(lidJid) : null;
       if (isPhoneJid(resolved)) {
         phoneNumber = resolved;
         body.key.remoteJidAlt = resolved;
@@ -1107,11 +1101,7 @@ export class ChatwootService {
           return (await this.cache.get(cacheKey)) as number;
         }
 
-        const chatId = isGroup
-          ? remoteJid
-          : isProvisionalLid
-            ? phoneNumber
-            : phoneNumber.split('@')[0].split(':')[0];
+        const chatId = isGroup ? remoteJid : isProvisionalLid ? phoneNumber : phoneNumber.split('@')[0].split(':')[0];
         let nameContact = !body.key.fromMe ? body.pushName : chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;

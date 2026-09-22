@@ -121,6 +121,38 @@ tags are never deployment inputs.
   receiver-fingerprint mismatch, and explicit relink before production
   promotion.
 
+## Chatwoot LID contact creation and webhook echo acknowledgement
+
+- **Behavior:** when a direct WhatsApp message arrives with a LID but no
+  `remoteJidAlt`, EVO first asks the live Baileys LID mapping for a phone JID.
+  A confirmed phone JID follows the canonical phone-contact path and is stored
+  back on the message key. If no mapping exists, EVO creates or reuses a
+  provisional contact keyed by the canonical `@lid` identifier without
+  inventing a `phone_number`; later history reconciliation can merge or update
+  that identity when a trusted phone mapping becomes available. Incoming
+  `message_created` events and outgoing Chatwoot echoes that already carry a
+  `WAID:` source are acknowledged before loading the Chatwoot client. A valid
+  new outgoing message still follows authenticated durable admission.
+- **Flags/schema:** no new flag, schema, or public API. The behavior uses the
+  existing Baileys LID mapping, Chatwoot contact identifier, `WAID:` source ID,
+  and durable outbound admission contract.
+- **Source areas:** `chatwoot.service.ts`, with focused unit coverage in
+  `chatwoot-create-conversation-lid.test.ts` and
+  `chatwoot-webhook-fast-ack.test.ts`.
+- **Upstream reapply/conflicts:** preserve the distinction between phone JIDs,
+  LIDs, hosted LIDs, and groups when upstream changes conversation creation.
+  Never derive a phone number from the numeric portion of a LID. Keep the fast
+  acknowledgement before `clientCw`; do not bypass authentication or durable
+  admission for a genuinely deliverable outgoing webhook.
+- **Rollback:** revert this block to the prior conversation lookup and webhook
+  path. Provisional contacts remain valid Chatwoot contacts and can be
+  reconciled by the existing LID maintenance path; no schema rollback is
+  required.
+- **Focused regression:** run both focused tests, the complete unit suite,
+  `npm run lint:check`, `npm run build`, and staging canaries for an unresolved
+  LID, a resolved LID, an inbound/retained echo, and one valid outgoing message
+  before production promotion.
+
 ## Durable Chatwoot API-inbox outbound delivery
 
 - **Behavior:** validated Chatwoot outgoing webhooks are transactionally
