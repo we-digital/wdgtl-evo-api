@@ -402,3 +402,33 @@ test('accepts the exact frozen provider origin without a reverse Chatwoot read',
   assert.equal(fixture.bindingWrites(), 1);
   assert.equal(fixture.reverseReads(), 0);
 });
+
+for (const suppliedId of [undefined, 'foreign-instance']) {
+  test(`binds an existing inbox using the stored instance ID (supplied: ${suppliedId})`, async () => {
+    const { service } = serviceFixture('instance-1');
+    let saved = false;
+    service.waMonitor.waInstances['test-instance'].setChatwoot = async () => undefined;
+    service.prismaRepository = {
+      instance: {
+        findUniqueOrThrow: async ({ where }: any) => {
+          assert.deepEqual(where, { name: 'test-instance' });
+          return { id: 'instance-1' };
+        },
+      },
+      chatwoot: {
+        update: async ({ where, data }: any) => {
+          assert.deepEqual(where, { instanceId: 'instance-1' });
+          assert.equal(data.webhookSecret, 's'.repeat(24));
+          saved = true;
+        },
+      },
+    };
+    service.getInbox = async (instance: any) => {
+      assert.equal(instance.instanceId, 'instance-1');
+      return { secret: 's'.repeat(24) };
+    };
+    service.cache.deleteAll = async () => undefined;
+    await service.create({ instanceName: 'test-instance', instanceId: suppliedId }, { autoCreate: false });
+    assert.equal(saved, true);
+  });
+}

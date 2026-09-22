@@ -253,3 +253,16 @@ quality jobs as part of conflict resolution.
 
 - EVO includes `X-Chatwoot-Native-Bridge-Token` from `CHATWOOT_NATIVE_BRIDGE_TOKEN` on its authenticated Chatwoot client. Chatwoot requires this second credential before accepting `skip_native`, channel reaction actors, or other bridge-only parameters.
 - Native-forward ambiguity and archive-key acceptance are shared production helpers imported directly by unit tests; tests must not duplicate these conditions.
+
+## Local development lab and existing inbox binding
+
+The local Docker lab in `bbc-devops/local/messaging` mounts this worktree using
+`Dockerfile.dev-lab`, runs `tsx watch`, and retains independent database and
+session volumes. It starts from production `db98edeca8eda7c55556207a64dc8d22901dca43`.
+During setup, `POST /chatwoot/set/:instanceName` with `autoCreate=false` returned
+500 because the route provides no `instanceId` when storing the signed webhook
+secret. `ChatwootService.create` now resolves the persisted ID by route name
+before either inbox initialization path and overrides any query-supplied ID.
+Regression cases cover missing and foreign IDs; the live local API verifies
+both existing inbox bindings and durable 24-character signing secrets.
+No production deployment is part of this local change.
