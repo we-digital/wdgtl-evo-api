@@ -694,11 +694,19 @@ export class ChatwootService {
         return null;
       }
 
-      const findContact = await this.findContact(instance, phoneNumber);
+      const createdContact = contact as any;
+      const createdContactId =
+        createdContact?.payload?.id || createdContact?.payload?.contact?.id || createdContact?.id;
+      const persistedContact = createdContactId
+        ? null
+        : jid
+          ? await this.findContactByIdentifier(instance, jid)
+          : await this.findContact(instance, phoneNumber);
+      const contactId = createdContactId || persistedContact?.id;
 
-      const contactId = findContact?.id;
-
-      await this.addLabelToContact(provider.nameInbox, contactId);
+      if (contactId) {
+        await this.addLabelToContact(provider.nameInbox, contactId);
+      }
 
       return contact;
     } catch (error) {
@@ -986,13 +994,16 @@ export class ChatwootService {
     }
 
     const isGroup = remoteJid.endsWith('@g.us');
-    const isLid = !isGroup && (body.key.addressingMode === 'lid' || isLidJid(remoteJid));
-    let phoneNumber: string | undefined =
-      isLid && !isGroup ? (typeof body.key.remoteJidAlt === 'string' ? body.key.remoteJidAlt : undefined) : remoteJid;
+    const isDirectLid = !isGroup && (body.key.addressingMode === 'lid' || isLidJid(remoteJid));
+    let phoneNumber: string | undefined = isDirectLid
+      ? typeof body.key.remoteJidAlt === 'string'
+        ? body.key.remoteJidAlt
+        : undefined
+      : remoteJid;
 
     // Baileys sometimes omits remoteJidAlt for LID chats. Resolve PN when possible;
     // otherwise keep a provisional @lid identity so ingress does not drop the message.
-    if (isLid && !isGroup && !isPhoneJid(phoneNumber)) {
+    if (isDirectLid && !isPhoneJid(phoneNumber)) {
       const lidJid = isLidJid(remoteJid) ? remoteJid : phoneNumber;
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       const resolved =
@@ -1010,7 +1021,7 @@ export class ChatwootService {
       }
     }
 
-    const isProvisionalLid = isLid && !isGroup && isLidJid(phoneNumber);
+    const isProvisionalLid = isDirectLid && isLidJid(phoneNumber);
     const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
     const maxWaitTime = 5000; // 5 seconds
@@ -1111,15 +1122,19 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
+          const participantJid =
+            !body.key.fromMe && isLidJid(body.key.participant) && isPhoneJid(body.key.participantAlt)
+              ? body.key.participantAlt
+              : body.key.participant;
+          const isProvisionalParticipantLid = isLidJid(participantJid);
           nameContact = `${group.subject} (GROUP)`;
 
-          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
-            participantJid.split('@')[0],
-          );
+          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
           this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
 
-          const findParticipant = await this.findContact(instance, participantJid.split('@')[0]);
+          const findParticipant = isProvisionalParticipantLid
+            ? await this.findContactByIdentifier(instance, participantJid)
+            : await this.findContact(instance, participantJid.split('@')[0]);
 
           if (findParticipant) {
             this.logger.verbose(
@@ -1144,7 +1159,7 @@ export class ChatwootService {
           }
         }
 
-        const pictureLookupId = isProvisionalLid ? phoneNumber.split('@')[0] : chatId;
+        const pictureLookupId = isProvisionalLid ? phoneNumber : chatId;
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(pictureLookupId);
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
