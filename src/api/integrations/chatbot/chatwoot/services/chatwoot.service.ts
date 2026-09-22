@@ -66,6 +66,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
   getExactChatwootMessage,
+  isChatwootOutgoingMessageType,
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
@@ -662,6 +663,7 @@ export class ChatwootService {
 
       let data: any = {};
       if (!isGroup) {
+        const isLidIdentifier = typeof jid === 'string' && (jid.endsWith('@lid') || jid.endsWith('@hosted.lid'));
         data = {
           inbox_id: inboxId,
           name: name || phoneNumber,
@@ -669,7 +671,8 @@ export class ChatwootService {
           avatar_url: avatar_url,
         };
 
-        if ((jid && jid.includes('@')) || !jid) {
+        // Provisional LID contacts must not invent a phone_number from the LID user id.
+        if (!isLidIdentifier && (!jid || jid.includes('@'))) {
           data['phone_number'] = `+${phoneNumber}`;
         }
       } else {
@@ -691,11 +694,19 @@ export class ChatwootService {
         return null;
       }
 
-      const findContact = await this.findContact(instance, phoneNumber);
+      const createdContact = contact as any;
+      const createdContactId =
+        createdContact?.payload?.id || createdContact?.payload?.contact?.id || createdContact?.id;
+      const persistedContact = createdContactId
+        ? null
+        : jid
+          ? await this.findContactByIdentifier(instance, jid)
+          : await this.findContact(instance, phoneNumber);
+      const contactId = createdContactId || persistedContact?.id;
 
-      const contactId = findContact?.id;
-
-      await this.addLabelToContact(provider.nameInbox, contactId);
+      if (contactId) {
+        await this.addLabelToContact(provider.nameInbox, contactId);
+      }
 
       return contact;
     } catch (error) {
@@ -976,10 +987,41 @@ export class ChatwootService {
   }
 
   public async createConversation(instance: InstanceDto, body: any) {
-    const isLid = body.key.addressingMode === 'lid';
-    const isGroup = body.key.remoteJid.endsWith('@g.us');
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
-    const { remoteJid } = body.key;
+    const remoteJid = typeof body?.key?.remoteJid === 'string' ? body.key.remoteJid : '';
+    if (!remoteJid) {
+      this.logger.warn('createConversation: missing remoteJid');
+      return null;
+    }
+
+    const isGroup = remoteJid.endsWith('@g.us');
+    const isDirectLid = !isGroup && (body.key.addressingMode === 'lid' || isLidJid(remoteJid));
+    let phoneNumber: string | undefined = isDirectLid
+      ? typeof body.key.remoteJidAlt === 'string'
+        ? body.key.remoteJidAlt
+        : undefined
+      : remoteJid;
+
+    // Baileys sometimes omits remoteJidAlt for LID chats. Resolve PN when possible;
+    // otherwise keep a provisional @lid identity so ingress does not drop the message.
+    if (isDirectLid && !isPhoneJid(phoneNumber)) {
+      const lidJid = isLidJid(remoteJid) ? remoteJid : phoneNumber;
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      const resolved =
+        lidJid && waInstance?.resolvePhoneJidForLid ? await waInstance.resolvePhoneJidForLid(lidJid) : null;
+      if (isPhoneJid(resolved)) {
+        phoneNumber = resolved;
+        body.key.remoteJidAlt = resolved;
+        this.logger.verbose(`Resolved LID ${lidJid} → ${resolved} for createConversation`);
+      } else if (isLidJid(lidJid)) {
+        phoneNumber = toCanonicalHistoryJid(lidJid);
+        this.logger.warn(`Using provisional LID contact for createConversation: ${phoneNumber}`);
+      } else {
+        this.logger.warn(`Unable to resolve LID for createConversation: ${remoteJid}`);
+        return null;
+      }
+    }
+
+    const isProvisionalLid = isDirectLid && isLidJid(phoneNumber);
     const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
     const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
     const maxWaitTime = 5000; // 5 seconds
@@ -988,8 +1030,8 @@ export class ChatwootService {
     const { client, provider } = context;
 
     try {
-      // Processa atualização de contatos já criados @lid
-      if (phoneNumber && remoteJid && !isGroup) {
+      // Processa atualização de contatos já criados @lid (only when we have a real PN)
+      if (phoneNumber && remoteJid && !isGroup && !isProvisionalLid) {
         const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
         if (contact && contact.identifier !== remoteJid) {
           this.logger.verbose(
@@ -1070,7 +1112,7 @@ export class ChatwootService {
           return (await this.cache.get(cacheKey)) as number;
         }
 
-        const chatId = isGroup ? remoteJid : phoneNumber.split('@')[0].split(':')[0];
+        const chatId = isGroup ? remoteJid : isProvisionalLid ? phoneNumber : phoneNumber.split('@')[0].split(':')[0];
         let nameContact = !body.key.fromMe ? body.pushName : chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;
@@ -1080,15 +1122,19 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
+          const participantJid =
+            !body.key.fromMe && isLidJid(body.key.participant) && isPhoneJid(body.key.participantAlt)
+              ? body.key.participantAlt
+              : body.key.participant;
+          const isProvisionalParticipantLid = isLidJid(participantJid);
           nameContact = `${group.subject} (GROUP)`;
 
-          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
-            participantJid.split('@')[0],
-          );
+          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
           this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
 
-          const findParticipant = await this.findContact(instance, participantJid.split('@')[0]);
+          const findParticipant = isProvisionalParticipantLid
+            ? await this.findContactByIdentifier(instance, participantJid)
+            : await this.findContact(instance, participantJid.split('@')[0]);
 
           if (findParticipant) {
             this.logger.verbose(
@@ -1113,11 +1159,14 @@ export class ChatwootService {
           }
         }
 
-        const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
+        const pictureLookupId = isProvisionalLid ? phoneNumber : chatId;
+        const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(pictureLookupId);
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
         this.logger.verbose(`Searching contact for: ${chatId}`);
-        let contact = await this.findContact(instance, chatId);
+        let contact = isProvisionalLid
+          ? await this.findContactByIdentifier(instance, phoneNumber)
+          : await this.findContact(instance, chatId);
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
@@ -1140,7 +1189,7 @@ export class ChatwootService {
         } else {
           contact = await this.createContact(
             instance,
-            chatId,
+            isProvisionalLid ? phoneNumber.split('@')[0] : chatId,
             filterInbox.id,
             isGroup,
             nameContact,
@@ -2333,6 +2382,15 @@ export class ChatwootService {
         body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
         '';
       const deliverableOutgoing = isDeliverableChatwootOutgoing(body, candidateChatId);
+      // Fast-ack Chatwoot echoes that must not be re-sent to WhatsApp. Doing heavy
+      // work here races Chatwoot's webhook read timeout and can falsely fail inbound.
+      if (body?.event === 'message_created' && !deliverableOutgoing) {
+        const isTemplate = body?.message_type === 'template' || body?.message_type === 3 || body?.message_type === '3';
+        const alreadyBridged = typeof body?.source_id === 'string' && body.source_id.startsWith('WAID:');
+        if ((!isChatwootOutgoingMessageType(body?.message_type) && !isTemplate) || alreadyBridged) {
+          return { message: 'ignored' };
+        }
+      }
       const asyncDeliverable = outboundConfig.OUTBOUND_ASYNC_ENABLED && deliverableOutgoing;
       outboundEnqueueAttempted = asyncDeliverable;
       if (asyncDeliverable && !authenticatedAdmission) {
