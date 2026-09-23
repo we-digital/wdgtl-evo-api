@@ -75,6 +75,7 @@ import {
   shouldAttemptNativeForward,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
+  compactReplyToIds,
   extractWhatsappReplyStanzaId,
   toChatwootWhatsappSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
@@ -3089,7 +3090,7 @@ export class ChatwootService {
   private async getReplyToIds(
     msg: any,
     instance: InstanceDto,
-  ): Promise<{ in_reply_to: string; in_reply_to_external_id: string }> {
+  ): Promise<Record<string, string | number>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
 
@@ -3105,10 +3106,10 @@ export class ChatwootService {
       }
     }
 
-    return {
+    return compactReplyToIds({
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
-    };
+    });
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
