@@ -9,6 +9,8 @@ import test from 'node:test';
 import {
   isAmbiguousNativeForwardError,
   isUsableArchiveMessageKey,
+  resolveArchiveChatJid,
+  resolveNativeChatProbeId,
   shouldAttemptNativeForward,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 
@@ -34,4 +36,46 @@ test('native forwarding consumes explicit delivery mode with legacy fallback', (
   assert.equal(shouldAttemptNativeForward({ delivery_mode: 'copy', same_inbox: true }), false);
   assert.equal(shouldAttemptNativeForward({ same_inbox: true }), true);
   assert.equal(shouldAttemptNativeForward({ same_inbox: false }), false);
+});
+
+test('archive chat JID prefers last message remoteJid over phone probe id', () => {
+  assert.equal(
+    resolveArchiveChatJid({
+      chat: '5511999999999@s.whatsapp.net',
+      lastMessageRemoteJid: '123456789012345@lid',
+    }),
+    '123456789012345@lid',
+  );
+  assert.equal(
+    resolveArchiveChatJid({
+      chat: '5511999999999',
+      lastMessageRemoteJid: null,
+    }),
+    '5511999999999',
+  );
+  assert.equal(resolveArchiveChatJid({ chat: '', lastMessageRemoteJid: '  ' }), null);
+});
+
+test('native chat probe id prefers contact_inbox source_id then sender fields', () => {
+  assert.equal(
+    resolveNativeChatProbeId({
+      contact_inbox: { source_id: '5511888777666' },
+      meta: { sender: { identifier: '999@lid', phone_number: '+5511999999999' } },
+    }),
+    '5511888777666',
+  );
+  assert.equal(
+    resolveNativeChatProbeId({
+      meta: { sender: { identifier: 'abc@lid', phone_number: '+5511999999999' } },
+    }),
+    'abc@lid',
+  );
+  assert.equal(
+    resolveNativeChatProbeId({
+      meta: { sender: { phone_number: '+5511999999999' } },
+    }, 'fallback'),
+    '5511999999999',
+  );
+  assert.equal(resolveNativeChatProbeId({ meta: { sender: { identifier: '123456' } } }, 'ok'), 'ok');
+  assert.equal(resolveNativeChatProbeId({}, ''), '');
 });
