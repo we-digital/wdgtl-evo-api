@@ -94,6 +94,7 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
+import { resolveWhatsappReactionKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
 import {
   buildWhatsappReactionActor,
   isAgentReactionWebhook,
@@ -3680,18 +3681,40 @@ export class ChatwootService {
     const reaction = body?.reaction;
     if (!reaction) return { message: 'bot' };
 
-    const localMessage = await this.prismaRepository.message.findFirst({
+    let localMessage = await this.prismaRepository.message.findFirst({
       where: {
         chatwootMessageId: Number(body.id),
         instanceId: instance.instanceId,
       },
     });
-    const key = localMessage?.key as { id?: string; remoteJid?: string; fromMe?: boolean; participant?: string } | null;
+
+    if (!localMessage) {
+      const waId = String(body.source_id || '')
+        .replace(/^WAID:/i, '')
+        .trim();
+      if (waId) {
+        localMessage = await this.getMessageByKeyId(instance, waId);
+      }
+    }
+
+    const key = resolveWhatsappReactionKey({
+      storedKey: localMessage?.key as {
+        id?: string;
+        remoteJid?: string;
+        fromMe?: boolean;
+        participant?: string;
+      } | null,
+      sourceId: body.source_id,
+      messageType: body.message_type,
+      body,
+    });
+
     if (!key?.id || !key?.remoteJid) {
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_reaction_outbound_key_missing',
           chatwootMessageId: body.id,
+          sourceId: body.source_id,
         }),
       );
       throw new BadRequestException('WhatsApp reaction key unavailable');
