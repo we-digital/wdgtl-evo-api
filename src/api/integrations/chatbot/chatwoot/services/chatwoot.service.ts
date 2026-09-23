@@ -75,6 +75,10 @@ import {
   shouldAttemptNativeForward,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
+  extractWhatsappReplyStanzaId,
+  toChatwootWhatsappSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
+import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
@@ -3090,9 +3094,11 @@ export class ChatwootService {
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
-      if (inReplyToExternalId) {
-        const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      const stanzaId = extractWhatsappReplyStanzaId(msg);
+      // Chatwoot Evolution messages use source_id `WAID:<stanzaId>`.
+      inReplyToExternalId = toChatwootWhatsappSourceId(stanzaId);
+      if (stanzaId) {
+        const message = await this.getMessageByKeyId(instance, stanzaId);
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
@@ -3885,7 +3891,7 @@ export class ChatwootService {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = extractWhatsappReplyStanzaId(body);
 
         let quotedMsg = null;
 
