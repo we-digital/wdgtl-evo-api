@@ -77,6 +77,11 @@ import {
   whatsappIdFromSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
+  compactReplyToIds,
+  extractWhatsappReplyStanzaId,
+  toChatwootWhatsappSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
+import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
@@ -3158,24 +3163,26 @@ export class ChatwootService {
   private async getReplyToIds(
     msg: any,
     instance: InstanceDto,
-  ): Promise<{ in_reply_to: string; in_reply_to_external_id: string }> {
+  ): Promise<Record<string, string | number>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
-      if (inReplyToExternalId) {
-        const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      const stanzaId = extractWhatsappReplyStanzaId(msg);
+      // Chatwoot Evolution messages use source_id `WAID:<stanzaId>`.
+      inReplyToExternalId = toChatwootWhatsappSourceId(stanzaId);
+      if (stanzaId) {
+        const message = await this.getMessageByKeyId(instance, stanzaId);
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
       }
     }
 
-    return {
+    return compactReplyToIds({
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
-    };
+    });
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
@@ -3986,7 +3993,7 @@ export class ChatwootService {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = extractWhatsappReplyStanzaId(body);
 
         let quotedMsg = null;
 
