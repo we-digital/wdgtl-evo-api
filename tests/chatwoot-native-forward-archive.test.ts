@@ -10,6 +10,7 @@ import {
   isAmbiguousNativeForwardError,
   isUsableArchiveMessageKey,
   shouldAttemptNativeForward,
+  whatsappIdFromSourceId,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 
 test('ambiguous native forward errors must not fall back to content re-send', () => {
@@ -32,6 +33,15 @@ test('archive refuses synthetic stub message keys', () => {
 test('native forwarding consumes explicit delivery mode with legacy fallback', () => {
   assert.equal(shouldAttemptNativeForward({ delivery_mode: 'native_forward', same_inbox: true }), true);
   assert.equal(shouldAttemptNativeForward({ delivery_mode: 'copy', same_inbox: true }), false);
+  assert.equal(shouldAttemptNativeForward({ delivery_mode: 'native_forward', same_inbox: false }), true);
   assert.equal(shouldAttemptNativeForward({ same_inbox: true }), true);
   assert.equal(shouldAttemptNativeForward({ same_inbox: false }), false);
+});
+
+test('whatsapp id is extracted from Chatwoot WAID source ids', () => {
+  assert.equal(whatsappIdFromSourceId('WAID:3EB0ABCDEF'), '3EB0ABCDEF');
+  assert.equal(whatsappIdFromSourceId('  WAID:abc123  '), 'abc123');
+  assert.equal(whatsappIdFromSourceId('WAID:'), null);
+  assert.equal(whatsappIdFromSourceId('3EB0ABCDEF'), null);
+  assert.equal(whatsappIdFromSourceId(null), null);
 });

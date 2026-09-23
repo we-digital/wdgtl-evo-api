@@ -12,3 +12,12 @@ export const shouldAttemptNativeForward = (forwardedFrom: Record<string, unknown
 
   return forwardedFrom.same_inbox !== false;
 };
+
+/** Extract Baileys message key id from Chatwoot source_id (`WAID:…`). */
+export const whatsappIdFromSourceId = (sourceId: unknown): string | null => {
+  if (typeof sourceId !== 'string') return null;
+  const trimmed = sourceId.trim();
+  if (!trimmed.startsWith('WAID:')) return null;
+  const id = trimmed.slice('WAID:'.length).trim();
+  return id || null;
+};

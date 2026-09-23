@@ -73,6 +73,7 @@ import {
 import {
   isAmbiguousNativeForwardError,
   shouldAttemptNativeForward,
+  whatsappIdFromSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   chatwootOutboundContactIdentity,
@@ -1504,6 +1505,8 @@ export class ChatwootService {
       return null;
     }
 
+    await this.bindInboundChatwootMessageId(sourceId, message, instance, conversationId, provider);
+
     return message;
   }
 
@@ -1659,6 +1662,8 @@ export class ChatwootService {
 
     try {
       const { data } = await axios.request(config);
+
+      await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId, provider);
 
       return data;
     } catch (error) {
@@ -3026,6 +3031,81 @@ export class ChatwootService {
     }
   }
 
+  /**
+   * Map inbound WA messages onto Chatwoot IDs so later native forward / reply /
+   * delete can resolve the original Baileys payload (contacts, media, etc.).
+   */
+  private async bindInboundChatwootMessageId(
+    sourceId: string | undefined,
+    chatwootMessage: { id?: number } | null | undefined,
+    instance: InstanceDto,
+    conversationId: number,
+    _provider?: ChatwootModel | null,
+  ): Promise<void> {
+    const whatsappMessageId = whatsappIdFromSourceId(sourceId);
+    const chatwootMessageId = Number(chatwootMessage?.id);
+    if (!whatsappMessageId || !Number.isSafeInteger(chatwootMessageId) || chatwootMessageId <= 0) {
+      return;
+    }
+
+    try {
+      await this.persistLocalChatwootMessageBinding(
+        whatsappMessageId,
+        {
+          messageId: chatwootMessageId,
+          conversationId,
+        },
+        instance,
+      );
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_inbound_message_bind_failed',
+          chatwootMessageId,
+          whatsappMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+    }
+  }
+
+  private async resolveStoredForwardMessage(
+    instance: InstanceDto,
+    sourceMessageId: number,
+    sourceId: unknown,
+  ): Promise<MessageModel | null> {
+    const byChatwootId = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: sourceMessageId,
+        instanceId: instance.instanceId,
+      },
+    });
+    if (byChatwootId?.key && byChatwootId?.message) {
+      return byChatwootId;
+    }
+
+    const whatsappMessageId = whatsappIdFromSourceId(sourceId);
+    if (!whatsappMessageId) return byChatwootId || null;
+
+    const byKey = await this.getMessageByKeyId(instance, whatsappMessageId);
+    if (byKey?.key && byKey?.message) {
+      // Heal the mapping for subsequent native ops (edit/delete/forward).
+      try {
+        await this.persistLocalChatwootMessageBinding(
+          whatsappMessageId,
+          { messageId: sourceMessageId },
+          instance,
+        );
+      } catch {
+        // Best-effort heal — forward can still proceed with the key lookup.
+      }
+      return byKey;
+    }
+
+    return byChatwootId || null;
+  }
+
   private async updateChatwootMessageId(
     message: MessageModel,
     chatwootMessageIds: ChatwootMessage,
@@ -3148,16 +3228,18 @@ export class ChatwootService {
 
     if (!shouldAttemptNativeForward(from)) return null;
 
-    const stored = await this.prismaRepository.message.findFirst({
-      where: {
-        chatwootMessageId: sourceMessageId,
-        instanceId: instance.instanceId,
-      },
-    });
+    const stored = await this.resolveStoredForwardMessage(instance, sourceMessageId, from.source_id);
 
     const key = stored?.key as WAMessageKey | undefined;
     const messageContent = stored?.message as WAMessageContent | undefined;
     if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_source_missing',
+          sourceMessageId,
+          sourceId: typeof from.source_id === 'string' ? from.source_id.slice(0, 80) : null,
+        }),
+      );
       return null;
     }
 
