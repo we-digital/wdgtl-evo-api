@@ -42,7 +42,7 @@ export const resolveWhatsappReactionRemoteJid = (body: {
 };
 
 export const resolveWhatsappReactionKey = (params: {
-  storedKey?: WhatsappReactionKey | null;
+  storedKey?: Partial<WhatsappReactionKey> | null;
   sourceId?: unknown;
   messageType?: unknown;
   body?: {
@@ -64,8 +64,7 @@ export const resolveWhatsappReactionKey = (params: {
 
   const id = stripWaid(params.sourceId) || (stored?.id ? String(stored.id) : '');
   const remoteJid =
-    (stored?.remoteJid ? String(stored.remoteJid) : null) ||
-    resolveWhatsappReactionRemoteJid(params.body || {});
+    (stored?.remoteJid ? String(stored.remoteJid) : null) || resolveWhatsappReactionRemoteJid(params.body || {});
 
   if (!id || !remoteJid) return null;
 

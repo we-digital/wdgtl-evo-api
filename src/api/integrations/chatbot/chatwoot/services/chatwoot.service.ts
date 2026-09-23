@@ -94,11 +94,11 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
+import { resolveWhatsappReactionKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
 import {
   buildWhatsappReactionActor,
   isAgentReactionWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
-import { resolveWhatsappReactionKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import {
   compactReplyToIds,
