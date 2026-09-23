@@ -34,7 +34,19 @@ export const buildWhatsappReactionActor = (body: {
   external_id: string;
   source: string;
 } => {
-  const externalId = body?.key?.participant || (body?.key?.fromMe ? 'me' : body?.key?.remoteJid) || 'unknown';
+  // Own-device reactions must always identity as `me`. Using participant/remoteJid
+  // for fromMe makes Chatwoot treat the echo as a second reactor beside the agent.
+  if (body?.key?.fromMe) {
+    return {
+      actor_type: 'external',
+      actor_id: 'me',
+      actor_name: body?.pushName || 'Me',
+      external_id: 'me',
+      source: 'whatsapp',
+    };
+  }
+
+  const externalId = body?.key?.participant || body?.key?.remoteJid || 'unknown';
   const name = body?.pushName || externalId.split('@')[0] || externalId;
   return {
     actor_type: 'external',
