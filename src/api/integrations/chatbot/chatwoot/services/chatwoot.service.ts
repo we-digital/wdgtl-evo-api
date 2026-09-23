@@ -72,7 +72,9 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
 import {
   isAmbiguousNativeForwardError,
+  resolveNativeChatProbeId,
   shouldAttemptNativeForward,
+  whatsappIdFromSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   chatwootOutboundContactIdentity,
@@ -97,6 +99,11 @@ import {
   isAgentReactionWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
+import {
+  compactReplyToIds,
+  extractWhatsappReplyStanzaId,
+  toChatwootWhatsappSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
@@ -1504,6 +1511,8 @@ export class ChatwootService {
       return null;
     }
 
+    await this.bindInboundChatwootMessageId(sourceId, message, instance, conversationId);
+
     return message;
   }
 
@@ -1659,6 +1668,8 @@ export class ChatwootService {
 
     try {
       const { data } = await axios.request(config);
+
+      await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId);
 
       return data;
     } catch (error) {
@@ -2433,8 +2444,7 @@ export class ChatwootService {
         if (!waInstance) {
           throw new BadRequestException('WhatsApp instance unavailable for native mute');
         }
-        const chatId =
-          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        const chatId = resolveNativeChatProbeId(body, candidateChatId);
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native mute');
         }
@@ -2447,8 +2457,7 @@ export class ChatwootService {
         if (!waInstance) {
           throw new BadRequestException('WhatsApp instance unavailable for native pin');
         }
-        const chatId =
-          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        const chatId = resolveNativeChatProbeId(body, candidateChatId);
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native pin');
         }
@@ -2461,12 +2470,11 @@ export class ChatwootService {
         if (!waInstance) {
           throw new BadRequestException('WhatsApp instance unavailable for native archive');
         }
-        const chatId =
-          body?.meta?.sender?.identifier || body?.meta?.sender?.phone_number?.replace('+', '') || candidateChatId;
+        const chatId = resolveNativeChatProbeId(body, candidateChatId);
         if (!chatId || chatId === '123456') {
           throw new BadRequestException('Chat id missing for native archive');
         }
-        await this.trySendNativeArchive(waInstance, chatId, body);
+        await this.trySendNativeArchive(waInstance, chatId, body, instance);
         return { message: body.archived ? 'archived' : 'unarchived' };
       }
 
@@ -3026,6 +3034,76 @@ export class ChatwootService {
     }
   }
 
+  /**
+   * Map inbound WA messages onto Chatwoot IDs so later native forward / reply /
+   * delete can resolve the original Baileys payload (contacts, media, etc.).
+   */
+  private async bindInboundChatwootMessageId(
+    sourceId: string | undefined,
+    chatwootMessage: { id?: number } | null | undefined,
+    instance: InstanceDto,
+    conversationId: number,
+  ): Promise<void> {
+    const whatsappMessageId = whatsappIdFromSourceId(sourceId);
+    const chatwootMessageId = Number(chatwootMessage?.id);
+    if (!whatsappMessageId || !Number.isSafeInteger(chatwootMessageId) || chatwootMessageId <= 0) {
+      return;
+    }
+
+    try {
+      await this.persistLocalChatwootMessageBinding(
+        whatsappMessageId,
+        {
+          messageId: chatwootMessageId,
+          conversationId,
+        },
+        instance,
+      );
+    } catch (error) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_inbound_message_bind_failed',
+          chatwootMessageId,
+          whatsappMessageId,
+          errorClass: error?.name || 'Error',
+          errorMessage: String(error?.message || error).slice(0, 200),
+        }),
+      );
+    }
+  }
+
+  private async resolveStoredForwardMessage(
+    instance: InstanceDto,
+    sourceMessageId: number,
+    sourceId: unknown,
+  ): Promise<MessageModel | null> {
+    const byChatwootId = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: sourceMessageId,
+        instanceId: instance.instanceId,
+      },
+    });
+    if (byChatwootId?.key && byChatwootId?.message) {
+      return byChatwootId;
+    }
+
+    const whatsappMessageId = whatsappIdFromSourceId(sourceId);
+    if (!whatsappMessageId) return byChatwootId || null;
+
+    const byKey = await this.getMessageByKeyId(instance, whatsappMessageId);
+    if (byKey?.key && byKey?.message) {
+      // Heal the mapping for subsequent native ops (edit/delete/forward).
+      try {
+        await this.persistLocalChatwootMessageBinding(whatsappMessageId, { messageId: sourceMessageId }, instance);
+      } catch {
+        // Best-effort heal — forward can still proceed with the key lookup.
+      }
+      return byKey;
+    }
+
+    return byChatwootId || null;
+  }
+
   private async updateChatwootMessageId(
     message: MessageModel,
     chatwootMessageIds: ChatwootMessage,
@@ -3082,27 +3160,26 @@ export class ChatwootService {
     return (messages as MessageModel[])[0] || null;
   }
 
-  private async getReplyToIds(
-    msg: any,
-    instance: InstanceDto,
-  ): Promise<{ in_reply_to: string; in_reply_to_external_id: string }> {
+  private async getReplyToIds(msg: any, instance: InstanceDto): Promise<Record<string, string | number>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
 
     if (msg) {
-      inReplyToExternalId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId ?? msg.contextInfo?.stanzaId;
-      if (inReplyToExternalId) {
-        const message = await this.getMessageByKeyId(instance, inReplyToExternalId);
+      const stanzaId = extractWhatsappReplyStanzaId(msg);
+      // Chatwoot Evolution messages use source_id `WAID:<stanzaId>`.
+      inReplyToExternalId = toChatwootWhatsappSourceId(stanzaId);
+      if (stanzaId) {
+        const message = await this.getMessageByKeyId(instance, stanzaId);
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
       }
     }
 
-    return {
+    return compactReplyToIds({
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
-    };
+    });
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
@@ -3148,16 +3225,18 @@ export class ChatwootService {
 
     if (!shouldAttemptNativeForward(from)) return null;
 
-    const stored = await this.prismaRepository.message.findFirst({
-      where: {
-        chatwootMessageId: sourceMessageId,
-        instanceId: instance.instanceId,
-      },
-    });
+    const stored = await this.resolveStoredForwardMessage(instance, sourceMessageId, from.source_id);
 
     const key = stored?.key as WAMessageKey | undefined;
     const messageContent = stored?.message as WAMessageContent | undefined;
     if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_native_forward_source_missing',
+          sourceMessageId,
+          sourceId: typeof from.source_id === 'string' ? from.source_id.slice(0, 80) : null,
+        }),
+      );
       return null;
     }
 
@@ -3281,14 +3360,39 @@ export class ChatwootService {
 
   /**
    * Native WhatsApp archive/unarchive (Baileys chatModify { archive }) for Chatwoot archive probe.
+   * Prefers a real last message keyed to this Chatwoot conversation (display_id in body.id)
+   * so PN/@lid mismatches and empty JID lookups do not fail closed incorrectly.
    */
-  private async trySendNativeArchive(waInstance: any, chatId: string, body: any): Promise<void> {
+  private async trySendNativeArchive(waInstance: any, chatId: string, body: any, instance: InstanceDto): Promise<void> {
     const archived = body?.archived === true;
-    if (typeof waInstance?.archiveChat === 'function') {
-      await waInstance.archiveChat({ chat: chatId, archive: archived });
-    } else {
+    if (typeof waInstance?.archiveChat !== 'function') {
       throw new BadRequestException('WhatsApp archive API unavailable');
     }
+
+    const conversationId = Number(body?.id);
+    let lastMessage: any = null;
+    if (Number.isFinite(conversationId) && conversationId > 0) {
+      lastMessage = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: instance.instanceId,
+          chatwootConversationId: conversationId,
+        },
+        orderBy: { messageTimestamp: 'desc' },
+      });
+    }
+
+    const archivePayload: { chat: string; archive: boolean; lastMessage?: any } = {
+      chat: chatId,
+      archive: archived,
+    };
+    if (lastMessage?.key) {
+      archivePayload.lastMessage = {
+        key: lastMessage.key,
+        messageTimestamp: Number(lastMessage.messageTimestamp) || Math.floor(Date.now() / 1000),
+      };
+    }
+
+    await waInstance.archiveChat(archivePayload);
 
     this.logger.verbose(
       JSON.stringify({
@@ -3296,6 +3400,7 @@ export class ChatwootService {
         chatwootConversationId: body?.id,
         targetChatId: chatId,
         archived,
+        lastMessageRemoteJid: archivePayload.lastMessage?.key?.remoteJid || null,
       }),
     );
   }
@@ -3885,7 +3990,7 @@ export class ChatwootService {
           return;
         }
 
-        const quotedId = body.contextInfo?.stanzaId || body.message?.contextInfo?.stanzaId;
+        const quotedId = extractWhatsappReplyStanzaId(body);
 
         let quotedMsg = null;
 

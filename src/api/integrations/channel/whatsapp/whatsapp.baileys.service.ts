@@ -57,7 +57,10 @@ import {
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
-import { isUsableArchiveMessageKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
+import {
+  isUsableArchiveMessageKey,
+  resolveArchiveChatJid,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
@@ -3993,6 +3996,30 @@ export class BaileysStartupService extends ChannelStartupService {
       if (messages.length > 0) {
         return messages[0] as unknown as LastMessage;
       }
+
+      // Some WA builds store the alternate addressing mode on remoteJidAlt.
+      const altMessages = await this.prismaRepository.message.findMany({
+        where: { key: { path: ['remoteJidAlt'], equals: remoteJid }, instanceId: this.instance.id },
+        orderBy: { messageTimestamp: 'desc' },
+        take: 1,
+      });
+      if (altMessages.length > 0) {
+        return altMessages[0] as unknown as LastMessage;
+      }
+    }
+
+    // Last resort: Chatwoot contact_inbox source_id binding (phone / lid / jid string).
+    for (const sourceId of Array.from(new Set([number, jid].filter(Boolean)))) {
+      const bySource = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: this.instance.id,
+          chatwootContactInboxSourceId: sourceId,
+        },
+        orderBy: { messageTimestamp: 'desc' },
+      });
+      if (bySource) {
+        return bySource as unknown as LastMessage;
+      }
     }
 
     throw new NotFoundException('Messages not found');
@@ -4002,7 +4029,6 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       let last_message = data.lastMessage;
       let number = data.chat;
-      const jid = createJid(number || last_message?.key?.remoteJid || '');
 
       if (!last_message && number) {
         last_message = await this.getLastMessage(number);
@@ -4021,9 +4047,26 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new NotFoundException('Last message not found for archive');
       }
 
-      await this.client.chatModify({ archive: data.archive, lastMessages: [last_message] }, jid);
+      // Must archive under the same JID as the stored last message (PN vs LID).
+      const archiveJid = resolveArchiveChatJid({
+        chat: number,
+        lastMessageRemoteJid: (last_message as any)?.key?.remoteJid,
+      });
+      if (!archiveJid) {
+        throw new NotFoundException('Last message not found for archive');
+      }
 
-      return { chatId: jid, archived: data.archive };
+      const minimalLastMessage = {
+        key: (last_message as any).key,
+        messageTimestamp: Number((last_message as any).messageTimestamp) || Math.floor(Date.now() / 1000),
+      };
+
+      await this.client.chatModify(
+        { archive: data.archive, lastMessages: [minimalLastMessage] },
+        createJid(archiveJid),
+      );
+
+      return { chatId: createJid(archiveJid), archived: data.archive };
     } catch (error) {
       if (error instanceof NotFoundException) throw error;
       throw new InternalServerErrorException({
