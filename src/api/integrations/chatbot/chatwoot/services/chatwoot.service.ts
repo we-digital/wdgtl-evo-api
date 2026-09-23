@@ -77,11 +77,6 @@ import {
   whatsappIdFromSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
-  compactReplyToIds,
-  extractWhatsappReplyStanzaId,
-  toChatwootWhatsappSourceId,
-} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
-import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
@@ -104,6 +99,11 @@ import {
   isAgentReactionWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
+import {
+  compactReplyToIds,
+  extractWhatsappReplyStanzaId,
+  toChatwootWhatsappSourceId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
@@ -3160,10 +3160,7 @@ export class ChatwootService {
     return (messages as MessageModel[])[0] || null;
   }
 
-  private async getReplyToIds(
-    msg: any,
-    instance: InstanceDto,
-  ): Promise<Record<string, string | number>> {
+  private async getReplyToIds(msg: any, instance: InstanceDto): Promise<Record<string, string | number>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
 
