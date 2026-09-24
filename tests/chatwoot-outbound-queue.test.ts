@@ -130,6 +130,40 @@ test('freezes the external WhatsApp quote identity for provider-cache fallback',
   assert.equal(parts[0].messageSetHash, buildParts()[0].messageSetHash);
 });
 
+test('freezes a native forward into one deterministic queued provider operation', () => {
+  const first = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: { ...webhook, attachments: [] },
+    chatId: 'opaque-chat',
+    formattedText: 'copied fallback text',
+    origin,
+    nativeForward: {
+      sourceChatwootMessageId: 99,
+      sourceWhatsappMessageId: 'SOURCE-WA-99',
+    },
+  });
+  const replay = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: { ...webhook, attachments: [] },
+    chatId: 'opaque-chat',
+    formattedText: 'copied fallback text',
+    origin,
+    nativeForward: {
+      sourceChatwootMessageId: 99,
+      sourceWhatsappMessageId: 'SOURCE-WA-99',
+    },
+  });
+
+  assert.equal(first.length, 1);
+  assert.deepEqual(replay, first);
+  assert.deepEqual(first[0].payload.nativeForward, {
+    sourceChatwootMessageId: 99,
+    sourceWhatsappMessageId: 'SOURCE-WA-99',
+  });
+  assert.equal(first[0].payload.text, null);
+  assert.match(first[0].plannedWhatsappMessageId, /^WD[A-F0-9]{18}$/);
+});
+
 test('keeps pre-upgrade frozen identities stable while retaining new contact snapshot fields', () => {
   const upgradedOrigin = { ...origin, contactId: 411, contactInboxId: 733 };
   const legacy = buildParts();

@@ -249,6 +249,14 @@ tags are never deployment inputs.
   instead of silently becoming an unquoted message. The existing operation
   identity remains compatible because the signed snapshot fingerprint already
   binds the complete quoted-message attributes.
+  Native same-session forwards use the same durable operation, deterministic
+  planned WhatsApp ID, transport fence, callback retry, and webhook replay
+  protection as text/media delivery. Source resolution and async-delivery
+  availability fail before transport. Once Baileys acknowledges the forward,
+  message-row persistence failure is deferred into callback maintenance and
+  can never return to the copied-content path or trigger a second provider
+  send. The prepared provider result is retained in the operation so local
+  persistence and Chatwoot binding can be retried without transport.
   Admission no longer serializes every route through the singleton
   `ChatwootOutboundAdmissionGuard`. The short transaction first acquires the
   existing destination lane row, which serializes only messages that share an
@@ -276,7 +284,7 @@ tags are never deployment inputs.
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
   before the first Baileys transport call, the deterministic message ID on
-  text/audio/media, persisted authenticated admission during socket outages,
+  text/audio/media/native-forward, persisted authenticated admission during socket outages,
   non-terminal readiness deferral, exact-current-message selection, route validation before
   enqueue, every per-part `provider_delivery` acknowledgement, API-only live
   source-ID confirmation, and fail-closed treatment of expired `sending`
@@ -297,7 +305,8 @@ tags are never deployment inputs.
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
   tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
-  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts`,
+  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts
+  tests/persist-native-forward-message.test.ts`,
   generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,
