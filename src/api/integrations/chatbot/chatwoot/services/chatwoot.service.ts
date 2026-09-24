@@ -59,6 +59,10 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  ChatwootIngressDeliveryFence,
+  chatwootIngressDeliveryKey,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-delivery-fence';
+import {
   buildChatwootEvoRouteBinding,
   buildChatwootIngressAttributes,
   ChatwootEvoRouteBinding,
@@ -177,6 +181,7 @@ export class ChatwootService {
   private readonly historySyncCheckpointKey = 'chatwoot:historySyncCheckpoint';
   private readonly outboundStore: ChatwootOutboundPrismaStore;
   private readonly outboundQueue: ChatwootOutboundQueue;
+  private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -3949,6 +3954,35 @@ export class ChatwootService {
   }
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
+    const deliveryKey = chatwootIngressDeliveryKey({
+      event,
+      instanceId: instance.instanceId,
+      whatsappMessageId: body?.key?.id,
+    });
+    if (!deliveryKey) return this.processWhatsappEvent(event, instance, body);
+
+    return this.inboundDeliveryFence.run(deliveryKey, async () => {
+      const existing = await this.prismaRepository.message.findFirst({
+        where: {
+          instanceId: instance.instanceId,
+          key: { path: ['id'], equals: body.key.id },
+          chatwootMessageId: { not: null },
+        },
+        orderBy: { messageTimestamp: 'desc' },
+      });
+      if (existing?.chatwootMessageId && existing.chatwootConversationId) {
+        return {
+          id: existing.chatwootMessageId,
+          inbox_id: existing.chatwootInboxId,
+          conversation_id: existing.chatwootConversationId,
+        };
+      }
+
+      return this.processWhatsappEvent(event, instance, body);
+    });
+  }
+
+  private async processWhatsappEvent(event: string, instance: InstanceDto, body: any) {
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 

@@ -103,7 +103,11 @@ tags are never deployment inputs.
   values from an earlier Baileys `append` event. If the matching `notify`
   event is stripped of that context, EVO restores those identifiers before
   Chatwoot delivery so native replies and mentions keep their structure;
-  quoted content and message text never enter this cache. Native reaction
+  quoted content and message text never enter this cache. Concurrent
+  `append`/`notify` deliveries for the same provider identity share one
+  Chatwoot request and retain its result briefly; later replays reuse the
+  already persisted Chatwoot binding. This prevents duplicate Chatwoot rows
+  without suppressing a retry after a failed request. Native reaction
   callbacks mark authenticated `fromMe` actors as `external_id=me` and forward the
   provider event timestamp so reporting can reconstruct additions/removals
   without using callback receipt time. For live group ingress, exact native
