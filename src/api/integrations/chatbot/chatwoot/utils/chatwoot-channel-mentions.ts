@@ -85,7 +85,13 @@ export function formatIncomingWhatsappMentions(
   participants: WhatsappGroupParticipantSnapshot[],
 ): string {
   let formatted = text || '';
-  const byId = new Map(participants.map((participant) => [normalizeWhatsappJid(participant.id), participant]));
+  const byId = new Map<string, WhatsappGroupParticipantSnapshot>();
+  for (const participant of participants) {
+    const participantId = normalizeWhatsappJid(participant.id);
+    if (participantId) byId.set(participantId, participant);
+    const phoneAlias = normalizeWhatsappJid(participant.phone || '');
+    if (phoneAlias) byId.set(phoneAlias, participant);
+  }
 
   for (const rawJid of mentionedJids) {
     const jid = normalizeWhatsappJid(rawJid);
@@ -99,7 +105,8 @@ export function formatIncomingWhatsappMentions(
 
     const name = participant.name?.trim() || token;
     const display = `@${name}`;
-    const markup = `[${display}](mention://whatsapp/${encodeURIComponent(jid)}/${encodeURIComponent(name)})`;
+    const participantId = normalizeWhatsappJid(participant.id);
+    const markup = `[${display}](mention://whatsapp/${encodeURIComponent(participantId)}/${encodeURIComponent(name)})`;
     formatted = formatted.replace(new RegExp(`${nativeMention}(?!\\d)`, 'g'), markup);
   }
 

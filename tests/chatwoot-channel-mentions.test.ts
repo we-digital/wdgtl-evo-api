@@ -74,3 +74,14 @@ test('formats only exact provider-mentioned participants as structured Chatwoot 
     'keep @6281119 intact',
   );
 });
+
+test('matches a phone mention to a LID roster participant and emits the roster identity', () => {
+  assert.equal(
+    formatIncomingWhatsappMentions(
+      'hello @628111',
+      ['628111@s.whatsapp.net'],
+      [{ id: '1555000111@lid', name: 'Alice', phone: '628111' }],
+    ),
+    'hello [@Alice](mention://whatsapp/1555000111%40lid/Alice)',
+  );
+});
