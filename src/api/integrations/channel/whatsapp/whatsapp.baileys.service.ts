@@ -58,6 +58,10 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  compactChatwootIngressContext,
+  mergeChatwootIngressContext,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import {
   isUsableArchiveMessageKey,
   resolveArchiveChatJid,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
@@ -1344,6 +1348,16 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+          const ingressContextKey = `chatwoot_ingress_context:${received.key.remoteJid}:${received.key.id}`;
+          const cachedIngressContext = type === 'notify' ? await this.baileysCache.get(ingressContextKey) : null;
+          const ingressContext = compactChatwootIngressContext(messageRaw.contextInfo);
+          if (ingressContext) {
+            await this.baileysCache.set(ingressContextKey, ingressContext, this.MESSAGE_CACHE_TTL_SECONDS);
+          }
+          if (type === 'notify') {
+            const mergedIngressContext = mergeChatwootIngressContext(messageRaw.contextInfo, cachedIngressContext);
+            if (mergedIngressContext) messageRaw.contextInfo = mergedIngressContext;
+          }
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;

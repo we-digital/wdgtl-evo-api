@@ -98,8 +98,13 @@ tags are never deployment inputs.
   provenance envelope. This lets read-only reporting distinguish an explicit
   linked-account mention from unrelated operational or informational group
   traffic. Extraction reads only the current message and supported wrappers;
-  quoted-message mentions are deliberately ignored. Native reaction callbacks
-  mark authenticated `fromMe` actors as `external_id=me` and forward the
+  quoted-message mentions are deliberately ignored. EVO also retains a
+  bounded, privacy-safe cache of only `stanzaId` and validated `mentionedJid`
+  values from an earlier Baileys `append` event. If the matching `notify`
+  event is stripped of that context, EVO restores those identifiers before
+  Chatwoot delivery so native replies and mentions keep their structure;
+  quoted content and message text never enter this cache. Native reaction
+  callbacks mark authenticated `fromMe` actors as `external_id=me` and forward the
   provider event timestamp so reporting can reconstruct additions/removals
   without using callback receipt time. For live group ingress, exact native
   `mentionedJid` actors are also joined to the freshly persisted participant
