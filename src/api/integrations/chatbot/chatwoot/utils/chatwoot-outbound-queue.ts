@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { ChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import { chatwootReplyReferences } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 export type ChatwootOutboundState =
   | 'pending'
@@ -41,6 +42,7 @@ export interface ChatwootOutboundPayload {
   attachmentId?: number;
   attachmentUrl?: string;
   quotedChatwootMessageId?: number;
+  quotedWhatsappMessageId?: string;
   /** Native WhatsApp mention JIDs for group @notifications */
   mentioned?: string[];
   origin: ChatwootOutboundOrigin;
@@ -305,7 +307,7 @@ export function buildChatwootOutboundParts(params: {
     routeBinding: normalizedOrigin.routeBinding,
   };
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
-  const quoted = Number(params.body?.content_attributes?.in_reply_to);
+  const quoted = chatwootReplyReferences(params.body?.content_attributes);
   if (params.body?.attachments !== undefined && !Array.isArray(params.body.attachments)) {
     throw new Error('Invalid current Chatwoot attachments');
   }
@@ -340,7 +342,7 @@ export function buildChatwootOutboundParts(params: {
       messageId,
       chatId,
       text: params.formattedText,
-      quoted: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : null,
+      quoted: quoted.chatwootMessageId || null,
       mentioned: Array.isArray(params.mentioned) ? [...params.mentioned].sort() : [],
       // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
       // excluded from the frozen identity so pre-upgrade retained rows replay
@@ -366,7 +368,8 @@ export function buildChatwootOutboundParts(params: {
         text: 'attachmentUrl' in part && !params.formattedText ? null : params.formattedText,
         attachmentId: 'attachmentId' in part ? part.attachmentId : undefined,
         attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : undefined,
-        quotedChatwootMessageId: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : undefined,
+        quotedChatwootMessageId: quoted.chatwootMessageId,
+        quotedWhatsappMessageId: quoted.whatsappMessageId,
         mentioned: Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
         origin: normalizedOrigin,
       },
