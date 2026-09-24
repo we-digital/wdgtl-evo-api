@@ -82,6 +82,23 @@ export const stripChatwootWhatsappSourceId = (sourceId: string | null | undefine
   return trimmed.startsWith(WAID_PREFIX) ? trimmed.slice(WAID_PREFIX.length) : trimmed;
 };
 
+export const chatwootReplyReferences = (
+  contentAttributes: Record<string, unknown> | null | undefined,
+): { chatwootMessageId?: number; whatsappMessageId?: string } => {
+  const rawChatwootId = Number(contentAttributes?.in_reply_to);
+  const chatwootMessageId = Number.isSafeInteger(rawChatwootId) && rawChatwootId > 0 ? rawChatwootId : undefined;
+  const whatsappMessageId = stripChatwootWhatsappSourceId(
+    typeof contentAttributes?.in_reply_to_external_id === 'string'
+      ? contentAttributes.in_reply_to_external_id
+      : undefined,
+  );
+
+  return {
+    ...(chatwootMessageId ? { chatwootMessageId } : {}),
+    ...(whatsappMessageId ? { whatsappMessageId } : {}),
+  };
+};
+
 /** Drop null reply ids so Chatwoot content_attributes stay clean. */
 export const compactReplyToIds = (ids: {
   in_reply_to: string | number | null;

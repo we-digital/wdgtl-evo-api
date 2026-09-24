@@ -116,6 +116,18 @@ test('uses only the exact top-level message and creates attachment identities in
   assert.equal(new Set(first.map((part) => part.operationKey)).size, 2);
   assert.ok(first.every((part) => /^WD[A-F0-9]{18}$/.test(part.plannedWhatsappMessageId)));
   assert.ok(first.every((part) => part.messageSetHash === first[0].messageSetHash && part.partCount === 2));
+  assert.ok(first.every((part) => part.payload.quotedChatwootMessageId === 99));
+});
+
+test('freezes the external WhatsApp quote identity for provider-cache fallback', () => {
+  const parts = buildParts({
+    ...webhook,
+    content_attributes: { in_reply_to: 99, in_reply_to_external_id: 'WAID:3EB0ABC' },
+  });
+
+  assert.ok(parts.every((part) => part.payload.quotedChatwootMessageId === 99));
+  assert.ok(parts.every((part) => part.payload.quotedWhatsappMessageId === '3EB0ABC'));
+  assert.equal(parts[0].messageSetHash, buildParts()[0].messageSetHash);
 });
 
 test('keeps pre-upgrade frozen identities stable while retaining new contact snapshot fields', () => {

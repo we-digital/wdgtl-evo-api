@@ -92,7 +92,19 @@ tags are never deployment inputs.
   the exact Chatwoot message failed. Successful Chatwoot and public `sendText` calls persist a
   privacy-safe origin and request ID in the stored message `contextInfo`, so a
   server send is distinguishable from an unbound linked-device `fromMe`
-  message after the fact.
+  message after the fact. Group ingress also preserves only the validated,
+  sorted WhatsApp participant JIDs from native `mentionedJid` metadata under
+  `we_digital_ingress.mentioned_jids`; message text is never copied into the
+  provenance envelope. This lets read-only reporting distinguish an explicit
+  linked-account mention from unrelated operational or informational group
+  traffic. Extraction reads only the current message and supported wrappers;
+  quoted-message mentions are deliberately ignored. Native reaction callbacks
+  mark authenticated `fromMe` actors as `external_id=me` and forward the
+  provider event timestamp so reporting can reconstruct additions/removals
+  without using callback receipt time. For live group ingress, exact native
+  `mentionedJid` actors are also joined to the freshly persisted participant
+  roster and rendered as Chatwoot structured mention links. Unresolved actors
+  remain plain text and cannot become a false notification.
 - **Source areas:**
   `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts`,
   `chatwoot-auto-reply-binding.ts`, `outbound-provenance.ts`, and
@@ -230,6 +242,13 @@ tags are never deployment inputs.
   later production history pass cannot re-import a successfully delivered
   live outbound row. Destination lookup failures abort the history batch
   instead of being interpreted as an empty destination.
+  Quoted sends retain both the Chatwoot parent row and its exact external
+  WhatsApp ID in the durable payload. Preparation resolves the internal
+  provider binding first and then the exact external ID within the same
+  instance; a requested quote that cannot be resolved fails before transport
+  instead of silently becoming an unquoted message. The existing operation
+  identity remains compatible because the signed snapshot fingerprint already
+  binds the complete quoted-message attributes.
   Admission no longer serializes every route through the singleton
   `ChatwootOutboundAdmissionGuard`. The short transaction first acquires the
   existing destination lane row, which serializes only messages that share an

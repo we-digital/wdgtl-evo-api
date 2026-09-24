@@ -5,6 +5,7 @@ import {
   buildWhatsappGroupParticipantSnapshots,
   channelMentionsFromAttributes,
   extractWhatsappMentionJids,
+  formatIncomingWhatsappMentions,
   normalizeWhatsappJid,
   stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
@@ -12,6 +13,7 @@ import {
 test('normalizes bare digits and jids', () => {
   assert.equal(normalizeWhatsappJid('628123456789'), '628123456789@s.whatsapp.net');
   assert.equal(normalizeWhatsappJid('628123456789@s.whatsapp.net'), '628123456789@s.whatsapp.net');
+  assert.equal(normalizeWhatsappJid('628123456789:4@s.whatsapp.net'), '628123456789@s.whatsapp.net');
   assert.equal(normalizeWhatsappJid(''), '');
 });
 
@@ -51,4 +53,24 @@ test('buildWhatsappGroupParticipantSnapshots skips empty ids', () => {
   assert.deepEqual(snapshots, [
     { id: '628333@s.whatsapp.net', name: 'Carol', phone: '628333' },
   ]);
+});
+
+test('formats only exact provider-mentioned participants as structured Chatwoot mentions', () => {
+  const participants = [
+    { id: '628111@s.whatsapp.net', name: 'Alice', phone: '628111' },
+    { id: '628222@s.whatsapp.net', name: 'Bob', phone: '628222' },
+  ];
+
+  assert.equal(
+    formatIncomingWhatsappMentions('hello @628111 and @628222', ['628111@s.whatsapp.net'], participants),
+    'hello [@Alice](mention://whatsapp/628111%40s.whatsapp.net/Alice) and @628222',
+  );
+  assert.equal(
+    formatIncomingWhatsappMentions('hello @999999', ['999999@s.whatsapp.net'], participants),
+    'hello @999999',
+  );
+  assert.equal(
+    formatIncomingWhatsappMentions('keep @6281119 intact', ['628111@s.whatsapp.net'], participants),
+    'keep @6281119 intact',
+  );
 });
