@@ -5,6 +5,7 @@ import {
   resolveWhatsappReactionKey,
   resolveWhatsappReactionRemoteJid,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
+import { buildWhatsappReactionActor } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 
 test('prefers stored Baileys key when present', () => {
   assert.deepEqual(
@@ -156,4 +157,30 @@ test('returns null when id or jid cannot be resolved', () => {
     }),
     null,
   );
+});
+
+test('marks authenticated linked-client reactions as self with provider event time', () => {
+  assert.deepEqual(
+    buildWhatsappReactionActor({
+      key: { fromMe: true, participant: '15551234567890@lid', remoteJid: '120363012345678901@g.us' },
+      messageTimestamp: 1_790_134_200,
+    }),
+    {
+      actor_type: 'external',
+      actor_id: '15551234567890@lid',
+      actor_name: '15551234567890',
+      external_id: 'me',
+      source: 'whatsapp',
+      reacted_at: '2026-09-23T03:30:00.000Z',
+    },
+  );
+});
+
+test('keeps unrelated WhatsApp reaction identities external', () => {
+  const actor = buildWhatsappReactionActor({
+    key: { fromMe: false, participant: '628999999999@s.whatsapp.net' },
+  });
+
+  assert.equal(actor.external_id, '628999999999@s.whatsapp.net');
+  assert.equal(actor.reacted_at, undefined);
 });

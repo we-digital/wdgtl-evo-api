@@ -116,6 +116,52 @@ test('uses only the exact top-level message and creates attachment identities in
   assert.equal(new Set(first.map((part) => part.operationKey)).size, 2);
   assert.ok(first.every((part) => /^WD[A-F0-9]{18}$/.test(part.plannedWhatsappMessageId)));
   assert.ok(first.every((part) => part.messageSetHash === first[0].messageSetHash && part.partCount === 2));
+  assert.ok(first.every((part) => part.payload.quotedChatwootMessageId === 99));
+});
+
+test('freezes the external WhatsApp quote identity for provider-cache fallback', () => {
+  const parts = buildParts({
+    ...webhook,
+    content_attributes: { in_reply_to: 99, in_reply_to_external_id: 'WAID:3EB0ABC' },
+  });
+
+  assert.ok(parts.every((part) => part.payload.quotedChatwootMessageId === 99));
+  assert.ok(parts.every((part) => part.payload.quotedWhatsappMessageId === '3EB0ABC'));
+  assert.equal(parts[0].messageSetHash, buildParts()[0].messageSetHash);
+});
+
+test('freezes a native forward into one deterministic queued provider operation', () => {
+  const first = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: { ...webhook, attachments: [] },
+    chatId: 'opaque-chat',
+    formattedText: 'copied fallback text',
+    origin,
+    nativeForward: {
+      sourceChatwootMessageId: 99,
+      sourceWhatsappMessageId: 'SOURCE-WA-99',
+    },
+  });
+  const replay = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: { ...webhook, attachments: [] },
+    chatId: 'opaque-chat',
+    formattedText: 'copied fallback text',
+    origin,
+    nativeForward: {
+      sourceChatwootMessageId: 99,
+      sourceWhatsappMessageId: 'SOURCE-WA-99',
+    },
+  });
+
+  assert.equal(first.length, 1);
+  assert.deepEqual(replay, first);
+  assert.deepEqual(first[0].payload.nativeForward, {
+    sourceChatwootMessageId: 99,
+    sourceWhatsappMessageId: 'SOURCE-WA-99',
+  });
+  assert.equal(first[0].payload.text, null);
+  assert.match(first[0].plannedWhatsappMessageId, /^WD[A-F0-9]{18}$/);
 });
 
 test('keeps pre-upgrade frozen identities stable while retaining new contact snapshot fields', () => {

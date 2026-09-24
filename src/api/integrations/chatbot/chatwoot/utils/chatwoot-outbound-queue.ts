@@ -2,6 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 
 import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { ChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import { chatwootReplyReferences } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 export type ChatwootOutboundState =
   | 'pending'
@@ -40,7 +41,12 @@ export interface ChatwootOutboundPayload {
   text: string | null;
   attachmentId?: number;
   attachmentUrl?: string;
+  nativeForward?: {
+    sourceChatwootMessageId: number;
+    sourceWhatsappMessageId?: string;
+  };
   quotedChatwootMessageId?: number;
+  quotedWhatsappMessageId?: string;
   /** Native WhatsApp mention JIDs for group @notifications */
   mentioned?: string[];
   origin: ChatwootOutboundOrigin;
@@ -82,6 +88,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   sentAt?: Date;
   callbackStartedAt?: Date;
   callbackContext?: unknown;
+  result?: unknown;
 }
 
 export interface ChatwootOutboundAdmission {
@@ -262,6 +269,10 @@ export function buildChatwootOutboundParts(params: {
   formattedText: string | null;
   origin: ChatwootOutboundOrigin;
   mentioned?: string[];
+  nativeForward?: {
+    sourceChatwootMessageId: number;
+    sourceWhatsappMessageId?: string;
+  };
 }): ChatwootOutboundPart[] {
   const instanceId = requiredString(params.instanceId, 'EVO instance id');
   const messageId = asRequiredInteger(params.body?.id, 'Chatwoot message id');
@@ -305,7 +316,18 @@ export function buildChatwootOutboundParts(params: {
     routeBinding: normalizedOrigin.routeBinding,
   };
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
-  const quoted = Number(params.body?.content_attributes?.in_reply_to);
+  const quoted = chatwootReplyReferences(params.body?.content_attributes);
+  const nativeForward = params.nativeForward
+    ? {
+        sourceChatwootMessageId: asRequiredInteger(
+          params.nativeForward.sourceChatwootMessageId,
+          'native forward source message id',
+        ),
+        sourceWhatsappMessageId: params.nativeForward.sourceWhatsappMessageId
+          ? requiredString(params.nativeForward.sourceWhatsappMessageId, 'native forward source WhatsApp id')
+          : undefined,
+      }
+    : undefined;
   if (params.body?.attachments !== undefined && !Array.isArray(params.body.attachments)) {
     throw new Error('Invalid current Chatwoot attachments');
   }
@@ -321,12 +343,17 @@ export function buildChatwootOutboundParts(params: {
   if (attachments.length > MAX_CHATWOOT_OUTBOUND_PARTS) {
     throw new Error('Chatwoot outbound message exceeds provider part limit');
   }
-  if (attachments.length === 0 && (typeof params.formattedText !== 'string' || params.formattedText.length === 0)) {
+  if (
+    !nativeForward &&
+    attachments.length === 0 &&
+    (typeof params.formattedText !== 'string' || params.formattedText.length === 0)
+  ) {
     throw new Error('Invalid empty Chatwoot outbound message');
   }
 
-  const partSpecs =
-    attachments.length > 0
+  const partSpecs = nativeForward
+    ? [{ identity: `native-forward:${nativeForward.sourceChatwootMessageId}` }]
+    : attachments.length > 0
       ? attachments.map((attachment) => ({ identity: `attachment:${attachment.attachmentId}`, ...attachment }))
       : [{ identity: 'text' }];
   const canonicalSet = partSpecs.map((part) => ({
@@ -340,8 +367,9 @@ export function buildChatwootOutboundParts(params: {
       messageId,
       chatId,
       text: params.formattedText,
-      quoted: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : null,
+      quoted: quoted.chatwootMessageId || null,
       mentioned: Array.isArray(params.mentioned) ? [...params.mentioned].sort() : [],
+      nativeForward: nativeForward || null,
       // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
       // excluded from the frozen identity so pre-upgrade retained rows replay
       // against their original operation keys instead of being quarantined.
@@ -363,10 +391,12 @@ export function buildChatwootOutboundParts(params: {
       laneKey: hash(`${instanceId}:${chatId}`),
       payload: {
         chatId,
-        text: 'attachmentUrl' in part && !params.formattedText ? null : params.formattedText,
+        text: nativeForward ? null : 'attachmentUrl' in part && !params.formattedText ? null : params.formattedText,
         attachmentId: 'attachmentId' in part ? part.attachmentId : undefined,
         attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : undefined,
-        quotedChatwootMessageId: Number.isSafeInteger(quoted) && quoted > 0 ? quoted : undefined,
+        nativeForward,
+        quotedChatwootMessageId: quoted.chatwootMessageId,
+        quotedWhatsappMessageId: quoted.whatsappMessageId,
         mentioned: Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
         origin: normalizedOrigin,
       },

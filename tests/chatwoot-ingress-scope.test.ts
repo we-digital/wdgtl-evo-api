@@ -6,7 +6,10 @@ import {
   buildChatwootIngressAttributes,
   chatwootEvoRouteBindingsEqual,
   classifyChatwootIngressScope,
+  compactChatwootIngressContext,
+  extractChatwootIngressMentionJids,
   isChatwootLinkedClientSentEvent,
+  mergeChatwootIngressContext,
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 
@@ -48,6 +51,89 @@ test('builds a versioned ingress contract for Chatwoot content attributes', () =
       route,
     },
   });
+});
+
+test('preserves exact WhatsApp mention identities without message text', () => {
+  const message = {
+    key: { remoteJid: '123@g.us', fromMe: false },
+    message: {
+      extendedTextMessage: {
+        text: 'private message text is not copied into ingress metadata',
+        contextInfo: {
+          mentionedJid: ['15551234567890@lid', '628123456789@s.whatsapp.net', 'bad@example.com'],
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(extractChatwootIngressMentionJids(message), ['15551234567890@lid', '628123456789@s.whatsapp.net']);
+  assert.deepEqual(buildChatwootIngressAttributes(message, route).we_digital_ingress.mentioned_jids, [
+    '15551234567890@lid',
+    '628123456789@s.whatsapp.net',
+  ]);
+  assert.equal(JSON.stringify(buildChatwootIngressAttributes(message, route)).includes('private message text'), false);
+});
+
+test('recovers reply and mention context from an earlier append before a stripped notify', () => {
+  const cached = compactChatwootIngressContext({
+    stanzaId: 'SOURCE-1',
+    mentionedJid: ['15551234567890@lid'],
+    quotedMessage: { conversation: 'must not enter the cache' },
+  });
+  assert.deepEqual(cached, {
+    stanzaId: 'SOURCE-1',
+    mentionedJid: ['15551234567890@lid'],
+  });
+
+  const merged = mergeChatwootIngressContext(undefined, cached);
+  const message = {
+    key: { remoteJid: '123@g.us', fromMe: false },
+    message: { conversation: 'visible message' },
+    contextInfo: merged,
+  };
+  assert.equal(merged?.stanzaId, 'SOURCE-1');
+  assert.deepEqual(extractChatwootIngressMentionJids(message), ['15551234567890@lid']);
+  assert.deepEqual(buildChatwootIngressAttributes(message, route).we_digital_ingress.mentioned_jids, [
+    '15551234567890@lid',
+  ]);
+  assert.equal(JSON.stringify(merged).includes('must not enter the cache'), false);
+});
+
+test('does not inherit a linked-account mention from a quoted message', () => {
+  const message = {
+    key: { remoteJid: '123@g.us', fromMe: false },
+    message: {
+      extendedTextMessage: {
+        text: 'reply without a current mention',
+        contextInfo: {
+          quotedMessage: {
+            extendedTextMessage: {
+              contextInfo: { mentionedJid: ['15551234567890@lid'] },
+            },
+          },
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(extractChatwootIngressMentionJids(message), []);
+});
+
+test('reads mentions inside supported current-message wrappers only', () => {
+  const message = {
+    key: { remoteJid: '123@g.us', fromMe: false },
+    message: {
+      ephemeralMessage: {
+        message: {
+          extendedTextMessage: {
+            contextInfo: { mentionedJid: ['15551234567890@hosted.lid'] },
+          },
+        },
+      },
+    },
+  };
+
+  assert.deepEqual(extractChatwootIngressMentionJids(message), ['15551234567890@hosted.lid']);
 });
 
 test('binds the physical receiver without exposing its number and rejects incomplete routes', () => {

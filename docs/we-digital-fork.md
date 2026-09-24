@@ -92,7 +92,30 @@ tags are never deployment inputs.
   the exact Chatwoot message failed. Successful Chatwoot and public `sendText` calls persist a
   privacy-safe origin and request ID in the stored message `contextInfo`, so a
   server send is distinguishable from an unbound linked-device `fromMe`
-  message after the fact.
+  message after the fact. Group ingress also preserves only the validated,
+  sorted WhatsApp participant JIDs from native `mentionedJid` metadata under
+  `we_digital_ingress.mentioned_jids`; message text is never copied into the
+  provenance envelope. This lets read-only reporting distinguish an explicit
+  linked-account mention from unrelated operational or informational group
+  traffic. Extraction reads only the current message and supported wrappers;
+  quoted-message mentions are deliberately ignored. EVO also retains a
+  bounded, privacy-safe cache of only `stanzaId` and validated `mentionedJid`
+  values from an earlier Baileys `append` event. If the matching `notify`
+  event is stripped of that context, EVO restores those identifiers before
+  Chatwoot delivery so native replies and mentions keep their structure;
+  quoted content and message text never enter this cache. Concurrent
+  `append`/`notify` deliveries for the same provider identity share one
+  Chatwoot request and retain its result briefly; later replays reuse the
+  already persisted Chatwoot binding. This prevents duplicate Chatwoot rows
+  without suppressing a retry after a failed request. Native reaction
+  callbacks mark authenticated `fromMe` actors as `external_id=me` and forward the
+  provider event timestamp so reporting can reconstruct additions/removals
+  without using callback receipt time. For live group ingress, exact native
+  `mentionedJid` actors are also joined to the freshly persisted participant
+  roster by either the exact participant identity or its confirmed phone alias,
+  then rendered as Chatwoot structured mention links using the roster identity.
+  Unresolved actors
+  remain plain text and cannot become a false notification.
 - **Source areas:**
   `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts`,
   `chatwoot-auto-reply-binding.ts`, `outbound-provenance.ts`, and
@@ -230,6 +253,21 @@ tags are never deployment inputs.
   later production history pass cannot re-import a successfully delivered
   live outbound row. Destination lookup failures abort the history batch
   instead of being interpreted as an empty destination.
+  Quoted sends retain both the Chatwoot parent row and its exact external
+  WhatsApp ID in the durable payload. Preparation resolves the internal
+  provider binding first and then the exact external ID within the same
+  instance; a requested quote that cannot be resolved fails before transport
+  instead of silently becoming an unquoted message. The existing operation
+  identity remains compatible because the signed snapshot fingerprint already
+  binds the complete quoted-message attributes.
+  Native same-session forwards use the same durable operation, deterministic
+  planned WhatsApp ID, transport fence, callback retry, and webhook replay
+  protection as text/media delivery. Source resolution and async-delivery
+  availability fail before transport. Once Baileys acknowledges the forward,
+  message-row persistence failure is deferred into callback maintenance and
+  can never return to the copied-content path or trigger a second provider
+  send. The prepared provider result is retained in the operation so local
+  persistence and Chatwoot binding can be retried without transport.
   Admission no longer serializes every route through the singleton
   `ChatwootOutboundAdmissionGuard`. The short transaction first acquires the
   existing destination lane row, which serializes only messages that share an
@@ -257,7 +295,7 @@ tags are never deployment inputs.
   PgBouncer and MySQL schemas; migrations exist for PostgreSQL and MySQL.
 - **Upstream reapply/conflicts:** preserve the database transition immediately
   before the first Baileys transport call, the deterministic message ID on
-  text/audio/media, persisted authenticated admission during socket outages,
+  text/audio/media/native-forward, persisted authenticated admission during socket outages,
   non-terminal readiness deferral, exact-current-message selection, route validation before
   enqueue, every per-part `provider_delivery` acknowledgement, API-only live
   source-ID confirmation, and fail-closed treatment of expired `sending`
@@ -278,7 +316,8 @@ tags are never deployment inputs.
   tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
   tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
   tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
-  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts`,
+  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts
+  tests/persist-native-forward-message.test.ts`,
   generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,

@@ -58,6 +58,10 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  compactChatwootIngressContext,
+  mergeChatwootIngressContext,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
+import {
   isUsableArchiveMessageKey,
   resolveArchiveChatJid,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
@@ -171,6 +175,7 @@ import { v4 } from 'uuid';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
+import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -1343,6 +1348,16 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+          const ingressContextKey = `chatwoot_ingress_context:${received.key.remoteJid}:${received.key.id}`;
+          const cachedIngressContext = type === 'notify' ? await this.baileysCache.get(ingressContextKey) : null;
+          const ingressContext = compactChatwootIngressContext(messageRaw.contextInfo);
+          if (ingressContext) {
+            await this.baileysCache.set(ingressContextKey, ingressContext, this.MESSAGE_CACHE_TTL_SECONDS);
+          }
+          if (type === 'notify') {
+            const mergedIngressContext = mergeChatwootIngressContext(messageRaw.contextInfo, cachedIngressContext);
+            if (mergedIngressContext) messageRaw.contextInfo = mergedIngressContext;
+          }
 
           if (messageRaw.messageType === 'pollUpdateMessage') {
             const pollCreationKey = messageRaw.message.pollUpdateMessage.pollCreationMessageKey;
@@ -3781,6 +3796,59 @@ export class BaileysStartupService extends ChannelStartupService {
     return await this.sendMessageWithTyping(data.key.remoteJid, {
       reactionMessage: { key: data.key, text: data.reaction },
     });
+  }
+
+  public async nativeForwardMessage(
+    number: string,
+    source: WAMessage,
+    options?: Pick<Options, 'messageId' | 'beforeTransport' | 'signal'>,
+  ) {
+    const jid = createJid(number);
+    if (options?.signal?.aborted) {
+      const error = new Error('Outbound operation aborted before native forward transport');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
+    await options?.beforeTransport?.();
+    if (options?.signal?.aborted) {
+      const error = new Error('Outbound operation aborted after native forward transport fencing');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
+    const messageSent = await this.client.sendMessage(
+      jid,
+      {
+        forward: source,
+        force: true,
+      },
+      options?.messageId ? ({ messageId: options.messageId } as MiscMessageGenerationOptions) : undefined,
+    );
+    if (!messageSent?.key?.id) {
+      throw new BadRequestException('Native forward returned empty message key');
+    }
+    if (Long.isLong(messageSent.messageTimestamp)) {
+      messageSent.messageTimestamp = messageSent.messageTimestamp.toNumber();
+    }
+
+    if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+      try {
+        await persistNativeForwardMessage({
+          repository: this.prismaRepository,
+          instanceId: this.instanceId,
+          messageRaw: this.prepareMessage(messageSent),
+        });
+      } catch (error) {
+        this.logger.error(
+          JSON.stringify({
+            event: 'native_forward_persistence_deferred',
+            providerMessageId: messageSent.key.id,
+            errorClass: error?.name || 'Error',
+          }),
+        );
+      }
+    }
+
+    return messageSent;
   }
 
   // Chat Controller
