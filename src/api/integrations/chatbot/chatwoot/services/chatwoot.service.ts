@@ -135,7 +135,6 @@ import ChatwootClient, {
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
-import { createJid } from '@utils/createJid';
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -3254,7 +3253,7 @@ export class ChatwootService {
 
     const key = stored?.key as WAMessageKey | undefined;
     const messageContent = stored?.message as WAMessageContent | undefined;
-    if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+    if (!key?.id || !messageContent || !waInstance?.nativeForwardMessage) {
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_native_forward_source_missing',
@@ -3267,11 +3266,7 @@ export class ChatwootService {
 
     let messageSent: any;
     try {
-      const jid = createJid(chatId);
-      messageSent = await waInstance.client.sendMessage(jid, {
-        forward: { key, message: messageContent },
-        force: true,
-      });
+      messageSent = await waInstance.nativeForwardMessage(chatId, { key, message: messageContent });
     } catch (error) {
       const errorMessage = String(error?.message || error);
       this.logger.warn(
