@@ -1,6 +1,7 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/whatsapp/media-message-metadata';
+import { persistNativeForwardMessage } from '@api/integrations/channel/whatsapp/persist-native-forward-message';
 import {
   ChatwootDto,
   ChatwootHistoryRecoveryBatchDto,
@@ -73,7 +74,6 @@ import {
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
 import {
-  isAmbiguousNativeForwardError,
   resolveNativeChatProbeId,
   shouldAttemptNativeForward,
   whatsappIdFromSourceId,
@@ -2066,7 +2066,31 @@ export class ChatwootService {
     };
 
     let messageSent: any;
-    if (payload.attachmentUrl) {
+    if (payload.nativeForward) {
+      const stored = await this.resolveStoredForwardMessage(
+        instance,
+        payload.nativeForward.sourceChatwootMessageId,
+        payload.nativeForward.sourceWhatsappMessageId
+          ? `WAID:${payload.nativeForward.sourceWhatsappMessageId}`
+          : undefined,
+      );
+      const key = stored?.key as WAMessageKey | undefined;
+      const message = stored?.message as WAMessageContent | undefined;
+      if (!key?.id || !message || !waInstance.nativeForwardMessage) {
+        const error = new Error('Native WhatsApp forward source is unavailable');
+        error.name = 'NativeForwardSourceMissing';
+        throw error;
+      }
+      messageSent = await waInstance.nativeForwardMessage(
+        payload.chatId,
+        { key, message },
+        {
+          messageId: operation.plannedWhatsappMessageId,
+          beforeTransport: onTransportStart,
+          signal,
+        },
+      );
+    } else if (payload.attachmentUrl) {
       messageSent = await this.sendAttachment(
         waInstance,
         payload.chatId,
@@ -2107,6 +2131,7 @@ export class ChatwootService {
         messageTimestamp: Long.isLong(messageSent?.messageTimestamp)
           ? messageSent.messageTimestamp.toNumber()
           : messageSent?.messageTimestamp,
+        ...(payload.nativeForward ? { nativeForwardMessage: waInstance.prepareMessage(messageSent) } : {}),
       },
     };
   }
@@ -2121,6 +2146,15 @@ export class ChatwootService {
     const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } });
     if (!instance || !this.providerMatchesFrozenOutboundOrigin(provider, origin)) {
       throw this.outboundBindingMismatch();
+    }
+    if (operation.payload.nativeForward) {
+      const messageRaw = (operation.result as any)?.nativeForwardMessage;
+      if (!messageRaw?.key?.id) throw new Error('NativeForwardPersistencePayloadMissing');
+      await persistNativeForwardMessage({
+        repository: this.prismaRepository,
+        instanceId: operation.instanceId,
+        messageRaw,
+      });
     }
     const expectedRoute = this.buildEvoRouteBinding(instance, provider, origin.inboxId);
     if (!chatwootEvoRouteBindingsEqual(expectedRoute, origin.routeBinding)) throw this.outboundBindingMismatch();
@@ -2281,6 +2315,10 @@ export class ChatwootService {
     chatId: string,
     formattedText: string | null,
     admission: ChatwootOutboundWebhookHeaders,
+    nativeForward?: {
+      sourceChatwootMessageId: number;
+      sourceWhatsappMessageId?: string;
+    },
   ) {
     const contactIdentity = chatwootOutboundContactIdentity(body);
     const origin: ChatwootOutboundOrigin = {
@@ -2303,6 +2341,7 @@ export class ChatwootService {
       formattedText,
       origin,
       mentioned: mentioned.length ? mentioned : undefined,
+      nativeForward,
     });
     const createdAtSeconds = Number(body.created_at);
     const messageCreatedAt =
@@ -2747,10 +2786,39 @@ export class ChatwootService {
         retainedMessage = await this.outboundStore.hasRetainedMessage(instance.instanceId, Number(body.id));
         if (!retainedMessage && !outboundConfig.OUTBOUND_ASYNC_ENABLED) outboundEnqueueAttempted = false;
       }
-      if (deliverableOutgoing && body?.content_attributes?.forwarded) {
-        const nativeForward = await this.trySendNativeForward(waInstance, chatId, body, instance);
+      if (
+        deliverableOutgoing &&
+        body?.content_attributes?.forwarded &&
+        shouldAttemptNativeForward(body.content_attributes.forwarded_from || {})
+      ) {
+        outboundEnqueueAttempted = true;
+        if (!outboundConfig.OUTBOUND_ASYNC_ENABLED) {
+          const error = new Error('Native forwarding requires durable asynchronous delivery');
+          error.name = 'NativeForwardRequiresAsyncDelivery';
+          (error as any).status = 503;
+          throw error;
+        }
+        if (outboundConfig.OUTBOUND_ASYNC_DRAIN_ONLY) {
+          const error = new Error('Chatwoot outbound async ingress is paused for drain');
+          error.name = 'ChatwootOutboundDrainOnly';
+          (error as any).status = 503;
+          throw error;
+        }
+        const nativeForward = await this.resolveNativeForwardSource(waInstance, body, instance);
         if (nativeForward) {
-          return { message: 'forwarded', key: nativeForward.key };
+          if (!expectedRoute || Number(provider.accountId) !== Number(body.account?.id)) {
+            throw this.outboundBindingMismatch();
+          }
+          return await this.enqueueChatwootOutbound(
+            instance,
+            provider,
+            expectedRoute,
+            body,
+            chatId,
+            formatOutboundText(),
+            authenticatedAdmission,
+            nativeForward,
+          );
         }
       }
       if (deliverableOutgoing && retainedMessage) {
@@ -3234,12 +3302,11 @@ export class ChatwootService {
    * outgoing message as forwarded and the source WA message is in this instance.
    * Returns null to fall back to content re-send.
    */
-  private async trySendNativeForward(
+  private async resolveNativeForwardSource(
     waInstance: any,
-    chatId: string,
     body: any,
     instance: InstanceDto,
-  ): Promise<any | null> {
+  ): Promise<{ sourceChatwootMessageId: number; sourceWhatsappMessageId: string } | null> {
     const attrs = body?.content_attributes;
     if (!attrs?.forwarded) return null;
 
@@ -3264,68 +3331,7 @@ export class ChatwootService {
       return null;
     }
 
-    let messageSent: any;
-    try {
-      messageSent = await waInstance.nativeForwardMessage(chatId, { key, message: messageContent });
-    } catch (error) {
-      const errorMessage = String(error?.message || error);
-      this.logger.warn(
-        JSON.stringify({
-          event: 'chatwoot_native_forward_failed',
-          sourceMessageId,
-          errorClass: error?.name || 'Error',
-          errorMessage: errorMessage.slice(0, 200),
-        }),
-      );
-      // Ambiguous transport failures may mean WA already accepted the forward —
-      // never fall back to content re-send (duplicate risk).
-      if (isAmbiguousNativeForwardError(errorMessage)) {
-        throw new BadRequestException(`Native forward ambiguous failure: ${errorMessage.slice(0, 200)}`);
-      }
-      return null;
-    }
-
-    if (!messageSent?.key?.id) {
-      throw new BadRequestException('Native forward returned empty message key');
-    }
-
-    if (Long.isLong(messageSent?.messageTimestamp)) {
-      messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
-    }
-
-    try {
-      await this.updateChatwootMessageId(
-        { ...messageSent },
-        {
-          messageId: body.id,
-          inboxId: body.inbox?.id,
-          conversationId: body.conversation?.id,
-          contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-        },
-        instance,
-      );
-    } catch (error) {
-      this.logger.warn(
-        JSON.stringify({
-          event: 'chatwoot_native_forward_map_failed',
-          sourceMessageId,
-          errorClass: error?.name || 'Error',
-          errorMessage: String(error?.message || error).slice(0, 200),
-        }),
-      );
-      // WA already has the forward — return success so caller does not re-send content.
-    }
-
-    this.logger.verbose(
-      JSON.stringify({
-        event: 'chatwoot_native_forward_sent',
-        sourceMessageId,
-        targetChatId: chatId,
-        chatwootMessageId: body.id,
-      }),
-    );
-
-    return messageSent;
+    return { sourceChatwootMessageId: sourceMessageId, sourceWhatsappMessageId: key.id };
   }
 
   /**

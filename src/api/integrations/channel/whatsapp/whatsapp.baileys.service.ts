@@ -3784,12 +3784,31 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
-  public async nativeForwardMessage(number: string, source: WAMessage) {
+  public async nativeForwardMessage(
+    number: string,
+    source: WAMessage,
+    options?: Pick<Options, 'messageId' | 'beforeTransport' | 'signal'>,
+  ) {
     const jid = createJid(number);
-    const messageSent = await this.client.sendMessage(jid, {
-      forward: source,
-      force: true,
-    });
+    if (options?.signal?.aborted) {
+      const error = new Error('Outbound operation aborted before native forward transport');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
+    await options?.beforeTransport?.();
+    if (options?.signal?.aborted) {
+      const error = new Error('Outbound operation aborted after native forward transport fencing');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
+    const messageSent = await this.client.sendMessage(
+      jid,
+      {
+        forward: source,
+        force: true,
+      },
+      options?.messageId ? ({ messageId: options.messageId } as MiscMessageGenerationOptions) : undefined,
+    );
     if (!messageSent?.key?.id) {
       throw new BadRequestException('Native forward returned empty message key');
     }
@@ -3798,11 +3817,21 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-      await persistNativeForwardMessage({
-        repository: this.prismaRepository,
-        instanceId: this.instanceId,
-        messageRaw: this.prepareMessage(messageSent),
-      });
+      try {
+        await persistNativeForwardMessage({
+          repository: this.prismaRepository,
+          instanceId: this.instanceId,
+          messageRaw: this.prepareMessage(messageSent),
+        });
+      } catch (error) {
+        this.logger.error(
+          JSON.stringify({
+            event: 'native_forward_persistence_deferred',
+            providerMessageId: messageSent.key.id,
+            errorClass: error?.name || 'Error',
+          }),
+        );
+      }
     }
 
     return messageSent;
