@@ -171,6 +171,7 @@ import { v4 } from 'uuid';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
+import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
@@ -3781,6 +3782,30 @@ export class BaileysStartupService extends ChannelStartupService {
     return await this.sendMessageWithTyping(data.key.remoteJid, {
       reactionMessage: { key: data.key, text: data.reaction },
     });
+  }
+
+  public async nativeForwardMessage(number: string, source: WAMessage) {
+    const jid = createJid(number);
+    const messageSent = await this.client.sendMessage(jid, {
+      forward: source,
+      force: true,
+    });
+    if (!messageSent?.key?.id) {
+      throw new BadRequestException('Native forward returned empty message key');
+    }
+    if (Long.isLong(messageSent.messageTimestamp)) {
+      messageSent.messageTimestamp = messageSent.messageTimestamp.toNumber();
+    }
+
+    if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+      await persistNativeForwardMessage({
+        repository: this.prismaRepository,
+        instanceId: this.instanceId,
+        messageRaw: this.prepareMessage(messageSent),
+      });
+    }
+
+    return messageSent;
   }
 
   // Chat Controller
