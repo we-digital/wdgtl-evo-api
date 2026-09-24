@@ -20,6 +20,47 @@ const CURRENT_MESSAGE_WRAPPERS = new Set([
   'editedMessage',
 ]);
 
+export type ChatwootIngressContextSnapshot = {
+  stanzaId?: string;
+  mentionedJid?: string[];
+};
+
+export const compactChatwootIngressContext = (value: unknown): ChatwootIngressContextSnapshot | null => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  const stanzaId = readNonEmptyString(record.stanzaId ?? record.stanzaid);
+  const mentionedJid = Array.isArray(record.mentionedJid)
+    ? [
+        ...new Set(
+          record.mentionedJid
+            .map((candidate) => readNonEmptyString(candidate).toLowerCase())
+            .filter((candidate) => CHATWOOT_MENTION_JID.test(candidate)),
+        ),
+      ].sort()
+    : [];
+
+  if (!stanzaId && mentionedJid.length === 0) return null;
+  return {
+    ...(stanzaId ? { stanzaId } : {}),
+    ...(mentionedJid.length > 0 ? { mentionedJid } : {}),
+  };
+};
+
+export const mergeChatwootIngressContext = (current: unknown, cached: unknown): Record<string, unknown> | null => {
+  const currentRecord = current && typeof current === 'object' && !Array.isArray(current) ? current : {};
+  const cachedSnapshot = compactChatwootIngressContext(cached) || {};
+  const currentSnapshot = compactChatwootIngressContext(current) || {};
+  const mentionedJid = [
+    ...new Set([...(cachedSnapshot.mentionedJid || []), ...(currentSnapshot.mentionedJid || [])]),
+  ].sort();
+  const merged = {
+    ...cachedSnapshot,
+    ...currentRecord,
+    ...(mentionedJid.length > 0 ? { mentionedJid } : {}),
+  };
+  return Object.keys(merged).length > 0 ? merged : null;
+};
+
 export const extractChatwootIngressMentionJids = (messageBody: unknown): string[] => {
   const mentions = new Set<string>();
   const addContextMentions = (value: unknown): void => {
@@ -48,6 +89,9 @@ export const extractChatwootIngressMentionJids = (messageBody: unknown): string[
     }
   };
 
+  if (messageBody && typeof messageBody === 'object' && !Array.isArray(messageBody)) {
+    addContextMentions((messageBody as Record<string, unknown>).contextInfo);
+  }
   visitCurrentMessage(messageBody);
   return [...mentions].sort();
 };
