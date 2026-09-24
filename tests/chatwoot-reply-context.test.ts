@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  chatwootReplyReferences,
   compactReplyToIds,
   extractWhatsappReplyStanzaId,
   stripChatwootWhatsappSourceId,
@@ -100,4 +101,12 @@ test('normalizes Chatwoot Evolution WAID source ids', () => {
   assert.equal(toChatwootWhatsappSourceId('  '), null);
   assert.equal(stripChatwootWhatsappSourceId('WAID:ABC123'), 'ABC123');
   assert.equal(stripChatwootWhatsappSourceId('ABC123'), 'ABC123');
+});
+
+test('retains both Chatwoot and provider reply identities for durable quote lookup', () => {
+  assert.deepEqual(
+    chatwootReplyReferences({ in_reply_to: '42', in_reply_to_external_id: 'WAID:ABC123' }),
+    { chatwootMessageId: 42, whatsappMessageId: 'ABC123' },
+  );
+  assert.deepEqual(chatwootReplyReferences({ in_reply_to: 'bad', in_reply_to_external_id: '' }), {});
 });

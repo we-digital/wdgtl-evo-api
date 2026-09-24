@@ -15,6 +15,7 @@ import {
 import {
   buildWhatsappGroupParticipantSnapshots,
   extractWhatsappMentionJids,
+  formatIncomingWhatsappMentions,
   stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
@@ -61,6 +62,7 @@ import {
   buildChatwootIngressAttributes,
   ChatwootEvoRouteBinding,
   chatwootEvoRouteBindingsEqual,
+  extractChatwootIngressMentionJids,
   isChatwootLinkedClientSentEvent,
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
@@ -101,6 +103,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import {
+  chatwootReplyReferences,
   compactReplyToIds,
   extractWhatsappReplyStanzaId,
   toChatwootWhatsappSourceId,
@@ -132,7 +135,6 @@ import ChatwootClient, {
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
-import { createJid } from '@utils/createJid';
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -1299,13 +1301,13 @@ export class ChatwootService {
     provider: ChatwootModel,
     conversationId: number,
     groupJid: string,
-  ): Promise<void> {
+  ): Promise<ReturnType<typeof buildWhatsappGroupParticipantSnapshots>> {
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
-      if (!waInstance?.findParticipants) return;
+      if (!waInstance?.findParticipants) return [];
       const groupParticipants = await waInstance.findParticipants({ groupJid });
       const snapshots = buildWhatsappGroupParticipantSnapshots(groupParticipants?.participants || []);
-      if (!snapshots.length) return;
+      if (!snapshots.length) return [];
 
       await chatwootRequest(this.getClientCwConfig(provider), {
         method: 'POST',
@@ -1317,6 +1319,7 @@ export class ChatwootService {
           },
         },
       });
+      return snapshots;
     } catch (error) {
       this.logger.warn(
         JSON.stringify({
@@ -1327,6 +1330,7 @@ export class ChatwootService {
           message: (error as any)?.message,
         }),
       );
+      return [];
     }
   }
 
@@ -2044,7 +2048,12 @@ export class ChatwootService {
 
     const payload = operation.payload;
     const quoted = await this.getQuotedMessage(
-      { content_attributes: { in_reply_to: payload.quotedChatwootMessageId } },
+      {
+        content_attributes: {
+          in_reply_to: payload.quotedChatwootMessageId,
+          in_reply_to_external_id: payload.quotedWhatsappMessageId,
+        },
+      },
       instance,
     );
     const provenance: OutboundMessageProvenance = {
@@ -3184,26 +3193,40 @@ export class ChatwootService {
   }
 
   private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
-    if (msg?.content_attributes?.in_reply_to) {
-      const message = await this.prismaRepository.message.findFirst({
+    const references = chatwootReplyReferences(msg?.content_attributes);
+    let message: MessageModel | null = null;
+    if (references.chatwootMessageId) {
+      message = await this.prismaRepository.message.findFirst({
         where: {
-          chatwootMessageId: msg?.content_attributes?.in_reply_to,
+          chatwootMessageId: references.chatwootMessageId,
           instanceId: instance.instanceId,
         },
       });
 
-      const key = message?.key as WAMessageKey;
-      const messageContent = message?.message as WAMessageContent;
+      const quoted = this.quotedMessage(message);
+      if (quoted) return quoted;
+    }
 
-      if (messageContent && key?.id) {
-        return {
-          key: key,
-          message: messageContent,
-        };
-      }
+    if (references.whatsappMessageId) {
+      message = await this.getMessageByKeyId(instance, references.whatsappMessageId);
+      const quoted = this.quotedMessage(message);
+      if (quoted) return quoted;
+    }
+
+    if (references.chatwootMessageId || references.whatsappMessageId) {
+      throw new BadRequestException('Quoted WhatsApp message not found');
     }
 
     return null;
+  }
+
+  private quotedMessage(message: MessageModel | null): Quoted {
+    const key = message?.key as WAMessageKey;
+    const messageContent = message?.message as WAMessageContent;
+
+    if (!messageContent || !key?.id) return null;
+
+    return { key, message: messageContent };
   }
 
   /**
@@ -3230,7 +3253,7 @@ export class ChatwootService {
 
     const key = stored?.key as WAMessageKey | undefined;
     const messageContent = stored?.message as WAMessageContent | undefined;
-    if (!key?.id || !messageContent || !waInstance?.client?.sendMessage) {
+    if (!key?.id || !messageContent || !waInstance?.nativeForwardMessage) {
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_native_forward_source_missing',
@@ -3243,11 +3266,7 @@ export class ChatwootService {
 
     let messageSent: any;
     try {
-      const jid = createJid(chatId);
-      messageSent = await waInstance.client.sendMessage(jid, {
-        forward: { key, message: messageContent },
-        force: true,
-      });
+      messageSent = await waInstance.nativeForwardMessage(chatId, { key, message: messageContent });
     } catch (error) {
       const errorMessage = String(error?.message || error);
       this.logger.warn(
@@ -4020,6 +4039,7 @@ export class ChatwootService {
         if (quotedId)
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
+              instanceId: instance.instanceId,
               key: {
                 path: ['id'],
                 equals: quotedId,
@@ -4050,6 +4070,20 @@ export class ChatwootService {
         }
 
         const messageType = body.key.fromMe ? 'outgoing' : 'incoming';
+        const isGroupMessage = body.key.remoteJid.includes('@g.us');
+        let chatwootBodyMessage = bodyMessage;
+        if (isGroupMessage && bodyMessage) {
+          const mentionedJids = extractChatwootIngressMentionJids(body);
+          if (mentionedJids.length > 0) {
+            const participants = await this.syncWhatsappGroupParticipants(
+              instance,
+              provider,
+              Number(getConversation),
+              body.key.remoteJid,
+            );
+            chatwootBodyMessage = formatIncomingWhatsappMentions(bodyMessage, mentionedJids, participants);
+          }
+        }
 
         if (isMedia) {
           const downloadBase64 = await waInstance?.getBase64FromMediaMessage({
@@ -4091,11 +4125,11 @@ export class ChatwootService {
             let content: string;
 
             if (!body.key.fromMe) {
-              content = bodyMessage
-                ? `**${formattedPhoneNumber} - ${participantName}:**\n\n${bodyMessage}`
+              content = chatwootBodyMessage
+                ? `**${formattedPhoneNumber} - ${participantName}:**\n\n${chatwootBodyMessage}`
                 : `**${formattedPhoneNumber} - ${participantName}:**`;
             } else {
-              content = bodyMessage || '';
+              content = chatwootBodyMessage || '';
             }
 
             const send = await this.sendData(
@@ -4262,9 +4296,9 @@ export class ChatwootService {
           let content: string;
 
           if (!body.key.fromMe) {
-            content = `**${formattedPhoneNumber} - ${participantName}:**\n\n${bodyMessage}`;
+            content = `**${formattedPhoneNumber} - ${participantName}:**\n\n${chatwootBodyMessage}`;
           } else {
-            content = `${bodyMessage}`;
+            content = `${chatwootBodyMessage}`;
           }
 
           const send = await this.createMessage(

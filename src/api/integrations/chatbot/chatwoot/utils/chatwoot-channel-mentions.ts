@@ -64,7 +64,10 @@ export function channelMentionsFromAttributes(
 export function normalizeWhatsappJid(raw: string): string {
   const value = String(raw || '').trim();
   if (!value) return '';
-  if (value.includes('@')) return value;
+  if (value.includes('@')) {
+    const [local, domain] = value.split('@', 2);
+    return `${local.split(':', 1)[0]}@${domain}`;
+  }
   const digits = value.replace(/\D/g, '');
   if (!digits) return value;
   return `${digits}@s.whatsapp.net`;
@@ -75,6 +78,33 @@ export type WhatsappGroupParticipantSnapshot = {
   name?: string;
   phone?: string;
 };
+
+export function formatIncomingWhatsappMentions(
+  text: string | null | undefined,
+  mentionedJids: string[],
+  participants: WhatsappGroupParticipantSnapshot[],
+): string {
+  let formatted = text || '';
+  const byId = new Map(participants.map((participant) => [normalizeWhatsappJid(participant.id), participant]));
+
+  for (const rawJid of mentionedJids) {
+    const jid = normalizeWhatsappJid(rawJid);
+    const participant = byId.get(jid);
+    if (!participant) continue;
+
+    const token = String(participant.phone || jid.split('@')[0] || '').replace(/\D/g, '');
+    if (!token) continue;
+    const nativeMention = `@${token}`;
+    if (!formatted.includes(nativeMention)) continue;
+
+    const name = participant.name?.trim() || token;
+    const display = `@${name}`;
+    const markup = `[${display}](mention://whatsapp/${encodeURIComponent(jid)}/${encodeURIComponent(name)})`;
+    formatted = formatted.replace(new RegExp(`${nativeMention}(?!\\d)`, 'g'), markup);
+  }
+
+  return formatted;
+}
 
 export function buildWhatsappGroupParticipantSnapshots(
   participants: Array<{ id?: string; name?: string | null; phoneNumber?: string | null; imgUrl?: string | null }>,

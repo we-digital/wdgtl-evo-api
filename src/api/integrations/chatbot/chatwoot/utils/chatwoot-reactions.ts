@@ -7,6 +7,7 @@ export type ChatwootReactionActor = {
   id: string;
   name?: string;
   external_id?: string;
+  reacted_at?: string;
 };
 
 export type ChatwootReactionEvent = {
@@ -27,20 +28,28 @@ export const isAgentReactionWebhook = (body: { event?: string; reaction?: Chatwo
 export const buildWhatsappReactionActor = (body: {
   key?: { fromMe?: boolean; participant?: string; remoteJid?: string };
   pushName?: string;
+  messageTimestamp?: number | string | { toNumber?: () => number };
 }): {
   actor_type: string;
   actor_id: string;
   actor_name: string;
   external_id: string;
   source: string;
+  reacted_at?: string;
 } => {
-  const externalId = body?.key?.participant || (body?.key?.fromMe ? 'me' : body?.key?.remoteJid) || 'unknown';
-  const name = body?.pushName || externalId.split('@')[0] || externalId;
+  const actorId = body?.key?.participant || body?.key?.remoteJid || 'unknown';
+  const externalId = body?.key?.fromMe ? 'me' : actorId;
+  const name = body?.pushName || actorId.split('@')[0] || actorId;
+  const rawTimestamp =
+    typeof body?.messageTimestamp === 'object' ? body.messageTimestamp?.toNumber?.() : Number(body?.messageTimestamp);
+  const reactedAt =
+    Number.isSafeInteger(rawTimestamp) && rawTimestamp > 0 ? new Date(rawTimestamp * 1000).toISOString() : undefined;
   return {
     actor_type: 'external',
-    actor_id: externalId,
+    actor_id: actorId,
     actor_name: name,
     external_id: externalId,
     source: 'whatsapp',
+    ...(reactedAt ? { reacted_at: reactedAt } : {}),
   };
 };

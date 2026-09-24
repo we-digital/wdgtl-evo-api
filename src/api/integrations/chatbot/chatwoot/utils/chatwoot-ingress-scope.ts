@@ -10,6 +10,48 @@ type MessageKey = {
   fromMe?: unknown;
 };
 
+const CHATWOOT_MENTION_JID = /^\d+(?::\d+)?@(s\.whatsapp\.net|lid|hosted|hosted\.lid)$/;
+const CURRENT_MESSAGE_WRAPPERS = new Set([
+  'ephemeralMessage',
+  'viewOnceMessage',
+  'viewOnceMessageV2',
+  'viewOnceMessageV2Extension',
+  'documentWithCaptionMessage',
+  'editedMessage',
+]);
+
+export const extractChatwootIngressMentionJids = (messageBody: unknown): string[] => {
+  const mentions = new Set<string>();
+  const addContextMentions = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const mentionedJid = (value as Record<string, unknown>).mentionedJid;
+    if (!Array.isArray(mentionedJid)) return;
+    mentionedJid.forEach((candidate) => {
+      const jid = readNonEmptyString(candidate).toLowerCase();
+      if (CHATWOOT_MENTION_JID.test(jid)) mentions.add(jid);
+    });
+  };
+
+  const visitCurrentMessage = (value: unknown, depth = 0): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 5) return;
+    const record = value as Record<string, unknown>;
+    const message =
+      record.message && typeof record.message === 'object' && !Array.isArray(record.message)
+        ? (record.message as Record<string, unknown>)
+        : record;
+
+    for (const [contentType, content] of Object.entries(message)) {
+      if (!content || typeof content !== 'object' || Array.isArray(content)) continue;
+      const contentRecord = content as Record<string, unknown>;
+      addContextMentions(contentRecord.contextInfo);
+      if (CURRENT_MESSAGE_WRAPPERS.has(contentType)) visitCurrentMessage(contentRecord.message, depth + 1);
+    }
+  };
+
+  visitCurrentMessage(messageBody);
+  return [...mentions].sort();
+};
+
 export type ChatwootEvoRouteBinding = {
   version: typeof CHATWOOT_INGRESS_CONTRACT_VERSION;
   provider: 'evo_whatsapp';
@@ -127,6 +169,7 @@ export const buildChatwootIngressAttributes = (
   clientSent = false,
 ) => {
   const fromMe = messageBody?.key?.fromMe;
+  const mentionedJids = extractChatwootIngressMentionJids(messageBody);
   const direction =
     fromMe === false ? ('inbound' as const) : fromMe === true ? ('outbound' as const) : ('unknown' as const);
 
@@ -138,6 +181,7 @@ export const buildChatwootIngressAttributes = (
       direction,
       from_me: typeof fromMe === 'boolean' ? fromMe : null,
       ...(clientSent === true ? { client_sent: true as const } : {}),
+      ...(mentionedJids.length > 0 ? { mentioned_jids: mentionedJids } : {}),
       route,
     },
   };
