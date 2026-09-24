@@ -112,7 +112,9 @@ tags are never deployment inputs.
   provider event timestamp so reporting can reconstruct additions/removals
   without using callback receipt time. For live group ingress, exact native
   `mentionedJid` actors are also joined to the freshly persisted participant
-  roster and rendered as Chatwoot structured mention links. Unresolved actors
+  roster by either the exact participant identity or its confirmed phone alias,
+  then rendered as Chatwoot structured mention links using the roster identity.
+  Unresolved actors
   remain plain text and cannot become a false notification.
 - **Source areas:**
   `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts`,
