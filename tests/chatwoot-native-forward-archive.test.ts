@@ -7,6 +7,10 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  isChatwootNativeArchiveProbe,
+  isChatwootNativePinProbe,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import {
   isAmbiguousNativeForwardError,
   isUsableArchiveMessageKey,
   resolveArchiveChatJid,
@@ -14,6 +18,13 @@ import {
   shouldAttemptNativeForward,
   whatsappIdFromSourceId,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
+
+test('native pin and archive probes require the exact conversation update contract', () => {
+  assert.equal(isChatwootNativePinProbe({ event: 'conversation_updated', native_pin_probe: true }), true);
+  assert.equal(isChatwootNativeArchiveProbe({ event: 'conversation_updated', native_archive_probe: true }), true);
+  assert.equal(isChatwootNativePinProbe({ event: 'message_created', native_pin_probe: true }), false);
+  assert.equal(isChatwootNativeArchiveProbe({ event: 'conversation_updated' }), false);
+});
 
 test('ambiguous native forward errors must not fall back to content re-send', () => {
   assert.equal(isAmbiguousNativeForwardError('request timeout after 20s'), true);
@@ -81,9 +92,12 @@ test('native chat probe id prefers contact_inbox source_id then sender fields', 
     'abc@lid',
   );
   assert.equal(
-    resolveNativeChatProbeId({
-      meta: { sender: { phone_number: '+5511999999999' } },
-    }, 'fallback'),
+    resolveNativeChatProbeId(
+      {
+        meta: { sender: { phone_number: '+5511999999999' } },
+      },
+      'fallback',
+    ),
     '5511999999999',
   );
   assert.equal(resolveNativeChatProbeId({ meta: { sender: { identifier: '123456' } } }, 'ok'), 'ok');
