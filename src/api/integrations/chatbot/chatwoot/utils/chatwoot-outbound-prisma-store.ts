@@ -79,7 +79,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     ]);
     let backlog: ChatwootOutboundBacklog | undefined;
     if (!knownReceipt && knownOperations.length === 0) {
-      backlog = await this.backlogForLane(parts[0].laneKey);
+      backlog = await this.backlogForLane(parts[0].laneKey, admission.receivedAt, admission.maxOldestAgeMs);
       if (backlog.depth + parts.length > admission.maxBacklog) {
         throw Object.assign(new Error('Chatwoot outbound backlog capacity is exhausted'), {
           name: 'ChatwootOutboundBacklogExceeded',
@@ -214,9 +214,9 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     return { depth, oldestAt: oldest?.createdAt ?? null };
   }
 
-  private async backlogForLane(laneKey: string): Promise<ChatwootOutboundBacklog> {
-    const where = { laneKey, state: { in: DELIVERY_BACKLOG_STATES } };
-    const [depth, oldest] = await Promise.all([
+  private async backlogForLane(laneKey: string, now: Date, maxOldestAgeMs: number): Promise<ChatwootOutboundBacklog> {
+    let where: any = { laneKey, state: { in: DELIVERY_BACKLOG_STATES } };
+    let [depth, oldest] = await Promise.all([
       this.repository.chatwootOutboundOperation.count({ where }),
       this.repository.chatwootOutboundOperation.findFirst({
         where,
@@ -224,7 +224,36 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         select: { createdAt: true },
       }),
     ]);
+    // Only on an age-gate failure path, discard still-fenced siblings of a
+    // settled ambiguous multipart send from the delivery backlog calculation.
+    if (oldest && now.getTime() - oldest.createdAt.getTime() > maxOldestAgeMs) {
+      const agedMessageIds = await this.agedUnresolvedMultipartMessageIds(laneKey, now);
+      if (agedMessageIds.length > 0) {
+        where = { AND: [where, { NOT: { state: 'pending', chatwootMessageId: { in: agedMessageIds } } }] };
+        [depth, oldest] = await Promise.all([
+          this.repository.chatwootOutboundOperation.count({ where }),
+          this.repository.chatwootOutboundOperation.findFirst({
+            where,
+            orderBy: { createdAt: 'asc' },
+            select: { createdAt: true },
+          }),
+        ]);
+      }
+    }
     return { depth, oldestAt: oldest?.createdAt ?? null };
+  }
+
+  private async agedUnresolvedMultipartMessageIds(laneKey: string, now: Date): Promise<number[]> {
+    const rows = await this.repository.chatwootOutboundOperation.findMany({
+      where: {
+        laneKey,
+        partCount: { gt: 1 },
+        sendStartedAt: { lte: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) },
+        OR: [{ state: 'ambiguous' }, { state: 'quarantined', transportOutcomeUnresolved: true }],
+      },
+      select: { chatwootMessageId: true },
+    });
+    return [...new Set(rows.map((row) => row.chatwootMessageId))];
   }
 
   public async recoverExpired(now: Date): Promise<void> {
@@ -836,24 +865,35 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         })) > 0
       );
     }
+    const predecessorWhere = {
+      AND: [
+        laneBlockingWhere,
+        {
+          OR: [
+            {
+              laneKey: candidate.laneKey,
+              OR: [
+                { laneSequence: { lt: candidate.laneSequence } },
+                { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
+              ],
+            },
+            { laneKey: '', createdAt: { lte: candidate.createdAt } },
+          ],
+        },
+      ],
+    };
+    const blocked = (await this.repository.chatwootOutboundOperation.count({ where: predecessorWhere })) > 0;
+    if (!blocked || candidate.state !== 'pending') return blocked;
+    // The unresolved first part also keeps its own later multipart parts pending.
+    // Aged siblings must not indefinitely fence distinct later messages.
+    const agedMessageIds = (await this.agedUnresolvedMultipartMessageIds(candidate.laneKey, now)).filter(
+      (id) => id !== candidate.chatwootMessageId,
+    );
+    if (agedMessageIds.length === 0) return true;
     return (
       (await this.repository.chatwootOutboundOperation.count({
         where: {
-          AND: [
-            laneBlockingWhere,
-            {
-              OR: [
-                {
-                  laneKey: candidate.laneKey,
-                  OR: [
-                    { laneSequence: { lt: candidate.laneSequence } },
-                    { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
-                  ],
-                },
-                { laneKey: '', createdAt: { lte: candidate.createdAt } },
-              ],
-            },
-          ],
+          AND: [predecessorWhere, { NOT: { state: 'pending', chatwootMessageId: { in: agedMessageIds } } }],
         },
       })) > 0
     );
