@@ -100,6 +100,7 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
+import { confirmProviderDeletionBeforeDroppingMapping } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-deletion';
 import { resolveWhatsappReactionKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
 import {
   buildWhatsappReactionActor,
@@ -383,7 +384,7 @@ export class ChatwootService {
 
   private async privilegedChatwootRequest(
     provider: ChatwootModel,
-    params: { method: 'POST'; path: string; data: Record<string, unknown> },
+    params: { method: 'POST' | 'DELETE'; path: string; data: Record<string, unknown> },
   ): Promise<void> {
     const config = this.configService.get<Chatwoot>('CHATWOOT');
     const url = requireTrustedChatwootUrl(provider.url, config.TRUSTED_BASE_URL, params.path);
@@ -4395,21 +4396,25 @@ export class ChatwootService {
           const message = await this.getMessageByKeyId(instance, body.key.id);
 
           if (message?.chatwootMessageId && message?.chatwootConversationId) {
-            await this.prismaRepository.message.deleteMany({
-              where: {
-                key: {
-                  path: ['id'],
-                  equals: body.key.id,
-                },
-                instanceId: instance.instanceId,
-              },
+            await confirmProviderDeletionBeforeDroppingMapping({
+              softDelete: () =>
+                this.privilegedChatwootRequest(provider, {
+                  method: 'DELETE',
+                  path: `/api/v1/accounts/${provider.accountId}/conversations/${message.chatwootConversationId}/messages/${message.chatwootMessageId}`,
+                  data: { skip_native: true, provider_source: 'whatsapp' },
+                }),
+              dropMapping: () =>
+                this.prismaRepository.message.deleteMany({
+                  where: {
+                    key: {
+                      path: ['id'],
+                      equals: body.key.id,
+                    },
+                    instanceId: instance.instanceId,
+                  },
+                }),
             });
-
-            return await client.messages.delete({
-              accountId: Number(provider.accountId),
-              conversationId: message.chatwootConversationId,
-              messageId: message.chatwootMessageId,
-            });
+            return { message: 'deleted' };
           }
         }
       }

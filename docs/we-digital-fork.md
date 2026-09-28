@@ -110,7 +110,11 @@ tags are never deployment inputs.
   without suppressing a retry after a failed request. Native reaction
   callbacks mark authenticated `fromMe` actors as `external_id=me` and forward the
   provider event timestamp so reporting can reconstruct additions/removals
-  without using callback receipt time. For live group ingress, exact native
+  without using callback receipt time. Provider deletion callbacks first obtain
+  an authenticated Chatwoot soft-delete acknowledgement containing explicit
+  WhatsApp provenance, then remove the local provider mapping. A failed or
+  uncertain Chatwoot callback leaves that mapping intact for safe retry; the
+  provider event never hard-deletes the Chatwoot row. For live group ingress, exact native
   `mentionedJid` actors are also joined to the freshly persisted participant
   roster by either the exact participant identity or its confirmed phone alias,
   then rendered as Chatwoot structured mention links using the roster identity.
@@ -118,7 +122,8 @@ tags are never deployment inputs.
   remain plain text and cannot become a false notification.
 - **Source areas:**
   `src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope.ts`,
-  `chatwoot-auto-reply-binding.ts`, `outbound-provenance.ts`, and
+  `chatwoot-auto-reply-binding.ts`, `chatwoot-provider-deletion.ts`,
+  `outbound-provenance.ts`, and
   the message/inbox creation paths and correlated delivery-failure update in
   `chatwoot.service.ts`.
 - **Flags/schema:** no EVO feature flag or database schema change. Ingress,
@@ -134,10 +139,14 @@ tags are never deployment inputs.
   agent access, or Chatwoot conversation shape.
 - **Rollback:** deploying the prior immutable EVO image removes the additive
   marker. Chatwoot then classifies new messages as unclassified and must not
-  auto-reply, while ordinary message delivery remains available.
+  auto-reply, while ordinary message delivery remains available. Roll back the
+  provider-deletion callback only together with a Chatwoot image that retains
+  the legacy deletion behavior; local message mappings remain recoverable
+  because they are removed only after acknowledged soft deletion.
 - **Focused regression:** run `npm run test:unit --
   tests/chatwoot-ingress-scope.test.ts tests/chatwoot-auto-reply-binding.test.ts
-  tests/outbound-provenance.test.ts`, `npm run lint:check`, and `npm run build`;
+  tests/chatwoot-provider-deletion.test.ts tests/outbound-provenance.test.ts`,
+  `npm run lint:check`, and `npm run build`;
   staging canary must prove direct/text, direct/media, group, broadcast,
   unknown, wrong-instance auto-reply rejection, stored provenance, a failed
   provider delivery, missing route, cross-instance/inbox replay,
