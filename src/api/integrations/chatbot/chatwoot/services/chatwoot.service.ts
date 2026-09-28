@@ -1958,12 +1958,28 @@ export class ChatwootService {
       signal,
     );
     const currentMessage = unwrapChatwootPayload(exactMessageResponse);
+    // Only a destination mismatch needs the compatibility read. The prior
+    // Chatwoot image fingerprints raw opaque labels; the fresh conversation
+    // verifies the current phone before an EVO-first production cutover sends.
+    const legacyDestinationCandidate =
+      typeof currentMessage?.destination === 'string' &&
+      currentMessage.destination.length > 0 &&
+      currentMessage.destination !== operation.payload.chatId;
+    const currentConversation = legacyDestinationCandidate
+      ? unwrapChatwootPayload(
+          await this.awaitCancelable(
+            client.conversations.get({ accountId: origin.accountId, conversationId: origin.conversationId }) as any,
+            signal,
+          ),
+        )
+      : null;
     const snapshot = {
       operation,
       provider,
       currentInbox: null,
       conversation: null,
       currentMessage,
+      currentConversation,
       expectedRoute,
       currentRoute: currentMessage?.route?.binding,
     };
@@ -2111,7 +2127,6 @@ export class ChatwootService {
         {
           number: payload.chatId,
           text: payload.text,
-          delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
           quoted,
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
@@ -2443,10 +2458,7 @@ export class ChatwootService {
     let outboundEnqueueAttempted = false;
     try {
       const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
-      const candidateChatId =
-        body?.conversation?.meta?.sender?.identifier ||
-        body?.conversation?.meta?.sender?.phone_number?.replace('+', '') ||
-        '';
+      const candidateChatId = chatwootOutboundDestination(body?.conversation);
       const deliverableOutgoing = isDeliverableChatwootOutgoing(body, candidateChatId);
       // Fast-ack Chatwoot echoes that must not be re-sent to WhatsApp. Doing heavy
       // work here races Chatwoot's webhook read timeout and can falsely fail inbound.

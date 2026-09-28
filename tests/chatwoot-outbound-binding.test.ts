@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   chatwootOutboundContactIdentity,
+  chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
   validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
@@ -111,6 +112,86 @@ test('derives outbound contact identity from the conversation instead of the sen
     contactId: 411,
     contactInboxId: 733,
   });
+});
+
+test('uses a valid WhatsApp address instead of an opaque contact identifier', () => {
+  assert.equal(
+    chatwootOutboundDestination({
+      meta: { sender: { identifier: 'whatsapp:12345678', phone_number: '+628123456789' } },
+    }),
+    '628123456789',
+  );
+  assert.equal(
+    chatwootOutboundDestination({ meta: { sender: { identifier: '628123@lid', phone_number: '+628999999999' } } }),
+    '628123@lid',
+  );
+  assert.equal(
+    chatwootOutboundDestination({ meta: { sender: { identifier: '120363123-123@g.us' } } }),
+    '120363123-123@g.us',
+  );
+  assert.equal(chatwootOutboundDestination({ meta: { sender: { identifier: 'whatsapp:12345678' } } }), '');
+});
+
+test('accepts a prior Chatwoot opaque snapshot only with a fresh matching contact and phone', () => {
+  const legacyOperation = {
+    ...operation,
+    payload: {
+      ...operation.payload,
+      chatId: '628123456789',
+      origin: { ...operation.payload.origin, contactId: 411 },
+    },
+  } as StoredChatwootOutboundOperation;
+  const legacyMessage = { ...currentMessage, destination: 'whatsapp:12345678', contact_id: 411 };
+  const liveConversation = {
+    id: 42,
+    account_id: 7,
+    inbox_id: 58,
+    meta: { sender: { id: 411, identifier: 'whatsapp:12345678', phone_number: '+628123456789' } },
+  };
+  const legacy = (changes: Record<string, unknown> = {}) =>
+    validate({
+      operation: legacyOperation,
+      currentMessage: legacyMessage,
+      currentConversation: liveConversation,
+      ...changes,
+    });
+
+  assert.equal(legacy(), true);
+  assert.equal(legacy({ currentConversation: null }), false);
+  assert.equal(legacy({ currentConversation: { ...liveConversation, account_id: 8 } }), false);
+  assert.equal(legacy({ currentConversation: { ...liveConversation, inbox_id: 59 } }), false);
+  assert.equal(
+    legacy({
+      currentConversation: { ...liveConversation, meta: { sender: { ...liveConversation.meta.sender, id: 412 } } },
+    }),
+    false,
+  );
+  assert.equal(
+    legacy({
+      currentConversation: {
+        ...liveConversation,
+        meta: { sender: { ...liveConversation.meta.sender, phone_number: '+628999999999' } },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    legacy({
+      currentConversation: {
+        ...liveConversation,
+        meta: { sender: { ...liveConversation.meta.sender, identifier: 'whatsapp:99999999' } },
+      },
+    }),
+    false,
+  );
+  assert.equal(
+    legacy({ currentMessage: { ...legacyMessage, outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) } } }),
+    false,
+  );
+  assert.equal(
+    validate({ operation: legacyOperation, currentMessage: { ...legacyMessage, destination: '628123456789' } }),
+    true,
+  );
 });
 
 test('rejects provider disable, compact-snapshot reassignment, destination change and message deletion', () => {

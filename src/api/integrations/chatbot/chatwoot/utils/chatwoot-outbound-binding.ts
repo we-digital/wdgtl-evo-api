@@ -4,8 +4,17 @@ import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatw
 import { matchesChatwootOutboundProvenance } from '@api/types/outbound-provenance';
 import { Chatwoot as ChatwootModel } from '@prisma/client';
 
-export const chatwootOutboundDestination = (conversation: any): string =>
-  conversation?.meta?.sender?.identifier || conversation?.meta?.sender?.phone_number?.replace(/^\+/, '') || '';
+const isWhatsAppAddress = (value: string): boolean =>
+  /^(?:[0-9]{6,20}|[A-Za-z0-9:_-]+@(?:s\.whatsapp\.net|lid|hosted\.lid|g\.us))$/.test(value);
+
+export const chatwootOutboundDestination = (conversation: any): string => {
+  const sender = conversation?.meta?.sender;
+  const identifier = typeof sender?.identifier === 'string' ? sender.identifier.trim() : '';
+  if (isWhatsAppAddress(identifier)) return identifier;
+
+  const phone = typeof sender?.phone_number === 'string' ? sender.phone_number.trim().replace(/^\+/, '') : '';
+  return /^[1-9][0-9]{6,14}$/.test(phone) ? phone : '';
+};
 
 const positiveInteger = (value: unknown): number | undefined => {
   const number = Number(value);
@@ -20,12 +29,40 @@ export const chatwootOutboundContactIdentity = (body: any) => ({
   contactInboxId: positiveInteger(body?.conversation?.contact_inbox?.id),
 });
 
+// The previous Chatwoot image fingerprints an opaque contact label as its
+// exact-message destination. During an EVO-first upgrade, the authenticated
+// webhook already freezes the valid phone. Verify that phone against a fresh,
+// account-scoped conversation read before accepting the old fingerprint.
+export const matchesLegacyOpaqueChatwootDestination = (
+  conversation: any,
+  currentMessage: any,
+  operation: StoredChatwootOutboundOperation,
+): boolean => {
+  const { origin } = operation.payload;
+  const identifier =
+    typeof conversation?.meta?.sender?.identifier === 'string' ? conversation.meta.sender.identifier.trim() : '';
+  const senderId = positiveInteger(conversation?.meta?.sender?.id);
+  return Boolean(
+    identifier &&
+      !isWhatsAppAddress(identifier) &&
+      identifier === currentMessage?.destination &&
+      chatwootOutboundDestination(conversation) === operation.payload.chatId &&
+      positiveInteger(conversation?.id) === origin.conversationId &&
+      positiveInteger(conversation?.account_id) === origin.accountId &&
+      positiveInteger(conversation?.inbox_id) === origin.inboxId &&
+      senderId &&
+      senderId === positiveInteger(currentMessage?.contact_id) &&
+      (!origin.contactId || senderId === origin.contactId),
+  );
+};
+
 export const validatesCurrentChatwootOutboundSnapshot = (params: {
   operation: StoredChatwootOutboundOperation;
   provider: ChatwootModel;
   currentInbox: any;
   conversation: any;
   currentMessage?: any;
+  currentConversation?: any;
   expectedRoute: unknown;
   currentRoute: unknown;
   expectedDeleted?: boolean;
@@ -58,7 +95,8 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       Number(currentMessage.message_id) === origin.messageId &&
       isChatwootOutgoingMessageType(currentMessage.message_type_name ?? currentMessage.message_type) &&
       currentMessage.deleted === (params.expectedDeleted ?? false) &&
-      currentMessage.destination === operation.payload.chatId &&
+      (currentMessage.destination === operation.payload.chatId ||
+        matchesLegacyOpaqueChatwootDestination(params.currentConversation, currentMessage, operation)) &&
       (!origin.contactInboxSourceId || currentMessage.contact_inbox_source_id === origin.contactInboxSourceId) &&
       (!origin.contactId || Number(currentMessage.contact_id) === origin.contactId) &&
       (!origin.contactInboxId || Number(currentMessage.contact_inbox_id) === origin.contactInboxId) &&

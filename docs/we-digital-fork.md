@@ -357,3 +357,20 @@ before either inbox initialization path and overrides any query-supplied ID.
 Regression cases cover missing and foreign IDs; the live local API verifies
 both existing inbox bindings and durable 24-character signing secrets.
 No production deployment is part of this local change.
+
+## API-inbox WhatsApp destination identity and immediate send (2026-09-28)
+
+- **Behavior:** The authenticated Chatwoot webhook accepts a valid WhatsApp JID or numeric identifier; an opaque contact label such as `whatsapp:<id>` falls back to a valid E.164 phone. The selector is shared by normal message, edit, and deletion paths and must match Chatwoot's exact-message snapshot. Invalid destination data is not coerced into a guessed JID. Durable queued text delivery no longer waits an artificial randomized 500–2000 ms or emits typing presence solely for that delay; the existing Baileys destination check, transport fence, deterministic WAID, and callback remain in place.
+- **Source areas:** `chatwoot-outbound-binding.ts`, `chatwoot.service.ts`, and focused outbound-binding tests. The matching Chatwoot snapshot selector must deploy in the same cutover.
+- **Flags/schema:** No new flag or schema. `CHATWOOT_OUTBOUND_ASYNC_ENABLED` continues to control durable delivery.
+- **Upstream reapply/conflicts:** Keep the same destination rule at webhook admission and in Chatwoot's signed frozen/exact snapshot. Do not remove authoritative pre-transport checks or retry an ambiguous send merely to improve latency.
+- **Rollback:** Drain nonterminal operations before rolling both selectors back together; terminal failed operations need exact-ID reconciliation and are never blindly replayed.
+- **Focused regression:** `npx tsx --test tests/chatwoot-outbound-binding.test.ts`, `npm run build`, `npm run lint:check`, and local/contour smoke checks. Measure creation-to-transport time on a designated test-only dialogue.
+
+## EVO-first Chatwoot snapshot compatibility (2026-09-28)
+
+- **Behavior:** During an EVO-first deployment, the prior Chatwoot image can still return an opaque contact label in its exact-message snapshot even though the authenticated webhook contains a separate valid phone. If and only if the exact destination differs from EVO's frozen valid phone, EVO reads the current account-scoped conversation and accepts the legacy snapshot only when account, inbox, conversation, contact ID, exact opaque label, current phone and frozen destination all agree. The existing exact snapshot fingerprint, route, deletion, provenance and pre-transport fence still apply. Normal matched snapshots incur no extra conversation read.
+- **Source areas:** `chatwoot-outbound-binding.ts` and `chatwoot.service.ts`; focused mixed-version binding regression.
+- **Upstream reapply/conflicts:** Keep this narrow transitional check until all production Chatwoot images and retained outbox rows have migrated. Never accept an arbitrary destination mismatch or skip the fresh phone/contact comparison. The exact message response alone does not include the current phone.
+- **Rollback:** Do not roll EVO back after new Chatwoot is active unless no nonterminal operations exist and the old EVO can safely consume the frozen Chatwoot payloads. Preserve immutable receipts and reconcile any ambiguous send rather than replaying it.
+- **Focused regression:** `npx tsx --test tests/chatwoot-outbound-binding.test.ts`, full EVO tests/build/lint, stage runtime canary, and a non-sending production legacy-shape validation before Chatwoot promotion.
