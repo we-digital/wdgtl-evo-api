@@ -126,8 +126,12 @@ duplicate WhatsApp messages.
   ambiguous or transport-unresolved quarantined outcomes block a destination
   lane for one full 10-minute transport-lease window. After that window, distinct later Chatwoot messages
   may advance, but another part of the same ambiguous multipart message stays
-  fenced. The ambiguous operation itself remains unresolved, continues exact-ID
-  reconciliation, and is never sent again. Such outcomes are excluded from
+  fenced. Pending siblings of an aged uncertain multipart message are excluded
+  only as predecessors of *distinct* later messages; they remain pending and
+  cannot send until their own preceding part reconciles. They are also omitted
+  from an otherwise stale delivery-backlog age gate. The uncertain operation
+  itself remains unresolved, continues exact-ID reconciliation, and is never
+  sent again. Such outcomes are excluded from
   destination delivery-backlog depth/age so they cannot cause a later webhook
   admission to fail solely because reconciliation remains open.
   Transport-to-maintenance state
