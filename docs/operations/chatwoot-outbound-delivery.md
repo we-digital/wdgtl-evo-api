@@ -175,6 +175,9 @@ duplicate WhatsApp messages.
 Backoff begins at five seconds and is capped at five minutes. Claims use a
 ten-minute database lease. Expired `preparing` leases return to `pending`;
 expired `sending` leases become `ambiguous`; callback leases are reclaimed.
+The production container execs Node as PID 1. SIGTERM stops HTTP ingress and
+waits for active requests and the outbound worker drain; compose allows three
+minutes, exceeding the 120-second send and 30-second callback budgets.
 The database claim generation and durable lane predecessor check prevent
 concurrent processes from taking the same row or overlapping sibling lane
 parts during restart, lease expiry or rolling deployment.

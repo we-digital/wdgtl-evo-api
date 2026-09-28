@@ -166,6 +166,35 @@ async function bootstrap() {
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
+  let shuttingDown = false;
+  const drainAndExit = async (signal: 'SIGTERM' | 'SIGINT') => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    logger.info(JSON.stringify({ event: 'evo_shutdown_draining', signal }));
+    try {
+      // Refuse new webhooks while completing accepted HTTP requests and every
+      // in-flight durable WhatsApp send before Docker replaces the process.
+      const httpClosed = new Promise<void>((resolve, reject) => {
+        server.close((error) => (error ? reject(error) : resolve()));
+      });
+      const drains = await Promise.allSettled([httpClosed, chatwootService.stopOutboundWorker()]);
+      const failed = drains.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+      if (failed) throw failed.reason;
+      logger.info(JSON.stringify({ event: 'evo_shutdown_drained' }));
+      process.exit(0);
+    } catch (error) {
+      logger.error(
+        JSON.stringify({
+          event: 'evo_shutdown_drain_failed',
+          errorClass: error instanceof Error ? error.name : 'Error',
+        }),
+      );
+      process.exit(1);
+    }
+  };
+  process.once('SIGTERM', () => void drainAndExit('SIGTERM'));
+  process.once('SIGINT', () => void drainAndExit('SIGINT'));
+
   initWA().catch((error) => {
     logger.error(JSON.stringify({ event: 'instance_startup_error', errorClass: error?.name || 'Error' }));
   });

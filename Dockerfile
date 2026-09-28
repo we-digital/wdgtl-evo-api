@@ -63,4 +63,4 @@ LABEL org.opencontainers.image.revision=$SOURCE_SHA \
 
 EXPOSE 8080
 
-ENTRYPOINT ["/bin/bash", "-c", ". ./Docker/scripts/deploy_database.sh && npm run start:prod" ]
+ENTRYPOINT ["/bin/bash", "-c", ". ./Docker/scripts/deploy_database.sh && exec node dist/main" ]
