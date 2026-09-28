@@ -1958,12 +1958,28 @@ export class ChatwootService {
       signal,
     );
     const currentMessage = unwrapChatwootPayload(exactMessageResponse);
+    // Only a destination mismatch needs the compatibility read. The prior
+    // Chatwoot image fingerprints raw opaque labels; the fresh conversation
+    // verifies the current phone before an EVO-first production cutover sends.
+    const legacyDestinationCandidate =
+      typeof currentMessage?.destination === 'string' &&
+      currentMessage.destination.length > 0 &&
+      currentMessage.destination !== operation.payload.chatId;
+    const currentConversation = legacyDestinationCandidate
+      ? unwrapChatwootPayload(
+          await this.awaitCancelable(
+            client.conversations.get({ accountId: origin.accountId, conversationId: origin.conversationId }) as any,
+            signal,
+          ),
+        )
+      : null;
     const snapshot = {
       operation,
       provider,
       currentInbox: null,
       conversation: null,
       currentMessage,
+      currentConversation,
       expectedRoute,
       currentRoute: currentMessage?.route?.binding,
     };
