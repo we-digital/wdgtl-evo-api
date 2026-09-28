@@ -35,9 +35,16 @@ const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'ambiguous',
   'delete_pending',
 ];
+const TRANSPORT_LANE_BLOCKING_STATES = LANE_BLOCKING_STATES.filter((state) => state !== 'ambiguous');
+// Unresolved transport outcomes need reconciliation, not queue capacity.
+const DELIVERY_BACKLOG_STATES = ACTIVE_STATES.filter((state) => state !== 'ambiguous');
 const LANE_BLOCKING_STATE_WHERE = {
   OR: [{ state: { in: LANE_BLOCKING_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };
+// A transport that started but lost its result must never be retried. It must
+// not starve distinct later messages forever either: after a full lease window,
+// only siblings of that same multipart message remain behind the ambiguity.
+const AMBIGUOUS_LANE_HOLD_MS = 10 * 60 * 1_000;
 const ACTIVE_STATE_WHERE = {
   OR: [{ state: { in: ACTIVE_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };
@@ -72,7 +79,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     ]);
     let backlog: ChatwootOutboundBacklog | undefined;
     if (!knownReceipt && knownOperations.length === 0) {
-      backlog = await this.backlogForLane(parts[0].laneKey);
+      backlog = await this.backlogForLane(parts[0].laneKey, admission.receivedAt, admission.maxOldestAgeMs);
       if (backlog.depth + parts.length > admission.maxBacklog) {
         throw Object.assign(new Error('Chatwoot outbound backlog capacity is exhausted'), {
           name: 'ChatwootOutboundBacklogExceeded',
@@ -207,9 +214,9 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     return { depth, oldestAt: oldest?.createdAt ?? null };
   }
 
-  private async backlogForLane(laneKey: string): Promise<ChatwootOutboundBacklog> {
-    const where = { laneKey, ...ACTIVE_STATE_WHERE };
-    const [depth, oldest] = await Promise.all([
+  private async backlogForLane(laneKey: string, now: Date, maxOldestAgeMs: number): Promise<ChatwootOutboundBacklog> {
+    let where: any = { laneKey, state: { in: DELIVERY_BACKLOG_STATES } };
+    let [depth, oldest] = await Promise.all([
       this.repository.chatwootOutboundOperation.count({ where }),
       this.repository.chatwootOutboundOperation.findFirst({
         where,
@@ -217,7 +224,36 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         select: { createdAt: true },
       }),
     ]);
+    // Only on an age-gate failure path, discard still-fenced siblings of a
+    // settled ambiguous multipart send from the delivery backlog calculation.
+    if (oldest && now.getTime() - oldest.createdAt.getTime() > maxOldestAgeMs) {
+      const agedMessageIds = await this.agedUnresolvedMultipartMessageIds(laneKey, now);
+      if (agedMessageIds.length > 0) {
+        where = { AND: [where, { NOT: { state: 'pending', chatwootMessageId: { in: agedMessageIds } } }] };
+        [depth, oldest] = await Promise.all([
+          this.repository.chatwootOutboundOperation.count({ where }),
+          this.repository.chatwootOutboundOperation.findFirst({
+            where,
+            orderBy: { createdAt: 'asc' },
+            select: { createdAt: true },
+          }),
+        ]);
+      }
+    }
     return { depth, oldestAt: oldest?.createdAt ?? null };
+  }
+
+  private async agedUnresolvedMultipartMessageIds(laneKey: string, now: Date): Promise<number[]> {
+    const rows = await this.repository.chatwootOutboundOperation.findMany({
+      where: {
+        laneKey,
+        partCount: { gt: 1 },
+        sendStartedAt: { lte: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) },
+        OR: [{ state: 'ambiguous' }, { state: 'quarantined', transportOutcomeUnresolved: true }],
+      },
+      select: { chatwootMessageId: true },
+    });
+    return [...new Set(rows.map((row) => row.chatwootMessageId))];
   }
 
   public async recoverExpired(now: Date): Promise<void> {
@@ -301,11 +337,11 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           take: 64,
         });
         for (const eligible of candidates) {
-          if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible))) {
+          if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible, now))) {
             candidate = eligible;
             break;
           }
-          if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible))) {
+          if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible, now))) {
             candidate = eligible;
             break;
           }
@@ -785,14 +821,39 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
-  private async hasLanePredecessor(candidate: any): Promise<boolean> {
+  private async hasLanePredecessor(candidate: any, now: Date): Promise<boolean> {
+    const laneBlockingWhere =
+      candidate.state === 'pending'
+        ? {
+            OR: [
+              { state: { in: TRANSPORT_LANE_BLOCKING_STATES } },
+              {
+                state: 'ambiguous',
+                OR: [
+                  { chatwootMessageId: candidate.chatwootMessageId },
+                  { sendStartedAt: null },
+                  { sendStartedAt: { gt: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) } },
+                ],
+              },
+              {
+                state: 'quarantined',
+                transportOutcomeUnresolved: true,
+                OR: [
+                  { chatwootMessageId: candidate.chatwootMessageId },
+                  { sendStartedAt: null },
+                  { sendStartedAt: { gt: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) } },
+                ],
+              },
+            ],
+          }
+        : LANE_BLOCKING_STATE_WHERE;
     if (!candidate.laneKey || BigInt(candidate.laneSequence ?? 0) <= 0n) {
       return (
         (await this.repository.chatwootOutboundOperation.count({
           where: {
             id: { not: candidate.id },
             AND: [
-              LANE_BLOCKING_STATE_WHERE,
+              laneBlockingWhere,
               {
                 OR: [
                   { createdAt: { lt: candidate.createdAt } },
@@ -804,33 +865,44 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
         })) > 0
       );
     }
+    const predecessorWhere = {
+      AND: [
+        laneBlockingWhere,
+        {
+          OR: [
+            {
+              laneKey: candidate.laneKey,
+              OR: [
+                { laneSequence: { lt: candidate.laneSequence } },
+                { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
+              ],
+            },
+            { laneKey: '', createdAt: { lte: candidate.createdAt } },
+          ],
+        },
+      ],
+    };
+    const blocked = (await this.repository.chatwootOutboundOperation.count({ where: predecessorWhere })) > 0;
+    if (!blocked || candidate.state !== 'pending') return blocked;
+    // The unresolved first part also keeps its own later multipart parts pending.
+    // Aged siblings must not indefinitely fence distinct later messages.
+    const agedMessageIds = (await this.agedUnresolvedMultipartMessageIds(candidate.laneKey, now)).filter(
+      (id) => id !== candidate.chatwootMessageId,
+    );
+    if (agedMessageIds.length === 0) return true;
     return (
       (await this.repository.chatwootOutboundOperation.count({
         where: {
-          AND: [
-            LANE_BLOCKING_STATE_WHERE,
-            {
-              OR: [
-                {
-                  laneKey: candidate.laneKey,
-                  OR: [
-                    { laneSequence: { lt: candidate.laneSequence } },
-                    { laneSequence: candidate.laneSequence, partIndex: { lt: candidate.partIndex } },
-                  ],
-                },
-                { laneKey: '', createdAt: { lte: candidate.createdAt } },
-              ],
-            },
-          ],
+          AND: [predecessorWhere, { NOT: { state: 'pending', chatwootMessageId: { in: agedMessageIds } } }],
         },
       })) > 0
     );
   }
 
-  private async isMaintenanceEligible(candidate: any): Promise<boolean> {
+  private async isMaintenanceEligible(candidate: any, now: Date): Promise<boolean> {
     if (candidate.state === 'ambiguous') return true;
     if (candidate.state === 'quarantined') return candidate.transportOutcomeUnresolved === true;
-    if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate));
+    if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate, now));
     if (!['callback_pending', 'failure_callback_pending'].includes(candidate.state) || candidate.partIndex !== 0) {
       return false;
     }

@@ -123,14 +123,26 @@ duplicate WhatsApp messages.
   maintenance capacity, so a callback outage cannot consume every transport
   slot. A lane releases transport ordering only after a part is durably fenced
   as sent/callback-pending or reaches a proven pre-transport terminal outcome;
-  ambiguous transport remains lane-blocking. Transport-to-maintenance state
+  ambiguous or transport-unresolved quarantined outcomes block a destination
+  lane for one full 10-minute transport-lease window. After that window, distinct later Chatwoot messages
+  may advance, but another part of the same ambiguous multipart message stays
+  fenced. Pending siblings of an aged uncertain multipart message are excluded
+  only as predecessors of *distinct* later messages; they remain pending and
+  cannot send until their own preceding part reconciles. They are also omitted
+  from an otherwise stale delivery-backlog age gate. The uncertain operation
+  itself remains unresolved, continues exact-ID reconciliation, and is never
+  sent again. Such outcomes are excluded from
+  destination delivery-backlog depth/age so they cannot cause a later webhook
+  admission to fail solely because reconciliation remains open.
+  Transport-to-maintenance state
   transitions clear the transport lease immediately. Claims keyset-page past
   blocked candidates, and an idle worker waits for its configured poll interval
   rather than repeatedly querying the database.
 - Quarantine is releasable only when transport provably never started or its
   result is already durable. A quarantined operation whose transport outcome
-  remains unresolved keeps its destination lane fenced until exact
-  reconciliation or authoritative deletion establishes a terminal result.
+  remains unresolved keeps same-message siblings fenced until exact
+  reconciliation or authoritative deletion establishes a terminal result;
+  distinct messages advance after the full lease window.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.
@@ -163,6 +175,9 @@ duplicate WhatsApp messages.
 Backoff begins at five seconds and is capped at five minutes. Claims use a
 ten-minute database lease. Expired `preparing` leases return to `pending`;
 expired `sending` leases become `ambiguous`; callback leases are reclaimed.
+The production container execs Node as PID 1. SIGTERM stops HTTP ingress and
+waits for active requests and the outbound worker drain; compose allows three
+minutes, exceeding the 120-second send and 30-second callback budgets.
 The database claim generation and durable lane predecessor check prevent
 concurrent processes from taking the same row or overlapping sibling lane
 parts during restart, lease expiry or rolling deployment.

@@ -65,12 +65,14 @@ const stored = (partIndex: number, state: string, whatsappMessageId?: string) =>
 const matchesPrismaWhere = (row: any, where: any): boolean => {
   if (!where) return true;
   if (where.AND && !where.AND.every((condition: any) => matchesPrismaWhere(row, condition))) return false;
+  if (where.NOT && matchesPrismaWhere(row, where.NOT)) return false;
   if (where.OR && !where.OR.some((condition: any) => matchesPrismaWhere(row, condition))) return false;
   return Object.entries(where).every(([key, expected]: [string, any]) => {
-    if (key === 'AND' || key === 'OR') return true;
+    if (key === 'AND' || key === 'OR' || key === 'NOT') return true;
     const actual = row[key];
     if (expected === null || typeof expected !== 'object' || expected instanceof Date) return actual === expected;
     if ('in' in expected && !expected.in.includes(actual)) return false;
+    if ('notIn' in expected && expected.notIn.includes(actual)) return false;
     if ('not' in expected && actual === expected.not) return false;
     if ('lt' in expected && !(actual < expected.lt)) return false;
     if ('lte' in expected && !(actual <= expected.lte)) return false;
@@ -358,30 +360,13 @@ const admissionRepository = (seedRows: any[] = []) => {
   const receipts = new Map<string, any>();
   const lanes = new Map<string, bigint>();
   const transactionOptions: any[] = [];
-  const matchesActive = (row: any, where: any) =>
-    where.state?.in?.includes(row.state) ||
-    where.OR?.some(
-      (condition: any) =>
-        condition.state?.in?.includes(row.state) ||
-        (condition.state === row.state &&
-          (condition.transportOutcomeUnresolved === undefined ||
-            condition.transportOutcomeUnresolved === row.transportOutcomeUnresolved)),
-    );
   const operations = {
     findMany: async ({ where }: any) =>
-      rows
-        .filter(
-          (row) =>
-            (where.instanceId === undefined || row.instanceId === where.instanceId) &&
-            (where.chatwootMessageId === undefined || row.chatwootMessageId === where.chatwootMessageId),
-        )
-        .sort((left, right) => left.partIndex - right.partIndex),
-    count: async ({ where }: any) =>
-      rows.filter((row) => (where.laneKey === undefined || row.laneKey === where.laneKey) && matchesActive(row, where))
-        .length,
+      rows.filter((row) => matchesPrismaWhere(row, where)).sort((left, right) => left.partIndex - right.partIndex),
+    count: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)).length,
     findFirst: async ({ where }: any) => {
       const active = rows
-        .filter((row) => (where.laneKey === undefined || row.laneKey === where.laneKey) && matchesActive(row, where))
+        .filter((row) => matchesPrismaWhere(row, where))
         .sort((left, right) => left.createdAt.getTime() - right.createdAt.getTime());
       return active[0] ? { createdAt: active[0].createdAt } : null;
     },
@@ -457,6 +442,74 @@ test('recovers a lost 202 idempotently and durably reserves every accepted deliv
   );
   assert.equal(memory.rows.length, parts.length);
   assert.ok(memory.rows.every((row) => row.state === 'pending'));
+});
+
+test('aged unresolved transport does not reject a distinct webhook as stale delivery backlog', async () => {
+  const now = admission('later').receivedAt;
+  const old = {
+    ...stored(0, 'ambiguous'),
+    id: 'unresolved-old',
+    chatwootMessageId: 313,
+    laneKey: parts[0].laneKey,
+    transportOutcomeUnresolved: true,
+    sendAttempts: 1,
+    sendStartedAt: new Date(now.getTime() - 2 * 60 * 60_000),
+    createdAt: new Date(now.getTime() - 2 * 60 * 60_000),
+  };
+  const memory = admissionRepository([old]);
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+  const result = await store.enqueue('instance-1', 314, 58, 42, parts, admission('later'));
+  assert.equal(result.recovered, false);
+  assert.deepEqual(result.backlog, { depth: parts.length, oldestAt: now });
+  assert.equal(old.state, 'ambiguous');
+
+  old.state = 'quarantined';
+  const nextParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 315,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 43 },
+      outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
+      attachments: [],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'successor',
+    origin: { ...origin, messageId: 315, conversationId: 43, snapshotFingerprint: 'c'.repeat(64) },
+  });
+  const second = await store.enqueue('instance-1', 315, 58, 43, nextParts, admission('later-2'));
+  assert.equal(second.recovered, false);
+  assert.equal(old.state, 'quarantined');
+});
+
+test('aged multipart uncertainty does not count its still-fenced sibling as stale admission backlog', async () => {
+  const now = admission('later').receivedAt;
+  const seed = [
+    {
+      ...stored(0, 'ambiguous'),
+      id: 'old-first',
+      chatwootMessageId: 313,
+      laneKey: parts[0].laneKey,
+      sendStartedAt: new Date(now.getTime() - 2 * 60 * 60_000),
+      createdAt: new Date(now.getTime() - 2 * 60 * 60_000),
+    },
+    {
+      ...stored(1, 'pending'),
+      id: 'old-sibling',
+      chatwootMessageId: 313,
+      laneKey: parts[0].laneKey,
+      createdAt: new Date(now.getTime() - 2 * 60 * 60_000),
+    },
+  ];
+  const memory = admissionRepository(seed);
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+  const result = await store.enqueue('instance-1', 314, 58, 42, parts, admission('later'));
+  assert.equal(result.recovered, false);
+  assert.deepEqual(result.backlog, { depth: parts.length, oldestAt: now });
+  assert.equal(seed[0].state, 'ambiguous');
+  assert.equal(seed[1].state, 'pending');
 });
 
 test('same delivery identity with changed frozen context quarantines the retained message atomically', async () => {
@@ -908,6 +961,109 @@ test('claims independent destinations concurrently but preserves exact same-lane
   assert.equal(sameLaneNext?.id, 'lane-a-2');
 });
 
+test('releases only a distinct successor after a full ambiguous-send lease window', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const laneKey = 'a'.repeat(64);
+  const rows: any[] = [
+    {
+      ...stored(0, 'ambiguous'),
+      id: 'uncertain-first',
+      laneKey,
+      laneSequence: 1n,
+      sendAttempts: 1,
+      sendStartedAt: new Date(now.getTime() - 9 * 60_000),
+      transportOutcomeUnresolved: true,
+      createdAt: new Date(now.getTime() - 11 * 60_000),
+    },
+    {
+      ...stored(0, 'pending'),
+      id: 'distinct-successor',
+      chatwootMessageId: 315,
+      laneKey,
+      laneSequence: 2n,
+      leaseOwner: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 8 * 60_000),
+    },
+  ];
+  const operations = {
+    findMany: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)),
+    count: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)).length,
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => matchesPrismaWhere(candidate, where));
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
+  rows[0].sendStartedAt = new Date(now.getTime() - 11 * 60_000);
+  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  assert.equal(rows[0].state, 'ambiguous');
+  assert.equal(rows[0].sendAttempts, 1);
+
+  rows[1].state = 'pending';
+  rows[1].leaseOwner = null;
+  rows[0].state = 'quarantined';
+  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  rows[0].state = 'ambiguous';
+
+  rows[1].state = 'callback_pending';
+  rows.push({
+    ...stored(1, 'pending'),
+    id: 'same-message-sibling',
+    laneKey,
+    laneSequence: 1n,
+    leaseOwner: null,
+    nextAttemptAt: now,
+    createdAt: new Date(now.getTime() - 7 * 60_000),
+  });
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
+
+  rows.pop();
+  rows[1].state = 'pending';
+  rows[1].leaseOwner = null;
+  rows[0].sendStartedAt = null;
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
+});
+
+test('aged ambiguous multipart siblings stay fenced while a distinct later message advances', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const laneKey = 'a'.repeat(64);
+  const rows: any[] = [
+    {
+      ...stored(0, 'ambiguous'), id: 'uncertain-first', laneKey, laneSequence: 1n,
+      sendStartedAt: new Date(now.getTime() - 11 * 60_000),
+      createdAt: new Date(now.getTime() - 12 * 60_000),
+    },
+    {
+      ...stored(1, 'pending'), id: 'fenced-sibling', laneKey, laneSequence: 1n,
+      leaseOwner: null, nextAttemptAt: now, createdAt: new Date(now.getTime() - 12 * 60_000),
+    },
+    {
+      ...stored(0, 'pending'), id: 'later-distinct', chatwootMessageId: 315,
+      laneKey, laneSequence: 2n, partCount: 1, leaseOwner: null,
+      nextAttemptAt: now, createdAt: new Date(now.getTime() - 8 * 60_000),
+    },
+  ];
+  const operations = {
+    findMany: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)),
+    count: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)).length,
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => matchesPrismaWhere(candidate, where));
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'later-distinct');
+  assert.equal(rows[0].state, 'ambiguous');
+  assert.equal(rows[1].state, 'pending');
+});
+
 test('paginates beyond 64 blocked candidates to claim an independent runnable lane', async () => {
   const now = new Date('2026-09-11T03:00:00.000Z');
   const rows: any[] = Array.from({ length: 64 }, (_, index) => ({
@@ -931,7 +1087,7 @@ test('paginates beyond 64 blocked candidates to claim an independent runnable la
   let pages = 0;
   const operations = {
     findMany: async ({ cursor, skip = 0, take }: any) => {
-      pages += 1;
+      if (take !== undefined) pages += 1;
       const cursorIndex = cursor ? rows.findIndex((row) => row.id === cursor.id) : -1;
       const start = cursor ? cursorIndex + skip : 0;
       return rows.slice(start, start + take);
