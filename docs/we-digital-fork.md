@@ -357,3 +357,12 @@ before either inbox initialization path and overrides any query-supplied ID.
 Regression cases cover missing and foreign IDs; the live local API verifies
 both existing inbox bindings and durable 24-character signing secrets.
 No production deployment is part of this local change.
+
+## API-inbox WhatsApp destination identity and immediate send (2026-09-28)
+
+- **Behavior:** The authenticated Chatwoot webhook accepts a valid WhatsApp JID or numeric identifier; an opaque contact label such as `whatsapp:<id>` falls back to a valid E.164 phone. The selector is shared by normal message, edit, and deletion paths and must match Chatwoot's exact-message snapshot. Invalid destination data is not coerced into a guessed JID. Durable queued text delivery no longer waits an artificial randomized 500–2000 ms or emits typing presence solely for that delay; the existing Baileys destination check, transport fence, deterministic WAID, and callback remain in place.
+- **Source areas:** `chatwoot-outbound-binding.ts`, `chatwoot.service.ts`, and focused outbound-binding tests. The matching Chatwoot snapshot selector must deploy in the same cutover.
+- **Flags/schema:** No new flag or schema. `CHATWOOT_OUTBOUND_ASYNC_ENABLED` continues to control durable delivery.
+- **Upstream reapply/conflicts:** Keep the same destination rule at webhook admission and in Chatwoot's signed frozen/exact snapshot. Do not remove authoritative pre-transport checks or retry an ambiguous send merely to improve latency.
+- **Rollback:** Drain nonterminal operations before rolling both selectors back together; terminal failed operations need exact-ID reconciliation and are never blindly replayed.
+- **Focused regression:** `npx tsx --test tests/chatwoot-outbound-binding.test.ts`, `npm run build`, `npm run lint:check`, and local/contour smoke checks. Measure creation-to-transport time on a designated test-only dialogue.
