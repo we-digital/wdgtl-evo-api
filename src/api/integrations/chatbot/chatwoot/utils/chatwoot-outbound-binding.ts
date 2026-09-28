@@ -4,8 +4,16 @@ import { StoredChatwootOutboundOperation } from '@api/integrations/chatbot/chatw
 import { matchesChatwootOutboundProvenance } from '@api/types/outbound-provenance';
 import { Chatwoot as ChatwootModel } from '@prisma/client';
 
-export const chatwootOutboundDestination = (conversation: any): string =>
-  conversation?.meta?.sender?.identifier || conversation?.meta?.sender?.phone_number?.replace(/^\+/, '') || '';
+export const chatwootOutboundDestination = (conversation: any): string => {
+  const sender = conversation?.meta?.sender;
+  const identifier = typeof sender?.identifier === 'string' ? sender.identifier.trim() : '';
+  if (/^(?:[0-9]{6,20}|[A-Za-z0-9:_-]+@(?:s\.whatsapp\.net|lid|hosted\.lid|g\.us))$/.test(identifier)) {
+    return identifier;
+  }
+
+  const phone = typeof sender?.phone_number === 'string' ? sender.phone_number.trim().replace(/^\+/, '') : '';
+  return /^[1-9][0-9]{6,14}$/.test(phone) ? phone : '';
+};
 
 const positiveInteger = (value: unknown): number | undefined => {
   const number = Number(value);

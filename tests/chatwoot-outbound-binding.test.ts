@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   chatwootOutboundContactIdentity,
+  chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
   validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
@@ -111,6 +112,22 @@ test('derives outbound contact identity from the conversation instead of the sen
     contactId: 411,
     contactInboxId: 733,
   });
+});
+
+test('uses a valid WhatsApp address instead of an opaque contact identifier', () => {
+  assert.equal(
+    chatwootOutboundDestination({ meta: { sender: { identifier: 'whatsapp:12345678', phone_number: '+628123456789' } } }),
+    '628123456789',
+  );
+  assert.equal(
+    chatwootOutboundDestination({ meta: { sender: { identifier: '628123@lid', phone_number: '+628999999999' } } }),
+    '628123@lid',
+  );
+  assert.equal(
+    chatwootOutboundDestination({ meta: { sender: { identifier: '120363123-123@g.us' } } }),
+    '120363123-123@g.us',
+  );
+  assert.equal(chatwootOutboundDestination({ meta: { sender: { identifier: 'whatsapp:12345678' } } }), '');
 });
 
 test('rejects provider disable, compact-snapshot reassignment, destination change and message deletion', () => {
