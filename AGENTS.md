@@ -5,16 +5,20 @@
 - This repository is the application-source owner for BBC EVO. Runtime and
   infrastructure configuration belong in `we-digital/bbc-devops`.
 - `main` is production source and deploys only `bbc-evo` after a successful
-  immutable image build. `staging` is staging source and deploys only
-  `bbc-stage-evo`.
+  immutable image build. `staging` remains a legacy staging source and deploys
+  only `bbc-stage-evo`; do not push new BBC delivery changes to it.
 - Images must use the exact branch plus full commit SHA and registry digest:
   `main-<40-char-sha>@sha256:<digest>` or
   `staging-<40-char-sha>@sha256:<digest>`. Never deploy `latest`, a run number,
   or another mutable tag.
 - The `bbc-devops` receiver must validate the exact source repository, branch,
   full SHA, image namespace, digest, and fixed destination before deployment.
-- Test product changes on `staging`, then promote the same source change to
-  `main`. Do not merge staging-only runtime experiments into production.
+- For every new BBC change, open a short-lived PR to `main`, test the exact
+  candidate in the shared lab with synthetic data, merge to `main`, and verify
+  the immutable production runtime. Do not use staging as a delivery or
+  acceptance step. Preserve staging-only runtime experiments separately.
+  This owner directive applies until changed; see
+  `visard-bbc-workspace/decisions/2026-09-28-lab-first-production.md`.
 - Every BBC-related pull request description must mention `@Razario`.
 - GitHub Actions is packaging and deployment transport only. Exactly one
   source workflow may remain; do not restore upstream lint, test, security,
