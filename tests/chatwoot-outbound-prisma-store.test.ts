@@ -459,6 +459,46 @@ test('recovers a lost 202 idempotently and durably reserves every accepted deliv
   assert.ok(memory.rows.every((row) => row.state === 'pending'));
 });
 
+test('aged unresolved transport does not reject a distinct webhook as stale delivery backlog', async () => {
+  const now = admission('later').receivedAt;
+  const old = {
+    ...stored(0, 'ambiguous'),
+    id: 'unresolved-old',
+    chatwootMessageId: 313,
+    laneKey: parts[0].laneKey,
+    transportOutcomeUnresolved: true,
+    sendAttempts: 1,
+    sendStartedAt: new Date(now.getTime() - 2 * 60 * 60_000),
+    createdAt: new Date(now.getTime() - 2 * 60 * 60_000),
+  };
+  const memory = admissionRepository([old]);
+  const store = new ChatwootOutboundPrismaStore(memory.repository);
+  const result = await store.enqueue('instance-1', 314, 58, 42, parts, admission('later'));
+  assert.equal(result.recovered, false);
+  assert.deepEqual(result.backlog, { depth: parts.length, oldestAt: now });
+  assert.equal(old.state, 'ambiguous');
+
+  old.state = 'quarantined';
+  const nextParts = buildChatwootOutboundParts({
+    instanceId: 'instance-1',
+    body: {
+      event: 'message_created',
+      id: 315,
+      account: { id: 7 },
+      inbox: { id: 58 },
+      conversation: { id: 43 },
+      outbound_snapshot: { version: 1, fingerprint: 'c'.repeat(64) },
+      attachments: [],
+    },
+    chatId: 'opaque-chat',
+    formattedText: 'successor',
+    origin: { ...origin, messageId: 315, conversationId: 43, snapshotFingerprint: 'c'.repeat(64) },
+  });
+  const second = await store.enqueue('instance-1', 315, 58, 43, nextParts, admission('later-2'));
+  assert.equal(second.recovered, false);
+  assert.equal(old.state, 'quarantined');
+});
+
 test('same delivery identity with changed frozen context quarantines the retained message atomically', async () => {
   const memory = admissionRepository();
   const store = new ChatwootOutboundPrismaStore(memory.repository);
@@ -906,6 +946,74 @@ test('claims independent destinations concurrently but preserves exact same-lane
   rows[0].state = 'callback_pending';
   const sameLaneNext = await store.claim('worker-2', now, new Date(now.getTime() + 1_000), 'transport');
   assert.equal(sameLaneNext?.id, 'lane-a-2');
+});
+
+test('releases only a distinct successor after a full ambiguous-send lease window', async () => {
+  const now = new Date('2026-09-11T03:00:00.000Z');
+  const laneKey = 'a'.repeat(64);
+  const rows: any[] = [
+    {
+      ...stored(0, 'ambiguous'),
+      id: 'uncertain-first',
+      laneKey,
+      laneSequence: 1n,
+      sendAttempts: 1,
+      sendStartedAt: new Date(now.getTime() - 9 * 60_000),
+      transportOutcomeUnresolved: true,
+      createdAt: new Date(now.getTime() - 11 * 60_000),
+    },
+    {
+      ...stored(0, 'pending'),
+      id: 'distinct-successor',
+      chatwootMessageId: 315,
+      laneKey,
+      laneSequence: 2n,
+      leaseOwner: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 8 * 60_000),
+    },
+  ];
+  const operations = {
+    findMany: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)),
+    count: async ({ where }: any) => rows.filter((row) => matchesPrismaWhere(row, where)).length,
+    updateMany: async ({ where, data }: any) => {
+      const row = rows.find((candidate) => matchesPrismaWhere(candidate, where));
+      if (!row) return { count: 0 };
+      Object.assign(row, data, { claimGeneration: row.claimGeneration + 1 });
+      return { count: 1 };
+    },
+  };
+  const store = new ChatwootOutboundPrismaStore({ chatwootOutboundOperation: operations } as any);
+
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
+  rows[0].sendStartedAt = new Date(now.getTime() - 11 * 60_000);
+  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  assert.equal(rows[0].state, 'ambiguous');
+  assert.equal(rows[0].sendAttempts, 1);
+
+  rows[1].state = 'pending';
+  rows[1].leaseOwner = null;
+  rows[0].state = 'quarantined';
+  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  rows[0].state = 'ambiguous';
+
+  rows[1].state = 'callback_pending';
+  rows.push({
+    ...stored(1, 'pending'),
+    id: 'same-message-sibling',
+    laneKey,
+    laneSequence: 1n,
+    leaseOwner: null,
+    nextAttemptAt: now,
+    createdAt: new Date(now.getTime() - 7 * 60_000),
+  });
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
+
+  rows.pop();
+  rows[1].state = 'pending';
+  rows[1].leaseOwner = null;
+  rows[0].sendStartedAt = null;
+  assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
 });
 
 test('paginates beyond 64 blocked candidates to claim an independent runnable lane', async () => {

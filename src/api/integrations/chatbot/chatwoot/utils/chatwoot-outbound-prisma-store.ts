@@ -35,9 +35,16 @@ const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'ambiguous',
   'delete_pending',
 ];
+const TRANSPORT_LANE_BLOCKING_STATES = LANE_BLOCKING_STATES.filter((state) => state !== 'ambiguous');
+// Unresolved transport outcomes need reconciliation, not queue capacity.
+const DELIVERY_BACKLOG_STATES = ACTIVE_STATES.filter((state) => state !== 'ambiguous');
 const LANE_BLOCKING_STATE_WHERE = {
   OR: [{ state: { in: LANE_BLOCKING_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };
+// A transport that started but lost its result must never be retried. It must
+// not starve distinct later messages forever either: after a full lease window,
+// only siblings of that same multipart message remain behind the ambiguity.
+const AMBIGUOUS_LANE_HOLD_MS = 10 * 60 * 1_000;
 const ACTIVE_STATE_WHERE = {
   OR: [{ state: { in: ACTIVE_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };
@@ -208,7 +215,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   }
 
   private async backlogForLane(laneKey: string): Promise<ChatwootOutboundBacklog> {
-    const where = { laneKey, ...ACTIVE_STATE_WHERE };
+    const where = { laneKey, state: { in: DELIVERY_BACKLOG_STATES } };
     const [depth, oldest] = await Promise.all([
       this.repository.chatwootOutboundOperation.count({ where }),
       this.repository.chatwootOutboundOperation.findFirst({
@@ -301,11 +308,11 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           take: 64,
         });
         for (const eligible of candidates) {
-          if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible))) {
+          if (workClass === 'maintenance' && (await this.isMaintenanceEligible(eligible, now))) {
             candidate = eligible;
             break;
           }
-          if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible))) {
+          if (workClass !== 'maintenance' && !(await this.hasLanePredecessor(eligible, now))) {
             candidate = eligible;
             break;
           }
@@ -785,14 +792,39 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
-  private async hasLanePredecessor(candidate: any): Promise<boolean> {
+  private async hasLanePredecessor(candidate: any, now: Date): Promise<boolean> {
+    const laneBlockingWhere =
+      candidate.state === 'pending'
+        ? {
+            OR: [
+              { state: { in: TRANSPORT_LANE_BLOCKING_STATES } },
+              {
+                state: 'ambiguous',
+                OR: [
+                  { chatwootMessageId: candidate.chatwootMessageId },
+                  { sendStartedAt: null },
+                  { sendStartedAt: { gt: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) } },
+                ],
+              },
+              {
+                state: 'quarantined',
+                transportOutcomeUnresolved: true,
+                OR: [
+                  { chatwootMessageId: candidate.chatwootMessageId },
+                  { sendStartedAt: null },
+                  { sendStartedAt: { gt: new Date(now.getTime() - AMBIGUOUS_LANE_HOLD_MS) } },
+                ],
+              },
+            ],
+          }
+        : LANE_BLOCKING_STATE_WHERE;
     if (!candidate.laneKey || BigInt(candidate.laneSequence ?? 0) <= 0n) {
       return (
         (await this.repository.chatwootOutboundOperation.count({
           where: {
             id: { not: candidate.id },
             AND: [
-              LANE_BLOCKING_STATE_WHERE,
+              laneBlockingWhere,
               {
                 OR: [
                   { createdAt: { lt: candidate.createdAt } },
@@ -808,7 +840,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       (await this.repository.chatwootOutboundOperation.count({
         where: {
           AND: [
-            LANE_BLOCKING_STATE_WHERE,
+            laneBlockingWhere,
             {
               OR: [
                 {
@@ -827,10 +859,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     );
   }
 
-  private async isMaintenanceEligible(candidate: any): Promise<boolean> {
+  private async isMaintenanceEligible(candidate: any, now: Date): Promise<boolean> {
     if (candidate.state === 'ambiguous') return true;
     if (candidate.state === 'quarantined') return candidate.transportOutcomeUnresolved === true;
-    if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate));
+    if (candidate.state === 'delete_pending') return !(await this.hasLanePredecessor(candidate, now));
     if (!['callback_pending', 'failure_callback_pending'].includes(candidate.state) || candidate.partIndex !== 0) {
       return false;
     }
