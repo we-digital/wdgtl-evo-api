@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { activateChatwootHistorySourceGuards } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-source-guard';
 import {
   filterImportableHistoryMessages,
   isGroupJid,
@@ -345,6 +346,10 @@ class ChatwootImport {
     } finally {
       client.release();
     }
+  }
+
+  public async activateHistorySourceGuards(sourceIds: string[], inboxId: number): Promise<void> {
+    await activateChatwootHistorySourceGuards(postgresClient.getChatwootConnection(), inboxId, sourceIds);
   }
 
   private async insertHistoryMessagesSerialized(sql: string, params: unknown[]): Promise<number> {

@@ -5389,6 +5389,7 @@ export class ChatwootService {
         }
         return stored;
       });
+      await chatwootImport.activateHistorySourceGuards(Array.from(requestedSourceIds), inbox.id);
       const preparedBySourceId = new Map(
         authoritativeMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
