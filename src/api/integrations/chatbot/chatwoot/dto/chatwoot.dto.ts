@@ -41,6 +41,10 @@ export class ChatwootHistorySyncBatchMessageDto {
   message: Record<string, unknown>;
 }
 
+export class ChatwootHistoryRecoveryBatchMessageDto extends ChatwootHistorySyncBatchMessageDto {
+  expectedDirection: 'incoming' | 'outgoing';
+}
+
 export class ChatwootHistorySyncBatchDto {
   contractVersion: '2026-08-01';
   dryRun: false;
@@ -59,7 +63,7 @@ export class ChatwootHistoryRecoveryBatchDto {
   recoveryMode: 'standard' | 'maximize';
   expectedDestinationKey: string;
   expectedInboxId: number;
-  messages: ChatwootHistorySyncBatchMessageDto[];
+  messages: ChatwootHistoryRecoveryBatchMessageDto[];
 }
 
 export function ChatwootInstanceMixin<TBase extends Constructor>(Base: TBase) {

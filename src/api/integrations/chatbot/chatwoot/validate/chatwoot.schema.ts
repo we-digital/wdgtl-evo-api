@@ -119,7 +119,35 @@ export const chatwootHistoryRecoveryBatchSchema: JSONSchema7 = {
     recoveryMode: { type: 'string', enum: ['standard', 'maximize'] },
     expectedDestinationKey: { type: 'string', minLength: 1, maxLength: 255 },
     expectedInboxId: { type: 'integer', minimum: 1 },
-    messages: chatwootHistorySyncBatchSchema.properties.messages,
+    messages: {
+      type: 'array',
+      minItems: 1,
+      maxItems: 500,
+      items: {
+        type: 'object',
+        additionalProperties: false,
+        properties: {
+          sourceId: { type: 'string', pattern: '^WAID:[^\\s]+$', maxLength: 255 },
+          expectedDirection: { type: 'string', enum: ['incoming', 'outgoing'] },
+          message: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 255 },
+              key: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', minLength: 1, maxLength: 255 },
+                  fromMe: { type: 'boolean' },
+                },
+                required: ['id', 'fromMe'],
+              },
+            },
+            required: ['id', 'key'],
+          },
+        },
+        required: ['sourceId', 'expectedDirection', 'message'],
+      },
+    },
   },
   required: [
     'contractVersion',

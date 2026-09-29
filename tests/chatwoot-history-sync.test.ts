@@ -468,7 +468,12 @@ test('accepts only the destination-aware recovery batch contract', () => {
     messages: [
       {
         sourceId: 'WAID:message-1',
-        message: { id: 'database-id-1', key: { id: 'message-1' }, messageTimestamp: 1_700_000_000 },
+        expectedDirection: 'incoming',
+        message: {
+          id: 'database-id-1',
+          key: { id: 'message-1', fromMe: false },
+          messageTimestamp: 1_700_000_000,
+        },
       },
     ],
   };
@@ -483,6 +488,117 @@ test('accepts only the destination-aware recovery batch contract', () => {
     validate({ ...validRequest, expectedInboxId: undefined }, chatwootHistoryRecoveryBatchSchema).valid,
     false,
   );
+  assert.equal(
+    validate(
+      { ...validRequest, messages: [{ ...validRequest.messages[0], expectedDirection: undefined }] },
+      chatwootHistoryRecoveryBatchSchema,
+    ).valid,
+    false,
+  );
+  assert.equal(
+    validate(
+      { ...validRequest, messages: [{ ...validRequest.messages[0], expectedDirection: 'sideways' }] },
+      chatwootHistoryRecoveryBatchSchema,
+    ).valid,
+    false,
+  );
+});
+
+test('rejects authoritative direction drift before destination mutation and accepts both bound directions', async (t) => {
+  const serverModulePath = require.resolve('../src/api/server.module.ts');
+  const previousServerModule = require.cache[serverModulePath];
+  require.cache[serverModulePath] = {
+    id: serverModulePath,
+    filename: serverModulePath,
+    loaded: true,
+    exports: new Proxy({}, { get: () => ({}) }),
+    children: [],
+    paths: [],
+  } as NodeModule;
+  t.after(() => {
+    if (previousServerModule) require.cache[serverModulePath] = previousServerModule;
+    else delete require.cache[serverModulePath];
+  });
+  const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const service = Object.create(ChatwootService.prototype) as any;
+  service.isImportHistoryAvailable = () => true;
+  service.getProvider = async () => ({ accountId: '1', importMessages: true });
+  service.getStoredHistoryRecoveryInbox = async () => ({ id: 99 });
+
+  const originalActivateGuards = chatwootImport.activateHistorySourceGuards;
+  const originalReconcileOutbound = chatwootImport.reconcileOutboundHistoryBindings;
+  const originalImportHistory = chatwootImport.importHistoryMessages;
+  let guardCalls = 0;
+  let reconcileCalls = 0;
+  let importCalls = 0;
+
+  chatwootImport.activateHistorySourceGuards = (async () => {
+    guardCalls += 1;
+    throw new Error('control_stop_after_direction_validation');
+  }) as any;
+  chatwootImport.reconcileOutboundHistoryBindings = (async () => {
+    reconcileCalls += 1;
+    return new Set<string>();
+  }) as any;
+  chatwootImport.importHistoryMessages = (async () => {
+    importCalls += 1;
+    return 0;
+  }) as any;
+
+  const recoveryRequest = (messages: Array<{ id: string; sourceId: string; fromMe: boolean }>) => ({
+    contractVersion: '2026-08-28' as const,
+    dryRun: false as const,
+    scope: 'all' as const,
+    unresolvedLidMode: 'provisional' as const,
+    refreshLidMappings: false,
+    recoveryMode: 'maximize' as const,
+    expectedDestinationKey: 'chatwoot:1:99',
+    expectedInboxId: 99,
+    messages: messages.map((entry) => ({
+      sourceId: entry.sourceId,
+      expectedDirection: entry.fromMe ? ('outgoing' as const) : ('incoming' as const),
+      message: { id: entry.id, key: { id: entry.sourceId.slice(5), fromMe: entry.fromMe } },
+    })),
+  });
+
+  try {
+    service.prismaRepository = {
+      message: {
+        findMany: async () => [{ id: 'database-in', key: { id: 'incoming-id', fromMe: true } }],
+      },
+    };
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch(
+        { instanceName: 'cycle8-authoritative-drift' },
+        recoveryRequest([{ id: 'database-in', sourceId: 'WAID:incoming-id', fromMe: false }]),
+      ),
+      (error: any) => {
+        assert.deepEqual(error?.message, ['Cached history message direction changed in authoritative storage']);
+        return true;
+      },
+    );
+    assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 0, reconcileCalls: 0, importCalls: 0 });
+
+    service.prismaRepository.message.findMany = async () => [
+      { id: 'database-in', key: { id: 'incoming-id', fromMe: false } },
+      { id: 'database-out', key: { id: 'outgoing-id', fromMe: true } },
+    ];
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch(
+        { instanceName: 'cycle8-bidirectional-control' },
+        recoveryRequest([
+          { id: 'database-in', sourceId: 'WAID:incoming-id', fromMe: false },
+          { id: 'database-out', sourceId: 'WAID:outgoing-id', fromMe: true },
+        ]),
+      ),
+      /control_stop_after_direction_validation/,
+    );
+    assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 1, reconcileCalls: 0, importCalls: 0 });
+  } finally {
+    chatwootImport.activateHistorySourceGuards = originalActivateGuards;
+    chatwootImport.reconcileOutboundHistoryBindings = originalReconcileOutbound;
+    chatwootImport.importHistoryMessages = originalImportHistory;
+  }
 });
 
 test('pins recovery apply to the exact capability destination', () => {
