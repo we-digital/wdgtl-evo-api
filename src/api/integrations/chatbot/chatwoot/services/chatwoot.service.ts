@@ -112,6 +112,8 @@ import {
   compactReplyToIds,
   extractWhatsappReplyStanzaId,
   toChatwootWhatsappSourceId,
+  whatsappQuotedMessageContent,
+  whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
   requireTrustedChatwootUrl,
@@ -2074,6 +2076,7 @@ export class ChatwootService {
         content_attributes: {
           in_reply_to: payload.quotedChatwootMessageId,
           in_reply_to_external_id: payload.quotedWhatsappMessageId,
+          quote_text: payload.quoteText,
         },
       },
       instance,
@@ -3259,6 +3262,7 @@ export class ChatwootService {
   private async getReplyToIds(msg: any, instance: InstanceDto): Promise<Record<string, string | number>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
+    let quoteText = null;
 
     if (msg) {
       const stanzaId = extractWhatsappReplyStanzaId(msg);
@@ -3269,12 +3273,14 @@ export class ChatwootService {
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
+        quoteText = whatsappReplyQuoteSnapshotText(msg, message?.message);
       }
     }
 
     return compactReplyToIds({
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
+      quote_text: quoteText,
     });
   }
 
@@ -3289,13 +3295,13 @@ export class ChatwootService {
         },
       });
 
-      const quoted = this.quotedMessage(message);
+      const quoted = this.quotedMessage(message, references.quoteText);
       if (quoted) return quoted;
     }
 
     if (references.whatsappMessageId) {
       message = await this.getMessageByKeyId(instance, references.whatsappMessageId);
-      const quoted = this.quotedMessage(message);
+      const quoted = this.quotedMessage(message, references.quoteText);
       if (quoted) return quoted;
     }
 
@@ -3306,13 +3312,13 @@ export class ChatwootService {
     return null;
   }
 
-  private quotedMessage(message: MessageModel | null): Quoted {
+  private quotedMessage(message: MessageModel | null, quoteText?: string): Quoted {
     const key = message?.key as WAMessageKey;
     const messageContent = message?.message as WAMessageContent;
 
     if (!messageContent || !key?.id) return null;
 
-    return { key, message: messageContent };
+    return { key, message: whatsappQuotedMessageContent(messageContent, quoteText) as WAMessageContent };
   }
 
   /**

@@ -8,6 +8,7 @@ const WAID_PREFIX = 'WAID:';
 type ContextInfoLike = {
   stanzaId?: unknown;
   stanzaid?: unknown;
+  quotedMessage?: unknown;
 };
 
 const WRAPPER_KEYS = new Set([
@@ -66,6 +67,78 @@ export const extractWhatsappReplyStanzaId = (msg: unknown): string | null => {
   return extractFromMessageContent(body.message);
 };
 
+const quotedMessageFromContext = (contextInfo: unknown): unknown | null => {
+  if (!contextInfo || typeof contextInfo !== 'object') return null;
+  return (contextInfo as ContextInfoLike).quotedMessage ?? null;
+};
+
+const extractQuotedMessageFromContent = (message: unknown, depth = 0): unknown | null => {
+  if (!message || typeof message !== 'object' || depth > 4) return null;
+  const content = message as Record<string, unknown>;
+
+  const direct = quotedMessageFromContext(content.contextInfo);
+  if (direct) return direct;
+
+  for (const [key, value] of Object.entries(content)) {
+    if (!value || typeof value !== 'object') continue;
+    if (WRAPPER_KEYS.has(key)) {
+      const nested = extractQuotedMessageFromContent((value as { message?: unknown }).message, depth + 1);
+      if (nested) return nested;
+      continue;
+    }
+
+    const quoted = quotedMessageFromContext((value as { contextInfo?: unknown }).contextInfo);
+    if (quoted) return quoted;
+  }
+
+  return null;
+};
+
+export const extractWhatsappReplyQuotedMessage = (msg: unknown): unknown | null => {
+  if (!msg || typeof msg !== 'object') return null;
+  const body = msg as Record<string, unknown>;
+  return quotedMessageFromContext(body.contextInfo) || extractQuotedMessageFromContent(body.message);
+};
+
+export const whatsappMessageText = (message: unknown, depth = 0): string | null => {
+  if (!message || typeof message !== 'object' || depth > 4) return null;
+  const content = message as Record<string, unknown>;
+  if (typeof content.conversation === 'string' && content.conversation) return content.conversation;
+
+  for (const [key, value] of Object.entries(content)) {
+    if (!value || typeof value !== 'object') continue;
+    if (WRAPPER_KEYS.has(key)) {
+      const nested = whatsappMessageText((value as { message?: unknown }).message, depth + 1);
+      if (nested) return nested;
+      continue;
+    }
+
+    const textContent = value as { text?: unknown; caption?: unknown };
+    if (typeof textContent.text === 'string' && textContent.text) return textContent.text;
+    if (typeof textContent.caption === 'string' && textContent.caption) return textContent.caption;
+  }
+
+  return null;
+};
+
+/**
+ * Preserve WhatsApp's provider quote snapshot when it differs from the parent
+ * currently stored by EVO. Equality proves an ordinary whole-parent reply.
+ * A difference can mean either a selected fragment or that the parent is
+ * missing/edited, so callers must not claim selection more strongly than the
+ * provider payload proves.
+ */
+export const whatsappReplyQuoteSnapshotText = (reply: unknown, parentMessage: unknown): string | null => {
+  const quotedText = whatsappMessageText(extractWhatsappReplyQuotedMessage(reply));
+  if (!quotedText) return null;
+
+  const parentText = whatsappMessageText(parentMessage);
+  return quotedText !== parentText ? quotedText : null;
+};
+
+export const whatsappQuotedMessageContent = (message: unknown, quoteText?: string): unknown =>
+  quoteText ? { conversation: quoteText } : message;
+
 /** Chatwoot Evolution inbox stores WA message source_id as `WAID:<stanzaId>`. */
 export const toChatwootWhatsappSourceId = (stanzaId: string | null | undefined): string | null => {
   if (!stanzaId || typeof stanzaId !== 'string') return null;
@@ -84,7 +157,7 @@ export const stripChatwootWhatsappSourceId = (sourceId: string | null | undefine
 
 export const chatwootReplyReferences = (
   contentAttributes: Record<string, unknown> | null | undefined,
-): { chatwootMessageId?: number; whatsappMessageId?: string } => {
+): { chatwootMessageId?: number; whatsappMessageId?: string; quoteText?: string } => {
   const rawChatwootId = Number(contentAttributes?.in_reply_to);
   const chatwootMessageId = Number.isSafeInteger(rawChatwootId) && rawChatwootId > 0 ? rawChatwootId : undefined;
   const whatsappMessageId = stripChatwootWhatsappSourceId(
@@ -92,10 +165,15 @@ export const chatwootReplyReferences = (
       ? contentAttributes.in_reply_to_external_id
       : undefined,
   );
+  const quoteText =
+    typeof contentAttributes?.quote_text === 'string' && contentAttributes.quote_text
+      ? contentAttributes.quote_text
+      : undefined;
 
   return {
     ...(chatwootMessageId ? { chatwootMessageId } : {}),
     ...(whatsappMessageId ? { whatsappMessageId } : {}),
+    ...(quoteText ? { quoteText } : {}),
   };
 };
 
@@ -103,6 +181,7 @@ export const chatwootReplyReferences = (
 export const compactReplyToIds = (ids: {
   in_reply_to: string | number | null;
   in_reply_to_external_id: string | null;
+  quote_text?: string | null;
 }): Record<string, string | number> => {
   const out: Record<string, string | number> = {};
   if (ids.in_reply_to != null && ids.in_reply_to !== '') {
@@ -110,6 +189,9 @@ export const compactReplyToIds = (ids: {
   }
   if (ids.in_reply_to_external_id) {
     out.in_reply_to_external_id = ids.in_reply_to_external_id;
+  }
+  if (ids.quote_text) {
+    out.quote_text = ids.quote_text;
   }
   return out;
 };
