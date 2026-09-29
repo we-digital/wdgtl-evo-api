@@ -5431,11 +5431,18 @@ export class ChatwootService {
       );
       const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
         dedupeHistoryMessagesBySourceId(scopedMessages);
+      const outboundBridgeSourceIds = await chatwootImport.reconcileOutboundHistoryBindings(
+        authoritativeMessages,
+        inbox.id,
+      );
       const existingSourceIds = await chatwootImport.getExistingSourceIds(
         Array.from(requestedSourceIds),
         undefined,
         inbox.id,
       );
+      for (const sourceId of outboundBridgeSourceIds) {
+        existingSourceIds.add(sourceId);
+      }
       const missingMessages = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );

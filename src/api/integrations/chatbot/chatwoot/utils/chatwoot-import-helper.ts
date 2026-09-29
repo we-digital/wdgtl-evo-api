@@ -39,6 +39,14 @@ type HistoryIdentity = firstLastTimestamp & {
   name: string;
 };
 
+type HistoryBridgeRow = {
+  id: string | number;
+  inbox_id: string | number;
+  conversation_id: string | number;
+  message_type: string | number;
+  source_id: string | null;
+};
+
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
 
 export type HistoryMessageImportOptions = {
@@ -256,6 +264,106 @@ class ChatwootImport {
     }
   }
 
+  public async reconcileOutboundHistoryBindings(messages: Message[], inboxId: number): Promise<Set<string>> {
+    const candidates = messages.filter((message) => {
+      const key = message.key as { fromMe?: unknown };
+      return key?.fromMe === true && Number.isSafeInteger(message.chatwootMessageId) && message.chatwootMessageId! > 0;
+    });
+    const reconciled = new Set<string>();
+    if (candidates.length === 0) return reconciled;
+
+    for (const message of candidates) {
+      if (
+        !Number.isSafeInteger(message.chatwootInboxId) ||
+        message.chatwootInboxId !== inboxId ||
+        !Number.isSafeInteger(message.chatwootConversationId) ||
+        message.chatwootConversationId! <= 0
+      ) {
+        throw new Error('Outbound history binding does not match the recovery destination');
+      }
+    }
+
+    const pool = postgresClient.getChatwootConnection();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE');
+      const messageIds = candidates.map((message) => message.chatwootMessageId);
+      const sourceIds = candidates.map((message) => toChatwootSourceId((message.key as { id: string }).id));
+      const sourceIdAliases = [...new Set(sourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)]))];
+      const result = await client.query(
+        `SELECT id, inbox_id, conversation_id, message_type, source_id
+         FROM messages
+         WHERE id = ANY($1::bigint[])
+            OR (inbox_id = $2 AND source_id = ANY($3::text[]))
+         FOR UPDATE`,
+        [messageIds, inboxId, sourceIdAliases],
+      );
+      const rows = result.rows as HistoryBridgeRow[];
+      const rowsById = new Map(rows.map((row) => [Number(row.id), row]));
+
+      for (const message of candidates) {
+        const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+        const bridgeId = Number(message.chatwootMessageId);
+        const bridge = rowsById.get(bridgeId);
+        if (
+          !bridge ||
+          Number(bridge.inbox_id) !== inboxId ||
+          Number(bridge.conversation_id) !== message.chatwootConversationId ||
+          Number(bridge.message_type) !== 1
+        ) {
+          throw new Error('Outbound history binding does not match an outgoing Chatwoot message');
+        }
+
+        const duplicate = rows.find(
+          (row) =>
+            Number(row.id) !== bridgeId &&
+            Number(row.inbox_id) === inboxId &&
+            typeof row.source_id === 'string' &&
+            toChatwootSourceId(row.source_id) === sourceId,
+        );
+        if (duplicate) {
+          throw new Error('Outbound history binding conflicts with an existing Chatwoot source id');
+        }
+        if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId) {
+          throw new Error('Outbound history binding has a conflicting Chatwoot source id');
+        }
+        if (bridge.source_id !== sourceId) {
+          await client.query('UPDATE messages SET source_id = $1, updated_at = NOW() WHERE id = $2', [
+            sourceId,
+            bridgeId,
+          ]);
+        }
+        reconciled.add(sourceId);
+      }
+
+      await client.query('COMMIT');
+      return reconciled;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  private async insertHistoryMessagesSerialized(sql: string, params: unknown[]): Promise<number> {
+    const pool = postgresClient.getChatwootConnection();
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE');
+      const result = await client.query(sql, params);
+      await client.query('COMMIT');
+      return result?.rowCount ?? 0;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
   public async importHistoryMessages(
     instance: InstanceDto,
     chatwootService: ChatwootService,
@@ -265,8 +373,6 @@ class ChatwootImport {
   ) {
     const usesBufferedHistory = options.messages === undefined;
     try {
-      const pgClient = postgresClient.getChatwootConnection();
-
       const chatwootUser = await this.getChatwootUser(provider);
       if (!chatwootUser) {
         throw new Error('User not found to import messages.');
@@ -425,7 +531,7 @@ class ChatwootImport {
               )
               ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
 
-            totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
+            totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg);
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
