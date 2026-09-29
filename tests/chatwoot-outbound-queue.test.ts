@@ -130,6 +130,16 @@ test('freezes the external WhatsApp quote identity for provider-cache fallback',
   assert.equal(parts[0].messageSetHash, buildParts()[0].messageSetHash);
 });
 
+test('freezes selected quote text in the durable outbound operation identity', () => {
+  const selected = buildParts({
+    ...webhook,
+    content_attributes: { in_reply_to: 99, quote_text: 'выбранный фрагмент 🌍' },
+  });
+
+  assert.ok(selected.every((part) => part.payload.quoteText === 'выбранный фрагмент 🌍'));
+  assert.notEqual(selected[0].messageSetHash, buildParts()[0].messageSetHash);
+});
+
 test('freezes a native forward into one deterministic queued provider operation', () => {
   const first = buildChatwootOutboundParts({
     instanceId: 'instance-1',

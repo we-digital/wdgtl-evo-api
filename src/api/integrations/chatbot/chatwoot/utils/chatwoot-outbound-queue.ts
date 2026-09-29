@@ -47,6 +47,7 @@ export interface ChatwootOutboundPayload {
   };
   quotedChatwootMessageId?: number;
   quotedWhatsappMessageId?: string;
+  quoteText?: string;
   /** Native WhatsApp mention JIDs for group @notifications */
   mentioned?: string[];
   origin: ChatwootOutboundOrigin;
@@ -368,6 +369,7 @@ export function buildChatwootOutboundParts(params: {
       chatId,
       text: params.formattedText,
       quoted: quoted.chatwootMessageId || null,
+      ...(quoted.quoteText ? { quoteText: quoted.quoteText } : {}),
       mentioned: Array.isArray(params.mentioned) ? [...params.mentioned].sort() : [],
       nativeForward: nativeForward || null,
       // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
@@ -397,6 +399,7 @@ export function buildChatwootOutboundParts(params: {
         nativeForward,
         quotedChatwootMessageId: quoted.chatwootMessageId,
         quotedWhatsappMessageId: quoted.whatsappMessageId,
+        quoteText: quoted.quoteText,
         mentioned: Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
         origin: normalizedOrigin,
       },

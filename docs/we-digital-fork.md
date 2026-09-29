@@ -382,3 +382,13 @@ No production deployment is part of this local change.
 - **Upstream reapply/conflicts:** Keep the no-resend rule for `ambiguous`, deterministic planned WAID, claim-generation fencing, and same-message multipart ordering. Never mark an ambiguous send failed merely because no local mapping exists.
 - **Rollback:** Do not roll back to an image that permanently fences a lane while distinct successor operations remain pending. An ambiguous predecessor still needs exact provider/device reconciliation independently of later deliveries.
 - **Focused regression:** `npx tsx --test tests/chatwoot-outbound-prisma-store.test.ts`, full unit suite, type/build/lint, Docker entrypoint signal test, staging exact-image verification and a production ledger readback of the affected lane without creating or replaying a customer message.
+
+## Selected WhatsApp reply excerpts (2026-09-29)
+
+- **Behavior:** WhatsApp ingress reads the provider quotedMessage and persists its textual excerpt as Chatwoot content_attributes.quote_text only when it differs from the stored complete parent. Outbound delivery freezes quoteText into the durable operation identity and presents a cloned Baileys quoted message whose key still identifies the complete parent while its quoted content contains the selected excerpt. Ordinary whole-message replies retain the previous payload, operation identity, and provider behavior.
+- **Source areas:** chatwoot-reply-context.ts, chatwoot-outbound-queue.ts, and chatwoot.service.ts.
+- **Official contract:** Baileys accepts a WAMessage in the quoted send option and copies its key and message into contextInfo; the pinned fork retains this contract for text and attachment sends.
+- **Flags/schema:** No new flag or database migration. The optional quoteText field is part of newly admitted durable operation JSON and its hash only when a selected excerpt exists.
+- **Upstream reapply/conflicts:** Preserve wrapper-aware inbound extraction, the parent-content comparison, cloned rather than mutated stored provider content, and quoteText in the deterministic message-set hash. Do not retry an ambiguous transport after changing quote metadata.
+- **Rollback:** Drain or reconcile nonterminal outbound operations before rolling EVO and Chatwoot back together. Existing terminal rows and Chatwoot quote_text metadata can remain.
+- **Focused regression:** full serialized EVO unit suite, TypeScript build, lint, shared-lab synthetic inbound/outbound text/media request shapes, and exact-current-main merge-candidate verification.
