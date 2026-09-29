@@ -5362,10 +5362,11 @@ export class ChatwootService {
       const requestedDatabaseIds = new Set<string>();
       for (const entry of data.messages) {
         const databaseId = String(entry.message.id || '');
-        const key = entry.message.key as { id?: unknown };
+        const key = entry.message.key as { id?: unknown; fromMe?: unknown };
         const canonicalSourceId = typeof key?.id === 'string' ? toChatwootSourceId(key.id) : '';
-        if (!databaseId || canonicalSourceId !== entry.sourceId) {
-          throw new BadRequestException('Cached history message source id does not match its embedded payload');
+        const embeddedDirection = typeof key?.fromMe === 'boolean' ? (key.fromMe ? 'outgoing' : 'incoming') : undefined;
+        if (!databaseId || canonicalSourceId !== entry.sourceId || embeddedDirection !== entry.expectedDirection) {
+          throw new BadRequestException('Cached history message identity does not match its bound payload');
         }
         if (requestedSourceIds.has(entry.sourceId) || requestedDatabaseIds.has(databaseId)) {
           throw new BadRequestException('Cached history batch contains duplicate messages');
@@ -5383,12 +5384,18 @@ export class ChatwootService {
       const storedById = new Map(storedMessages.map((message) => [message.id, message]));
       const authoritativeMessages = data.messages.map((entry) => {
         const stored = storedById.get(String(entry.message.id));
-        const storedKey = stored?.key as { id?: unknown } | undefined;
+        const storedKey = stored?.key as { id?: unknown; fromMe?: unknown } | undefined;
         if (!stored || typeof storedKey?.id !== 'string' || toChatwootSourceId(storedKey.id) !== entry.sourceId) {
           throw new BadRequestException('Cached history message is not available for the requested instance');
         }
+        const authoritativeDirection =
+          typeof storedKey.fromMe === 'boolean' ? (storedKey.fromMe ? 'outgoing' : 'incoming') : undefined;
+        if (authoritativeDirection !== entry.expectedDirection) {
+          throw new BadRequestException('Cached history message direction changed in authoritative storage');
+        }
         return stored;
       });
+      await chatwootImport.activateHistorySourceGuards(Array.from(requestedSourceIds), inbox.id);
       const preparedBySourceId = new Map(
         authoritativeMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
@@ -5431,11 +5438,18 @@ export class ChatwootService {
       );
       const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
         dedupeHistoryMessagesBySourceId(scopedMessages);
+      const outboundBridgeSourceIds = await chatwootImport.reconcileOutboundHistoryBindings(
+        authoritativeMessages,
+        inbox.id,
+      );
       const existingSourceIds = await chatwootImport.getExistingSourceIds(
         Array.from(requestedSourceIds),
         undefined,
         inbox.id,
       );
+      for (const sourceId of outboundBridgeSourceIds) {
+        existingSourceIds.add(sourceId);
+      }
       const missingMessages = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );

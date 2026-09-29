@@ -93,10 +93,86 @@ test('fails closed when retained Chatwoot source ids cannot be read', async () =
       },
     })) as any;
 
-    await assert.rejects(
-      chatwootImport.getExistingSourceIds(['ABC'], undefined, 42),
-      /destination unavailable/,
+    await assert.rejects(chatwootImport.getExistingSourceIds(['ABC'], undefined, 42), /destination unavailable/);
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+  }
+});
+
+test('heals an authoritative outbound bridge under the serialized message lock', async () => {
+  const originalGetConnection = postgresClient.getChatwootConnection;
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+  const outbound = {
+    ...message({ id: 'outbound-bridge', remoteJid: '123@g.us', fromMe: true }),
+    chatwootMessageId: 123,
+    chatwootInboxId: 7,
+    chatwootConversationId: 9,
+  } as Message;
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          queries.push({ sql, params });
+          if (/^SELECT id, inbox_id/.test(sql.trim())) {
+            return {
+              rows: [{ id: 123, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: null }],
+            };
+          }
+          return { rows: [], rowCount: 1 };
+        },
+        release: () => undefined,
+      }),
+    })) as any;
+
+    const reconciled = await chatwootImport.reconcileOutboundHistoryBindings([outbound], 7);
+
+    assert.deepEqual(reconciled, new Set(['WAID:outbound-bridge']));
+    assert.deepEqual(
+      queries.map(({ sql }) => sql.trim().split(/\s+/).slice(0, 3).join(' ')),
+      ['BEGIN', 'LOCK TABLE messages', 'SELECT id, inbox_id,', 'UPDATE messages SET', 'COMMIT'],
     );
+    assert.deepEqual(queries[3].params, ['WAID:outbound-bridge', 123]);
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+  }
+});
+
+test('fails closed when an outbound bridge would duplicate a Chatwoot source id', async () => {
+  const originalGetConnection = postgresClient.getChatwootConnection;
+  const queries: string[] = [];
+  const outbound = {
+    ...message({ id: 'outbound-conflict', remoteJid: '123@g.us', fromMe: true }),
+    chatwootMessageId: 123,
+    chatwootInboxId: 7,
+    chatwootConversationId: 9,
+  } as Message;
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      connect: async () => ({
+        query: async (sql: string) => {
+          queries.push(sql.trim());
+          if (/^SELECT id, inbox_id/.test(sql.trim())) {
+            return {
+              rows: [
+                { id: 123, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: null },
+                { id: 124, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: 'WAID:outbound-conflict' },
+              ],
+            };
+          }
+          return { rows: [], rowCount: 0 };
+        },
+        release: () => undefined,
+      }),
+    })) as any;
+
+    await assert.rejects(
+      chatwootImport.reconcileOutboundHistoryBindings([outbound], 7),
+      /conflicts with an existing Chatwoot source id/,
+    );
+    assert.equal(queries.at(-1), 'ROLLBACK');
+    assert.ok(!queries.some((sql) => sql.startsWith('UPDATE messages')));
   } finally {
     postgresClient.getChatwootConnection = originalGetConnection;
   }
@@ -129,9 +205,7 @@ test('filters existing and unsupported history before any identity can be materi
   );
 
   assert.deepEqual(selected, [importable]);
-  assert.deepEqual(Array.from(chatwootImport.createMessagesMapByIdentity(selected).keys()), [
-    '628333@s.whatsapp.net',
-  ]);
+  assert.deepEqual(Array.from(chatwootImport.createMessagesMapByIdentity(selected).keys()), ['628333@s.whatsapp.net']);
 });
 
 test('reuses stored LID mappings and skips groups and unresolved LIDs', async () => {
@@ -144,10 +218,7 @@ test('reuses stored LID mappings and skips groups and unresolved LIDs', async ()
   const unresolved = message({ id: 'unresolved', remoteJid: '222@lid' });
   const group = message({ id: 'group', remoteJid: '123@g.us' });
 
-  const result = await normalizeStoredHistoryMessages(
-    [lidMessage, unresolved, group],
-    [storedMapping],
-  );
+  const result = await normalizeStoredHistoryMessages([lidMessage, unresolved, group], [storedMapping]);
 
   assert.equal(result.messages.length, 1);
   assert.equal((result.messages[0].key as any).remoteJid, '628111@s.whatsapp.net');
@@ -264,13 +335,21 @@ test('legacy full-history import creates FKs only for identities with importable
   const originalImportHistoryContacts = chatwootImport.importHistoryContacts;
   const fkIdentityBatches: string[][] = [];
   const insertedParams: unknown[][] = [];
+  const transactionQueries: string[] = [];
 
   try {
     postgresClient.getChatwootConnection = (() => ({
-      query: async (_sql: string, params: unknown[]) => {
-        insertedParams.push(params);
-        return { rowCount: 1, rows: [] };
-      },
+      connect: async () => ({
+        query: async (sql: string, params: unknown[] = []) => {
+          transactionQueries.push(sql.trim());
+          if (/^INSERT INTO messages/.test(sql.trim())) {
+            insertedParams.push(params);
+            return { rowCount: 1, rows: [] };
+          }
+          return { rowCount: 0, rows: [] };
+        },
+        release: () => undefined,
+      }),
     })) as any;
     chatwootImport.getChatwootUser = (async () => ({ user_type: 'User', user_id: 9 })) as any;
     chatwootImport.getExistingSourceIds = (async () => new Set<string>()) as any;
@@ -302,6 +381,10 @@ test('legacy full-history import creates FKs only for identities with importable
     assert.equal(insertedParams.length, 1);
     assert.ok(insertedParams[0].includes('WAID:supported'));
     assert.ok(!insertedParams[0].includes('WAID:unsupported-mixed'));
+    assert.equal(transactionQueries[0], 'BEGIN');
+    assert.equal(transactionQueries[1], 'LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE');
+    assert.match(transactionQueries[2], /^INSERT INTO messages/);
+    assert.equal(transactionQueries[3], 'COMMIT');
   } finally {
     postgresClient.getChatwootConnection = originalGetConnection;
     chatwootImport.getChatwootUser = originalGetChatwootUser;
@@ -332,8 +415,10 @@ test('accepts only the versioned bounded cached history batch contract', () => {
   assert.equal(validate({ ...validRequest, contractVersion: 'latest' }, chatwootHistorySyncBatchSchema).valid, false);
   assert.equal(validate({ ...validRequest, dryRun: true }, chatwootHistorySyncBatchSchema).valid, false);
   assert.equal(
-    validate({ ...validRequest, messages: Array.from({ length: 501 }, () => validRequest.messages[0]) }, chatwootHistorySyncBatchSchema)
-      .valid,
+    validate(
+      { ...validRequest, messages: Array.from({ length: 501 }, () => validRequest.messages[0]) },
+      chatwootHistorySyncBatchSchema,
+    ).valid,
     false,
   );
 });
@@ -383,16 +468,18 @@ test('accepts only the destination-aware recovery batch contract', () => {
     messages: [
       {
         sourceId: 'WAID:message-1',
-        message: { id: 'database-id-1', key: { id: 'message-1' }, messageTimestamp: 1_700_000_000 },
+        expectedDirection: 'incoming',
+        message: {
+          id: 'database-id-1',
+          key: { id: 'message-1', fromMe: false },
+          messageTimestamp: 1_700_000_000,
+        },
       },
     ],
   };
 
   assert.equal(validate(validRequest, chatwootHistoryRecoveryBatchSchema).valid, true);
-  assert.equal(
-    validate({ ...validRequest, recoveryMode: 'unknown' }, chatwootHistoryRecoveryBatchSchema).valid,
-    false,
-  );
+  assert.equal(validate({ ...validRequest, recoveryMode: 'unknown' }, chatwootHistoryRecoveryBatchSchema).valid, false);
   assert.equal(
     validate({ ...validRequest, contractVersion: '2026-08-01' }, chatwootHistoryRecoveryBatchSchema).valid,
     false,
@@ -401,6 +488,117 @@ test('accepts only the destination-aware recovery batch contract', () => {
     validate({ ...validRequest, expectedInboxId: undefined }, chatwootHistoryRecoveryBatchSchema).valid,
     false,
   );
+  assert.equal(
+    validate(
+      { ...validRequest, messages: [{ ...validRequest.messages[0], expectedDirection: undefined }] },
+      chatwootHistoryRecoveryBatchSchema,
+    ).valid,
+    false,
+  );
+  assert.equal(
+    validate(
+      { ...validRequest, messages: [{ ...validRequest.messages[0], expectedDirection: 'sideways' }] },
+      chatwootHistoryRecoveryBatchSchema,
+    ).valid,
+    false,
+  );
+});
+
+test('rejects authoritative direction drift before destination mutation and accepts both bound directions', async (t) => {
+  const serverModulePath = require.resolve('../src/api/server.module.ts');
+  const previousServerModule = require.cache[serverModulePath];
+  require.cache[serverModulePath] = {
+    id: serverModulePath,
+    filename: serverModulePath,
+    loaded: true,
+    exports: new Proxy({}, { get: () => ({}) }),
+    children: [],
+    paths: [],
+  } as NodeModule;
+  t.after(() => {
+    if (previousServerModule) require.cache[serverModulePath] = previousServerModule;
+    else delete require.cache[serverModulePath];
+  });
+  const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const service = Object.create(ChatwootService.prototype) as any;
+  service.isImportHistoryAvailable = () => true;
+  service.getProvider = async () => ({ accountId: '1', importMessages: true });
+  service.getStoredHistoryRecoveryInbox = async () => ({ id: 99 });
+
+  const originalActivateGuards = chatwootImport.activateHistorySourceGuards;
+  const originalReconcileOutbound = chatwootImport.reconcileOutboundHistoryBindings;
+  const originalImportHistory = chatwootImport.importHistoryMessages;
+  let guardCalls = 0;
+  let reconcileCalls = 0;
+  let importCalls = 0;
+
+  chatwootImport.activateHistorySourceGuards = (async () => {
+    guardCalls += 1;
+    throw new Error('control_stop_after_direction_validation');
+  }) as any;
+  chatwootImport.reconcileOutboundHistoryBindings = (async () => {
+    reconcileCalls += 1;
+    return new Set<string>();
+  }) as any;
+  chatwootImport.importHistoryMessages = (async () => {
+    importCalls += 1;
+    return 0;
+  }) as any;
+
+  const recoveryRequest = (messages: Array<{ id: string; sourceId: string; fromMe: boolean }>) => ({
+    contractVersion: '2026-08-28' as const,
+    dryRun: false as const,
+    scope: 'all' as const,
+    unresolvedLidMode: 'provisional' as const,
+    refreshLidMappings: false,
+    recoveryMode: 'maximize' as const,
+    expectedDestinationKey: 'chatwoot:1:99',
+    expectedInboxId: 99,
+    messages: messages.map((entry) => ({
+      sourceId: entry.sourceId,
+      expectedDirection: entry.fromMe ? ('outgoing' as const) : ('incoming' as const),
+      message: { id: entry.id, key: { id: entry.sourceId.slice(5), fromMe: entry.fromMe } },
+    })),
+  });
+
+  try {
+    service.prismaRepository = {
+      message: {
+        findMany: async () => [{ id: 'database-in', key: { id: 'incoming-id', fromMe: true } }],
+      },
+    };
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch(
+        { instanceName: 'cycle8-authoritative-drift' },
+        recoveryRequest([{ id: 'database-in', sourceId: 'WAID:incoming-id', fromMe: false }]),
+      ),
+      (error: any) => {
+        assert.deepEqual(error?.message, ['Cached history message direction changed in authoritative storage']);
+        return true;
+      },
+    );
+    assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 0, reconcileCalls: 0, importCalls: 0 });
+
+    service.prismaRepository.message.findMany = async () => [
+      { id: 'database-in', key: { id: 'incoming-id', fromMe: false } },
+      { id: 'database-out', key: { id: 'outgoing-id', fromMe: true } },
+    ];
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch(
+        { instanceName: 'cycle8-bidirectional-control' },
+        recoveryRequest([
+          { id: 'database-in', sourceId: 'WAID:incoming-id', fromMe: false },
+          { id: 'database-out', sourceId: 'WAID:outgoing-id', fromMe: true },
+        ]),
+      ),
+      /control_stop_after_direction_validation/,
+    );
+    assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 1, reconcileCalls: 0, importCalls: 0 });
+  } finally {
+    chatwootImport.activateHistorySourceGuards = originalActivateGuards;
+    chatwootImport.reconcileOutboundHistoryBindings = originalReconcileOutbound;
+    chatwootImport.importHistoryMessages = originalImportHistory;
+  }
 });
 
 test('pins recovery apply to the exact capability destination', () => {
