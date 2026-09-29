@@ -121,7 +121,14 @@ export const whatsappMessageText = (message: unknown, depth = 0): string | null 
   return null;
 };
 
-export const selectedWhatsappReplyQuoteText = (reply: unknown, parentMessage: unknown): string | null => {
+/**
+ * Preserve WhatsApp's provider quote snapshot when it differs from the parent
+ * currently stored by EVO. Equality proves an ordinary whole-parent reply.
+ * A difference can mean either a selected fragment or that the parent is
+ * missing/edited, so callers must not claim selection more strongly than the
+ * provider payload proves.
+ */
+export const whatsappReplyQuoteSnapshotText = (reply: unknown, parentMessage: unknown): string | null => {
   const quotedText = whatsappMessageText(extractWhatsappReplyQuotedMessage(reply));
   if (!quotedText) return null;
 

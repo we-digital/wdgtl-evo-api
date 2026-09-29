@@ -6,7 +6,7 @@ import {
   compactReplyToIds,
   extractWhatsappReplyQuotedMessage,
   extractWhatsappReplyStanzaId,
-  selectedWhatsappReplyQuoteText,
+  whatsappReplyQuoteSnapshotText,
   stripChatwootWhatsappSourceId,
   toChatwootWhatsappSourceId,
   whatsappMessageText,
@@ -110,10 +110,17 @@ test('extracts selected WhatsApp quote text from wrapped reply context', () => {
   });
   assert.equal(whatsappMessageText(extractWhatsappReplyQuotedMessage(reply)), 'выбранный 🌍 фрагмент');
   assert.equal(
-    selectedWhatsappReplyQuoteText(reply, { conversation: 'полное исходное сообщение' }),
+    whatsappReplyQuoteSnapshotText(reply, { conversation: 'полное исходное сообщение' }),
     'выбранный 🌍 фрагмент',
   );
-  assert.equal(selectedWhatsappReplyQuoteText(reply, { conversation: 'выбранный 🌍 фрагмент' }), null);
+  assert.equal(whatsappReplyQuoteSnapshotText(reply, { conversation: 'выбранный 🌍 фрагмент' }), null);
+  assert.equal(whatsappReplyQuoteSnapshotText(reply, null), 'выбранный 🌍 фрагмент');
+  assert.equal(
+    whatsappReplyQuoteSnapshotText(reply, {
+      conversation: 'parent text edited after the reply',
+    }),
+    'выбранный 🌍 фрагмент',
+  );
 });
 
 test('replaces only quoted WhatsApp content while retaining whole-reply compatibility', () => {

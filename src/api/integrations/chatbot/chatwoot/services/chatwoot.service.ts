@@ -111,9 +111,9 @@ import {
   chatwootReplyReferences,
   compactReplyToIds,
   extractWhatsappReplyStanzaId,
-  selectedWhatsappReplyQuoteText,
   toChatwootWhatsappSourceId,
   whatsappQuotedMessageContent,
+  whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
   requireTrustedChatwootUrl,
@@ -3273,7 +3273,7 @@ export class ChatwootService {
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
-        quoteText = selectedWhatsappReplyQuoteText(msg, message?.message);
+        quoteText = whatsappReplyQuoteSnapshotText(msg, message?.message);
       }
     }
 
