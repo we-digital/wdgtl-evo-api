@@ -178,6 +178,70 @@ test('fails closed when an outbound bridge would duplicate a Chatwoot source id'
   }
 });
 
+for (const scenario of [
+  { name: 'canonical existing source', sourceId: 'WAID:legacy-outbound', accepted: true },
+  { name: 'raw existing source', sourceId: 'legacy-outbound', accepted: true },
+  { name: 'unbound source', sourceId: null, accepted: false },
+  { name: 'conflicting source', sourceId: 'WAID:another-source', accepted: false },
+  { name: 'wrong inbox', sourceId: 'WAID:legacy-outbound', inboxId: 8, accepted: false },
+  { name: 'wrong conversation', sourceId: 'WAID:legacy-outbound', conversationId: 10, accepted: false },
+  { name: 'incoming bridge', sourceId: 'WAID:legacy-outbound', messageType: 0, accepted: false },
+  { name: 'explicit conflicting binding', sourceId: 'WAID:legacy-outbound', bindingInboxId: 8, accepted: false },
+]) {
+  test(`legacy outbound inbox omission: ${scenario.name}`, async () => {
+    const originalGetConnection = postgresClient.getChatwootConnection;
+    const queries: string[] = [];
+    const outbound = {
+      ...message({ id: 'legacy-outbound', remoteJid: '123@g.us', fromMe: true }),
+      chatwootMessageId: 123,
+      chatwootInboxId: scenario.bindingInboxId ?? null,
+      chatwootConversationId: 9,
+    } as Message;
+    try {
+      postgresClient.getChatwootConnection = (() => ({
+        connect: async () => ({
+          query: async (sql: string) => {
+            queries.push(sql.trim());
+            return {
+              rows: /^SELECT id, inbox_id/.test(sql.trim())
+                ? [
+                    {
+                      id: 123,
+                      inbox_id: scenario.inboxId ?? 7,
+                      conversation_id: scenario.conversationId ?? 9,
+                      message_type: scenario.messageType ?? 1,
+                      source_id: scenario.sourceId,
+                    },
+                  ]
+                : [],
+              rowCount: 1,
+            };
+          },
+          release: () => undefined,
+        }),
+      })) as any;
+      if (scenario.accepted) {
+        assert.deepEqual(
+          await chatwootImport.reconcileOutboundHistoryBindings([outbound], 7),
+          new Set(['WAID:legacy-outbound']),
+        );
+        assert.ok(queries.some((sql) => sql.includes('FOR UPDATE')));
+        assert.equal(queries.at(-1), 'COMMIT');
+        if (scenario.sourceId.startsWith('WAID:')) assert.ok(!queries.some((sql) => sql.startsWith('UPDATE')));
+      } else {
+        await assert.rejects(
+          chatwootImport.reconcileOutboundHistoryBindings([outbound], 7),
+          /Outbound history binding/,
+        );
+        assert.ok(!queries.some((sql) => sql.startsWith('UPDATE')));
+        if (queries.length) assert.equal(queries.at(-1), 'ROLLBACK');
+      }
+    } finally {
+      postgresClient.getChatwootConnection = originalGetConnection;
+    }
+  });
+}
+
 test('deduplicates stored history rows by canonical Chatwoot source id', () => {
   const first = message({ id: 'duplicate', remoteJid: '628111@s.whatsapp.net' });
   const duplicate = message({ id: 'WAID:duplicate', remoteJid: '628222@s.whatsapp.net' });
