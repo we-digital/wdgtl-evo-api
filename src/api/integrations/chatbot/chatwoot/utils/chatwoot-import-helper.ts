@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { acknowledgedMultipartSourceIds } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { activateChatwootHistorySourceGuards } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-source-guard';
 import {
   filterImportableHistoryMessages,
@@ -46,6 +47,7 @@ type HistoryBridgeRow = {
   conversation_id: string | number;
   message_type: string | number;
   source_id: string | null;
+  additional_attributes?: unknown;
 };
 
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
@@ -293,7 +295,7 @@ class ChatwootImport {
       const sourceIds = candidates.map((message) => toChatwootSourceId((message.key as { id: string }).id));
       const sourceIdAliases = [...new Set(sourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)]))];
       const result = await client.query(
-        `SELECT id, inbox_id, conversation_id, message_type, source_id
+        `SELECT id, inbox_id, conversation_id, message_type, source_id, additional_attributes
          FROM messages
          WHERE id = ANY($1::bigint[])
             OR (inbox_id = $2 AND source_id = ANY($3::text[]))
@@ -326,17 +328,30 @@ class ChatwootImport {
         if (duplicate) {
           throw new Error('Outbound history binding conflicts with an existing Chatwoot source id');
         }
-        if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId) {
+        const multipartSources = acknowledgedMultipartSourceIds(bridge.additional_attributes, bridge.source_id);
+        const multipartAcknowledged = multipartSources?.has(sourceId) === true;
+        if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId && !multipartAcknowledged) {
           throw new Error('Outbound history binding has a conflicting Chatwoot source id');
+        }
+        if (multipartAcknowledged) {
+          const aliases = [...multipartSources!].flatMap((id) => [id, id.slice('WAID:'.length)]);
+          const owners = await client.query(
+            'SELECT id FROM messages WHERE inbox_id = $1 AND source_id = ANY($2::text[]) FOR UPDATE',
+            [inboxId, aliases],
+          );
+          if (owners.rows.length !== 1 || Number(owners.rows[0].id) !== bridgeId) {
+            throw new Error('Outbound multipart history binding has conflicting source owners');
+          }
         }
         // Legacy native sends can omit the inbox binding. Accept them only when the locked
         // destination row already proves the exact source, conversation, inbox and direction.
         if (message.chatwootInboxId == null && !bridge.source_id) {
           throw new Error('Outbound history binding lacks a proven destination source id');
         }
-        if (bridge.source_id !== sourceId) {
+        const canonicalSourceId = multipartAcknowledged ? toChatwootSourceId(bridge.source_id!) : sourceId;
+        if (bridge.source_id !== canonicalSourceId) {
           await client.query('UPDATE messages SET source_id = $1, updated_at = NOW() WHERE id = $2', [
-            sourceId,
+            canonicalSourceId,
             bridgeId,
           ]);
         }

@@ -212,3 +212,44 @@ export const isDeliverableChatwootOutgoing = (body: any, chatId: string): boolea
   Number(body.id) > 0 &&
   chatId !== '123456' &&
   !(typeof body?.source_id === 'string' && body.source_id.startsWith('WAID:'));
+
+// Reuse the confirmed native multipart receipt instead of inventing a second bubble per attachment.
+export const acknowledgedMultipartSourceIds = (
+  additionalAttributes: unknown,
+  canonicalSource: string | null,
+): Set<string> | null => {
+  let attributes = additionalAttributes;
+  if (typeof attributes === 'string') {
+    try {
+      attributes = JSON.parse(attributes);
+    } catch {
+      return null;
+    }
+  }
+  if (!attributes || typeof attributes !== 'object' || Array.isArray(attributes)) return null;
+  const status = (attributes as Record<string, any>).we_digital_api_inbox_status;
+  const delivery = status?.provider_delivery;
+  if (
+    !['sent', 'delivered', 'read'].includes(status?.confirmed_status) ||
+    delivery?.contract_version !== 1 ||
+    !Number.isSafeInteger(delivery.part_count) ||
+    delivery.part_count < 2 ||
+    delivery.part_count > 100 ||
+    !delivery.acknowledgements ||
+    typeof delivery.acknowledgements !== 'object' ||
+    Array.isArray(delivery.acknowledgements)
+  )
+    return null;
+  const parts = Object.entries(delivery.acknowledgements)
+    .map(([partKey, value]) => {
+      const part = value as { part_index?: unknown; source_id?: unknown };
+      return { partKey, partIndex: part?.part_index, partCount: delivery.part_count, sourceId: part?.source_id };
+    })
+    .sort((left, right) => Number(left.partIndex) - Number(right.partIndex));
+  if (parts.length !== delivery.part_count || !isCanonicalProviderPartSet(parts as ChatwootProviderDeliveryPart[]))
+    return null;
+  const normalize = (id: string) => 'WAID:' + id.replace(/^WAID:/, '');
+  if (!canonicalSource || normalize(canonicalSource) !== normalize(parts[0].sourceId as string)) return null;
+  const sources = new Set(parts.map((part) => normalize(part.sourceId as string)));
+  return sources.size === parts.length ? sources : null;
+};

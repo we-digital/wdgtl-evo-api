@@ -1234,6 +1234,7 @@ export class BaileysStartupService extends ChannelStartupService {
       { messages, type, requestId }: { messages: WAMessage[]; type: MessageUpsertType; requestId?: string },
       settings: any,
     ) => {
+      const ingressReceivedAt = Date.now();
       try {
         for (const received of messages) {
           if (
@@ -1496,6 +1497,7 @@ export class BaileysStartupService extends ChannelStartupService {
             this.localChatwoot?.enabled &&
             !received.key.id.includes('@broadcast')
           ) {
+            const deliveryStartedAt = Date.now();
             const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
               Events.MESSAGES_UPSERT,
               { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -1506,6 +1508,21 @@ export class BaileysStartupService extends ChannelStartupService {
               messageRaw.chatwootMessageId = chatwootSentMessage.id;
               messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
               messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
+              const providerTimestamp = Number(received.messageTimestamp);
+              this.logger.info(
+                JSON.stringify({
+                  event: 'chatwoot_ingress_timing',
+                  instanceId: this.instanceId,
+                  inboxId: chatwootSentMessage.inbox_id,
+                  destinationId: chatwootSentMessage.id,
+                  upsertType: type,
+                  providerAgeAtReceiptSeconds: Number.isFinite(providerTimestamp)
+                    ? (ingressReceivedAt - providerTimestamp * 1000) / 1000
+                    : null,
+                  beforeDeliveryMs: deliveryStartedAt - ingressReceivedAt,
+                  destinationDeliveryMs: Date.now() - deliveryStartedAt,
+                }),
+              );
             }
           }
 
