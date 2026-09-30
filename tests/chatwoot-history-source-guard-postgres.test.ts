@@ -68,6 +68,19 @@ test(
       assert.equal(await count('WAID:source-update'), 1);
 
       await reset();
+      await activateChatwootHistorySourceGuards(pool, 110, ['legacy-alias']);
+      await pool.query("INSERT INTO messages (inbox_id, source_id) VALUES (110, 'WAID:legacy-alias')");
+      // Simulate retained legacy aliases without weakening the deployed guard.
+      await pool.query('ALTER TABLE messages DISABLE TRIGGER evolution_history_source_guard_trigger');
+      await pool.query("INSERT INTO messages (inbox_id, source_id) VALUES (110, 'legacy-alias')");
+      await pool.query('ALTER TABLE messages ENABLE TRIGGER evolution_history_source_guard_trigger');
+      await pool.query('UPDATE messages SET inbox_id = inbox_id, source_id = source_id');
+      assert.equal(await count('WAID:legacy-alias'), 2);
+      await expectDuplicate(pool.query("INSERT INTO messages (inbox_id, source_id) VALUES (110, 'legacy-alias')"));
+      const different = await pool.query("INSERT INTO messages (inbox_id, source_id) VALUES (110, 'different') RETURNING id");
+      await expectDuplicate(pool.query("UPDATE messages SET source_id = 'legacy-alias' WHERE id = $1", [different.rows[0].id]));
+
+      await reset();
       let releaseActivation!: () => void;
       let reportLock!: () => void;
       const activationMayContinue = new Promise<void>((resolve) => {
