@@ -177,6 +177,11 @@ import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoo
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
+import {
+  ORIGINAL_WHATSAPP_TIMESTAMP,
+  originalWhatsappTimestamp,
+  whatsappEditAllowed,
+} from './whatsapp-edit-restrictions';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
@@ -1277,15 +1282,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const oldMessage = await this.getMessage(editedMessage.key, true);
             if ((oldMessage as any)?.id) {
-              const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
-                ? Math.floor(received?.messageTimestamp.toNumber())
-                : Math.floor(received?.messageTimestamp as number);
+              const previousEdit = await this.prismaRepository.messageUpdate.findFirst({
+                where: { messageId: (oldMessage as any).id, instanceId: this.instanceId, status: 'EDITED' },
+              });
+              const originalTimestamp = originalWhatsappTimestamp(
+                oldMessage,
+                !!previousEdit || (oldMessage as any).status === 'EDITED',
+              );
 
               await this.prismaRepository.message.update({
                 where: { id: (oldMessage as any).id },
                 data: {
                   message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
+                  contextInfo: {
+                    ...((oldMessage as any).contextInfo || {}),
+                    ...(originalTimestamp ? { [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp } : {}),
+                  },
                   status: 'EDITED',
                 },
               });
@@ -4590,13 +4602,35 @@ export class BaileysStartupService extends ChannelStartupService {
         if (oldMessage?.key?.remoteJid !== jid) {
           throw new BadRequestException('RemoteJid does not match');
         }
-        if (oldMessage?.messageTimestamp > Date.now() + 900000) {
-          // 15 minutes in milliseconds
-          throw new BadRequestException('Message is older than 15 minutes');
-        }
       }
 
-      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: data.key });
+      const previousEdit = oldMessage?.id
+        ? await this.prismaRepository.messageUpdate.findFirst({
+            where: { messageId: oldMessage.id, instanceId: this.instanceId, status: 'EDITED' },
+          })
+        : null;
+      const legacyOperation =
+        previousEdit && !oldMessage?.contextInfo?.[ORIGINAL_WHATSAPP_TIMESTAMP]
+          ? await this.prismaRepository.chatwootOutboundOperation.findFirst({
+              where: {
+                instanceId: this.instanceId,
+                plannedWhatsappMessageId: data.key.id,
+                state: 'completed',
+                transportOutcomeUnresolved: false,
+              },
+              select: { sentAt: true },
+            })
+          : null;
+      const originalTimestamp = originalWhatsappTimestamp(
+        oldMessage,
+        !!previousEdit || oldMessage?.status === 'EDITED',
+        legacyOperation?.sentAt,
+      );
+      if (!whatsappEditAllowed(oldMessage, originalTimestamp)) {
+        throw new BadRequestException('whatsapp_edit_restricted');
+      }
+
+      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: oldMessage.key });
       if (messageSent) {
         const editedMessage =
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
@@ -4604,7 +4638,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (editedMessage) {
           this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
 
-          const messageId = messageSent.message?.protocolMessage?.key?.id;
+          const messageId = editedMessage.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
               where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageId } },
@@ -4612,13 +4646,15 @@ export class BaileysStartupService extends ChannelStartupService {
             if (!message) throw new NotFoundException('Message not found');
 
             if (!(message.key.valueOf() as any).fromMe) {
-              new BadRequestException('You cannot edit others messages');
+              throw new BadRequestException('You cannot edit others messages');
             }
             if ((message.key.valueOf() as any)?.deleted) {
-              new BadRequestException('You cannot edit deleted messages');
+              throw new BadRequestException('You cannot edit deleted messages');
             }
 
-            if (oldMessage.messageType === 'conversation' || oldMessage.messageType === 'extendedTextMessage') {
+            if (oldMessage.messageType === 'extendedTextMessage') {
+              oldMessage.message.extendedTextMessage.text = data.text;
+            } else if (oldMessage.messageType === 'conversation') {
               oldMessage.message.conversation = data.text;
             } else {
               oldMessage.message[oldMessage.messageType].caption = data.text;
@@ -4628,7 +4664,7 @@ export class BaileysStartupService extends ChannelStartupService {
               data: {
                 message: oldMessage.message,
                 status: 'EDITED',
-                messageTimestamp: Math.floor(Date.now() / 1000), // Convert to int32 by dividing by 1000 to get seconds
+                contextInfo: { ...(oldMessage.contextInfo || {}), [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp },
               },
             });
 

@@ -2766,6 +2766,7 @@ export class ChatwootService {
         }
         const chatIdForEdit = candidateChatId;
         const edited = await this.trySendNativeEdit(waInstance, chatIdForEdit, body, instance);
+        if (edited?.edit_restriction === 'whatsapp') return { message: 'edit_rejected', edit_restriction: 'whatsapp' };
         if (!edited) {
           throw new BadRequestException('Native WhatsApp edit failed');
         }
@@ -3509,6 +3510,9 @@ export class ChatwootService {
       );
       return messageSent;
     } catch (error) {
+      if (Array.isArray(error?.message) && error.message.includes('whatsapp_edit_restricted')) {
+        return { edit_restriction: 'whatsapp' };
+      }
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_native_edit_failed',
