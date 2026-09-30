@@ -177,6 +177,11 @@ import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoo
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
+import {
+  ORIGINAL_WHATSAPP_TIMESTAMP,
+  originalWhatsappTimestamp,
+  whatsappEditAllowed,
+} from './whatsapp-edit-restrictions';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
@@ -1229,6 +1234,7 @@ export class BaileysStartupService extends ChannelStartupService {
       { messages, type, requestId }: { messages: WAMessage[]; type: MessageUpsertType; requestId?: string },
       settings: any,
     ) => {
+      const ingressReceivedAt = Date.now();
       try {
         for (const received of messages) {
           if (
@@ -1269,13 +1275,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-              this.chatwootService.eventWhatsapp(
-                'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instance.id },
-                editedMessage,
-              );
-
             await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
 
             if (received.key?.id && editedMessage.key?.id) {
@@ -1284,15 +1283,22 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const oldMessage = await this.getMessage(editedMessage.key, true);
             if ((oldMessage as any)?.id) {
-              const editedMessageTimestamp = Long.isLong(received?.messageTimestamp)
-                ? Math.floor(received?.messageTimestamp.toNumber())
-                : Math.floor(received?.messageTimestamp as number);
+              const previousEdit = await this.prismaRepository.messageUpdate.findFirst({
+                where: { messageId: (oldMessage as any).id, instanceId: this.instanceId, status: 'EDITED' },
+              });
+              const originalTimestamp = originalWhatsappTimestamp(
+                oldMessage,
+                !!previousEdit || (oldMessage as any).status === 'EDITED',
+              );
 
               await this.prismaRepository.message.update({
                 where: { id: (oldMessage as any).id },
                 data: {
                   message: editedMessage.editedMessage as any,
-                  messageTimestamp: editedMessageTimestamp,
+                  contextInfo: {
+                    ...((oldMessage as any).contextInfo || {}),
+                    ...(originalTimestamp ? { [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp } : {}),
+                  },
                   status: 'EDITED',
                 },
               });
@@ -1307,6 +1313,12 @@ export class BaileysStartupService extends ChannelStartupService {
                 },
               });
             }
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
+              await this.chatwootService.eventWhatsapp(
+                'messages.edit',
+                { instanceName: this.instance.name, instanceId: this.instance.id },
+                editedMessage,
+              );
           }
 
           if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
@@ -1485,6 +1497,7 @@ export class BaileysStartupService extends ChannelStartupService {
             this.localChatwoot?.enabled &&
             !received.key.id.includes('@broadcast')
           ) {
+            const deliveryStartedAt = Date.now();
             const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
               Events.MESSAGES_UPSERT,
               { instanceName: this.instance.name, instanceId: this.instanceId },
@@ -1495,6 +1508,21 @@ export class BaileysStartupService extends ChannelStartupService {
               messageRaw.chatwootMessageId = chatwootSentMessage.id;
               messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
               messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
+              const providerTimestamp = Number(received.messageTimestamp);
+              this.logger.info(
+                JSON.stringify({
+                  event: 'chatwoot_ingress_timing',
+                  instanceId: this.instanceId,
+                  inboxId: chatwootSentMessage.inbox_id,
+                  destinationId: chatwootSentMessage.id,
+                  upsertType: type,
+                  providerAgeAtReceiptSeconds: Number.isFinite(providerTimestamp)
+                    ? (ingressReceivedAt - providerTimestamp * 1000) / 1000
+                    : null,
+                  beforeDeliveryMs: deliveryStartedAt - ingressReceivedAt,
+                  destinationDeliveryMs: Date.now() - deliveryStartedAt,
+                }),
+              );
             }
           }
 
@@ -4194,7 +4222,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (messageId) {
           const isLogicalDeleted = configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
           let message = await this.prismaRepository.message.findFirst({
-            where: { key: { path: ['id'], equals: messageId } },
+            where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageId } },
           });
           if (isLogicalDeleted) {
             if (!message) return response;
@@ -4591,41 +4619,60 @@ export class BaileysStartupService extends ChannelStartupService {
         if (oldMessage?.key?.remoteJid !== jid) {
           throw new BadRequestException('RemoteJid does not match');
         }
-        if (oldMessage?.messageTimestamp > Date.now() + 900000) {
-          // 15 minutes in milliseconds
-          throw new BadRequestException('Message is older than 15 minutes');
-        }
       }
 
-      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: data.key });
+      const previousEdit = oldMessage?.id
+        ? await this.prismaRepository.messageUpdate.findFirst({
+            where: { messageId: oldMessage.id, instanceId: this.instanceId, status: 'EDITED' },
+          })
+        : null;
+      const legacyOperation =
+        previousEdit && !oldMessage?.contextInfo?.[ORIGINAL_WHATSAPP_TIMESTAMP]
+          ? await this.prismaRepository.chatwootOutboundOperation.findFirst({
+              where: {
+                instanceId: this.instanceId,
+                plannedWhatsappMessageId: data.key.id,
+                state: 'completed',
+                transportOutcomeUnresolved: false,
+              },
+              select: { sentAt: true },
+            })
+          : null;
+      const originalTimestamp = originalWhatsappTimestamp(
+        oldMessage,
+        !!previousEdit || oldMessage?.status === 'EDITED',
+        legacyOperation?.sentAt,
+      );
+      if (!whatsappEditAllowed(oldMessage, originalTimestamp)) {
+        const expired = originalTimestamp !== null && Math.floor(Date.now() / 1000) - originalTimestamp >= 15 * 60;
+        throw new BadRequestException(expired ? 'whatsapp_edit_time_expired' : 'whatsapp_edit_restricted');
+      }
+
+      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: oldMessage.key });
       if (messageSent) {
         const editedMessage =
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
 
         if (editedMessage) {
           this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-            this.chatwootService.eventWhatsapp(
-              'send.message.update',
-              { instanceName: this.instance.name, instanceId: this.instance.id },
-              editedMessage,
-            );
 
-          const messageId = messageSent.message?.protocolMessage?.key?.id;
+          const messageId = editedMessage.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
-              where: { key: { path: ['id'], equals: messageId } },
+              where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageId } },
             });
             if (!message) throw new NotFoundException('Message not found');
 
             if (!(message.key.valueOf() as any).fromMe) {
-              new BadRequestException('You cannot edit others messages');
+              throw new BadRequestException('You cannot edit others messages');
             }
             if ((message.key.valueOf() as any)?.deleted) {
-              new BadRequestException('You cannot edit deleted messages');
+              throw new BadRequestException('You cannot edit deleted messages');
             }
 
-            if (oldMessage.messageType === 'conversation' || oldMessage.messageType === 'extendedTextMessage') {
+            if (oldMessage.messageType === 'extendedTextMessage') {
+              oldMessage.message.extendedTextMessage.text = data.text;
+            } else if (oldMessage.messageType === 'conversation') {
               oldMessage.message.conversation = data.text;
             } else {
               oldMessage.message[oldMessage.messageType].caption = data.text;
@@ -4635,7 +4682,7 @@ export class BaileysStartupService extends ChannelStartupService {
               data: {
                 message: oldMessage.message,
                 status: 'EDITED',
-                messageTimestamp: Math.floor(Date.now() / 1000), // Convert to int32 by dividing by 1000 to get seconds
+                contextInfo: { ...(oldMessage.contextInfo || {}), [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp },
               },
             });
 
@@ -4652,6 +4699,12 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
             }
           }
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
+            await this.chatwootService.eventWhatsapp(
+              'send.message.update',
+              { instanceName: this.instance.name, instanceId: this.instance.id },
+              editedMessage,
+            );
         }
       }
 

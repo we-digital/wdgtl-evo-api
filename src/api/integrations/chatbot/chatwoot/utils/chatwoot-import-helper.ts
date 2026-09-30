@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { acknowledgedMultipartSourceIds } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { activateChatwootHistorySourceGuards } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-source-guard';
 import {
   filterImportableHistoryMessages,
@@ -46,6 +47,7 @@ type HistoryBridgeRow = {
   conversation_id: string | number;
   message_type: string | number;
   source_id: string | null;
+  additional_attributes?: unknown;
 };
 
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
@@ -293,7 +295,7 @@ class ChatwootImport {
       const sourceIds = candidates.map((message) => toChatwootSourceId((message.key as { id: string }).id));
       const sourceIdAliases = [...new Set(sourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)]))];
       const result = await client.query(
-        `SELECT id, inbox_id, conversation_id, message_type, source_id
+        `SELECT id, inbox_id, conversation_id, message_type, source_id, additional_attributes
          FROM messages
          WHERE id = ANY($1::bigint[])
             OR (inbox_id = $2 AND source_id = ANY($3::text[]))
@@ -326,17 +328,30 @@ class ChatwootImport {
         if (duplicate) {
           throw new Error('Outbound history binding conflicts with an existing Chatwoot source id');
         }
-        if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId) {
+        const multipartSources = acknowledgedMultipartSourceIds(bridge.additional_attributes, bridge.source_id);
+        const multipartAcknowledged = multipartSources?.has(sourceId) === true;
+        if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId && !multipartAcknowledged) {
           throw new Error('Outbound history binding has a conflicting Chatwoot source id');
+        }
+        if (multipartAcknowledged) {
+          const aliases = [...multipartSources!].flatMap((id) => [id, id.slice('WAID:'.length)]);
+          const owners = await client.query(
+            'SELECT id FROM messages WHERE inbox_id = $1 AND source_id = ANY($2::text[]) FOR UPDATE',
+            [inboxId, aliases],
+          );
+          if (owners.rows.length !== 1 || Number(owners.rows[0].id) !== bridgeId) {
+            throw new Error('Outbound multipart history binding has conflicting source owners');
+          }
         }
         // Legacy native sends can omit the inbox binding. Accept them only when the locked
         // destination row already proves the exact source, conversation, inbox and direction.
         if (message.chatwootInboxId == null && !bridge.source_id) {
           throw new Error('Outbound history binding lacks a proven destination source id');
         }
-        if (bridge.source_id !== sourceId) {
+        const canonicalSourceId = multipartAcknowledged ? toChatwootSourceId(bridge.source_id!) : sourceId;
+        if (bridge.source_id !== canonicalSourceId) {
           await client.query('UPDATE messages SET source_id = $1, updated_at = NOW() WHERE id = $2', [
-            sourceId,
+            canonicalSourceId,
             bridgeId,
           ]);
         }
@@ -350,6 +365,62 @@ class ChatwootImport {
       throw error;
     } finally {
       client.release();
+    }
+  }
+
+  public async reconcileProviderHistoryEdits(
+    messages: Message[],
+    inboxId: number,
+    provider: ChatwootModel,
+    evolution: ChatwootService,
+  ): Promise<void> {
+    const edited = messages;
+    if (!edited.length) return;
+    const pool = postgresClient.getChatwootConnection();
+    for (const message of edited) {
+      const key = message.key as { id: string; fromMe: boolean };
+      const sourceId = toChatwootSourceId(key.id);
+      const payload = message.message as any;
+      const content =
+        payload?.conversation ??
+        payload?.extendedTextMessage?.text ??
+        payload?.imageMessage?.caption ??
+        payload?.videoMessage?.caption ??
+        payload?.documentMessage?.caption;
+      if (typeof content !== 'string') continue;
+      const result = await pool.query(
+        `SELECT m.id, m.message_type, m.content, m.content_attributes, c.display_id
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.account_id = $1 AND m.inbox_id = $2 AND m.source_id = ANY($3::text[])`,
+        [Number(provider.accountId), inboxId, [sourceId, key.id]],
+      );
+      if (!result.rows.length) continue; // A missing original is handled by the normal import below.
+      if (result.rows.length !== 1) throw new Error('Provider history edit has conflicting source owners');
+      const target = result.rows[0];
+      if (Number(target.message_type) !== (key.fromMe ? 1 : 0)) {
+        throw new Error('Provider history edit direction does not match');
+      }
+      const attributes =
+        typeof target.content_attributes === 'string'
+          ? JSON.parse(target.content_attributes)
+          : target.content_attributes;
+      if (target.content === content && attributes?.edited === true) continue;
+      await evolution.applyWhatsappProviderEdit(provider, {
+        messageId: Number(target.id),
+        conversationId: Number(target.display_id),
+        sourceId,
+        direction: key.fromMe ? 'outgoing' : 'incoming',
+        content,
+      });
+      const verified = await pool.query('SELECT content, content_attributes FROM messages WHERE id = $1', [target.id]);
+      const after = verified.rows[0];
+      const afterAttributes =
+        typeof after?.content_attributes === 'string'
+          ? JSON.parse(after.content_attributes)
+          : after?.content_attributes;
+      if (after?.content !== content || afterAttributes?.edited !== true) {
+        throw new Error('Provider history edit was not persisted');
+      }
     }
   }
 
