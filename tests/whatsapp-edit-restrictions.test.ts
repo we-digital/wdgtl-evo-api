@@ -84,7 +84,7 @@ test('actual native sender rejects expired edits before send and preserves origi
   assert.equal(persisted.messageTimestamp, undefined);
   source.messageTimestamp = Math.floor(Date.now() / 1000) - 16 * 60;
   await assert.rejects(service.updateMessage({ number: '123', key, text: 'too late' }), (error: any) =>
-    error.message.includes('whatsapp_edit_restricted'),
+    error.message.includes('whatsapp_edit_time_expired'),
   );
   assert.equal(sent, 1);
 });

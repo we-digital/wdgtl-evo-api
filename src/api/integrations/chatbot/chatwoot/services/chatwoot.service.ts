@@ -2766,7 +2766,7 @@ export class ChatwootService {
         }
         const chatIdForEdit = candidateChatId;
         const edited = await this.trySendNativeEdit(waInstance, chatIdForEdit, body, instance);
-        if (edited?.edit_restriction === 'whatsapp') return { message: 'edit_rejected', edit_restriction: 'whatsapp' };
+        if (edited?.edit_restriction === 'whatsapp') return { message: 'edit_rejected', ...edited };
         if (!edited) {
           throw new BadRequestException('Native WhatsApp edit failed');
         }
@@ -3510,6 +3510,9 @@ export class ChatwootService {
       );
       return messageSent;
     } catch (error) {
+      if (Array.isArray(error?.message) && error.message.includes('whatsapp_edit_time_expired')) {
+        return { edit_restriction: 'whatsapp', edit_restriction_reason: 'time_expired' };
+      }
       if (Array.isArray(error?.message) && error.message.includes('whatsapp_edit_restricted')) {
         return { edit_restriction: 'whatsapp' };
       }

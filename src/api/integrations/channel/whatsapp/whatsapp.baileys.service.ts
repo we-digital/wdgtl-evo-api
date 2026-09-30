@@ -4627,7 +4627,8 @@ export class BaileysStartupService extends ChannelStartupService {
         legacyOperation?.sentAt,
       );
       if (!whatsappEditAllowed(oldMessage, originalTimestamp)) {
-        throw new BadRequestException('whatsapp_edit_restricted');
+        const expired = originalTimestamp !== null && Math.floor(Date.now() / 1000) - originalTimestamp >= 15 * 60;
+        throw new BadRequestException(expired ? 'whatsapp_edit_time_expired' : 'whatsapp_edit_restricted');
       }
 
       const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: oldMessage.key });
