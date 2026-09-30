@@ -392,3 +392,11 @@ No production deployment is part of this local change.
 - **Upstream reapply/conflicts:** Preserve wrapper-aware inbound extraction, parent-content comparison including missing/edited-parent fixtures, cloned rather than mutated stored provider content, and quoteText in the deterministic message-set hash. Do not retry an ambiguous transport after changing quote metadata.
 - **Rollback:** Drain or reconcile nonterminal outbound operations before rolling EVO and Chatwoot back together. Existing terminal rows and Chatwoot quote_text metadata can remain.
 - **Focused regression:** full serialized EVO unit suite, TypeScript build, lint, shared-lab synthetic inbound/outbound text/media request shapes, and exact-current-main merge-candidate verification.
+
+## 2026-09-30: WhatsApp provider edits preserve the original identity
+
+Edit callbacks POST to the existing authenticated Chatwoot native edit endpoint instead of creating a notice with the original WAID. Source content/edit history is persisted before the awaited callback; native outgoing edit/delete lookups are scoped by instance because two connected instances can legitimately observe the same WhatsApp ID. Original Chatwoot IDs and bindings are never overwritten by an edit notice.
+
+Destination-aware cached recovery reconciles retained edited content through that same endpoint, including messages whose status was later replaced by a read receipt. It compares the destination text/edited flag and verifies persistence before acknowledging an existing source; imported edited originals receive the same update. Existing guards, account/inbox/direction scope, unsupported outcomes and immutable deployment contract remain unchanged. No new schema, provider retry queue or public n8n changes.
+
+Reapply: retain this behavior when upstream changes messages.edit/send.message.update, import helper or native mutations. Rollback: stop in-place outgoing edit callers before reverting the coordinated Chatwoot permission extension; repaired original/provider ownership remains valid. Focused checks: chatwoot-provider-edit, history-sync/source guard, TypeScript/build/ESLint, exact synthetic shared lab and protected immutable receiver readback.

@@ -406,6 +406,23 @@ export class ChatwootService {
     });
   }
 
+  public async applyWhatsappProviderEdit(
+    provider: ChatwootModel,
+    target: { messageId: number; conversationId: number; sourceId: string; direction: string; content: string },
+  ): Promise<void> {
+    await this.privilegedChatwootRequest(provider, {
+      method: 'POST',
+      path: `/api/v1/accounts/${provider.accountId}/conversations/${target.conversationId}/messages/${target.messageId}/edit`,
+      data: {
+        content: target.content,
+        source_id: target.sourceId,
+        message_type: target.direction,
+        skip_native: true,
+        provider_source: 'whatsapp',
+      },
+    });
+  }
+
   public getCache() {
     return this.cache;
   }
@@ -4446,46 +4463,21 @@ export class ChatwootService {
           body?.editedMessage?.documentMessage?.caption ??
           (typeof body?.text === 'string' ? body.text : undefined);
 
-        const editedMessageContent = (editedMessageContentRaw ?? '').trim();
-
-        if (!editedMessageContent) {
-          this.logger.info('[CW.EDIT] Conteúdo vazio — ignorando (DELETE tratará se for revoke).');
-          return;
-        }
+        if (typeof editedMessageContentRaw !== 'string') return;
 
         const message = await this.getMessageByKeyId(instance, body?.key?.id);
-
-        if (!message) {
-          this.logger.warn('Message not found for edit event');
-          return;
+        if (!message?.chatwootConversationId || !message?.chatwootMessageId) {
+          throw new Error('Provider edit has no mapped Chatwoot message');
         }
 
-        const key = message.key as WAMessageKey;
-
-        const messageType = key?.fromMe ? 'outgoing' : 'incoming';
-
-        if (message && message.chatwootConversationId && message.chatwootMessageId) {
-          // Criar nova mensagem com formato: "Mensagem editada:\n\nteste1"
-          const editedText = `\n\n\`${i18next.t('cw.message.edited')}:\`\n\n${editedMessageContent}`;
-
-          const send = await this.createMessage(
-            instance,
-            message.chatwootConversationId,
-            editedText,
-            messageType,
-            false,
-            [],
-            {
-              message: { extendedTextMessage: { contextInfo: { stanzaId: key.id } } },
-            },
-            'WAID:' + body.key.id,
-            null,
-          );
-          if (!send) {
-            this.logger.warn('edited message not sent');
-            return;
-          }
-        }
+        // Edit the original row; a notice must never reuse its provider identity.
+        await this.applyWhatsappProviderEdit(provider, {
+          messageId: message.chatwootMessageId,
+          conversationId: message.chatwootConversationId,
+          content: editedMessageContentRaw,
+          sourceId: toChatwootSourceId(body.key.id),
+          direction: (message.key as WAMessageKey).fromMe ? 'outgoing' : 'incoming',
+        });
         return;
       }
 
@@ -5450,6 +5442,21 @@ export class ChatwootService {
       for (const sourceId of outboundBridgeSourceIds) {
         existingSourceIds.add(sourceId);
       }
+      // Retained edits are updates, even when the original source already exists.
+      // Confirm them before acknowledging this batch so the ordinary worker can retry failures.
+      const retainedEdits = await this.prismaRepository.messageUpdate.findMany({
+        where: {
+          Instance: { name: instance.instanceName },
+          messageId: { in: Array.from(requestedDatabaseIds) },
+          status: 'EDITED',
+        },
+        select: { messageId: true },
+      });
+      const editedIds = new Set(retainedEdits.map((edit) => edit.messageId));
+      const editedMessages = authoritativeMessages.filter(
+        (message) => message.status === 'EDITED' || editedIds.has(message.id),
+      );
+      await chatwootImport.reconcileProviderHistoryEdits(editedMessages, inbox.id, provider, this);
       const missingMessages = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
@@ -5486,6 +5493,15 @@ export class ChatwootService {
         appliedMessages = appliedSourceIds.size;
         await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
       }
+
+      await chatwootImport.reconcileProviderHistoryEdits(
+        editedMessages.filter((message) =>
+          appliedSourceIds.has(toChatwootSourceId((message.key as { id: string }).id)),
+        ),
+        inbox.id,
+        provider,
+        this,
+      );
 
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);

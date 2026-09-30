@@ -1269,13 +1269,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-              this.chatwootService.eventWhatsapp(
-                'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instance.id },
-                editedMessage,
-              );
-
             await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
 
             if (received.key?.id && editedMessage.key?.id) {
@@ -1307,6 +1300,12 @@ export class BaileysStartupService extends ChannelStartupService {
                 },
               });
             }
+            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
+              await this.chatwootService.eventWhatsapp(
+                'messages.edit',
+                { instanceName: this.instance.name, instanceId: this.instance.id },
+                editedMessage,
+              );
           }
 
           if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
@@ -4194,7 +4193,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (messageId) {
           const isLogicalDeleted = configService.get<Database>('DATABASE').DELETE_DATA.LOGICAL_MESSAGE_DELETE;
           let message = await this.prismaRepository.message.findFirst({
-            where: { key: { path: ['id'], equals: messageId } },
+            where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageId } },
           });
           if (isLogicalDeleted) {
             if (!message) return response;
@@ -4604,17 +4603,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
         if (editedMessage) {
           this.sendDataWebhook(Events.SEND_MESSAGE_UPDATE, editedMessage);
-          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-            this.chatwootService.eventWhatsapp(
-              'send.message.update',
-              { instanceName: this.instance.name, instanceId: this.instance.id },
-              editedMessage,
-            );
 
           const messageId = messageSent.message?.protocolMessage?.key?.id;
           if (messageId && this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             let message = await this.prismaRepository.message.findFirst({
-              where: { key: { path: ['id'], equals: messageId } },
+              where: { instanceId: this.instanceId, key: { path: ['id'], equals: messageId } },
             });
             if (!message) throw new NotFoundException('Message not found');
 
@@ -4652,6 +4645,12 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.prismaRepository.messageUpdate.create({ data: messageUpdate });
             }
           }
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
+            await this.chatwootService.eventWhatsapp(
+              'send.message.update',
+              { instanceName: this.instance.name, instanceId: this.instance.id },
+              editedMessage,
+            );
         }
       }
 

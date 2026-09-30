@@ -353,6 +353,62 @@ class ChatwootImport {
     }
   }
 
+  public async reconcileProviderHistoryEdits(
+    messages: Message[],
+    inboxId: number,
+    provider: ChatwootModel,
+    evolution: ChatwootService,
+  ): Promise<void> {
+    const edited = messages;
+    if (!edited.length) return;
+    const pool = postgresClient.getChatwootConnection();
+    for (const message of edited) {
+      const key = message.key as { id: string; fromMe: boolean };
+      const sourceId = toChatwootSourceId(key.id);
+      const payload = message.message as any;
+      const content =
+        payload?.conversation ??
+        payload?.extendedTextMessage?.text ??
+        payload?.imageMessage?.caption ??
+        payload?.videoMessage?.caption ??
+        payload?.documentMessage?.caption;
+      if (typeof content !== 'string') continue;
+      const result = await pool.query(
+        `SELECT m.id, m.message_type, m.content, m.content_attributes, c.display_id
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.account_id = $1 AND m.inbox_id = $2 AND m.source_id = ANY($3::text[])`,
+        [Number(provider.accountId), inboxId, [sourceId, key.id]],
+      );
+      if (!result.rows.length) continue; // A missing original is handled by the normal import below.
+      if (result.rows.length !== 1) throw new Error('Provider history edit has conflicting source owners');
+      const target = result.rows[0];
+      if (Number(target.message_type) !== (key.fromMe ? 1 : 0)) {
+        throw new Error('Provider history edit direction does not match');
+      }
+      const attributes =
+        typeof target.content_attributes === 'string'
+          ? JSON.parse(target.content_attributes)
+          : target.content_attributes;
+      if (target.content === content && attributes?.edited === true) continue;
+      await evolution.applyWhatsappProviderEdit(provider, {
+        messageId: Number(target.id),
+        conversationId: Number(target.display_id),
+        sourceId,
+        direction: key.fromMe ? 'outgoing' : 'incoming',
+        content,
+      });
+      const verified = await pool.query('SELECT content, content_attributes FROM messages WHERE id = $1', [target.id]);
+      const after = verified.rows[0];
+      const afterAttributes =
+        typeof after?.content_attributes === 'string'
+          ? JSON.parse(after.content_attributes)
+          : after?.content_attributes;
+      if (after?.content !== content || afterAttributes?.edited !== true) {
+        throw new Error('Provider history edit was not persisted');
+      }
+    }
+  }
+
   public async activateHistorySourceGuards(sourceIds: string[], inboxId: number): Promise<void> {
     await activateChatwootHistorySourceGuards(postgresClient.getChatwootConnection(), inboxId, sourceIds);
   }
