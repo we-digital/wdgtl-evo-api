@@ -23,6 +23,14 @@ const CREATE_GUARD_FUNCTION = `
       RETURN NEW;
     END IF;
 
+    -- ORMs may include unchanged identity columns in a status/content update.
+    -- Existing legacy aliases must not block that update; new/rebound identities
+    -- still pass through the locked uniqueness check below.
+    IF TG_OP = 'UPDATE' AND NEW.inbox_id IS NOT DISTINCT FROM OLD.inbox_id
+       AND NEW.source_id IS NOT DISTINCT FROM OLD.source_id THEN
+      RETURN NEW;
+    END IF;
+
     canonical_source_id := CASE
       WHEN LEFT(NEW.source_id, 5) = 'WAID:' THEN NEW.source_id
       ELSE 'WAID:' || NEW.source_id
