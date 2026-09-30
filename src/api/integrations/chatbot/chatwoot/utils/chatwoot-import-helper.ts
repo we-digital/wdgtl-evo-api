@@ -275,8 +275,8 @@ class ChatwootImport {
 
     for (const message of candidates) {
       if (
-        !Number.isSafeInteger(message.chatwootInboxId) ||
-        message.chatwootInboxId !== inboxId ||
+        (message.chatwootInboxId != null &&
+          (!Number.isSafeInteger(message.chatwootInboxId) || message.chatwootInboxId !== inboxId)) ||
         !Number.isSafeInteger(message.chatwootConversationId) ||
         message.chatwootConversationId! <= 0
       ) {
@@ -328,6 +328,11 @@ class ChatwootImport {
         }
         if (bridge.source_id && toChatwootSourceId(bridge.source_id) !== sourceId) {
           throw new Error('Outbound history binding has a conflicting Chatwoot source id');
+        }
+        // Legacy native sends can omit the inbox binding. Accept them only when the locked
+        // destination row already proves the exact source, conversation, inbox and direction.
+        if (message.chatwootInboxId == null && !bridge.source_id) {
+          throw new Error('Outbound history binding lacks a proven destination source id');
         }
         if (bridge.source_id !== sourceId) {
           await client.query('UPDATE messages SET source_id = $1, updated_at = NOW() WHERE id = $2', [
