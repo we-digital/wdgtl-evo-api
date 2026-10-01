@@ -409,6 +409,182 @@ export class ChatwootService {
     });
   }
 
+  private async providerConversationRequest(
+    provider: ChatwootModel,
+    method: 'GET' | 'POST',
+    data: Record<string, unknown>,
+  ): Promise<Record<string, any>> {
+    const config = this.configService.get<Chatwoot>('CHATWOOT');
+    const url = requireTrustedChatwootUrl(
+      provider.url,
+      config.TRUSTED_BASE_URL,
+      `/api/v1/accounts/${provider.accountId}/provider_conversations`,
+    );
+    if (!config.NATIVE_BRIDGE_TOKEN) throw new Error('Chatwoot native bridge token is not configured');
+    const response = await axios.request({
+      method,
+      url,
+      ...(method === 'GET' ? { params: data } : { data }),
+      headers: {
+        'api-access-token': provider.token,
+        'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+      },
+      timeout: 20_000,
+      maxRedirects: 0,
+    });
+    return response.data;
+  }
+
+  private async providerConversationsEnabled(provider: ChatwootModel, inboxId: number): Promise<boolean> {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) return false;
+    const capability = await this.providerConversationRequest(provider, 'GET', { inbox_id: inboxId });
+    if (capability.enabled === false) return false;
+    if (capability.enabled !== true || capability.provider !== 'whatsapp') {
+      throw new Error('Chatwoot provider conversation contract does not match WhatsApp');
+    }
+    return true;
+  }
+
+  private async canonicalProviderConversation(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    peer: string,
+    body: any,
+  ): Promise<number> {
+    const remoteLid = isLidJid(body.key.remoteJid) ? toCanonicalHistoryJid(body.key.remoteJid) : null;
+    let contact: any = await this.findProviderContact(instance, peer);
+    const isGroup = isGroupJid(peer);
+    const user = peer.split('@')[0];
+    if (!contact) {
+      const group = isGroup ? await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer) : null;
+      contact = await this.createContact(
+        instance,
+        isGroup ? peer : user,
+        inboxId,
+        isGroup,
+        isGroup ? `${group.subject} (GROUP)` : body.pushName || user,
+        undefined,
+        peer,
+      );
+    }
+    const contactId = Number(contact?.payload?.id || contact?.payload?.contact?.id || contact?.id);
+    if (!Number.isSafeInteger(contactId) || contactId <= 0)
+      throw new Error('Provider contact could not be established');
+    const resolved = await this.providerConversationRequest(provider, 'POST', {
+      inbox_id: inboxId,
+      contact_id: contactId,
+      provider: 'whatsapp',
+      peer,
+      aliases: remoteLid && remoteLid !== peer ? [remoteLid] : [],
+      ...(provider.conversationPending ? { status: 'pending' } : {}),
+    });
+    if (
+      !Number.isSafeInteger(resolved.id) ||
+      resolved.id <= 0 ||
+      !Number.isSafeInteger(resolved.database_id) ||
+      resolved.database_id <= 0 ||
+      resolved.contact_id !== contactId ||
+      resolved.inbox_id !== inboxId ||
+      resolved.provider !== 'whatsapp' ||
+      resolved.peer !== peer
+    ) {
+      throw new Error('Chatwoot canonical provider conversation result is ambiguous');
+    }
+    if (provider.conversationPending && resolved.status !== 'open' && resolved.status !== 'pending') {
+      if (!['resolved', 'snoozed'].includes(resolved.status))
+        throw new Error('Provider conversation status is unavailable');
+      const context = await this.clientCw(instance);
+      await context.client.conversations.toggleStatus({
+        accountId: Number(provider.accountId),
+        conversationId: resolved.id,
+        data: { status: 'pending' },
+      });
+    }
+    if (isGroup) {
+      await this.ensureProviderGroupParticipant(instance, inboxId, body);
+      const rosterKey = `${instance.instanceName}:providerParticipants-${inboxId}-${peer}`;
+      if ((await this.cache.get(rosterKey)) !== resolved.id) {
+        await this.cache.set(rosterKey, resolved.id, 1800);
+        void this.syncWhatsappGroupParticipants(instance, provider, resolved.id, peer);
+      }
+    }
+    return resolved.id;
+  }
+
+  private async ensureProviderGroupParticipant(instance: InstanceDto, inboxId: number, body: any): Promise<void> {
+    if (body.key.fromMe || !body.key.participant) return;
+    const nativeParticipant =
+      isLidJid(body.key.participant) && isPhoneJid(body.key.participantAlt)
+        ? body.key.participantAlt
+        : body.key.participant;
+    const participant = toCanonicalHistoryJid(nativeParticipant);
+    if (!isPhoneJid(participant) && !isLidJid(participant))
+      throw new Error('Group participant native identity is unsupported');
+    const contact = await this.findProviderContact(instance, participant);
+    const user = participant.split('@')[0];
+    if (contact) {
+      if ((isPhoneJid(contact.identifier) || isLidJid(contact.identifier)) && contact.identifier !== participant)
+        throw new Error('Group participant contact identity conflicts');
+      if (body.pushName && (!contact.name || contact.name === user))
+        await this.updateContact(instance, contact.id, { name: body.pushName });
+      return;
+    }
+    const result: any = await this.createContact(
+      instance,
+      user,
+      inboxId,
+      false,
+      body.pushName || user,
+      undefined,
+      participant,
+    );
+    const created = result?.payload?.contact || result?.payload || result;
+    const createdId = created?.id;
+    if (
+      typeof createdId !== 'number' ||
+      !Number.isSafeInteger(createdId) ||
+      createdId <= 0 ||
+      created?.identifier !== participant
+    )
+      throw new Error('Group participant contact creation could not be verified');
+  }
+
+  private async findProviderContact(instance: InstanceDto, peer: string) {
+    const context = await this.clientCw(instance);
+    if (!context) throw new Error('Provider contact lookup context is unavailable');
+    const lookup = async (attribute: 'identifier' | 'phone_number', value: string) => {
+      const response: any = await context.client.contacts.filter({
+        accountId: Number(context.provider.accountId),
+        payload: [{ attribute_key: attribute, filter_operator: 'equal_to', values: [value] }],
+      });
+      if (!Array.isArray(response) && !Array.isArray(response?.payload) && !Array.isArray(response?.data?.payload))
+        throw new Error('Provider contact lookup result is unavailable');
+      const contacts = extractChatwootContacts(response);
+      const count = response?.meta?.count ?? response?.data?.meta?.count;
+      if (
+        contacts.length > 1 ||
+        (count !== undefined && (!Number.isSafeInteger(count) || count !== contacts.length)) ||
+        contacts.some(
+          (item) =>
+            item[attribute] !== value || typeof item.id !== 'number' || !Number.isSafeInteger(item.id) || item.id <= 0,
+        )
+      )
+        throw new Error('Provider contact lookup identity is ambiguous');
+      return contacts[0] || null;
+    };
+    const exact = await lookup('identifier', peer);
+    if (exact || !isPhoneJid(peer)) return exact;
+    const phone = await lookup('phone_number', `+${peer.split('@')[0]}`);
+    if (
+      phone &&
+      (isPhoneJid(phone.identifier) || isLidJid(phone.identifier) || isGroupJid(phone.identifier)) &&
+      phone.identifier !== peer
+    )
+      throw new Error('Provider phone contact identity conflicts');
+    return phone;
+  }
+
   public async applyWhatsappProviderEdit(
     provider: ChatwootModel,
     target: { messageId: number; conversationId: number; sourceId: string; direction: string; content: string },
@@ -763,7 +939,6 @@ export class ChatwootService {
       }
 
       this.logger.error('Error creating contact');
-      console.log(error);
       return null;
     }
   }
@@ -1068,6 +1243,19 @@ export class ChatwootService {
     const { client, provider } = context;
 
     try {
+      const providerInbox = await this.getInbox(instance);
+      if (!providerInbox) return null;
+      if (await this.providerConversationsEnabled(provider, Number(providerInbox.id))) {
+        // A legacy cache entry must not bypass the shared database binding.
+        return await this.canonicalProviderConversation(
+          instance,
+          provider,
+          Number(providerInbox.id),
+          toCanonicalHistoryJid(phoneNumber),
+          body,
+        );
+      }
+
       // Processa atualização de contatos já criados @lid (only when we have a real PN)
       if (phoneNumber && remoteJid && !isGroup && !isProvisionalLid) {
         const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
@@ -5009,6 +5197,7 @@ export class ChatwootService {
         mappingMessages,
         (lid) => this.resolvePhoneJidForLid(instance, lid),
         {
+          retainProviderAliases: this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS,
           includeGroups: scope === 'groups' || scope === 'all',
           includeUnresolvedLids: unresolvedLidMode === 'provisional' && (scope === 'direct' || scope === 'all'),
         },
@@ -5211,6 +5400,7 @@ export class ChatwootService {
         authoritativeMessages,
         (lid) => this.resolvePhoneJidForLid(instance, lid),
         {
+          retainProviderAliases: this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS,
           includeGroups: data.scope === 'groups' || data.scope === 'all',
           includeUnresolvedLids:
             data.unresolvedLidMode === 'provisional' && (data.scope === 'direct' || data.scope === 'all'),
@@ -5453,6 +5643,7 @@ export class ChatwootService {
         authoritativeMessages,
         (lid) => this.resolvePhoneJidForLid(instance, lid),
         {
+          retainProviderAliases: this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS,
           includeGroups: data.scope === 'groups' || data.scope === 'all',
           includeUnresolvedLids:
             data.unresolvedLidMode === 'provisional' && (data.scope === 'direct' || data.scope === 'all'),

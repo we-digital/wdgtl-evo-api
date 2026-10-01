@@ -12,6 +12,7 @@ import {
   toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -729,6 +730,33 @@ class ChatwootImport {
     identityNames: Map<string, string>,
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
+
+    const identities = Array.from(messagesByIdentity.entries()).flatMap(([identityKey, messages]) => {
+      const timestamps = identitiesWithTimestamp.get(identityKey);
+      if (!timestamps) return [];
+      const identity = this.getHistoryIdentity(identityKey, messages, timestamps, identityNames);
+      const aliases = [
+        ...new Set(
+          messages.flatMap((message) => {
+            const key = message.key as { remoteJid?: string; historyOriginalRemoteJid?: string };
+            return isLidJid(key.historyOriginalRemoteJid) &&
+              toCanonicalHistoryJid(key.remoteJid) === identity.identityKey
+              ? [toCanonicalHistoryJid(key.historyOriginalRemoteJid)]
+              : [];
+          }),
+        ),
+      ];
+      return [{ ...identity, aliases }];
+    });
+    if (configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) {
+      const canonical = await resolveProviderHistoryConversations(
+        pgClient,
+        Number(provider.accountId),
+        Number(inbox.id),
+        identities,
+      );
+      if (canonical !== null) return canonical;
+    }
 
     const bindValues = [provider.accountId, inbox.id];
     const identityBind = Array.from(messagesByIdentity.entries())

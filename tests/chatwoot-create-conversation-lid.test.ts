@@ -29,6 +29,7 @@ const serviceFixture = (resolvePhoneJidForLid: (lid: string) => Promise<string |
   const profilePictureLookups: string[] = [];
   const client = {
     contacts: {
+      filter: async (_params: unknown): Promise<any> => ({ payload: [], meta: { count: 0 } }),
       create: async () => null,
       listConversations: async () => ({
         payload: [
@@ -78,9 +79,114 @@ const serviceFixture = (resolvePhoneJidForLid: (lid: string) => Promise<string |
   return { service, client, profilePictureLookups };
 };
 
+test('canonical provider resolution ignores a stale conversation cache and reuses the inbox-scoped binding', async () => {
+  const { service, client, profilePictureLookups } = serviceFixture(async () => null);
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  const peer = '120363000000001@g.us';
+  await service.cache.set(`${instance.instanceName}:createConversation-${peer}`, 999);
+  service.findProviderContact = async () => ({ id: 9, identifier: peer });
+  client.contacts.listConversations = async () => assert.fail('legacy first-conversation selection must not run');
+  client.conversations.get = async () => assert.fail('legacy cached conversation must not be returned');
+  const requests: any[] = [];
+  service.providerConversationRequest = async (_provider: unknown, method: string, data: any) => {
+    requests.push({ method, data });
+    if (method === 'GET') return { enabled: true, provider: 'whatsapp' };
+    return { id: 77, database_id: 901, contact_id: 9, inbox_id: 58, provider: 'whatsapp', peer };
+  };
+  assert.equal(await service.createConversation(instance, { key: { remoteJid: peer, fromMe: false } }), 77);
+  assert.deepEqual(requests[1], {
+    method: 'POST',
+    data: { inbox_id: 58, contact_id: 9, provider: 'whatsapp', peer, aliases: [] },
+  });
+  assert.deepEqual(profilePictureLookups, []);
+});
+
+test('canonical provider resolution fails closed on a conflicting reply without creating a fallback conversation', async () => {
+  const { service, client } = serviceFixture(async () => null);
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  const peer = '120363000000001@g.us';
+  service.findProviderContact = async () => ({ id: 9, identifier: peer });
+  client.conversations.create = async () => assert.fail('conflicting writes must not fall back to legacy creation');
+  service.providerConversationRequest = async (_provider: unknown, method: string) =>
+    method === 'GET'
+      ? { enabled: true, provider: 'whatsapp' }
+      : { id: 77, database_id: 901, contact_id: 9, inbox_id: 59, provider: 'whatsapp', peer };
+  assert.equal(await service.createConversation(instance, { key: { remoteJid: peer, fromMe: false } }), null);
+});
+
+test('canonical provider resolution supplies a verified native LID alias to the shared lock', async () => {
+  const { service } = serviceFixture(async () => '628100000001@s.whatsapp.net');
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  const peer = '628100000001@s.whatsapp.net';
+  service.findProviderContact = async () => ({ id: 9, identifier: peer });
+  let captured: any;
+  service.providerConversationRequest = async (_provider: unknown, method: string, data: any) => {
+    if (method === 'GET') return { enabled: true, provider: 'whatsapp' };
+    captured = data;
+    return { id: 77, database_id: 901, contact_id: 9, inbox_id: 58, provider: 'whatsapp', peer };
+  };
+  assert.equal(await service.createConversation(instance, { key: { remoteJid: '999999:7@lid', fromMe: false } }), 77);
+  assert.deepEqual(captured.aliases, ['999999@lid']);
+});
+
 test('preserves canonical LID namespaces for ancillary Baileys lookups', () => {
   assert.equal(createJid('222@lid'), '222@lid');
   assert.equal(createJid('222@hosted.lid'), '222@hosted.lid');
+});
+
+test('canonical group reuse preserves a confirmed participant identity without downloading avatars', async () => {
+  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  const peer = '120363000000001@g.us';
+  const participant = '628100000001@s.whatsapp.net';
+  const lookups: string[] = [];
+  service.findProviderContact = async (_instance: unknown, identifier: string) => {
+    lookups.push(identifier);
+    return { id: identifier === peer ? 9 : 10, identifier, name: 'Preserved name' };
+  };
+  service.createContact = async () => assert.fail('existing group and participant must be reused');
+  service.syncWhatsappGroupParticipants = async () => [];
+  service.providerConversationRequest = async (_provider: unknown, method: string) =>
+    method === 'GET'
+      ? { enabled: true, provider: 'whatsapp' }
+      : { id: 77, database_id: 901, contact_id: 9, inbox_id: 58, provider: 'whatsapp', peer };
+  assert.equal(
+    await service.createConversation(instance, {
+      key: { remoteJid: peer, fromMe: false, participant: '999999:7@lid', participantAlt: participant },
+      pushName: 'Provider author',
+    }),
+    77,
+  );
+  assert.deepEqual(lookups, [peer, participant]);
+  assert.deepEqual(profilePictureLookups, []);
+});
+
+test('canonical group reuse creates a missing provisional participant with its LID and no invented phone', async () => {
+  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  const peer = '120363000000001@g.us';
+  service.findProviderContact = async (_instance: unknown, identifier: string) =>
+    identifier === peer ? { id: 9, identifier: peer } : null;
+  service.findContact = async () => assert.fail('unresolved LID must not be searched as a phone');
+  let created: unknown[];
+  service.createContact = async (...args: unknown[]) => {
+    created = args;
+    return { id: 10, identifier: '999999@lid' };
+  };
+  service.syncWhatsappGroupParticipants = async () => [];
+  service.providerConversationRequest = async (_provider: unknown, method: string) =>
+    method === 'GET'
+      ? { enabled: true, provider: 'whatsapp' }
+      : { id: 77, database_id: 901, contact_id: 9, inbox_id: 58, provider: 'whatsapp', peer };
+  assert.equal(
+    await service.createConversation(instance, {
+      key: { remoteJid: peer, fromMe: false, participant: '999999:7@lid' },
+      pushName: 'Provider author',
+    }),
+    77,
+  );
+  assert.deepEqual(created!.slice(1), ['999999', 58, false, 'Provider author', undefined, '999999@lid']);
+  assert.deepEqual(profilePictureLookups, []);
 });
 
 test('creates a provisional LID contact when no phone mapping exists', async () => {
@@ -296,4 +402,68 @@ test('reconciles a provisional LID contact after a trusted phone mapping appears
   assert.equal(updatedContacts.length, 1);
   assert.deepEqual(updatedContacts[0].slice(1), [9, { identifier: '628123@s.whatsapp.net', phone_number: '+628123' }]);
   assert.deepEqual(removedLabels, [9]);
+});
+
+test('provider contact lookup uses exact phone equality without legacy Brazilian merging', async () => {
+  const { service, client } = serviceFixture(async () => null);
+  service.findContact = async () => assert.fail('legacy phone matching and merging must not run');
+  const filters: any[] = [];
+  client.contacts.filter = async (query: any) => {
+    filters.push(query.payload[0]);
+    return query.payload[0].attribute_key === 'identifier'
+      ? { payload: [], meta: { count: 0 } }
+      : { payload: [{ id: 9, phone_number: '+551100000001', identifier: 'legacy-contact' }], meta: { count: 1 } };
+  };
+  const found = await service.findProviderContact(instance, '551100000001@s.whatsapp.net');
+  assert.equal(found.id, 9);
+  assert.deepEqual(
+    filters.map((item) => [item.attribute_key, item.filter_operator, item.values]),
+    [
+      ['identifier', 'equal_to', ['551100000001@s.whatsapp.net']],
+      ['phone_number', 'equal_to', ['+551100000001']],
+    ],
+  );
+});
+
+test('provider contact lookup rejects ambiguous phones, contradictory JIDs and incomplete filters', async () => {
+  const { service, client } = serviceFixture(async () => null);
+  const peer = '551100000001@s.whatsapp.net';
+  for (const response of [
+    {
+      payload: [
+        { id: 9, phone_number: '+551100000001' },
+        { id: 10, phone_number: '+551100000001' },
+      ],
+    },
+    { payload: [{ id: 9, phone_number: '+551100000001', identifier: '999999@lid' }] },
+    { payload: [{ id: 9, phone_number: '+551100000001' }], meta: { count: 2 } },
+    { payload: [{ id: 9, phone_number: '+551100000009' }] },
+  ]) {
+    client.contacts.filter = async (query: any) =>
+      query.payload[0].attribute_key === 'identifier' ? { payload: [] } : response;
+    await assert.rejects(service.findProviderContact(instance, peer));
+  }
+});
+
+test('canonical group resolution stops when participant contact creation has no proven identity', async () => {
+  const { service } = serviceFixture(async () => null);
+  const peer = '120363000000001@g.us';
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
+  service.findProviderContact = async (_instance: unknown, id: string) =>
+    id === peer ? { id: 9, identifier: peer } : null;
+  service.syncWhatsappGroupParticipants = async () =>
+    assert.fail('unproven author must not report successful resolution');
+  service.providerConversationRequest = async (_provider: unknown, method: string) =>
+    method === 'GET'
+      ? { enabled: true, provider: 'whatsapp' }
+      : { id: 77, database_id: 901, contact_id: 9, inbox_id: 58, provider: 'whatsapp', peer };
+  for (const response of [null, { id: 10 }, { id: 10, identifier: 'different@lid' }]) {
+    service.createContact = async () => response;
+    assert.equal(
+      await service.createConversation(instance, {
+        key: { remoteJid: peer, fromMe: false, participant: '999999@lid' },
+      }),
+      null,
+    );
+  }
 });
