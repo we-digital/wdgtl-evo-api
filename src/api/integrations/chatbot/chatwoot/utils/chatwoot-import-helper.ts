@@ -267,6 +267,44 @@ class ChatwootImport {
     }
   }
 
+  public async getVerifiedRecoverySourceIds(
+    messages: Message[],
+    inboxId: number,
+    provider: ChatwootModel,
+  ): Promise<Set<string>> {
+    const requested = new Map(
+      messages.map((message) => [toChatwootSourceId((message.key as { id: string }).id), message]),
+    );
+    if (!requested.size) return new Set();
+    const aliases = Array.from(requested.keys()).flatMap((id) => [id, id.slice('WAID:'.length)]);
+    const result = await postgresClient.getChatwootConnection().query(
+      `SELECT m.source_id, m.account_id, m.message_type, m.private,
+         c.account_id AS conversation_account_id, c.inbox_id AS conversation_inbox_id
+       FROM messages m JOIN conversations c ON c.id = m.conversation_id
+       WHERE m.inbox_id = $1 AND m.source_id = ANY($2::text[])`,
+      [inboxId, aliases],
+    );
+    const existing = new Set<string>();
+    for (const target of result.rows) {
+      const sourceId = toChatwootSourceId(target.source_id);
+      const message = requested.get(sourceId);
+      const key = message?.key as { fromMe: boolean } | undefined;
+      if (
+        !key ||
+        existing.has(sourceId) ||
+        target.private !== false ||
+        Number(target.account_id) !== Number(provider.accountId) ||
+        Number(target.conversation_account_id) !== Number(provider.accountId) ||
+        Number(target.conversation_inbox_id) !== inboxId ||
+        Number(target.message_type) !== (key.fromMe ? 1 : 0)
+      ) {
+        throw new Error('Recovery destination source identity, account or direction is ambiguous');
+      }
+      existing.add(sourceId);
+    }
+    return existing;
+  }
+
   public async reconcileOutboundHistoryBindings(messages: Message[], inboxId: number): Promise<Set<string>> {
     const candidates = messages.filter((message) => {
       const key = message.key as { fromMe?: unknown };
@@ -373,21 +411,68 @@ class ChatwootImport {
     inboxId: number,
     provider: ChatwootModel,
     evolution: ChatwootService,
-  ): Promise<void> {
+  ): Promise<Map<string, 'preserved_existing_source_payload_unavailable'>> {
     const edited = messages;
-    if (!edited.length) return;
+    const preserved = new Map<string, 'preserved_existing_source_payload_unavailable'>();
+    if (!edited.length) return preserved;
     const pool = postgresClient.getChatwootConnection();
     for (const message of edited) {
       const key = message.key as { id: string; fromMe: boolean };
       const sourceId = toChatwootSourceId(key.id);
       const payload = message.message as any;
+      if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0) {
+        if (message.messageType !== 'imageMessage') throw new Error('Empty provider edit is not a known image');
+        const client = await pool.connect();
+        try {
+          await client.query('BEGIN');
+          const result = await client.query(
+            `SELECT m.id, m.message_type, m.conversation_id, m.private, m.content_attributes,
+               EXISTS (SELECT 1 FROM attachments a
+                 JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
+                   AND asa.record_id = a.id AND asa.name = 'file'
+                 JOIN active_storage_blobs b ON b.id = asa.blob_id
+                 WHERE a.message_id = m.id AND a.file_type = 0 AND b.content_type LIKE 'image/%') AS has_image
+             FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
+               AND c.inbox_id = $2 AND m.source_id = ANY($3::text[]) FOR UPDATE OF m`,
+            [Number(provider.accountId), inboxId, [sourceId, key.id]],
+          );
+          const target = result.rows[0];
+          const attributes =
+            typeof target?.content_attributes === 'string'
+              ? JSON.parse(target.content_attributes)
+              : target?.content_attributes;
+          if (
+            result.rows.length !== 1 ||
+            target.private !== false ||
+            target.has_image !== true ||
+            attributes?.deleted === true ||
+            Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
+            (message.chatwootMessageId != null && Number(message.chatwootMessageId) !== Number(target.id)) ||
+            (message.chatwootInboxId != null && Number(message.chatwootInboxId) !== inboxId) ||
+            (message.chatwootConversationId != null &&
+              Number(message.chatwootConversationId) !== Number(target.conversation_id))
+          ) {
+            throw new Error('Empty provider image edit lacks a unique matching destination image');
+          }
+          await client.query('COMMIT');
+          preserved.set(sourceId, 'preserved_existing_source_payload_unavailable');
+        } catch (error) {
+          await client.query('ROLLBACK');
+          throw error;
+        } finally {
+          client.release();
+        }
+        continue;
+      }
       const content =
         payload?.conversation ??
         payload?.extendedTextMessage?.text ??
         payload?.imageMessage?.caption ??
         payload?.videoMessage?.caption ??
         payload?.documentMessage?.caption;
-      if (typeof content !== 'string') continue;
+      if (typeof content !== 'string')
+        throw new Error('Retained provider edit content is unavailable for reconciliation');
       const result = await pool.query(
         `SELECT m.id, m.message_type, m.content, m.content_attributes, c.display_id
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
@@ -422,6 +507,7 @@ class ChatwootImport {
         throw new Error('Provider history edit was not persisted');
       }
     }
+    return preserved;
   }
 
   public async activateHistorySourceGuards(sourceIds: string[], inboxId: number): Promise<void> {

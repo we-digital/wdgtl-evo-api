@@ -621,7 +621,12 @@ test('rejects authoritative direction drift before destination mutation and acce
     messages: messages.map((entry) => ({
       sourceId: entry.sourceId,
       expectedDirection: entry.fromMe ? ('outgoing' as const) : ('incoming' as const),
-      message: { id: entry.id, key: { id: entry.sourceId.slice(5), fromMe: entry.fromMe } },
+      message: {
+        id: entry.id,
+        key: { id: entry.sourceId.slice(5), fromMe: entry.fromMe },
+        messageType: 'conversation',
+        message: { conversation: 'synthetic' },
+      },
     })),
   });
 
@@ -643,9 +648,20 @@ test('rejects authoritative direction drift before destination mutation and acce
     );
     assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 0, reconcileCalls: 0, importCalls: 0 });
 
+    service.prismaRepository.messageUpdate = { findMany: async () => [] };
     service.prismaRepository.message.findMany = async () => [
-      { id: 'database-in', key: { id: 'incoming-id', fromMe: false } },
-      { id: 'database-out', key: { id: 'outgoing-id', fromMe: true } },
+      {
+        id: 'database-in',
+        key: { id: 'incoming-id', fromMe: false },
+        messageType: 'conversation',
+        message: { conversation: 'synthetic' },
+      },
+      {
+        id: 'database-out',
+        key: { id: 'outgoing-id', fromMe: true },
+        messageType: 'conversation',
+        message: { conversation: 'synthetic' },
+      },
     ];
     await assert.rejects(
       service.syncStoredHistoryRecoveryBatch(
