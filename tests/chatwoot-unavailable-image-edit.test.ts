@@ -31,13 +31,7 @@ test('cached controls stay controls and empty images require retained edit evide
     'encryption_control',
   );
   assert.equal(
-    classifyCachedHistoryRecord(
-      { messageType: 'imageMessage', message: {} },
-      { messageType: 'imageMessage', message: { imageMessage: {} } },
-      { messageType: 'conversation', message: { conversation: 123 } },
-      { messageType: 'extendedTextMessage', message: { extendedTextMessage: { text: 123 } } },
-      true,
-    ),
+    classifyCachedHistoryRecord({ messageType: 'imageMessage', message: {} }, true),
     'unavailable_image_edit',
   );
   assert.equal(
@@ -55,6 +49,9 @@ test('cached controls stay controls and empty images require retained edit evide
   );
   for (const record of [
     { messageType: 'imageMessage', message: {} },
+    { messageType: 'imageMessage', message: { imageMessage: {} } },
+    { messageType: 'conversation', message: { conversation: 123 } },
+    { messageType: 'extendedTextMessage', message: { extendedTextMessage: { text: 123 } } },
     { messageType: 'unknown', message: { protocolMessage: {} } },
     { messageType: 'reactionMessage', message: { reactionMessage: {} } },
     { messageType: 'unknown', message: { senderKeyDistributionMessage: {} } },
@@ -95,7 +92,7 @@ test('empty edited image proves one destination and leaves all message fields un
         } as any,
       );
       assert.equal(outcome.get('WAID:synthetic-image'), 'preserved_existing_source_payload_unavailable');
-      assert.equal(queries.at(-1), 'COMMIT');
+      assert.equal(queries[queries.length - 1], 'COMMIT');
       assert.equal(
         queries.some((sql) => /^\s*(UPDATE|INSERT|DELETE)\b/.test(sql)),
         false,
@@ -149,7 +146,7 @@ test('missing/conflicting image, wrong direction or stale binding refuses ACK wi
         ),
         /unique matching destination image/,
       );
-      assert.equal(queries.at(-1), 'ROLLBACK');
+      assert.equal(queries[queries.length - 1], 'ROLLBACK');
       assert.equal(
         queries.some((sql) => /^\s*(UPDATE|INSERT|DELETE)\b/.test(sql)),
         false,
@@ -181,7 +178,14 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   service.getProvider = async () => ({ accountId: '1', importMessages: true, enabled: true });
   service.getStoredHistoryRecoveryInbox = async () => ({ id: 99 });
   service.resolvePhoneJidForLid = async () => null;
-  const messages = [
+  const messages: Array<{
+    id: string;
+    messageType: string;
+    message: Record<string, unknown>;
+    status?: string;
+    messageTimestamp: number;
+    key: { id: string; fromMe: boolean; remoteJid: string };
+  }> = [
     { id: 'db-text', messageType: 'conversation', message: { conversation: 'synthetic' } },
     { id: 'db-image', messageType: 'imageMessage', message: {}, status: 'EDITED' },
     {
