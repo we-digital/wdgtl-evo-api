@@ -387,6 +387,24 @@ export class ChatwootService {
     return resolveTrustedChatwootBaseUrl(provider.url, trustedBaseUrl);
   }
 
+  private async privilegedChatwootRead(provider: ChatwootModel, path: string): Promise<unknown> {
+    const config = this.configService.get<Chatwoot>('CHATWOOT');
+    const url = requireTrustedChatwootUrl(provider.url, config.TRUSTED_BASE_URL, path);
+    if (!config.NATIVE_BRIDGE_TOKEN) throw new Error('Chatwoot native bridge token is not configured');
+
+    const response = await axios.request({
+      method: 'GET',
+      url,
+      headers: {
+        'api-access-token': provider.token,
+        'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+      },
+      timeout: 20_000,
+      maxRedirects: 0,
+    });
+    return response.data;
+  }
+
   private async privilegedChatwootRequest(
     provider: ChatwootModel,
     params: { method: 'POST' | 'DELETE'; path: string; data: Record<string, unknown> },
@@ -3822,10 +3840,10 @@ export class ChatwootService {
     const accountId = provider.accountId;
     let current: { muted?: boolean; pinned?: boolean; archived?: boolean } | null = null;
     try {
-      const raw = await chatwootRequest(this.getClientCwConfig(provider), {
-        method: 'GET',
-        url: `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
-      });
+      const raw = await this.privilegedChatwootRead(
+        provider,
+        `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
+      );
       // Show endpoint is flat; list-style wrappers use payload — accept both.
       const rawAny = raw as { payload?: unknown; muted?: boolean; pinned?: boolean; archived?: boolean } | null;
       current = (rawAny?.payload && typeof rawAny.payload === 'object' ? rawAny.payload : rawAny) as typeof current;
