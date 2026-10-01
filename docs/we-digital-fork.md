@@ -452,3 +452,12 @@ schema. Reapply in the Chatwoot service, identity normalization/import helper an
 SQL resolver; check upstream new ingestion/creation paths. Focused checks: TypeScript,
 changed-file ESLint, LID/cache/identity/history tests, actual PostgreSQL cross-runtime
 worker through Chatwoot concurrency RSpec, exact-source synthetic lab and runtime readback.
+
+
+The opt-in live contact resolver uses exact identifier/phone filters instead of
+legacy Brazilian-number rewriting or contact merging. Duplicate, truncated or
+contradictory PN/LID/group identities fail closed. Group participant creation must
+return a positive contact ID and its exact native identifier before roster updates.
+Existing confirmed contacts and avatars are reused. The legacy route remains
+unchanged with the opt-in off. Focused regression includes phone fallback,
+ambiguous filter results and unproven participant creation.

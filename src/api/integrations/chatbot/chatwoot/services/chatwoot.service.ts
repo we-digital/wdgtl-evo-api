@@ -453,10 +453,9 @@ export class ChatwootService {
     body: any,
   ): Promise<number> {
     const remoteLid = isLidJid(body.key.remoteJid) ? toCanonicalHistoryJid(body.key.remoteJid) : null;
-    let contact: any = await this.findContactByIdentifier(instance, peer);
+    let contact: any = await this.findProviderContact(instance, peer);
     const isGroup = isGroupJid(peer);
     const user = peer.split('@')[0];
-    if (!contact && isPhoneJid(peer)) contact = await this.findContact(instance, user);
     if (!contact) {
       const group = isGroup ? await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer) : null;
       contact = await this.createContact(
@@ -522,9 +521,8 @@ export class ChatwootService {
     const participant = toCanonicalHistoryJid(nativeParticipant);
     if (!isPhoneJid(participant) && !isLidJid(participant))
       throw new Error('Group participant native identity is unsupported');
-    let contact = await this.findContactByIdentifier(instance, participant);
+    const contact = await this.findProviderContact(instance, participant);
     const user = participant.split('@')[0];
-    if (!contact && isPhoneJid(participant)) contact = await this.findContact(instance, user);
     if (contact) {
       if ((isPhoneJid(contact.identifier) || isLidJid(contact.identifier)) && contact.identifier !== participant)
         throw new Error('Group participant contact identity conflicts');
@@ -532,7 +530,59 @@ export class ChatwootService {
         await this.updateContact(instance, contact.id, { name: body.pushName });
       return;
     }
-    await this.createContact(instance, user, inboxId, false, body.pushName || user, undefined, participant);
+    const result: any = await this.createContact(
+      instance,
+      user,
+      inboxId,
+      false,
+      body.pushName || user,
+      undefined,
+      participant,
+    );
+    const created = result?.payload?.contact || result?.payload || result;
+    const createdId = created?.id;
+    if (
+      typeof createdId !== 'number' ||
+      !Number.isSafeInteger(createdId) ||
+      createdId <= 0 ||
+      created?.identifier !== participant
+    )
+      throw new Error('Group participant contact creation could not be verified');
+  }
+
+  private async findProviderContact(instance: InstanceDto, peer: string) {
+    const context = await this.clientCw(instance);
+    if (!context) throw new Error('Provider contact lookup context is unavailable');
+    const lookup = async (attribute: 'identifier' | 'phone_number', value: string) => {
+      const response: any = await context.client.contacts.filter({
+        accountId: Number(context.provider.accountId),
+        payload: [{ attribute_key: attribute, filter_operator: 'equal_to', values: [value] }],
+      });
+      if (!Array.isArray(response) && !Array.isArray(response?.payload) && !Array.isArray(response?.data?.payload))
+        throw new Error('Provider contact lookup result is unavailable');
+      const contacts = extractChatwootContacts(response);
+      const count = response?.meta?.count ?? response?.data?.meta?.count;
+      if (
+        contacts.length > 1 ||
+        (count !== undefined && (!Number.isSafeInteger(count) || count !== contacts.length)) ||
+        contacts.some(
+          (item) =>
+            item[attribute] !== value || typeof item.id !== 'number' || !Number.isSafeInteger(item.id) || item.id <= 0,
+        )
+      )
+        throw new Error('Provider contact lookup identity is ambiguous');
+      return contacts[0] || null;
+    };
+    const exact = await lookup('identifier', peer);
+    if (exact || !isPhoneJid(peer)) return exact;
+    const phone = await lookup('phone_number', `+${peer.split('@')[0]}`);
+    if (
+      phone &&
+      (isPhoneJid(phone.identifier) || isLidJid(phone.identifier) || isGroupJid(phone.identifier)) &&
+      phone.identifier !== peer
+    )
+      throw new Error('Provider phone contact identity conflicts');
+    return phone;
   }
 
   public async applyWhatsappProviderEdit(
