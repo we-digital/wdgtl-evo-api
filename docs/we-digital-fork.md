@@ -461,3 +461,24 @@ return a positive contact ID and its exact native identifier before roster updat
 Existing confirmed contacts and avatars are reused. The legacy route remains
 unchanged with the opt-in off. Focused regression includes phone fallback,
 ambiguous filter results and unproven participant creation.
+
+## Trusted provider requests and personal pins (2026-10-02)
+
+Conversation detail GET requests now carry the existing native bridge credential
+as well as the account API token when the configured destination is the trusted
+Chatwoot origin. This lets the paired Chatwoot personal-pin feature retain shared
+native pin state for provider reads and updates, without creating personal pin
+preferences or changing a user's Unpin decision. Ordinary API credentials alone
+do not authorize the native bridge context. No new secret, provider request,
+conversation creation, media download or schema change is introduced.
+
+Reapply around the existing Chatwoot getConversation request and trusted-origin
+header helper; retain redirect rejection. Rollback is coordinated with Chatwoot
+and keeps personal pins disabled until both runtimes are compatible. The existing
+provider-conversation bindings remain enabled in the managed production runtime;
+the deployment configuration must preserve that accepted setting and Telegram
+session registry bytes. The controlled Baileys dependency is unchanged.
+
+Focused verification: 13 actual-method tests, changed-source ESLint, the normal
+commit hook's complete TypeScript check and independent paired source review.
+Exact shared synthetic lab and immutable production readback remain release gates.
