@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/whatsapp/media-message-metadata';
@@ -13,6 +15,7 @@ import {
   buildChatwootOutboundProvenance,
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
+import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
   buildWhatsappGroupParticipantSnapshots,
   extractWhatsappMentionJids,
@@ -5392,11 +5395,43 @@ export class ChatwootService {
         if (authoritativeDirection !== entry.expectedDirection) {
           throw new BadRequestException('Cached history message direction changed in authoritative storage');
         }
+        if (
+          stored.messageTimestamp !== entry.message.messageTimestamp ||
+          !isDeepStrictEqual(stored.key, entry.message.key) ||
+          !isDeepStrictEqual(stored.message, entry.message.message)
+        ) {
+          throw new BadRequestException('Cached history source version changed; refresh before recovery');
+        }
         return stored;
       });
+      const retainedEdits = await this.prismaRepository.messageUpdate.findMany({
+        where: {
+          Instance: { name: instance.instanceName },
+          messageId: { in: Array.from(requestedDatabaseIds) },
+          status: 'EDITED',
+        },
+        select: { messageId: true },
+      });
+      const editedIds = new Set(retainedEdits.map((edit) => edit.messageId));
+      const classifications = new Map(
+        authoritativeMessages.map((message) => [
+          toChatwootSourceId((message.key as { id: string }).id),
+          classifyCachedHistoryRecord(message, message.status === 'EDITED' || editedIds.has(message.id)),
+        ]),
+      );
+      const editedMessages = authoritativeMessages.filter((message) => {
+        const classification = classifications.get(toChatwootSourceId((message.key as { id: string }).id));
+        return (
+          (message.status === 'EDITED' || editedIds.has(message.id)) &&
+          (classification === 'ordinary' || classification === 'unavailable_image_edit')
+        );
+      });
+      const ordinaryMessages = authoritativeMessages.filter(
+        (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
+      );
       await chatwootImport.activateHistorySourceGuards(Array.from(requestedSourceIds), inbox.id);
       const preparedBySourceId = new Map(
-        authoritativeMessages.map((message) => {
+        ordinaryMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
           const prepared =
             data.recoveryMode === 'maximize'
@@ -5405,7 +5440,7 @@ export class ChatwootService {
           return [sourceId, prepared] as const;
         }),
       );
-      const preparedMessages = authoritativeMessages.map((message) => {
+      const preparedMessages = ordinaryMessages.map((message) => {
         const sourceId = toChatwootSourceId((message.key as { id: string }).id);
         return preparedBySourceId.get(sourceId)?.message || message;
       });
@@ -5441,31 +5476,32 @@ export class ChatwootService {
         authoritativeMessages,
         inbox.id,
       );
-      const existingSourceIds = await chatwootImport.getExistingSourceIds(
-        Array.from(requestedSourceIds),
-        undefined,
+      const existingSourceIds = await chatwootImport.getVerifiedRecoverySourceIds(
+        authoritativeMessages,
         inbox.id,
+        provider,
       );
       for (const sourceId of outboundBridgeSourceIds) {
         existingSourceIds.add(sourceId);
       }
-      // Retained edits are updates, even when the original source already exists.
-      // Confirm them before acknowledging this batch so the ordinary worker can retry failures.
-      const retainedEdits = await this.prismaRepository.messageUpdate.findMany({
-        where: {
-          Instance: { name: instance.instanceName },
-          messageId: { in: Array.from(requestedDatabaseIds) },
-          status: 'EDITED',
-        },
-        select: { messageId: true },
-      });
-      const editedIds = new Set(retainedEdits.map((edit) => edit.messageId));
-      const editedMessages = authoritativeMessages.filter(
-        (message) => message.status === 'EDITED' || editedIds.has(message.id),
-      );
-      await chatwootImport.reconcileProviderHistoryEdits(editedMessages, inbox.id, provider, this);
       const missingMessages = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      // This native SQL importer cannot materialize media blobs. Existence of a
+      // placeholder must not be mistaken for a completely recovered attachment.
+      if (missingMessages.some((message) => !['conversation', 'extendedTextMessage'].includes(message.messageType))) {
+        throw new Error('Cached recovery cannot prove complete media import; keep the job paused');
+      }
+      // Retained edits are updates, even when the original source already exists.
+      // Confirm them before acknowledging this batch so the ordinary worker can retry failures.
+      const editedSourceIds = new Set(
+        editedMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
+      );
+      const preservedEdits = await chatwootImport.reconcileProviderHistoryEdits(
+        editedMessages,
+        inbox.id,
+        provider,
+        this,
       );
       const importableMessages = missingMessages.filter((message: any) =>
         Boolean(chatwootImport.getContentMessage(this, message)),
@@ -5487,11 +5523,7 @@ export class ChatwootService {
           throw new Error(`Chatwoot recovery import failed for ${instance.instanceName}`);
         }
         importedMessages = Number(imported);
-        appliedSourceIds = await chatwootImport.getExistingSourceIds(
-          importableMessages.map((message: any) => message.key.id),
-          undefined,
-          inbox.id,
-        );
+        appliedSourceIds = await chatwootImport.getVerifiedRecoverySourceIds(importableMessages, inbox.id, provider);
         if (appliedSourceIds.size !== importableMessages.length) {
           throw new Error(
             `Chatwoot recovery only applied ${appliedSourceIds.size}/${importableMessages.length} messages for ${instance.instanceName}`,
@@ -5512,14 +5544,26 @@ export class ChatwootService {
 
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
+        const classification = classifications.get(sourceId);
+        if (classification === 'reaction_control' || classification === 'encryption_control') {
+          return { sourceId, status: 'skipped', reason: `known_${classification}`, recovery: 'unsupported' };
+        }
+        if (preservedEdits.has(sourceId)) {
+          return { sourceId, status: 'existing', reason: preservedEdits.get(sourceId), recovery: 'native' };
+        }
         if (existingSourceIds.has(sourceId)) {
-          return { sourceId, status: 'existing', reason: 'already_in_destination', recovery: preparation?.recovery };
+          return {
+            sourceId,
+            status: 'existing',
+            reason: editedSourceIds.has(sourceId) ? 'provider_edit_reconciled' : 'already_in_destination',
+            recovery: preparation?.recovery,
+          };
         }
         if (appliedSourceIds.has(sourceId)) {
           return {
             sourceId,
             status: 'imported',
-            reason: preparation?.reason || 'native',
+            reason: editedSourceIds.has(sourceId) ? 'provider_edit_reconciled' : preparation?.reason || 'native',
             recovery: preparation?.recovery,
           };
         }
@@ -5556,7 +5600,7 @@ export class ChatwootService {
         attemptedPhoneJids: lidMappingRefresh.attemptedPhoneJids,
         refreshedLidMappings: lidMappingRefresh.refreshedMappings,
         sourceMessages: data.messages.length,
-        existingMessages: existingSourceIds.size,
+        existingMessages: outcomes.filter((outcome) => outcome.status === 'existing').length,
         selectedMessages: data.messages.length,
         importedMessages,
         appliedMessages,
