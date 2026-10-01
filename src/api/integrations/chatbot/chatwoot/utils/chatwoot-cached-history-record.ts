@@ -57,7 +57,19 @@ export function classifyCachedHistoryRecord(
     ordinaryTypes.has(record.messageType) &&
     keys.includes(record.messageType) &&
     keys.every((key) => key === record.messageType || auxiliaryKeys.has(key))
-  )
+  ) {
+    const primary = (payload as Record<string, unknown>)[record.messageType];
+    const valid =
+      record.messageType === 'conversation'
+        ? typeof primary === 'string'
+        : primary !== null && typeof primary === 'object' && !Array.isArray(primary) && Object.keys(primary).length > 0;
+    if (
+      !valid ||
+      (record.messageType === 'extendedTextMessage' && typeof (primary as Record<string, unknown>).text !== 'string')
+    ) {
+      throw new Error('Cached ordinary payload is unclassifiable');
+    }
     return 'ordinary';
+  }
   throw new Error('Cached history contains an unknown or contradictory record');
 }

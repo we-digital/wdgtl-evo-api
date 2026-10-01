@@ -5484,6 +5484,14 @@ export class ChatwootService {
       for (const sourceId of outboundBridgeSourceIds) {
         existingSourceIds.add(sourceId);
       }
+      const missingMessages = uniqueMessages.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      // This native SQL importer cannot materialize media blobs. Existence of a
+      // placeholder must not be mistaken for a completely recovered attachment.
+      if (missingMessages.some((message) => !['conversation', 'extendedTextMessage'].includes(message.messageType))) {
+        throw new Error('Cached recovery cannot prove complete media import; keep the job paused');
+      }
       // Retained edits are updates, even when the original source already exists.
       // Confirm them before acknowledging this batch so the ordinary worker can retry failures.
       const editedSourceIds = new Set(
@@ -5494,9 +5502,6 @@ export class ChatwootService {
         inbox.id,
         provider,
         this,
-      );
-      const missingMessages = uniqueMessages.filter(
-        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
       const importableMessages = missingMessages.filter((message: any) =>
         Boolean(chatwootImport.getContentMessage(this, message)),

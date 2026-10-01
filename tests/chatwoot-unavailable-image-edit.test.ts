@@ -31,7 +31,13 @@ test('cached controls stay controls and empty images require retained edit evide
     'encryption_control',
   );
   assert.equal(
-    classifyCachedHistoryRecord({ messageType: 'imageMessage', message: {} }, true),
+    classifyCachedHistoryRecord(
+      { messageType: 'imageMessage', message: {} },
+      { messageType: 'imageMessage', message: { imageMessage: {} } },
+      { messageType: 'conversation', message: { conversation: 123 } },
+      { messageType: 'extendedTextMessage', message: { extendedTextMessage: { text: 123 } } },
+      true,
+    ),
     'unavailable_image_edit',
   );
   assert.equal(
@@ -298,6 +304,28 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   assert.equal(repeat.existingMessages, 3);
   assert.equal(importCalls, 1);
 
+  const missingMedia = {
+    ...missing,
+    id: 'db-new-image',
+    key: { ...missing.key, id: 'db-new-image' },
+    messageType: 'imageMessage',
+    message: { imageMessage: { caption: 'synthetic media', mimetype: 'image/png' } },
+  };
+  authoritative = [...messages, missingMedia] as any;
+  const mediaRequest = {
+    ...request,
+    messages: authoritative.map((message) => ({
+      sourceId: `WAID:${message.id}`,
+      expectedDirection: 'incoming',
+      message,
+    })),
+  };
+  await assert.rejects(
+    service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, mediaRequest),
+    /cannot prove complete media import/,
+  );
+  assert.equal(importCalls, 1);
+
   authoritative = messages.map((message) =>
     message.id === 'db-image'
       ? {
@@ -310,7 +338,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, request),
     (error: any) => error.message?.[0]?.includes('source version changed'),
   );
-  assert.equal(guardCalls, 4);
+  assert.equal(guardCalls, 5);
   authoritative = messages.map((message) =>
     message.id === 'db-control'
       ? {
@@ -331,7 +359,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, unknownRequest),
     /unknown or contradictory/,
   );
-  assert.equal(guardCalls, 4);
+  assert.equal(guardCalls, 5);
 });
 
 test('recovery verifies every destination alias and direction instead of counting existence', async () => {
