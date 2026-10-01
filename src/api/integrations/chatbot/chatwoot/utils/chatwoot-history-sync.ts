@@ -29,6 +29,7 @@ export type ResolvePhoneJid = (lid: string) => Promise<string | null | undefined
 export type HistoryNormalizationOptions = {
   includeGroups?: boolean;
   includeUnresolvedLids?: boolean;
+  retainProviderAliases?: boolean;
 };
 
 export type HistoryRecoveryPreparation = {
@@ -328,6 +329,9 @@ export const normalizeStoredHistoryMessages = async (
       key: {
         ...key,
         remoteJid: toCanonicalHistoryJid(normalizedJid),
+        ...(options.retainProviderAliases && isLidJid(key.remoteJid)
+          ? { historyOriginalRemoteJid: toCanonicalHistoryJid(key.remoteJid) }
+          : {}),
       },
     });
   }

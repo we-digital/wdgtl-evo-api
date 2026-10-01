@@ -57,6 +57,16 @@ test('normalizes Chatwoot source ids exactly once', () => {
   assert.equal(toChatwootSourceId('WAID:ABC'), 'WAID:ABC');
 });
 
+test('retains verified LID provenance only for canonical provider conversation resolution', async () => {
+  const original = message({ id: 'alias', remoteJid: '999999@lid', remoteJidAlt: '628100000001@s.whatsapp.net' });
+  const enabled = await normalizeStoredHistoryMessages([original], [original], undefined, { retainProviderAliases: true });
+  assert.equal((enabled.messages[0].key as any).remoteJid, '628100000001@s.whatsapp.net');
+  assert.equal((enabled.messages[0].key as any).historyOriginalRemoteJid, '999999@lid');
+  assert.equal((original.key as any).remoteJid, '999999@lid');
+  const disabled = await normalizeStoredHistoryMessages([original], [original]);
+  assert.equal((disabled.messages[0].key as any).historyOriginalRemoteJid, undefined);
+});
+
 test('treats exact raw and canonical Chatwoot source ids as the same retained history message', async () => {
   const originalGetConnection = postgresClient.getChatwootConnection;
   const queries: Array<{ sql: string; params: unknown[] }> = [];

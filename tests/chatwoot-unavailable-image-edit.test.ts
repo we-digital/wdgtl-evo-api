@@ -174,6 +174,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   });
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
   const service = Object.create(ChatwootService.prototype) as any;
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.isImportHistoryAvailable = () => true;
   service.getProvider = async () => ({ accountId: '1', importMessages: true, enabled: true });
   service.getStoredHistoryRecoveryInbox = async () => ({ id: 99 });

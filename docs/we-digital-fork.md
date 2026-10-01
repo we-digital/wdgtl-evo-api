@@ -417,3 +417,38 @@ Expired native edit probes carry only the structured time_expired reason; other 
 - Contract version remains 2026-08-28; this is an additive outcome, not permission to replay old operator approval. No new feature flag or EVO schema migration. History adds SQLite schema v3. Rollback to previous immutable sources preserves gap rows; do not drop the ledger or manually change ACK markers.
 - Focused checks: history/provider edit and unavailable image tests, cache restart/race/version tests, source lint/build and exact synthetic shared-lab candidate. Provider sender-key compatibility remains pinned and unaffected.
 - The native SQL history importer does not materialize attachment blobs. Fresh missing media therefore stops this recovery before edit/import/ACK instead of silently acknowledging a placeholder as complete media. Fresh supported conversation/extended-text records can import once; existing media and uniquely proven unavailable image edits remain eligible.
+
+## Canonical Chatwoot provider conversations (2026-10-01)
+
+Opt-in `CHATWOOT_PROVIDER_CONVERSATION_BINDINGS=false` preserves the legacy path
+by default. After Chatwoot's additive binding schema/controller is deployed, live
+WhatsApp capability reads and trusted native resolution use the stable native peer
+within the exact account/inbox. The protected reply distinguishes API display ID
+from database ID, validates its complete scope, and bypasses old conversation caches.
+Resolved incoming conversations reopen through the existing Chatwoot message path;
+pending configuration is retained. Existing contacts, avatar attachments and files
+are reused; group metadata is fetched only for new contacts and roster synchronization
+retains the previous cache interval. Incoming group participants still reuse their
+native PN/LID contact, or create it
+when missing, without downloading existing avatars or inventing phone identities.
+Native bridge credentials are sent only to the already configured trusted Chatwoot
+origin, without redirects. Contact failures no
+longer dump the complete HTTP error object into logs.
+
+The direct SQL history resolver shares Chatwoot's binding, sorted
+`provider-conversation:<account>:<inbox>:whatsapp:<peer>` PostgreSQL transaction
+locks, ownership constraints and earliest-conversation rule. It fails on contradictory
+native ContactInbox identities and ambiguous contacts. History timestamps and existing
+statuses are preserved and no live callbacks/auto replies are introduced. Verified
+LID normalization retains its original peer only while the opt-in is enabled; both
+writers lock its aliases and stop when alias history needs independent reconciliation.
+This release does not merge conversations, rewrite mappings, remove blobs or upgrade
+Baileys. The controlled dependency/lockfile and sender-key layer remain unchanged.
+
+Deploy Chatwoot first, then source with the opt-in off. Enable source capability reads
+before independently reviewed account activation; rollout must include all live/history
+writers before destructive cleanup. Rollback disables opt-ins and retains the binding
+schema. Reapply in the Chatwoot service, identity normalization/import helper and provider
+SQL resolver; check upstream new ingestion/creation paths. Focused checks: TypeScript,
+changed-file ESLint, LID/cache/identity/history tests, actual PostgreSQL cross-runtime
+worker through Chatwoot concurrency RSpec, exact-source synthetic lab and runtime readback.
