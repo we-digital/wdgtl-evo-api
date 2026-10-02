@@ -482,3 +482,21 @@ session registry bytes. The controlled Baileys dependency is unchanged.
 Focused verification: 13 actual-method tests, changed-source ESLint, the normal
 commit hook's complete TypeScript check and independent paired source review.
 Exact shared synthetic lab and immutable production readback remain release gates.
+
+## Retained image edits with a JSON null payload (2026-10-02)
+
+Cached history now classifies JSON null as unavailable content only for a retained
+EDITED image. Reconciliation preserves the existing image only after proving one
+destination with matching source identity, inbox and direction. It retains the
+durable unavailable-edit result rather than claiming that an edit was applied.
+Undefined, contradictory and encrypted payloads continue to stop recovery.
+
+Reapply in the cached-history classifier and image-edit import helper. No schema,
+provider send, media download, cache acknowledgement or job resume accompanies
+this source change. The two recovery jobs remain paused while their current
+source contains unsupported encrypted edits and their cached versions are stale.
+Rollback preserves the consumer's existing unavailable-edit ledger.
+
+Focused verification: 44 EVO tests, TypeScript and changed-file lint, plus real
+PostgreSQL preservation of all image fields for a JSON null source. Independent
+source review, exact candidate lab and immutable production readback remain gates.

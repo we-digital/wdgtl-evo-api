@@ -30,10 +30,9 @@ test('cached controls stay controls and empty images require retained edit evide
     ),
     'encryption_control',
   );
-  assert.equal(
-    classifyCachedHistoryRecord({ messageType: 'imageMessage', message: {} }, true),
-    'unavailable_image_edit',
-  );
+  for (const message of [{}, null]) {
+    assert.equal(classifyCachedHistoryRecord({ messageType: 'imageMessage', message }, true), 'unavailable_image_edit');
+  }
   assert.equal(
     classifyCachedHistoryRecord(
       {
@@ -49,6 +48,10 @@ test('cached controls stay controls and empty images require retained edit evide
   );
   for (const record of [
     { messageType: 'imageMessage', message: {} },
+    { messageType: 'imageMessage', message: null },
+    { messageType: 'imageMessage', message: undefined },
+    { messageType: 'imageMessage', message: [] },
+    { messageType: 'imageMessage', message: '' },
     { messageType: 'imageMessage', message: { imageMessage: {} } },
     { messageType: 'conversation', message: { conversation: 123 } },
     { messageType: 'extendedTextMessage', message: { extendedTextMessage: { text: 123 } } },
@@ -63,7 +66,9 @@ test('cached controls stay controls and empty images require retained edit evide
 test('empty edited image proves one destination and leaves all message fields untouched in both directions', async () => {
   const originalPool = postgresClient.getChatwootConnection;
   try {
-    for (const fromMe of [false, true]) {
+    for (const [fromMe, payload] of [false, true].flatMap((direction) =>
+      [{}, null].map((body) => [direction, body] as const),
+    )) {
       const queries: string[] = [];
       const target = { id: 314, message_type: fromMe ? 1 : 0, conversation_id: 40, private: false, has_image: true };
       const client = {
@@ -79,7 +84,7 @@ test('empty edited image proves one destination and leaves all message fields un
           {
             key: { id: 'synthetic-image', fromMe },
             messageType: 'imageMessage',
-            message: {},
+            message: payload,
             chatwootMessageId: 314,
             chatwootInboxId: 99,
             chatwootConversationId: 40,
@@ -182,13 +187,13 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   const messages: Array<{
     id: string;
     messageType: string;
-    message: Record<string, unknown>;
+    message: Record<string, unknown> | null;
     status?: string;
     messageTimestamp: number;
     key: { id: string; fromMe: boolean; remoteJid: string };
   }> = [
     { id: 'db-text', messageType: 'conversation', message: { conversation: 'synthetic' } },
-    { id: 'db-image', messageType: 'imageMessage', message: {}, status: 'EDITED' },
+    { id: 'db-image', messageType: 'imageMessage', message: null, status: 'EDITED' },
     {
       id: 'db-reaction',
       status: 'EDITED',
@@ -425,4 +430,24 @@ test('new nonempty edited media without checkable content cannot claim reconcili
     ),
     /unavailable for reconciliation/,
   );
+});
+
+test('encrypted edit remains unknown even with an EDITED status', () => {
+  assert.throws(
+    () =>
+      classifyCachedHistoryRecord(
+        {
+          messageType: 'unknown',
+          message: { secretEncryptedMessage: { secretEncType: 2, encPayload: 'synthetic', encIv: 'synthetic' } },
+        },
+        true,
+      ),
+    /unknown or contradictory/,
+  );
+  for (const message of [undefined, [], '', false]) {
+    assert.throws(
+      () => classifyCachedHistoryRecord({ messageType: 'imageMessage', message }, true),
+      /unclassifiable|unknown or contradictory/,
+    );
+  }
 });

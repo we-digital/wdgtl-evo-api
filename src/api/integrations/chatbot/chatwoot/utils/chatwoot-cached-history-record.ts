@@ -17,6 +17,8 @@ export function classifyCachedHistoryRecord(
   edited: boolean,
 ): 'ordinary' | 'reaction_control' | 'encryption_control' | 'unavailable_image_edit' {
   const payload = record.message;
+  // SQL JSON null is an unavailable retained edit, never an instruction to clear an image.
+  if (payload === null && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Cached history payload is unclassifiable');
   }
