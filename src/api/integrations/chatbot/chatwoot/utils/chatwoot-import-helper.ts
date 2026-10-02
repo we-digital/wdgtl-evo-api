@@ -421,7 +421,10 @@ class ChatwootImport {
       const key = message.key as { id: string; fromMe: boolean };
       const sourceId = toChatwootSourceId(key.id);
       const payload = message.message as any;
-      if (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0) {
+      if (
+        payload === null ||
+        (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0)
+      ) {
         if (message.messageType !== 'imageMessage') throw new Error('Empty provider edit is not a known image');
         const client = await pool.connect();
         try {
