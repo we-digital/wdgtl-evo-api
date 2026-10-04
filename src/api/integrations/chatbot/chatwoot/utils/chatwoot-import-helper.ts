@@ -518,12 +518,56 @@ class ChatwootImport {
     await activateChatwootHistorySourceGuards(postgresClient.getChatwootConnection(), inboxId, sourceIds);
   }
 
-  private async insertHistoryMessagesSerialized(sql: string, params: unknown[]): Promise<number> {
+  private async insertHistoryMessagesSerialized(
+    sql: string,
+    params: unknown[],
+    scope: { accountId: number; inboxId: number; peers: string[]; conversationIds: number[] },
+  ): Promise<number> {
     const pool = postgresClient.getChatwootConnection();
     const client = await pool.connect();
     try {
-      await client.query('BEGIN');
-      await client.query('LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE');
+      await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
+      await client.query(
+        "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='10s'",
+      );
+      // Original NOT EXISTS is scoped to inbox/source. Serialize only import
+      // batches for this inbox; never upgrade the messages table lock while a
+      // direct INSERT holds RowExclusive and waits for a provider peer.
+      await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+        `provider-history-import:${scope.accountId}:${scope.inboxId}`,
+      ]);
+      const peers = new Set<string>();
+      if (configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) {
+        for (const peer of scope.peers) peers.add(peer);
+      }
+      const available = await client.query(
+        "SELECT to_regclass('public.provider_conversation_bindings') AS bindings,to_regclass('public.provider_conversation_routes') AS routes",
+      );
+      if (available.rows[0]?.bindings) {
+        // Resolve the actual primary keys used by the CW trigger. A declared
+        // LID alias must not miss its existing PN binding/primary peer lock.
+        const bindings = await client.query(
+          `SELECT DISTINCT b.peer FROM provider_conversation_bindings b
+           JOIN conversations canonical ON canonical.id=b.conversation_id
+             AND canonical.account_id=b.account_id AND canonical.inbox_id=b.inbox_id
+           JOIN conversations source ON source.contact_id=canonical.contact_id
+             AND source.account_id=canonical.account_id AND source.inbox_id=canonical.inbox_id
+           WHERE b.account_id=$1 AND b.inbox_id=$2 AND b.provider='whatsapp' AND (source.id=ANY($3::integer[])${
+             available.rows[0]?.routes
+               ? ` OR b.conversation_id IN
+             (SELECT canonical_conversation_id FROM provider_conversation_routes
+              WHERE account_id=$1 AND inbox_id=$2 AND source_conversation_id=ANY($3::integer[]))`
+               : ''
+           })`,
+          [scope.accountId, scope.inboxId, scope.conversationIds],
+        );
+        for (const row of bindings.rows) peers.add(row.peer);
+      }
+      for (const peer of [...peers].sort()) {
+        await client.query('SELECT pg_advisory_xact_lock(hashtextextended($1,0))', [
+          `provider-conversation:${scope.accountId}:${scope.inboxId}:whatsapp:${peer}`,
+        ]);
+      }
       const result = await client.query(sql, params);
       await client.query('COMMIT');
       return result?.rowCount ?? 0;
@@ -702,7 +746,14 @@ class ChatwootImport {
               )
               ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
 
-            totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg);
+            totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg, {
+              accountId: Number(provider.accountId),
+              inboxId: Number(inbox.id),
+              peers: [...fksByIdentity.keys()],
+              conversationIds: [...fksByIdentity.values()]
+                .map((row) => Number(row.conversation_id))
+                .filter((id) => Number.isSafeInteger(id) && id > 0),
+            });
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
