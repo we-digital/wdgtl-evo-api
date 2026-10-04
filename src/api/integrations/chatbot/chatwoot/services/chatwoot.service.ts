@@ -16,6 +16,7 @@ import {
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
 import {
   buildWhatsappGroupParticipantSnapshots,
   extractWhatsappMentionJids,
@@ -3461,17 +3462,45 @@ export class ChatwootService {
     chatwootMessageIds: ChatwootMessage,
     instance: InstanceDto,
   ): Promise<number> {
-    return this.prismaRepository.$executeRaw`
-      UPDATE "Message"
-      SET
-        "chatwootMessageId" = ${chatwootMessageIds.messageId},
-        "chatwootConversationId" = ${chatwootMessageIds.conversationId},
-        "chatwootInboxId" = ${chatwootMessageIds.inboxId},
-        "chatwootContactInboxSourceId" = ${chatwootMessageIds.contactInboxSourceId},
-        "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
-      WHERE "instanceId" = ${instance.instanceId}
-      AND "key"->>'id' = ${whatsappMessageId}
-    `;
+    const persist = async (binding: ChatwootMessage): Promise<number> =>
+      this.prismaRepository.$transaction(
+        (transaction) => transaction.$executeRaw`
+        UPDATE "Message"
+        SET "chatwootMessageId" = ${chatwootMessageIds.messageId},
+            "chatwootConversationId" = ${binding.conversationId},
+            "chatwootInboxId" = ${binding.inboxId},
+            "chatwootContactInboxSourceId" = ${binding.contactInboxSourceId},
+            "chatwootIsRead" = ${chatwootMessageIds.isRead || false}
+        WHERE "instanceId" = ${instance.instanceId} AND "key"->>'id' = ${whatsappMessageId}
+      `,
+        { maxWait: 2000, timeout: 5000 },
+      );
+    if (!this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS)
+      return persist(chatwootMessageIds);
+    const capability = await postgresClient
+      .getChatwootConnection()
+      .query(
+        "SELECT to_regclass('public.provider_conversation_routes') AS routes, to_regprocedure('public.provider_message_conversation_route(integer,integer,integer)') AS resolver",
+      );
+    // Deploy this EFO lock-order correction before the atomic CW migration.
+    // No route/deletion can exist while both migration objects are absent.
+    if (!capability.rows[0]?.routes && !capability.rows[0]?.resolver) return persist(chatwootMessageIds);
+    if (!capability.rows[0]?.routes || !capability.rows[0]?.resolver)
+      throw new Error('Incomplete canonical routing migration');
+    const context = await this.clientCw(instance);
+    const inbox = await this.getInbox(instance);
+    if (!context || !inbox) throw new Error('Canonical mapping provider context unavailable');
+    return withCanonicalChatwootMessageBinding(
+      postgresClient.getChatwootConnection(),
+      {
+        accountId: Number(context.provider.accountId),
+        inboxId: Number(inbox.id),
+        messageId: Number(chatwootMessageIds.messageId),
+        whatsappMessageId,
+        claimedConversationId: chatwootMessageIds.conversationId,
+      },
+      persist,
+    );
   }
 
   private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {

@@ -1,5 +1,15 @@
 # we:Digital Evolution API fork
 
+## Canonical routing for delayed provider writes (2026-10-04)
+
+- Resolve actual Chatwoot message ownership under the Chatwoot provider peer lock before persisting Evolution conversation mappings. Preserve all source payload fields and existing outgoing null-source behavior; stale display IDs require the exact retained internal route.
+- History imports serialize per inbox and then acquire sorted authenticated provider peer/alias locks before the existing source checks and insert. This replaces the broad messages table lock and preserves importer deduplication without claiming a universal source-ID uniqueness constraint.
+- Source areas: chatwoot.service, chatwoot-canonical-message-binding and chatwoot-import-helper. No dependency, provider authentication, Baileys, template, auto-reply flag or Evolution schema changes. Deploy this compatible bridge before the additive Chatwoot routing migration.
+- Reapply the cross-store lock lifetime and import lock order together. A native commit followed by a Chatwoot connection failure requires reconciliation; it is never evidence of rollback or authority to replay a send.
+- Rollback: old shells remain through qualification. After deletion, retain compatible mapping/import consumers and durable Chatwoot routes; unbridged writers are unsafe. This change introduces no provider sends or business operations.
+- Focused validation: literal mapping/import helper recordings, actual PostgreSQL delayed writer/import interleavings and duplicate import, existing direction/source guards, targeted TypeScript checks and lint. Runtime bridge and final cleanup acceptance are separate.
+
+
 ## Source and deployment contract
 
 `main` packages the production source for `bbc-evo`; `staging` packages the
