@@ -73,11 +73,23 @@ export async function resolveProviderHistoryConversations(
         if (aliasConversations.rows.length)
           throw new Error('History LID alias needs verified conversation reconciliation');
       }
+      // Match live provider ingress: exact provider identifier wins over phone aliases.
+      // Retain the other contact, documents and message authors without merging them.
       let contacts = await client.query(
         `SELECT id, identifier FROM contacts WHERE account_id = $1
-         AND (identifier = $2 OR ($3::text IS NOT NULL AND phone_number = $3)) ORDER BY id FOR UPDATE`,
-        [accountId, peer, identity.phoneNumber],
+         AND identifier = $2 ORDER BY id FOR UPDATE`,
+        [accountId, peer],
       );
+      if (!contacts.rows.length && identity.phoneNumber !== null) {
+        if (!/^[1-9]\d{4,19}@s\.whatsapp\.net$/.test(peer) || identity.phoneNumber !== `+${peer.split('@')[0]}`) {
+          throw new Error('History provider phone identity is unavailable');
+        }
+        contacts = await client.query(
+          `SELECT id, identifier FROM contacts WHERE account_id = $1
+           AND phone_number = $2 ORDER BY id FOR UPDATE`,
+          [accountId, identity.phoneNumber],
+        );
+      }
       if (!contacts.rows.length) {
         contacts = await client.query(
           `INSERT INTO contacts (account_id,identifier,phone_number,name,created_at,updated_at)
