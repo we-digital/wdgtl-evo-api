@@ -510,3 +510,10 @@ Rollback preserves the consumer's existing unavailable-edit ledger.
 Focused verification: 44 EVO tests, TypeScript and changed-file lint, plus real
 PostgreSQL preservation of all image fields for a JSON null source. Independent
 source review, exact candidate lab and immutable production readback remain gates.
+
+
+### Exact provider contact precedence for history import
+
+History now uses the exact account-scoped WhatsApp identifier before the unique PN phone fallback, matching live provider ingress. A same-phone Telegram contact remains intact, including its documents and message authors; contact merge, deletion and identifier rewrites are excluded. Duplicate exact identifiers, foreign provider identifiers, inconsistent PN phones and existing binding/contact-inbox conflicts still refuse. This does not itself authorize cross-contact consolidation or reparent conversations.
+
+Validation: five whole-resolver cases on an owned Unix-only PostgreSQL17 fixture, including the old two-contact refusal, exact WA selection with both contacts/authors/documents unchanged, duplicate exact/foreign fallback refusals and normal missing-contact creation. Portable regression: `node tests/provider-history-contact-pg.cjs /tmp/historycontact246-OWNED/socket` (requires an exclusively owned synthetic schema and fixture user; refuses TCP/other socket paths). The ROOT release remains PR → owned lab → immutable main readback.
