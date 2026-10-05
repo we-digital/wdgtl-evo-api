@@ -7,14 +7,18 @@ import { proto } from 'baileys';
 import { recoverEncryptedHistoryEdit } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 
-function fixture(edit: any) {
+function fixture(edit: any, metadata?: any, extraBody: any = {}) {
   const participant = '123456789@s.whatsapp.net';
   const key = { id: 'original', remoteJid: '123456@g.us', fromMe: true };
   const secret = Buffer.alloc(32, 7);
   const iv = Buffer.alloc(12, 8);
   const plaintext = Buffer.from(
     proto.Message.encode(
-      proto.Message.fromObject({ protocolMessage: { type: 14, key, editedMessage: edit } }),
+      proto.Message.fromObject({
+        protocolMessage: { type: 14, key, editedMessage: edit },
+        ...(metadata === undefined ? {} : { messageContextInfo: metadata }),
+        ...extraBody,
+      }),
     ).finish(),
   );
   const derived = Buffer.from(
@@ -92,6 +96,43 @@ test('caption-only delta conserves every original attachment field and original 
     ...original.message.documentMessage,
     caption: 'new caption',
   });
+});
+
+test('authenticated 32-byte wrapper metadata is accepted without replacing original context', () => {
+  const { envelope, original } = fixture(
+    { extendedTextMessage: { text: 'after' } },
+    { messageSecret: Buffer.alloc(32, 19).toString('base64') },
+  );
+  const before = JSON.stringify({ envelope, original });
+  const result = recoverEncryptedHistoryEdit(envelope, original);
+  assert.equal((result.message as any).extendedTextMessage.text, 'after');
+  assert.deepEqual((result.message as any).messageContextInfo, original.message.messageContextInfo);
+  assert.notEqual((result.message as any).messageContextInfo.messageSecret, Buffer.alloc(32, 19).toString('base64'));
+  assert.deepEqual(result.key, original.key);
+  assert.equal(result.messageTimestamp, original.messageTimestamp);
+  assert.equal(JSON.stringify({ envelope, original }), before);
+});
+
+test('authenticated wrapper metadata rejects malformed lengths, extra metadata and extra message bodies', () => {
+  for (const metadata of [
+    {},
+    { messageSecret: Buffer.alloc(31).toString('base64') },
+    { messageSecret: Buffer.alloc(33).toString('base64') },
+    { deviceListMetadataVersion: 2 },
+    { messageSecret: Buffer.alloc(32).toString('base64'), deviceListMetadataVersion: 2 },
+  ]) {
+    const { envelope, original } = fixture({ conversation: 'after' }, metadata);
+    const before = JSON.stringify({ envelope, original });
+    assert.throws(() => recoverEncryptedHistoryEdit(envelope, original), /authenticated metadata/);
+    assert.equal(JSON.stringify({ envelope, original }), before);
+  }
+  assert.throws(() => fixture({ conversation: 'after' }, { messageSecret: 'invalid%' }), /invalid encoding/);
+  const { envelope, original } = fixture(
+    { conversation: 'after' },
+    { messageSecret: Buffer.alloc(32).toString('base64') },
+    { conversation: 'contradictory extra body' },
+  );
+  assert.throws(() => recoverEncryptedHistoryEdit(envelope, original), /inner target/);
 });
 
 test('unknown keys, wrong author/direction/instance/target, AEAD corruption or replacement media refuse', () => {

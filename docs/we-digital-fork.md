@@ -540,3 +540,19 @@ Verification: `npx tsx --test tests/chatwoot-authenticated-history-edit.test.ts
 `npx tsc --noEmit --incremental false`, normal ESLint on those four runtime files,
 and exact synthetic shared-lab/immutable readback. The matching history schema4
 and optional CW CAS must be accepted before activating recovery outcomes.
+
+### Authenticated edit wrapper metadata
+
+Retained encrypted MESSAGE_EDIT recovery accepts an optional authenticated
+`messageContextInfo` containing only a canonical 32-byte `messageSecret`.
+This wrapper metadata is validated and discarded: the recovered body keeps the
+original message context, key, UTC and attachments. Extra message bodies, unknown
+metadata, malformed lengths, invalid authentication, different targets, authors,
+directions or unsafe ordering still refuse. No provider sends, dependencies,
+live ingress behavior, source acknowledgements or automatic resume are changed.
+
+Reapply in `chatwoot-encrypted-history-edit.ts`; rollback restores its strict
+single-body refusal and leaves retained source/gap data intact. Focused checks:
+`npx tsx --test tests/chatwoot-authenticated-history-edit.test.ts`,
+`npx tsc --noEmit --incremental false`, normal ESLint on the helper, and an exact
+candidate network-isolated synthetic lab before immutable production readback.

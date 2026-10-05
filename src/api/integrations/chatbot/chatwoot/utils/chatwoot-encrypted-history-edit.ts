@@ -85,8 +85,21 @@ export function recoverEncryptedHistoryEdit(envelope: Message, original: Message
     throw new Error('Retained encrypted edit has unknown protobuf data');
   const message = proto.Message.toObject(decoded, { bytes: String, longs: String, enums: Number });
   const protocol = message.protocolMessage;
-  if (Object.keys(message).length !== 1 || protocol?.type !== 14 || !isDeepStrictEqual(protocol.key, target))
+  const metadata = message.messageContextInfo;
+  if (
+    metadata !== undefined &&
+    (Object.keys(metadata).length !== 1 ||
+      typeof metadata.messageSecret !== 'string' ||
+      bytes(metadata.messageSecret).length !== 32)
+  )
+    throw new Error('Retained encrypted edit authenticated metadata is unsupported');
+  if (
+    Object.keys(message).some((field) => field !== 'protocolMessage' && field !== 'messageContextInfo') ||
+    protocol?.type !== 14 ||
+    !isDeepStrictEqual(protocol.key, target)
+  )
     throw new Error('Retained encrypted edit inner target differs');
+  // Authenticated wrapper metadata is not a replacement for the original message context.
   const edit = protocol.editedMessage;
   let body: any;
   if (
