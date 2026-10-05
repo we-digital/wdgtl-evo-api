@@ -517,3 +517,26 @@ source review, exact candidate lab and immutable production readback remain gate
 History now uses the exact account-scoped WhatsApp identifier before the unique PN phone fallback, matching live provider ingress. A same-phone Telegram contact remains intact, including its documents and message authors; contact merge, deletion and identifier rewrites are excluded. Duplicate exact identifiers, foreign provider identifiers, inconsistent PN phones and existing binding/contact-inbox conflicts still refuse. This does not itself authorize cross-contact consolidation or reparent conversations.
 
 Validation: five whole-resolver cases on an owned Unix-only PostgreSQL17 fixture, including the old two-contact refusal, exact WA selection with both contacts/authors/documents unchanged, duplicate exact/foreign fallback refusals and normal missing-contact creation. Portable regression: `node tests/provider-history-contact-pg.cjs /tmp/historycontact246-OWNED/socket` (requires an exclusively owned synthetic schema and fixture user; refuses TCP/other socket paths). The ROOT release remains PR → owned lab → immutable main readback.
+
+## Authenticated retained-history edits and explicit semantic gaps (2026-10-06)
+
+Cached recovery authenticates encrypted MESSAGE_EDIT plaintext against a unique
+same-instance original and exact inner target, author, peer and direction.
+Ordering/current-source checks refuse newer or ambiguous native edits before a
+write. The existing CW edit endpoint receives an optional locked content CAS;
+no older recovery edit may overwrite a different current edited body. Original
+native key, UTC, ciphertext and attachment/media remain intact; document-caption
+deltas never replace attachments. NULL edited text can preserve an existing
+nonempty matching target with an explicitly unresolved unavailable-body gap.
+Known pins/polls remain unsupported UI semantics with durable original payload
+and version in the coordinated history worker; unknown records still stop.
+No dependency, provider send, live routing, permissions or implicit resume change.
+
+Reapply around chatwoot-cached-history-record.ts, chatwoot-encrypted-history-edit.ts,
+chatwoot-import-helper.ts and ChatwootService.syncStoredHistoryRecoveryBatch.
+Rollback first pauses coordinated recovery; retained official gap rows survive.
+Verification: `npx tsx --test tests/chatwoot-authenticated-history-edit.test.ts
+ tests/chatwoot-unavailable-image-edit.test.ts tests/chatwoot-provider-edit.test.ts`,
+`npx tsc --noEmit --incremental false`, normal ESLint on those four runtime files,
+and exact synthetic shared-lab/immutable readback. The matching history schema4
+and optional CW CAS must be accepted before activating recovery outcomes.

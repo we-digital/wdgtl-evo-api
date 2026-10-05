@@ -38,6 +38,7 @@ import {
   isChatwootProviderDeliveryAcknowledged,
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
 import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
@@ -606,7 +607,14 @@ export class ChatwootService {
 
   public async applyWhatsappProviderEdit(
     provider: ChatwootModel,
-    target: { messageId: number; conversationId: number; sourceId: string; direction: string; content: string },
+    target: {
+      messageId: number;
+      conversationId: number;
+      sourceId: string;
+      direction: string;
+      content: string;
+      providerRecoveryGuard?: { content: string | null; content_attributes: unknown };
+    },
   ): Promise<void> {
     await this.privilegedChatwootRequest(provider, {
       method: 'POST',
@@ -617,6 +625,7 @@ export class ChatwootService {
         message_type: target.direction,
         skip_native: true,
         provider_source: 'whatsapp',
+        ...(target.providerRecoveryGuard ? { provider_recovery_guard: target.providerRecoveryGuard } : {}),
       },
     });
   }
@@ -5660,9 +5669,76 @@ export class ChatwootService {
         const classification = classifications.get(toChatwootSourceId((message.key as { id: string }).id));
         return (
           (message.status === 'EDITED' || editedIds.has(message.id)) &&
-          (classification === 'ordinary' || classification === 'unavailable_image_edit')
+          (classification === 'ordinary' ||
+            classification === 'unavailable_image_edit' ||
+            classification === 'unavailable_text_edit')
         );
       });
+      const encryptedEdits = authoritativeMessages.filter(
+        (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'encrypted_edit',
+      );
+      const assertEncryptedEditCurrent = async (envelope: MessageModel, target: MessageModel) => {
+        const [sourceRows, targetUpdates, competitors] = await Promise.all([
+          this.prismaRepository.message.findMany({
+            where: { instanceId: envelope.instanceId, id: { in: [envelope.id, target.id] } },
+          }),
+          this.prismaRepository.messageUpdate.findMany({
+            where: { instanceId: envelope.instanceId, messageId: target.id, status: 'EDITED' },
+          }),
+          this.prismaRepository.message.findMany({
+            where: {
+              instanceId: envelope.instanceId,
+              id: { not: envelope.id },
+              messageTimestamp: { gte: envelope.messageTimestamp },
+              OR: [
+                {
+                  message: {
+                    path: ['secretEncryptedMessage', 'targetMessageKey', 'id'],
+                    equals: (target.key as any).id,
+                  },
+                },
+                { message: { path: ['protocolMessage', 'key', 'id'], equals: (target.key as any).id } },
+                {
+                  message: {
+                    path: ['editedMessage', 'message', 'protocolMessage', 'key', 'id'],
+                    equals: (target.key as any).id,
+                  },
+                },
+              ],
+            },
+          }),
+        ]);
+        if (
+          sourceRows.length !== 2 ||
+          !sourceRows.some((row) => isDeepStrictEqual(row, envelope)) ||
+          !sourceRows.some((row) => isDeepStrictEqual(row, target)) ||
+          targetUpdates.length ||
+          competitors.length
+        )
+          throw new Error('Retained encrypted edit source, ordering or current original rotated');
+      };
+      const encryptedTargets = new Map<string, MessageModel>();
+      const recoveredEdits: MessageModel[] = [];
+      for (const envelope of encryptedEdits) {
+        const targetKey = (envelope.message as any).secretEncryptedMessage.targetMessageKey;
+        const matches = await this.prismaRepository.message.findMany({
+          where: {
+            instanceId: envelope.instanceId,
+            key: { path: ['id'], equals: targetKey.id },
+          },
+        });
+        if (matches.length !== 1) throw new Error('Retained encrypted edit original is missing or ambiguous');
+        const target = matches[0];
+        if (encryptedTargets.has(target.id))
+          throw new Error('Multiple retained encrypted edits require ordered reconciliation');
+        const recovered = recoverEncryptedHistoryEdit(envelope, target);
+        await assertEncryptedEditCurrent(envelope, target);
+        const verified = await chatwootImport.getVerifiedRecoverySourceIds([recovered], inbox.id, provider);
+        if (!verified.has(toChatwootSourceId((target.key as { id: string }).id)))
+          throw new Error('Retained encrypted edit requires an existing unique destination original');
+        encryptedTargets.set(target.id, target);
+        recoveredEdits.push(recovered);
+      }
       const ordinaryMessages = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
       );
@@ -5735,6 +5811,12 @@ export class ChatwootService {
       const editedSourceIds = new Set(
         editedMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
       );
+      for (let index = 0; index < recoveredEdits.length; index++) {
+        const envelope = encryptedEdits[index];
+        const target = encryptedTargets.get(recoveredEdits[index].id)!;
+        await assertEncryptedEditCurrent(envelope, target);
+        await chatwootImport.reconcileProviderHistoryEdits([recoveredEdits[index]], inbox.id, provider, this, true);
+      }
       const preservedEdits = await chatwootImport.reconcileProviderHistoryEdits(
         editedMessages,
         inbox.id,
@@ -5780,9 +5862,36 @@ export class ChatwootService {
         this,
       );
 
+      // Do not acknowledge a control if its native ciphertext/original changed during reconciliation.
+      if (encryptedEdits.length) {
+        const before = [...encryptedEdits, ...encryptedTargets.values()];
+        const after = await this.prismaRepository.message.findMany({
+          where: { instanceId: before[0].instanceId, id: { in: before.map((message) => message.id) } },
+        });
+        if (
+          after.length !== before.length ||
+          before.some(
+            (message) =>
+              !isDeepStrictEqual(
+                message,
+                after.find((row) => row.id === message.id),
+              ),
+          )
+        )
+          throw new Error('Retained encrypted edit source or original rotated during reconciliation');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
+        if (classification === 'encrypted_edit')
+          return { sourceId, status: 'existing', reason: 'authenticated_provider_edit_reconciled', recovery: 'native' };
+        if (classification === 'pin_control' || classification === 'poll_control')
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: `preserved_unsupported_${classification}`,
+            recovery: 'unsupported',
+          };
         if (classification === 'reaction_control' || classification === 'encryption_control') {
           return { sourceId, status: 'skipped', reason: `known_${classification}`, recovery: 'unsupported' };
         }
