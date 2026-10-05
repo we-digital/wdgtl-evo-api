@@ -70,7 +70,7 @@ test('empty edited image proves one destination and leaves all message fields un
       [{}, null].map((body) => [direction, body] as const),
     )) {
       const queries: string[] = [];
-      const target = { id: 314, message_type: fromMe ? 1 : 0, conversation_id: 40, private: false, has_image: true };
+      const target = { id: 314, message_type: fromMe ? 1 : 0, conversation_id: 140, display_id: 40, private: false, has_image: true };
       const client = {
         query: async (sql: string) => {
           queries.push(sql);
@@ -112,7 +112,7 @@ test('empty edited image proves one destination and leaves all message fields un
 
 test('missing/conflicting image, wrong direction or stale binding refuses ACK without writing', async () => {
   const originalPool = postgresClient.getChatwootConnection;
-  const valid = { id: 314, message_type: 0, conversation_id: 40, private: false, has_image: true };
+  const valid = { id: 314, message_type: 0, conversation_id: 140, display_id: 40, private: false, has_image: true };
   try {
     for (const rows of [
       [],
@@ -121,7 +121,7 @@ test('missing/conflicting image, wrong direction or stale binding refuses ACK wi
       [{ ...valid, has_image: false }],
       [{ ...valid, private: true }],
       [{ ...valid, id: 315 }],
-      [{ ...valid, conversation_id: 41 }],
+      [{ ...valid, display_id: 41 }],
     ]) {
       const queries: string[] = [];
       postgresClient.getChatwootConnection = (() => ({

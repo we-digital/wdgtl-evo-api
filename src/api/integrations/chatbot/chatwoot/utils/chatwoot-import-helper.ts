@@ -412,31 +412,35 @@ class ChatwootImport {
     inboxId: number,
     provider: ChatwootModel,
     evolution: ChatwootService,
+    requireExistingTarget = false,
   ): Promise<Map<string, 'preserved_existing_source_payload_unavailable'>> {
     const edited = messages;
     const preserved = new Map<string, 'preserved_existing_source_payload_unavailable'>();
     if (!edited.length) return preserved;
     const pool = postgresClient.getChatwootConnection();
     for (const message of edited) {
-      const key = message.key as { id: string; fromMe: boolean };
+      const key = message.key as { id: string; fromMe: boolean; remoteJid: string };
       const sourceId = toChatwootSourceId(key.id);
       const payload = message.message as any;
       if (
         payload === null ||
         (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0)
       ) {
-        if (message.messageType !== 'imageMessage') throw new Error('Empty provider edit is not a known image');
+        const textEdit = ['conversation', 'extendedTextMessage'].includes(message.messageType);
+        if (message.messageType !== 'imageMessage' && !textEdit)
+          throw new Error('Empty provider edit is not a known image or text');
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
           const result = await client.query(
-            `SELECT m.id, m.message_type, m.conversation_id, m.private, m.content_attributes,
+            `SELECT m.id, m.message_type, c.display_id, m.private, m.content_attributes, m.content, contact.identifier AS provider_peer,
                EXISTS (SELECT 1 FROM attachments a
                  JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
                    AND asa.record_id = a.id AND asa.name = 'file'
                  JOIN active_storage_blobs b ON b.id = asa.blob_id
                  WHERE a.message_id = m.id AND a.file_type = 0 AND b.content_type LIKE 'image/%') AS has_image
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
+             JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
              WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
                AND c.inbox_id = $2 AND m.source_id = ANY($3::text[]) FOR UPDATE OF m`,
             [Number(provider.accountId), inboxId, [sourceId, key.id]],
@@ -449,15 +453,23 @@ class ChatwootImport {
           if (
             result.rows.length !== 1 ||
             target.private !== false ||
-            target.has_image !== true ||
+            (textEdit
+              ? typeof target.content !== 'string' ||
+                target.content.length === 0 ||
+                !key.remoteJid ||
+                target.provider_peer !== key.remoteJid ||
+                message.chatwootMessageId == null ||
+                message.chatwootInboxId == null ||
+                message.chatwootConversationId == null
+              : target.has_image !== true) ||
             attributes?.deleted === true ||
             Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
             (message.chatwootMessageId != null && Number(message.chatwootMessageId) !== Number(target.id)) ||
             (message.chatwootInboxId != null && Number(message.chatwootInboxId) !== inboxId) ||
             (message.chatwootConversationId != null &&
-              Number(message.chatwootConversationId) !== Number(target.conversation_id))
+              Number(message.chatwootConversationId) !== Number(target.display_id))
           ) {
-            throw new Error('Empty provider image edit lacks a unique matching destination image');
+            throw new Error('Empty provider edit lacks a unique matching destination image or text');
           }
           await client.query('COMMIT');
           preserved.set(sourceId, 'preserved_existing_source_payload_unavailable');
@@ -478,14 +490,30 @@ class ChatwootImport {
       if (typeof content !== 'string')
         throw new Error('Retained provider edit content is unavailable for reconciliation');
       const result = await pool.query(
-        `SELECT m.id, m.message_type, m.content, m.content_attributes, c.display_id
+        `SELECT m.id, m.message_type, m.content, m.content_attributes, m.private, c.display_id, contact.identifier AS provider_peer
          FROM messages m JOIN conversations c ON c.id = m.conversation_id
-         WHERE m.account_id = $1 AND m.inbox_id = $2 AND m.source_id = ANY($3::text[])`,
+         JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+         WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2 AND c.inbox_id = $2 AND m.source_id = ANY($3::text[])`,
         [Number(provider.accountId), inboxId, [sourceId, key.id]],
       );
+      if (!result.rows.length && requireExistingTarget)
+        throw new Error('Authenticated provider edit original destination is missing');
       if (!result.rows.length) continue; // A missing original is handled by the normal import below.
       if (result.rows.length !== 1) throw new Error('Provider history edit has conflicting source owners');
       const target = result.rows[0];
+      if (
+        requireExistingTarget &&
+        (target.private !== false ||
+          !key.remoteJid ||
+          target.provider_peer !== key.remoteJid ||
+          message.chatwootMessageId == null ||
+          message.chatwootInboxId == null ||
+          message.chatwootConversationId == null ||
+          Number(message.chatwootMessageId) !== Number(target.id) ||
+          Number(message.chatwootInboxId) !== inboxId ||
+          Number(message.chatwootConversationId) !== Number(target.display_id))
+      )
+        throw new Error('Authenticated provider edit current destination binding differs');
       if (Number(target.message_type) !== (key.fromMe ? 1 : 0)) {
         throw new Error('Provider history edit direction does not match');
       }
@@ -493,13 +521,20 @@ class ChatwootImport {
         typeof target.content_attributes === 'string'
           ? JSON.parse(target.content_attributes)
           : target.content_attributes;
+      if (requireExistingTarget && attributes?.deleted === true)
+        throw new Error('Authenticated provider edit target is deleted');
       if (target.content === content && attributes?.edited === true) continue;
+      if (requireExistingTarget && attributes?.edited === true)
+        throw new Error('Authenticated provider edit cannot replace a different existing edit');
       await evolution.applyWhatsappProviderEdit(provider, {
         messageId: Number(target.id),
         conversationId: Number(target.display_id),
         sourceId,
         direction: key.fromMe ? 'outgoing' : 'incoming',
         content,
+        ...(requireExistingTarget
+          ? { providerRecoveryGuard: { content: target.content, content_attributes: attributes || {} } }
+          : {}),
       });
       const verified = await pool.query('SELECT content, content_attributes FROM messages WHERE id = $1', [target.id]);
       const after = verified.rows[0];

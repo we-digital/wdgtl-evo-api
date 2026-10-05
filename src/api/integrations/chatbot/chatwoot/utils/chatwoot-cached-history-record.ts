@@ -15,16 +15,35 @@ export function classifyCachedHistoryRecord(
     message: unknown;
   },
   edited: boolean,
-): 'ordinary' | 'reaction_control' | 'encryption_control' | 'unavailable_image_edit' {
+):
+  | 'ordinary'
+  | 'reaction_control'
+  | 'encryption_control'
+  | 'unavailable_image_edit'
+  | 'unavailable_text_edit'
+  | 'encrypted_edit'
+  | 'pin_control'
+  | 'poll_control' {
   const payload = record.message;
   // SQL JSON null is an unavailable retained edit, never an instruction to clear an image.
   if (payload === null && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
+  if (
+    (payload === null ||
+      (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0)) &&
+    edited &&
+    ['conversation', 'extendedTextMessage'].includes(record.messageType)
+  )
+    return 'unavailable_text_edit';
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Cached history payload is unclassifiable');
   }
   const keys = Object.keys(payload);
   if (keys.length === 0 && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
-  if (record.messageType === 'reactionMessage' && keys.length === 1 && keys[0] === 'reactionMessage') {
+  if (
+    record.messageType === 'reactionMessage' &&
+    keys.includes('reactionMessage') &&
+    keys.every((key) => key === 'reactionMessage' || auxiliaryKeys.has(key))
+  ) {
     const reaction = (payload as Record<string, any>).reactionMessage;
     if (
       reaction &&
@@ -38,6 +57,37 @@ export function classifyCachedHistoryRecord(
       return 'reaction_control';
     throw new Error('Cached reaction control is unclassifiable');
   }
+  const primary = (payload as Record<string, any>)[record.messageType];
+  const validTarget = (key: any) =>
+    key &&
+    typeof key.id === 'string' &&
+    key.id.length > 0 &&
+    typeof key.remoteJid === 'string' &&
+    typeof key.fromMe === 'boolean';
+  if (
+    record.messageType === 'secretEncryptedMessage' &&
+    keys.every((key) => key === record.messageType || key === 'messageContextInfo') &&
+    primary?.secretEncType === 2 &&
+    validTarget(primary.targetMessageKey) &&
+    primary.encIv != null &&
+    primary.encPayload != null
+  )
+    return 'encrypted_edit';
+  if (
+    record.messageType === 'pinInChatMessage' &&
+    keys.every((key) => key === record.messageType || key === 'messageContextInfo') &&
+    validTarget(primary?.key) &&
+    [1, 2].includes(primary.type)
+  )
+    return 'pin_control';
+  if (
+    record.messageType === 'pollUpdateMessage' &&
+    keys.every((key) => key === record.messageType || auxiliaryKeys.has(key)) &&
+    validTarget(primary?.pollCreationMessageKey) &&
+    primary.vote?.encIv != null &&
+    primary.vote?.encPayload != null
+  )
+    return 'poll_control';
   if (
     record.messageType === 'unknown' &&
     keys.includes('senderKeyDistributionMessage') &&
