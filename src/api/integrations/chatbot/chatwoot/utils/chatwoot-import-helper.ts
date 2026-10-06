@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
@@ -12,6 +14,11 @@ import {
   toCanonicalHistoryJid,
   toChatwootSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import {
+  assertIgnoredEditOriginalIdentity,
+  IgnoredHistoryEditKind,
+  IgnoredHistoryEditProof,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
@@ -405,6 +412,72 @@ class ChatwootImport {
     } finally {
       client.release();
     }
+  }
+
+  public async captureIgnoredHistoryEdit(
+    envelope: Message,
+    original: Message,
+    inboxId: number,
+    provider: ChatwootModel,
+    kind: IgnoredHistoryEditKind,
+    rejection: string,
+  ): Promise<IgnoredHistoryEditProof> {
+    assertIgnoredEditOriginalIdentity(envelope, original);
+    const key = original.key as { id: string; remoteJid: string; fromMe: boolean };
+    const sourceId = toChatwootSourceId(key.id);
+    const result = await postgresClient.getChatwootConnection().query(
+      `SELECT m.id, m.message_type, m.private, m.content, m.content_attributes,
+         to_jsonb(m) AS message_snapshot, c.display_id, contact.identifier AS provider_peer,
+         COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment', to_jsonb(a), 'blob', to_jsonb(b)) ORDER BY a.id)
+           FROM attachments a
+           LEFT JOIN active_storage_attachments asa ON asa.record_type = 'Attachment' AND asa.record_id = a.id AND asa.name = 'file'
+           LEFT JOIN active_storage_blobs b ON b.id = asa.blob_id WHERE a.message_id = m.id), '[]'::jsonb) AS attachments
+       FROM messages m JOIN conversations c ON c.id = m.conversation_id
+       JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+       WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2 AND c.inbox_id = $2
+         AND m.source_id = ANY($3::text[])`,
+      [Number(provider.accountId), inboxId, [sourceId, key.id]],
+    );
+    const target = result.rows[0];
+    const attributes =
+      typeof target?.content_attributes === 'string'
+        ? JSON.parse(target.content_attributes)
+        : target?.content_attributes;
+    const attachments = target?.attachments;
+    if (
+      result.rows.length !== 1 ||
+      target.private !== false ||
+      attributes?.deleted === true ||
+      target.provider_peer !== key.remoteJid ||
+      Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
+      original.chatwootMessageId == null ||
+      original.chatwootInboxId == null ||
+      original.chatwootConversationId == null ||
+      Number(original.chatwootMessageId) !== Number(target.id) ||
+      Number(original.chatwootInboxId) !== inboxId ||
+      Number(original.chatwootConversationId) !== Number(target.display_id) ||
+      !Array.isArray(attachments) ||
+      attachments.some((item: any) => !item.blob || !item.blob.key || Number(item.blob.byte_size) <= 0) ||
+      (!(typeof target.content === 'string' && target.content.length > 0) && attachments.length === 0)
+    )
+      throw new Error('Ignored provider edit lacks a unique current scoped original destination');
+    return {
+      version: 1,
+      kind,
+      rejection,
+      editSourceId: toChatwootSourceId((envelope.key as { id: string }).id),
+      editNativeId: envelope.id,
+      targetSourceId: sourceId,
+      targetNativeId: original.id,
+      peer: key.remoteJid,
+      direction: key.fromMe ? 'outgoing' : 'incoming',
+      accountId: Number(provider.accountId),
+      inboxId,
+      destinationMessageId: Number(target.id),
+      destinationConversationId: Number(target.display_id),
+      nativeVersionSHA256: createHash('sha256').update(JSON.stringify(original)).digest('hex'),
+      destinationVersionSHA256: createHash('sha256').update(JSON.stringify(target)).digest('hex'),
+    };
   }
 
   public async reconcileProviderHistoryEdits(
