@@ -1,5 +1,11 @@
 # we:Digital Evolution API fork
 
+## Rails JSON store representation in recovery media proof (2026-10-07)
+
+- The media import postimage reader accepts Chatwoot content attributes as a plain object or one JSON-encoded plain object, matching the Rails JSON store representation. It retains every field and compares every expected native/ingress attribute exactly. Malformed, null, array, double-encoded and changed attributes refuse before acceptance.
+- No persisted attributes, media bytes, routing, provider requests or history markers are changed by this correction. Existing source, owner, attachment digest, timestamp and physical storage proof checks remain required.
+- Source: `chatwoot.service.ts`; focused validation covers real service postimage checks, both valid representations and malformed/native-field negatives.
+
 ## Canonical routing for delayed provider writes (2026-10-04)
 
 - Resolve actual Chatwoot message ownership under the Chatwoot provider peer lock before persisting Evolution conversation mappings. Preserve all source payload fields and existing outgoing null-source behavior; stale display IDs require the exact retained internal route.

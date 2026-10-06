@@ -2167,6 +2167,19 @@ export class ChatwootService {
       [inboxId, [toChatwootSourceId((message.key as { id: string }).id), (message.key as { id: string }).id]],
     );
     const row = rows.rows[0];
+    let contentAttributes: unknown = row?.content_attributes;
+    try {
+      if (typeof contentAttributes === 'string') contentAttributes = JSON.parse(contentAttributes);
+    } catch {
+      throw new Error('cached_media_import_postimage_unconfirmed');
+    }
+    if (
+      !contentAttributes ||
+      typeof contentAttributes !== 'object' ||
+      Array.isArray(contentAttributes) ||
+      Object.getPrototypeOf(contentAttributes) !== Object.prototype
+    )
+      throw new Error('cached_media_import_postimage_unconfirmed');
     if (
       rows.rows.length !== 1 ||
       Number(row.message_type) !== ((message.key as { fromMe: boolean }).fromMe ? 1 : 0) ||
@@ -2179,7 +2192,7 @@ export class ChatwootService {
       Number(row.display_id) !== expected.displayId ||
       row.content !== (expected.content || null) ||
       Object.entries(expected.attributes).some(
-        ([key, value]) => !isDeepStrictEqual(row.content_attributes?.[key], value),
+        ([key, value]) => !isDeepStrictEqual((contentAttributes as Record<string, unknown>)[key], value),
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
       row.attachment_meta?.whatsapp_history_media_type !== retainedHistoryMedia(message).type.replace(/Message$/, '') ||
