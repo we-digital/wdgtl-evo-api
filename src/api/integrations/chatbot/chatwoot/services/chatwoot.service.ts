@@ -2461,6 +2461,7 @@ export class ChatwootService {
           contactInboxSourceId: origin.contactInboxSourceId,
         },
         instance,
+        callbackParts,
       );
       if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
@@ -3477,6 +3478,7 @@ export class ChatwootService {
     whatsappMessageId: string,
     chatwootMessageIds: ChatwootMessage,
     instance: InstanceDto,
+    acknowledgedParts?: ChatwootProviderDeliveryPart[],
   ): Promise<number> {
     const persist = async (binding: ChatwootMessage): Promise<number> =>
       this.prismaRepository.$transaction(
@@ -3514,6 +3516,7 @@ export class ChatwootService {
         messageId: Number(chatwootMessageIds.messageId),
         whatsappMessageId,
         claimedConversationId: chatwootMessageIds.conversationId,
+        acknowledgedParts,
       },
       persist,
     );

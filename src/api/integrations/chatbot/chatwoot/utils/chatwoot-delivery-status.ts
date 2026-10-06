@@ -253,3 +253,22 @@ export const acknowledgedMultipartSourceIds = (
   const sources = new Set(parts.map((part) => normalize(part.sourceId as string)));
   return sources.size === parts.length ? sources : null;
 };
+
+// A callback can bind a later part only to the complete, exact acknowledged set.
+export const acknowledgedMultipartPartsMatch = (
+  additionalAttributes: unknown,
+  canonicalSource: string | null,
+  expectedParts: ChatwootProviderDeliveryPart[],
+): boolean => {
+  if (!isCanonicalProviderPartSet(expectedParts)) return false;
+  const sources = acknowledgedMultipartSourceIds(additionalAttributes, canonicalSource);
+  if (!sources || sources.size !== expectedParts.length) return false;
+  const attributes = typeof additionalAttributes === 'string' ? JSON.parse(additionalAttributes) : additionalAttributes;
+  const acknowledgements = (attributes as Record<string, any>).we_digital_api_inbox_status.provider_delivery
+    .acknowledgements;
+  return expectedParts.every(
+    (part) =>
+      acknowledgements[part.partKey]?.part_index === part.partIndex &&
+      acknowledgements[part.partKey]?.source_id === part.sourceId,
+  );
+};

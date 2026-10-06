@@ -1,3 +1,7 @@
+import {
+  acknowledgedMultipartPartsMatch,
+  ChatwootProviderDeliveryPart,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import type { Pool } from 'pg';
 
 type Binding = { conversationId: number; inboxId: number; contactInboxSourceId: string };
@@ -13,6 +17,7 @@ export async function withCanonicalChatwootMessageBinding<T>(
     messageId: number;
     whatsappMessageId: string;
     claimedConversationId?: number;
+    acknowledgedParts?: ChatwootProviderDeliveryPart[];
   },
   write: (binding: Binding) => Promise<T>,
 ): Promise<T> {
@@ -28,15 +33,22 @@ export async function withCanonicalChatwootMessageBinding<T>(
       "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='10s'",
     );
     const original = await client.query(
-      'SELECT conversation_id,source_id FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3',
+      'SELECT conversation_id,source_id,message_type,additional_attributes FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3' +
+        (scope.acknowledgedParts ? ' FOR SHARE' : ''),
       [scope.messageId, scope.accountId, scope.inboxId],
     );
     // An outgoing operator message gets its WA source ID only after this
     // existing binding call. Do not disable that established null-source path.
+    const message = original.rows[0];
+    const acknowledgedPart =
+      message?.message_type === 1 &&
+      scope.acknowledgedParts?.some((part) => part.sourceId === scope.whatsappMessageId) &&
+      acknowledgedMultipartPartsMatch(message.additional_attributes, message.source_id, scope.acknowledgedParts);
     if (
       original.rows.length !== 1 ||
       (original.rows[0].source_id &&
-        ![scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(original.rows[0].source_id))
+        ![scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(original.rows[0].source_id) &&
+        !acknowledgedPart)
     )
       throw new Error('Canonical mapping message identity mismatch');
     const routed = await client.query('SELECT public.provider_message_conversation_route($1,$2,$3) AS id', [
