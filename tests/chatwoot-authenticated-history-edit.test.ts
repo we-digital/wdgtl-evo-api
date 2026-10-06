@@ -471,7 +471,7 @@ test('NULL edited PDF document preservation never clears content and rejects for
     content: '',
     content_attributes: { in_reply_to: 11 },
     provider_peer: '123456@g.us',
-    has_pdf_document: true,
+    has_preservable_document: true,
   };
   const source: any = {
     id: 'document-source',
@@ -487,7 +487,7 @@ test('NULL edited PDF document preservation never clears content and rejects for
     { rows: [], message: source },
     { rows: [valid, valid], message: source },
     ...[
-      { has_pdf_document: false },
+      { has_preservable_document: false },
       { provider_peer: 'foreign@g.us' },
       { private: true },
       { id: 315 },
@@ -511,7 +511,10 @@ test('NULL edited PDF document preservation never clears content and rejects for
             queries.push(sql);
             if (sql.includes('SELECT m.id')) {
               assert.match(sql, /c\.display_id/);
-              assert.match(sql, /a\.file_type = 3 AND b\.content_type = 'application\/pdf'/);
+              assert.match(
+                sql,
+                /a\.file_type = 3 AND b\.content_type IN \('application\/pdf', 'application\/msword'\)/,
+              );
               assert.match(sql, /b\.byte_size > 0 AND length\(b\.key\) > 0/);
             }
             return { rows: sql.includes('SELECT m.id') ? variant.rows : [] };
