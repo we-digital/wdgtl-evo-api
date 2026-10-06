@@ -18,8 +18,14 @@ export function cachedMediaDescriptor(message: Message, media: Media) {
     !descriptor ||
     media.messageId !== message.id ||
     media.instanceId !== message.instanceId ||
-    media.type !== message.messageType.replace('Message', '') ||
-    !media.fileName.startsWith(`${message.instanceId}/${key.remoteJid}/${media.type}/`) ||
+    media.type !== message.messageType ||
+    !(
+      (media.fileName.startsWith(`${message.instanceId}/${key.remoteJid}/${media.type}/`) &&
+        media.fileName.split('/').length === 4 &&
+        /^[0-9]{13}_.+/.test(basename(media.fileName))) ||
+      (media.fileName.startsWith(`${message.instanceId}/${key.remoteJid}/${key.id}/${media.type}/`) &&
+        media.fileName.split('/').length === 5)
+    ) ||
     media.fileName.split('/').some((part) => part === '..' || part === '.') ||
     typeof descriptor.mimetype !== 'string' ||
     descriptor.mimetype !== media.mimetype

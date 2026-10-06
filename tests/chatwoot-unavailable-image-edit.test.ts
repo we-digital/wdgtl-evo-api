@@ -185,6 +185,9 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     else delete require.cache[modulePath];
   });
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const originalPool = postgresClient.getChatwootConnection;
+  postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [] }) })) as any;
+  t.after(() => { postgresClient.getChatwootConnection = originalPool; });
   const service = Object.create(ChatwootService.prototype) as any;
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.isImportHistoryAvailable = () => true;

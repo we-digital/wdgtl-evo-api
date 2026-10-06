@@ -2010,6 +2010,119 @@ export class ChatwootService {
     return binding;
   }
 
+  private async assertTaggedHistoryMediaStored(
+    messages: MessageModel[],
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    requiredSources = new Set<string>(),
+  ) {
+    if (!messages.length) return new Set<string>();
+    const bySource = new Map(
+      messages.map((message) => [toChatwootSourceId((message.key as { id: string }).id), message]),
+    );
+    const aliases = Array.from(bySource.keys()).flatMap((source) => [source, source.substring(5)]);
+    const query = await postgresClient.getChatwootConnection().query(
+      `SELECT m.id, m.source_id, m.message_type, m.private, m.created_at, c.display_id, a.id AS attachment_id,
+         a.meta AS attachment_meta, a.file_type, b.byte_size, pc.peer
+       FROM messages m JOIN conversations c ON c.id=m.conversation_id AND c.account_id=m.account_id AND c.inbox_id=m.inbox_id
+       JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
+       JOIN active_storage_attachments sa ON sa.record_type='Attachment' AND sa.record_id=a.id AND sa.name='file'
+       JOIN active_storage_blobs b ON b.id=sa.blob_id
+       JOIN provider_conversation_bindings pc ON pc.conversation_id=c.id AND pc.account_id=c.account_id
+         AND pc.inbox_id=c.inbox_id AND pc.provider='whatsapp'
+       WHERE m.account_id=$1 AND m.inbox_id=$2 AND m.source_id=ANY($3::text[]) AND a.meta ? 'whatsapp_history_sha256'`,
+      [Number(provider.accountId), inboxId, aliases],
+    );
+    const seen = new Set<string>();
+    for (const row of query.rows) {
+      const sourceId = toChatwootSourceId(row.source_id);
+      const message = bySource.get(sourceId);
+      const sha256 = row.attachment_meta?.whatsapp_history_sha256;
+      const mediaType = { 0: 'image', 1: 'audio', 2: 'video', 3: 'document' }[Number(row.file_type)];
+      if (
+        !message ||
+        seen.has(sourceId) ||
+        !/^[0-9a-f]{64}$/.test(sha256) ||
+        !mediaType ||
+        row.attachment_meta?.whatsapp_history_media_type !== mediaType ||
+        !Number.isSafeInteger(Number(row.byte_size)) ||
+        Number(row.byte_size) < 1 ||
+        Number(row.byte_size) > 8 * 1024 * 1024 ||
+        typeof (message.key as any).fromMe !== 'boolean' ||
+        Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
+        row.private !== false ||
+        new Date(row.created_at).getTime() !== message.messageTimestamp * 1000 ||
+        !Number.isSafeInteger(Number(row.display_id)) ||
+        Number(row.display_id) < 1 ||
+        typeof row.peer !== 'string' ||
+        !row.peer
+      )
+        throw new Error('cached_media_tagged_destination_unconfirmed');
+      seen.add(sourceId);
+      await this.verifyTaggedMediaStorageProof(instance, provider, inboxId, message, row, mediaType, sha256);
+    }
+    if ([...requiredSources].some((source) => !seen.has(source)))
+      throw new Error('cached_media_tagged_destination_rotated');
+    return seen;
+  }
+
+  private async verifyTaggedMediaStorageProof(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    message: MessageModel,
+    row: any,
+    mediaType: string,
+    sha256: string,
+  ) {
+    const binding = await this.assertSilentHistoryMediaCapability(instance, provider, inboxId);
+    let proof: any;
+    try {
+      const response = await axios.request({
+        method: 'GET',
+        maxRedirects: 0,
+        timeout: 15_000,
+        url: requireTrustedChatwootUrl(
+          provider.url,
+          this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL,
+          `/api/v1/accounts/${provider.accountId}/inboxes/${inboxId}/conversations/${row.display_id}/messages/${row.id}`,
+        ),
+        headers: {
+          'api-access-token': provider.token,
+          'X-Chatwoot-Native-Bridge-Token': this.configService.get<Chatwoot>('CHATWOOT').NATIVE_BRIDGE_TOKEN,
+        },
+        params: {
+          history_media_proof: '1',
+          provider_instance_id: instance.instanceId || message.instanceId,
+          provider_instance_name: instance.instanceName,
+          provider_receiver_fingerprint: binding.receiver_fingerprint,
+          provider_peer: row.peer,
+          source_id: toChatwootSourceId((message.key as { id: string }).id),
+          message_type: (message.key as any).fromMe ? 'outgoing' : 'incoming',
+          private: 'false',
+          external_created_at: String(message.messageTimestamp),
+          provider_file_sha256: sha256,
+          provider_file_bytes: String(row.byte_size),
+          provider_media_type: mediaType,
+        },
+      });
+      proof = response.data?.whatsapp_history_media_proof;
+    } catch {
+      throw new Error('cached_media_stored_bytes_unconfirmed');
+    }
+    if (
+      proof?.verified !== true ||
+      proof.message_id !== Number(row.id) ||
+      proof.source_id !== toChatwootSourceId((message.key as { id: string }).id) ||
+      proof.attachment_id !== Number(row.attachment_id) ||
+      proof.sha256 !== sha256 ||
+      proof.byte_size !== Number(row.byte_size) ||
+      proof.media_type !== mediaType
+    )
+      throw new Error('cached_media_stored_bytes_unconfirmed');
+  }
+
   private async verifyRecoveryMediaDestination(
     message: MessageModel,
     provider: ChatwootModel,
@@ -2021,7 +2134,7 @@ export class ChatwootService {
     const rows = await postgresClient.getChatwootConnection().query(
       `SELECT m.id, m.message_type, m.private, m.account_id, m.inbox_id, m.created_at, m.content, m.content_attributes, c.id AS conversation_id, c.display_id,
          c.account_id AS conversation_account, c.inbox_id AS conversation_inbox,
-         b.byte_size, b.content_type, b.filename, b.checksum, b.metadata
+         a.id AS attachment_id, a.meta AS attachment_meta, b.byte_size, b.content_type, b.filename, b.checksum
        FROM messages m JOIN conversations c ON c.id=m.conversation_id
        JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
        JOIN active_storage_attachments sa ON sa.record_type='Attachment' AND sa.record_id=a.id AND sa.name='file'
@@ -2044,7 +2157,8 @@ export class ChatwootService {
       Object.entries(expected.attributes).some(
         ([key, value]) => !isDeepStrictEqual(row.content_attributes?.[key], value),
       ) ||
-      row.metadata?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
+      row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
+      row.attachment_meta?.whatsapp_history_media_type !== message.messageType.replace(/Message$/, '') ||
       row.content_type !== descriptor.mimetype ||
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
@@ -5962,6 +6076,12 @@ export class ChatwootService {
       );
       const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
         dedupeHistoryMessagesBySourceId(scopedMessages);
+      const taggedMediaSourceIds = await this.assertTaggedHistoryMediaStored(
+        [...authoritativeMessages, ...encryptedTargets.values()],
+        instance,
+        provider,
+        inbox.id,
+      );
       const existingSourceIds = await chatwootImport.getVerifiedRecoverySourceIds(
         authoritativeMessages,
         inbox.id,
@@ -6123,7 +6243,7 @@ export class ChatwootService {
             mimetype: cached.descriptor.mimetype,
             size: cached.descriptor.size,
             sha256: cached.descriptor.digest.toString('hex'),
-            mediaType: cached.media.type,
+            mediaType: cached.media.type.replace(/Message$/, ''),
           },
         );
         await this.verifyRecoveryMediaDestination(message, provider, inbox.id, cached.descriptor, cached.bytes, {
@@ -6132,6 +6252,8 @@ export class ChatwootService {
           content,
           attributes: uploaded.expectedContentAttributes,
         });
+        await this.assertTaggedHistoryMediaStored([message], instance, provider, inbox.id, new Set([sourceId]));
+        taggedMediaSourceIds.add(sourceId);
         appliedSourceIds.add(sourceId);
         importableSourceIds.add(sourceId);
         importedMessages++;
@@ -6190,6 +6312,13 @@ export class ChatwootService {
         if (!isDeepStrictEqual(current, storedById.get(id)) || !isDeepStrictEqual(media, cached.media))
           throw new Error('cached_media_source_rotated_before_acknowledgement');
       }
+      await this.assertTaggedHistoryMediaStored(
+        [...authoritativeMessages, ...encryptedTargets.values()],
+        instance,
+        provider,
+        inbox.id,
+        taggedMediaSourceIds,
+      );
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);

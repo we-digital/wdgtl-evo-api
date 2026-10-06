@@ -29,15 +29,15 @@ const media = {
   id: 'owned-media',
   messageId: 'native-doc',
   instanceId: 'synthetic-instance',
-  type: 'document',
+  type: 'documentMessage',
   mimetype: 'application/pdf',
-  fileName: 'synthetic-instance/628111111111@s.whatsapp.net/document/123_synthetic.pdf',
+  fileName: 'synthetic-instance/628111111111@s.whatsapp.net/documentMessage/1700000000000_synthetic.pdf',
 } as any;
 
 test('owned bytes preserve digest and all four supported incoming media types; foreign authority and corruption refuse', async () => {
   for (const type of ['document', 'image', 'audio', 'video']) {
     const d = doc(`${type}Message`);
-    const m = { ...media, type, fileName: media.fileName.replace('/document/', `/${type}/`) };
+    const m = { ...media, type: `${type}Message`, fileName: media.fileName.replace('/documentMessage/', `/${type}Message/`) };
     const prepared = await prepareCachedRecoveryMedia(
       [d],
       async () => m,
@@ -131,6 +131,9 @@ test('literal whole250 service preflights before writes and uses silent original
   service.ingressAttributes = async () => ({ synthetic_author: 'preserved' });
   service.getConversationMessage = () => 'synthetic-caption';
   service.waMonitor = { waInstances: {} };
+  let stored = false;
+  let corruptStored = false;
+  let proofs = 0;
   let rows = [
     ...Array.from({ length: 249 }, (_, i) => ({
       ...doc(),
@@ -176,7 +179,7 @@ test('literal whole250 service preflights before writes and uses silent original
   };
   chatwootImport.reconcileOutboundHistoryBindings = async () => new Set();
   chatwootImport.getVerifiedRecoverySourceIds = async (requested: any[]) =>
-    new Set(requested.filter((row) => row.messageType === 'conversation').map((row) => `WAID:${row.key.id}`));
+    new Set(requested.filter((row) => row.messageType === 'conversation' || stored && row.id === 'native-doc').map((row) => `WAID:${row.key.id}`));
   chatwootImport.reconcileProviderHistoryEdits = async () => {
     editCalls++;
     return new Map();
@@ -187,10 +190,14 @@ test('literal whole250 service preflights before writes and uses silent original
   // Original sendData duplicate check and literal postimage query remain exercised.
   postgresClient.getChatwootConnection = (() => ({
     query: async (sql: string) => ({
-      rows: sql.includes('active_storage_blobs')
+      rows: sql.includes("a.meta ?") && !stored ? [] : sql.includes('active_storage_blobs')
         ? [
             {
               id: 7,
+              attachment_id: 8,
+              source_id: 'WAID:doc',
+              peer: doc().key.remoteJid,
+              file_type: 3,
               message_type: rows[249].key.fromMe ? 1 : 0,
               private: false,
               account_id: 1,
@@ -199,7 +206,7 @@ test('literal whole250 service preflights before writes and uses silent original
               byte_size: bytes.length,
               content_type: 'application/pdf',
               filename: 'synthetic.pdf',
-              metadata: { whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex') },
+              attachment_meta: { whatsapp_history_media_type: 'document', whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex') },
               checksum: createHash('md5').update(bytes).digest('base64'),
               created_at: new Date(1700000000000),
               conversation_id: 123,
@@ -225,6 +232,15 @@ test('literal whole250 service preflights before writes and uses silent original
     }),
   })) as any;
   axios.request = (async (config: any) => {
+    if (config.method === 'GET') {
+      proofs++;
+      assert.equal(config.url.endsWith('/inboxes/99/conversations/345/messages/7'), true);
+      assert.equal(config.params.provider_receiver_fingerprint.length, 64);
+      assert.equal(config.params.history_media_proof, '1');
+      if (corruptStored) throw new Error('synthetic stored object absent/corrupt');
+      return { data: { whatsapp_history_media_proof: { verified: true, message_id: 7, source_id: 'WAID:doc',
+        attachment_id: 8, sha256: createHash('sha256').update(bytes).digest('hex'), byte_size: bytes.length } } };
+    }
     posts++;
     assert.equal(config.url.endsWith('/conversations/345/messages'), true);
     assert.equal(config.headers['X-Chatwoot-History-Import'], '1');
@@ -253,6 +269,7 @@ test('literal whole250 service preflights before writes and uses silent original
     ])
       assert.equal(body.includes(value), true, value);
     if (unknownWrite) throw new Error('synthetic response lost');
+    stored = true;
     return { data: { id: 7 } };
   }) as any;
   const request = () => ({
@@ -278,6 +295,16 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(result.importedMessages, 1);
   assert.equal(posts, 1);
   assert.equal(result.outcomes.find((outcome: any) => outcome.sourceId === 'WAID:doc').status, 'imported');
+  assert.equal(proofs, 2);
+  const retained = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic', instanceId: 'synthetic-instance' }, request());
+  assert.equal(retained.importedMessages, 0);
+  assert.equal(posts, 1);
+  corruptStored = true;
+  guards = 0; editCalls = 0;
+  await assert.rejects(service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic', instanceId: 'synthetic-instance' }, request()), /stored_bytes_unconfirmed/);
+  assert.equal(guards + editCalls, 0);
+  assert.equal(posts, 1);
+  corruptStored = false; stored = false;
   rows[249] = { ...doc(), key: { ...doc().key, fromMe: true } };
   const outgoing = await service.syncStoredHistoryRecoveryBatch(
     { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
@@ -288,6 +315,7 @@ test('literal whole250 service preflights before writes and uses silent original
   guards = 0;
   editCalls = 0;
   posts = 0;
+  stored = false;
   rows = [
     ...rows.slice(0, 248),
     doc(),
