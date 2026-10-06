@@ -20,7 +20,7 @@ import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/
 import {
   nativeCachedMediaPayload,
   prepareCachedRecoveryMedia,
-  readRetainedRecoveryVideo,
+  readRetainedRecoveryMedia,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
 import {
@@ -6151,7 +6151,7 @@ export class ChatwootService {
         (message) =>
           this.prismaRepository.media.findFirst({ where: { messageId: message.id, instanceId: message.instanceId } }),
         (name, limit, mime) => this.readCachedRecoveryObject(name, limit, mime),
-        (message) => readRetainedRecoveryVideo(message),
+        (message) => readRetainedRecoveryMedia(message),
       );
       if (cachedMedia.size) {
         const config = this.configService.get<Chatwoot>('CHATWOOT');

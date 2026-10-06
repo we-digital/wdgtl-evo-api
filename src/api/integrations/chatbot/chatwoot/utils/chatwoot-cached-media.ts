@@ -62,22 +62,25 @@ export function cachedMediaDescriptor(message: Message, media: Media) {
   return { size, digest, filename, mimetype: media.mimetype, objectName: media.fileName };
 }
 
-function retainedVideoDescriptor(message: Message) {
+function retainedDownloadDescriptor(message: Message) {
   const key = message.key as any;
   const { type, descriptor } = retainedHistoryMedia(message);
   const { size, digest } = nativeCachedMediaPayload(message);
   if (
-    !['associatedChildMessage', 'templateMessage'].includes(message.messageType) ||
-    type !== 'videoMessage' ||
+    !(
+      (message.messageType === 'imageMessage' && type === 'imageMessage' && descriptor.mimetype === 'image/jpeg') ||
+      (['associatedChildMessage', 'templateMessage'].includes(message.messageType) &&
+        type === 'videoMessage' &&
+        descriptor.mimetype === 'video/mp4')
+    ) ||
     typeof key?.id !== 'string' ||
     !key.id ||
     typeof key.remoteJid !== 'string' ||
     !key.remoteJid ||
-    typeof key.fromMe !== 'boolean' ||
-    descriptor.mimetype !== 'video/mp4'
+    typeof key.fromMe !== 'boolean'
   )
     throw new Error('cached_media_authority_unavailable');
-  const filename = basename(descriptor.fileName || `${key.id}.mp4`);
+  const filename = basename(descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : 'mp4'}`);
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
   return { size, digest, filename, mimetype: descriptor.mimetype, objectName: '' };
@@ -85,11 +88,11 @@ function retainedVideoDescriptor(message: Message) {
 
 // A necessary source download is one GET of the authenticated native descriptor.
 // No socket reupload request, fallback, retry, cache mutation or provider send is allowed.
-export async function readRetainedRecoveryVideo(
+export async function readRetainedRecoveryMedia(
   message: Message,
   download = downloadContentFromMessage,
 ): Promise<Buffer> {
-  const expected = retainedVideoDescriptor(message);
+  const expected = retainedDownloadDescriptor(message);
   const { descriptor } = retainedHistoryMedia(message);
   const key =
     typeof descriptor.mediaKey === 'string'
@@ -115,9 +118,13 @@ export async function readRetainedRecoveryVideo(
   };
   const timer = setTimeout(abort, 5000);
   try {
-    stream = await download({ mediaKey: key, url: url.toString() }, 'video', {
-      options: { signal: controller.signal, redirect: 'error' },
-    });
+    stream = await download(
+      { mediaKey: key, url: url.toString() },
+      retainedHistoryMedia(message).type === 'imageMessage' ? 'image' : 'video',
+      {
+        options: { signal: controller.signal, redirect: 'error' },
+      },
+    );
     if (controller.signal.aborted) {
       stream.destroy();
       throw new Error('cached_media_provider_read_deadline');
@@ -138,6 +145,9 @@ export async function readRetainedRecoveryVideo(
   }
 }
 
+// Retained video callers keep the same bounded transport and descriptor checks.
+export const readRetainedRecoveryVideo = readRetainedRecoveryMedia;
+
 export function verifyCachedMediaBytes(bytes: Buffer, descriptor: ReturnType<typeof cachedMediaDescriptor>): Buffer {
   if (bytes.length !== descriptor.size || !createHash('sha256').update(bytes).digest().equals(descriptor.digest)) {
     throw new Error('cached_media_bytes_mismatch');
@@ -151,7 +161,7 @@ export async function prepareCachedRecoveryMedia(
   messages: Message[],
   findMedia: (message: Message) => Promise<Media | null>,
   readObject: (name: string, limit: number, mime: string) => Promise<Buffer>,
-  readMissingVideo?: (message: Message) => Promise<Buffer>,
+  readMissingMedia?: (message: Message) => Promise<Buffer>,
 ) {
   const result = new Map<
     string,
@@ -162,15 +172,14 @@ export async function prepareCachedRecoveryMedia(
     if (['conversation', 'extendedTextMessage', 'contactMessage'].includes(message.messageType)) continue;
     if (message.messageType === 'templateMessage' && !retainedTemplate(message.message).video) continue;
     const media = await findMedia(message);
-    if (!media && (!readMissingVideo || !['associatedChildMessage', 'templateMessage'].includes(message.messageType)))
-      throw new Error('cached_media_authority_unavailable');
-    const descriptor = media ? cachedMediaDescriptor(message, media) : retainedVideoDescriptor(message);
+    if (!media && !readMissingMedia) throw new Error('cached_media_authority_unavailable');
+    const descriptor = media ? cachedMediaDescriptor(message, media) : retainedDownloadDescriptor(message);
     total += descriptor.size;
     if (total > CACHED_MEDIA_BATCH_LIMIT) throw new Error('cached_media_batch_limit');
     const bytes = verifyCachedMediaBytes(
       media
         ? await readObject(descriptor.objectName, descriptor.size, descriptor.mimetype)
-        : await readMissingVideo!(message),
+        : await readMissingMedia!(message),
       descriptor,
     );
     result.set(message.id, { media, descriptor, bytes });
