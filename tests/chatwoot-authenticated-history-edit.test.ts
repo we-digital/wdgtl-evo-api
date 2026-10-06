@@ -431,6 +431,22 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
   assert.equal(ignoredUnavailable.outcomes[0].ignoredEditPreservation.kind, 'unavailable');
   assert.equal(content, 'authenticated after');
   assert.equal(calls, 1);
+  let destinationReads = 0;
+  const existingCapture = chatwootImport.captureIgnoredHistoryEdit;
+  chatwootImport.captureIgnoredHistoryEdit = async (...args) => {
+    const proof = await existingCapture.apply(chatwootImport, args);
+    destinationReads++;
+    return destinationReads === 2 ? { ...proof, destinationVersionSHA256: 'c'.repeat(64) } : proof;
+  };
+  try {
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request),
+      /destination or media rotated/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    chatwootImport.captureIgnoredHistoryEdit = existingCapture;
+  }
   encrypted.encPayload = priorPayload;
 });
 

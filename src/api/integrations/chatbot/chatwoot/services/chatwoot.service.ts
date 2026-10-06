@@ -5960,6 +5960,20 @@ export class ChatwootService {
       for (const envelope of encryptedEdits)
         await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       await albumPreservation.assertCurrent();
+      for (const [sourceId, ignored] of ignoredEdits) {
+        const current = await chatwootImport.captureIgnoredHistoryEdit(
+          ignored.envelope,
+          ignored.target,
+          inbox.id,
+          provider,
+          ignored.kind,
+          ignored.rejection,
+        );
+        if (!isDeepStrictEqual(current, ignoredEditProofs.get(sourceId)))
+          throw new Error('Ignored provider edit destination or media rotated before acknowledgement');
+      }
+      for (const envelope of encryptedEdits)
+        await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
