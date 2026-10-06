@@ -595,3 +595,10 @@ Reapply the optional acknowledged-parts argument in `chatwoot.service.ts` and `c
 - Source areas: `docs/operations/native-source-key-index.sql` and its runbook. The existing three edit-target statements and application files remain unchanged.
 - Reapply the operator-only serial/autocommit, key-size/continuity and no-retry contract; never add this index to automatic startup migration. Invalid or unknown index outcomes require inspection, not automatic replacement.
 - Validate on synthetic PostgreSQL 16.15: full-row conservation, OR/UNION equivalence, exact catalogue/conditioned plans and duplicate versions. Runtime identity and recovery eligibility remain independent.
+
+
+### Cached-media recovery UTC timestamp verification (263)
+
+The cached-media tagged preflight and import postimage queries compare PostgreSQL's persisted UTC epoch with the native message timestamp at whole-second precision. A `timestamp without time zone` returned by node-pg otherwise inherits the process timezone and can reject correct stored media in a non-UTC deployment. Both checks require a finite numeric epoch before flooring; a different native second still refuses. This changes read verification only: no global date parser, timezone configuration, stored timestamp, permissions, source identity, provider send or recovery acknowledgement is changed.
+
+Reapply the two query projections and comparisons in `chatwoot.service.ts` when upstream changes cached-media verification. Keep native descriptor/digest/size, peer/inbox/direction/cardinality and authenticated physical storage proof guards. Rollback restores strict safe refusal without changing historical messages or cache data. Focused regression: `TZ=America/Sao_Paulo node node_modules/tsx/dist/cli.mjs --test --test-name-pattern="literal whole250|tagged document" tests/chatwoot-cached-media.test.ts`; the real pg timestamp parser, fractional seconds, wrong seconds/nonfinite epochs, tagged replay and import postimage are covered. Run normal runtime ESLint, the test-only parser override, TypeScript checks and an exact synthetic candidate lab before immutable readback.

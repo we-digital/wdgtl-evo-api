@@ -2026,7 +2026,7 @@ export class ChatwootService {
     );
     const aliases = Array.from(bySource.keys()).flatMap((source) => [source, source.substring(5)]);
     const query = await postgresClient.getChatwootConnection().query(
-      `SELECT m.id, m.source_id, m.message_type, m.private, m.created_at, c.display_id, a.id AS attachment_id,
+      `SELECT m.id, m.source_id, m.message_type, m.private, m.created_at, extract(epoch from m.created_at)::double precision AS created_at_epoch, c.display_id, a.id AS attachment_id,
          a.meta AS attachment_meta, a.file_type, b.byte_size, pc.peer
        FROM messages m JOIN conversations c ON c.id=m.conversation_id AND c.account_id=m.account_id AND c.inbox_id=m.inbox_id
        JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
@@ -2062,7 +2062,9 @@ export class ChatwootService {
         typeof (message.key as any).fromMe !== 'boolean' ||
         Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
         row.private !== false ||
-        new Date(row.created_at).getTime() !== message.messageTimestamp * 1000 ||
+        typeof row.created_at_epoch !== 'number' ||
+        !Number.isFinite(row.created_at_epoch) ||
+        Math.floor(row.created_at_epoch) !== message.messageTimestamp ||
         !Number.isSafeInteger(Number(row.display_id)) ||
         Number(row.display_id) < 1 ||
         typeof row.peer !== 'string' ||
@@ -2142,7 +2144,7 @@ export class ChatwootService {
     expected: { conversationId: number; displayId: number; content: string; attributes: Record<string, unknown> },
   ) {
     const rows = await postgresClient.getChatwootConnection().query(
-      `SELECT m.id, m.message_type, m.private, m.account_id, m.inbox_id, m.created_at, m.content, m.content_attributes, c.id AS conversation_id, c.display_id,
+      `SELECT m.id, m.message_type, m.private, m.account_id, m.inbox_id, m.created_at, extract(epoch from m.created_at)::double precision AS created_at_epoch, m.content, m.content_attributes, c.id AS conversation_id, c.display_id,
          c.account_id AS conversation_account, c.inbox_id AS conversation_inbox,
          a.id AS attachment_id, a.meta AS attachment_meta, b.byte_size, b.content_type, b.filename, b.checksum
        FROM messages m JOIN conversations c ON c.id=m.conversation_id
@@ -2172,7 +2174,9 @@ export class ChatwootService {
       row.content_type !== descriptor.mimetype ||
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
-      new Date(row.created_at).getTime() !== message.messageTimestamp * 1000
+      typeof row.created_at_epoch !== 'number' ||
+      !Number.isFinite(row.created_at_epoch) ||
+      Math.floor(row.created_at_epoch) !== message.messageTimestamp
     )
       throw new Error('cached_media_import_postimage_unconfirmed');
   }
