@@ -130,28 +130,46 @@ const readStoredFile = async (fileName: string, limit: number, mime: string): Pr
   if (!minioClient || !Number.isSafeInteger(limit) || limit < 1 || limit > 8 * 1024 * 1024) {
     throw new Error('cached_media_storage_unavailable');
   }
+  let stream: Readable | undefined;
+  let expired = false;
+  let timer: ReturnType<typeof setTimeout>;
   try {
-    const objectName = join('evolution-api', fileName);
-    const stat = await minioClient.statObject(bucketName, objectName);
-    if (stat.size !== limit || stat.metaData?.['content-type'] !== mime) {
-      throw new Error('cached_media_storage_metadata_mismatch');
-    }
-    const stream = await minioClient.getObject(bucketName, objectName);
-    const chunks: Buffer[] = [];
-    let size = 0;
-    try {
+    const read = async () => {
+      const objectName = join('evolution-api', fileName);
+      const stat = await minioClient.statObject(bucketName, objectName);
+      if (expired || stat.size !== limit || stat.metaData?.['content-type'] !== mime)
+        throw new Error('cached_media_storage_metadata_mismatch');
+      stream = await minioClient.getObject(bucketName, objectName);
+      if (expired) {
+        stream.destroy();
+        throw new Error('cached_media_storage_timeout');
+      }
+      const chunks: Buffer[] = [];
+      let size = 0;
       for await (const chunk of stream) {
         const bytes = Buffer.from(chunk);
         size += bytes.length;
-        if (size > limit) throw new Error('cached_media_storage_bound');
+        if (expired || size > limit) throw new Error('cached_media_storage_bound');
         chunks.push(bytes);
       }
-    } finally {
-      stream.destroy();
-    }
-    return Buffer.concat(chunks);
+      return Buffer.concat(chunks);
+    };
+    return await Promise.race([
+      read(),
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          expired = true;
+          stream?.destroy();
+          reject(new Error('cached_media_storage_timeout'));
+        }, 5000);
+      }),
+    ]);
   } catch {
     throw new Error('cached_media_storage_read_unconfirmed');
+  } finally {
+    expired = true;
+    clearTimeout(timer);
+    stream?.destroy();
   }
 };
 

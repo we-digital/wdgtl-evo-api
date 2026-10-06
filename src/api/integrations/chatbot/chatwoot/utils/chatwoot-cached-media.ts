@@ -7,6 +7,26 @@ export const CACHED_MEDIA_BATCH_LIMIT = 16 * 1024 * 1024;
 export const CACHED_MEDIA_FILE_LIMIT = 8 * 1024 * 1024;
 const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage']);
 
+export function nativeCachedMediaPayload(message: Message) {
+  const descriptor = (message.message as Record<string, any>)?.[message.messageType];
+  if (!types.has(message.messageType) || !descriptor) throw new Error('cached_media_native_digest_unavailable');
+  const rawLength = descriptor.fileLength;
+  const size =
+    typeof rawLength === 'number'
+      ? rawLength
+      : rawLength?.high === 0 && Number.isSafeInteger(rawLength.low)
+        ? rawLength.low
+        : NaN;
+  const digest =
+    typeof descriptor.fileSha256 === 'string'
+      ? Buffer.from(descriptor.fileSha256, 'base64')
+      : Buffer.from(descriptor.fileSha256?.data || Object.values(descriptor.fileSha256 || {}));
+  if (!Number.isSafeInteger(size) || size < 1 || size > CACHED_MEDIA_FILE_LIMIT || digest.length !== 32) {
+    throw new Error('cached_media_size_or_digest_unavailable');
+  }
+  return { size, digest };
+}
+
 export function cachedMediaDescriptor(message: Message, media: Media) {
   const key = message.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
   const payload = message.message as Record<string, any>;
@@ -32,20 +52,7 @@ export function cachedMediaDescriptor(message: Message, media: Media) {
   ) {
     throw new Error('cached_media_authority_unavailable');
   }
-  const rawLength = descriptor.fileLength;
-  const size =
-    typeof rawLength === 'number'
-      ? rawLength
-      : rawLength?.high === 0 && Number.isSafeInteger(rawLength.low)
-        ? rawLength.low
-        : NaN;
-  const digest =
-    typeof descriptor.fileSha256 === 'string'
-      ? Buffer.from(descriptor.fileSha256, 'base64')
-      : Buffer.from(descriptor.fileSha256?.data || Object.values(descriptor.fileSha256 || {}));
-  if (!Number.isSafeInteger(size) || size < 1 || size > CACHED_MEDIA_FILE_LIMIT || digest.length !== 32) {
-    throw new Error('cached_media_size_or_digest_unavailable');
-  }
+  const { size, digest } = nativeCachedMediaPayload(message);
   const filename = basename(descriptor.fileName || media.fileName);
   if (!filename || filename.length > 255 || [...filename].some((character) => character.charCodeAt(0) < 32)) {
     throw new Error('cached_media_filename_unavailable');

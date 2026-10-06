@@ -17,7 +17,10 @@ import {
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
-import { prepareCachedRecoveryMedia } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
+import {
+  nativeCachedMediaPayload,
+  prepareCachedRecoveryMedia,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
 import {
   buildWhatsappGroupParticipantSnapshots,
@@ -2039,13 +2042,20 @@ export class ChatwootService {
       const sourceId = toChatwootSourceId(row.source_id);
       const message = bySource.get(sourceId);
       const sha256 = row.attachment_meta?.whatsapp_history_sha256;
-      const mediaType = { 0: 'image', 1: 'audio', 2: 'video', 3: 'document' }[Number(row.file_type)];
+      const mediaType = message?.messageType?.replace(/Message$/, '');
+      const nativeMedia = message ? nativeCachedMediaPayload(message) : null;
+      const nativePeers = message ? Array.from(chatwootImport.createMessagesMapByIdentity([message]).keys()) : [];
       if (
         !message ||
         seen.has(sourceId) ||
         !/^[0-9a-f]{64}$/.test(sha256) ||
-        !mediaType ||
+        !['image', 'audio', 'video', 'document'].includes(mediaType) ||
         row.attachment_meta?.whatsapp_history_media_type !== mediaType ||
+        !nativeMedia ||
+        nativeMedia.digest.toString('hex') !== sha256 ||
+        nativeMedia.size !== Number(row.byte_size) ||
+        nativePeers.length !== 1 ||
+        nativePeers[0] !== row.peer ||
         !Number.isSafeInteger(Number(row.byte_size)) ||
         Number(row.byte_size) < 1 ||
         Number(row.byte_size) > 8 * 1024 * 1024 ||
@@ -6076,8 +6086,23 @@ export class ChatwootService {
       );
       const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
         dedupeHistoryMessagesBySourceId(scopedMessages);
+      const normalizedPeerBySource = new Map(
+        normalized.messages.map((message) => [
+          toChatwootSourceId((message.key as { id: string }).id),
+          (message.key as { remoteJid: string }).remoteJid,
+        ]),
+      );
+      const taggedAuthorityMessages = [...authoritativeMessages, ...encryptedTargets.values()].map((message) => ({
+        ...message,
+        key: {
+          ...(message.key as any),
+          remoteJid:
+            normalizedPeerBySource.get(toChatwootSourceId((message.key as { id: string }).id)) ||
+            (message.key as any).remoteJid,
+        },
+      }));
       const taggedMediaSourceIds = await this.assertTaggedHistoryMediaStored(
-        [...authoritativeMessages, ...encryptedTargets.values()],
+        taggedAuthorityMessages,
         instance,
         provider,
         inbox.id,
@@ -6313,7 +6338,7 @@ export class ChatwootService {
           throw new Error('cached_media_source_rotated_before_acknowledgement');
       }
       await this.assertTaggedHistoryMediaStored(
-        [...authoritativeMessages, ...encryptedTargets.values()],
+        taggedAuthorityMessages,
         instance,
         provider,
         inbox.id,

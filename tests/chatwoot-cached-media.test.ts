@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import test from 'node:test';
+
+import axios from 'axios';
+
+import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { prepareCachedRecoveryMedia } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
-import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
-import axios from 'axios';
 
 const bytes = Buffer.from('synthetic-owned-pdf');
 function doc(type = 'documentMessage') {
@@ -37,7 +39,11 @@ const media = {
 test('owned bytes preserve digest and all four supported incoming media types; foreign authority and corruption refuse', async () => {
   for (const type of ['document', 'image', 'audio', 'video']) {
     const d = doc(`${type}Message`);
-    const m = { ...media, type: `${type}Message`, fileName: media.fileName.replace('/documentMessage/', `/${type}Message/`) };
+    const m = {
+      ...media,
+      type: `${type}Message`,
+      fileName: media.fileName.replace('/documentMessage/', `/${type}Message/`),
+    };
     const prepared = await prepareCachedRecoveryMedia(
       [d],
       async () => m,
@@ -90,6 +96,7 @@ test('literal whole250 service preflights before writes and uses silent original
     if (previousModule) require.cache[modulePath] = previousModule;
     else delete require.cache[modulePath];
   });
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- Load only after the inert server fixture is installed.
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
   const service = Object.create(ChatwootService.prototype) as any;
   const provider = {
@@ -179,7 +186,11 @@ test('literal whole250 service preflights before writes and uses silent original
   };
   chatwootImport.reconcileOutboundHistoryBindings = async () => new Set();
   chatwootImport.getVerifiedRecoverySourceIds = async (requested: any[]) =>
-    new Set(requested.filter((row) => row.messageType === 'conversation' || stored && row.id === 'native-doc').map((row) => `WAID:${row.key.id}`));
+    new Set(
+      requested
+        .filter((row) => row.messageType === 'conversation' || (stored && row.id === 'native-doc'))
+        .map((row) => `WAID:${row.key.id}`),
+    );
   chatwootImport.reconcileProviderHistoryEdits = async () => {
     editCalls++;
     return new Map();
@@ -190,45 +201,51 @@ test('literal whole250 service preflights before writes and uses silent original
   // Original sendData duplicate check and literal postimage query remain exercised.
   postgresClient.getChatwootConnection = (() => ({
     query: async (sql: string) => ({
-      rows: sql.includes("a.meta ?") && !stored ? [] : sql.includes('active_storage_blobs')
-        ? [
-            {
-              id: 7,
-              attachment_id: 8,
-              source_id: 'WAID:doc',
-              peer: doc().key.remoteJid,
-              file_type: 3,
-              message_type: rows[249].key.fromMe ? 1 : 0,
-              private: false,
-              account_id: 1,
-              conversation_account: 1,
-              conversation_inbox: 99,
-              byte_size: bytes.length,
-              content_type: 'application/pdf',
-              filename: 'synthetic.pdf',
-              attachment_meta: { whatsapp_history_media_type: 'document', whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex') },
-              checksum: createHash('md5').update(bytes).digest('base64'),
-              created_at: new Date(1700000000000),
-              conversation_id: 123,
-              display_id: 345,
-              content: 'synthetic-caption',
-              content_attributes: {
-                in_reply_to_external_id: 'quoted',
-                synthetic_author: 'preserved',
-                provider_history_native: {
-                  message_id: 'native-doc',
-                  from_me: rows[249].key.fromMe,
-                  remote_jid: doc().key.remoteJid,
-                  participant: null,
-                  participant_alt: null,
-                  push_name: null,
+      rows:
+        sql.includes('a.meta ?') && !stored
+          ? []
+          : sql.includes('active_storage_blobs')
+            ? [
+                {
+                  id: 7,
+                  attachment_id: 8,
+                  source_id: 'WAID:doc',
+                  peer: doc().key.remoteJid,
+                  file_type: 3,
+                  message_type: rows[249].key.fromMe ? 1 : 0,
+                  private: false,
+                  account_id: 1,
+                  conversation_account: 1,
+                  conversation_inbox: 99,
+                  byte_size: bytes.length,
+                  content_type: 'application/pdf',
+                  filename: 'synthetic.pdf',
+                  attachment_meta: {
+                    whatsapp_history_media_type: 'document',
+                    whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
+                  },
+                  checksum: createHash('md5').update(bytes).digest('base64'),
+                  created_at: new Date(1700000000000),
+                  conversation_id: 123,
+                  display_id: 345,
+                  content: 'synthetic-caption',
+                  content_attributes: {
+                    in_reply_to_external_id: 'quoted',
+                    synthetic_author: 'preserved',
+                    provider_history_native: {
+                      message_id: 'native-doc',
+                      from_me: rows[249].key.fromMe,
+                      remote_jid: doc().key.remoteJid,
+                      participant: null,
+                      participant_alt: null,
+                      push_name: null,
+                    },
+                  },
                 },
-              },
-            },
-          ]
-        : sql.includes('provider_conversation_bindings')
-          ? [{ id: 123, display_id: 345 }]
-          : [],
+              ]
+            : sql.includes('provider_conversation_bindings')
+              ? [{ id: 123, display_id: 345 }]
+              : [],
     }),
   })) as any;
   axios.request = (async (config: any) => {
@@ -238,8 +255,19 @@ test('literal whole250 service preflights before writes and uses silent original
       assert.equal(config.params.provider_receiver_fingerprint.length, 64);
       assert.equal(config.params.history_media_proof, '1');
       if (corruptStored) throw new Error('synthetic stored object absent/corrupt');
-      return { data: { whatsapp_history_media_proof: { verified: true, message_id: 7, source_id: 'WAID:doc',
-        attachment_id: 8, sha256: createHash('sha256').update(bytes).digest('hex'), byte_size: bytes.length } } };
+      return {
+        data: {
+          whatsapp_history_media_proof: {
+            verified: true,
+            message_id: 7,
+            source_id: 'WAID:doc',
+            attachment_id: 8,
+            media_type: 'document',
+            sha256: createHash('sha256').update(bytes).digest('hex'),
+            byte_size: bytes.length,
+          },
+        },
+      };
     }
     posts++;
     assert.equal(config.url.endsWith('/conversations/345/messages'), true);
@@ -296,15 +324,23 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(posts, 1);
   assert.equal(result.outcomes.find((outcome: any) => outcome.sourceId === 'WAID:doc').status, 'imported');
   assert.equal(proofs, 2);
-  const retained = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic', instanceId: 'synthetic-instance' }, request());
+  const retained = await service.syncStoredHistoryRecoveryBatch(
+    { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+    request(),
+  );
   assert.equal(retained.importedMessages, 0);
   assert.equal(posts, 1);
   corruptStored = true;
-  guards = 0; editCalls = 0;
-  await assert.rejects(service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic', instanceId: 'synthetic-instance' }, request()), /stored_bytes_unconfirmed/);
+  guards = 0;
+  editCalls = 0;
+  await assert.rejects(
+    service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic', instanceId: 'synthetic-instance' }, request()),
+    /stored_bytes_unconfirmed/,
+  );
   assert.equal(guards + editCalls, 0);
   assert.equal(posts, 1);
-  corruptStored = false; stored = false;
+  corruptStored = false;
+  stored = false;
   rows[249] = { ...doc(), key: { ...doc().key, fromMe: true } };
   const outgoing = await service.syncStoredHistoryRecoveryBatch(
     { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
@@ -333,4 +369,101 @@ test('literal whole250 service preflights before writes and uses silent original
     /write_outcome_unconfirmed/,
   );
   assert.equal(posts, 1);
+});
+
+test('tagged document wire kind remains document when Chatwoot presents its MIME as image', async (t) => {
+  const modulePath = require.resolve('../src/api/server.module.ts');
+  const previousModule = require.cache[modulePath];
+  require.cache[modulePath] = {
+    id: modulePath,
+    filename: modulePath,
+    loaded: true,
+    exports: {},
+    children: [],
+    paths: [],
+  } as NodeModule;
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- Load only after the inert server fixture is installed.
+  const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const service = Object.create(ChatwootService.prototype) as any;
+  const originalPool = postgresClient.getChatwootConnection;
+  const originalAxios = axios.request;
+  t.after(() => {
+    postgresClient.getChatwootConnection = originalPool;
+    axios.request = originalAxios;
+    if (previousModule) require.cache[modulePath] = previousModule;
+    else delete require.cache[modulePath];
+  });
+  service.configService = {
+    get: () => ({ TRUSTED_BASE_URL: 'https://synthetic.invalid', NATIVE_BRIDGE_TOKEN: 'synthetic-only' }),
+  };
+  service.assertSilentHistoryMediaCapability = async () => ({ receiver_fingerprint: 'f'.repeat(64) });
+  const message = doc();
+  const digest = createHash('sha256').update(bytes).digest('hex');
+  const row = {
+    id: 7,
+    attachment_id: 8,
+    source_id: 'WAID:doc',
+    message_type: 0,
+    private: false,
+    created_at: new Date(1700000000000),
+    display_id: 345,
+    peer: message.key.remoteJid,
+    byte_size: bytes.length,
+    file_type: 0,
+    attachment_meta: { whatsapp_history_sha256: digest, whatsapp_history_media_type: 'document' },
+  };
+  postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [row] }) })) as any;
+  let gets = 0;
+  axios.request = (async (config: any) => {
+    gets++;
+    assert.equal(config.params.provider_media_type, 'document');
+    return {
+      data: {
+        whatsapp_history_media_proof: {
+          verified: true,
+          message_id: 7,
+          source_id: 'WAID:doc',
+          attachment_id: 8,
+          sha256: digest,
+          byte_size: bytes.length,
+          media_type: 'document',
+        },
+      },
+    };
+  }) as any;
+  const provider = { accountId: '1', url: 'https://synthetic.invalid', token: 'synthetic-only' } as any;
+  await service.assertTaggedHistoryMediaStored(
+    [message],
+    { instanceId: 'synthetic-instance', instanceName: 'synthetic' },
+    provider,
+    99,
+  );
+  assert.equal(gets, 1);
+  row.attachment_meta.whatsapp_history_media_type = 'image';
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /tagged_destination_unconfirmed/,
+  );
+  row.attachment_meta.whatsapp_history_media_type = 'document';
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored(
+      [{ ...message, messageType: 'stickerMessage' }],
+      { instanceName: 'synthetic' },
+      provider,
+      99,
+    ),
+    /native_digest_unavailable/,
+  );
+  row.attachment_meta.whatsapp_history_sha256 = '0'.repeat(64);
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /tagged_destination_unconfirmed/,
+  );
+  row.attachment_meta.whatsapp_history_sha256 = digest;
+  row.peer = 'foreign@s.whatsapp.net';
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /tagged_destination_unconfirmed/,
+  );
+  assert.equal(gets, 1);
 });

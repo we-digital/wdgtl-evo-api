@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+
 import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
-import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 
 test('cached controls stay controls and empty images require retained edit evidence', () => {
   assert.equal(
@@ -184,10 +185,13 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     if (previousModule) require.cache[modulePath] = previousModule;
     else delete require.cache[modulePath];
   });
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- Load only after the inert server fixture is installed.
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
   const originalPool = postgresClient.getChatwootConnection;
   postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [] }) })) as any;
-  t.after(() => { postgresClient.getChatwootConnection = originalPool; });
+  t.after(() => {
+    postgresClient.getChatwootConnection = originalPool;
+  });
   const service = Object.create(ChatwootService.prototype) as any;
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.isImportHistoryAvailable = () => true;
