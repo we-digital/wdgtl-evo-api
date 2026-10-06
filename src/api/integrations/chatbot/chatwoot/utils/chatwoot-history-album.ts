@@ -168,6 +168,38 @@ const bytes = (value: any) => {
   return fail();
 };
 
+const albumMetadataCompanion = (record: any, parent: any) => {
+  const context = record.message?.messageContextInfo;
+  return (
+    typeof record.id === 'string' &&
+    record.id.length > 0 &&
+    record.id !== parent.id &&
+    record.instanceId === parent.instanceId &&
+    record.messageType === 'unknown' &&
+    object(record.message) &&
+    Object.keys(record.message).join(',') === 'messageContextInfo' &&
+    object(context) &&
+    Object.keys(context).sort().join(',') === 'messageSecret,threadId' &&
+    Array.isArray(context.threadId) &&
+    context.threadId.length === 0 &&
+    typeof context.messageSecret === 'string' &&
+    Buffer.from(context.messageSecret, 'base64').length === 32 &&
+    Buffer.from(context.messageSecret, 'base64').toString('base64') === context.messageSecret &&
+    record.key?.id === parent.key.id &&
+    record.key.fromMe === parent.key.fromMe &&
+    record.key.remoteJid === parent.key.remoteJid &&
+    Object.keys(record.key).every((name) =>
+      ['id', 'fromMe', 'remoteJid', 'participant', 'participantAlt'].includes(name),
+    ) &&
+    (record.key.participant === undefined || record.key.participant === parent.key.participant) &&
+    (record.key.participantAlt === undefined || record.key.participantAlt === parent.key.participantAlt) &&
+    Number.isSafeInteger(record.messageTimestamp) &&
+    record.messageTimestamp > 0 &&
+    record.messageTimestamp <= parent.messageTimestamp
+  );
+};
+const rawHash = (value: string) => createHash('sha256').update(value).digest('hex');
+
 export async function preserveAlbumContainers(
   parents: any[],
   repository: any,
@@ -193,8 +225,23 @@ export async function preserveAlbumContainers(
       fail();
     const originals = await repository.findMany({
       where: { instanceId: parent.instanceId, key: { path: ['id'], equals: key.id } },
-      take: 2,
+      take: 17,
+      orderBy: { id: 'asc' },
     });
+    if (originals.length > 1) {
+      if (
+        typeof parent.id !== 'string' ||
+        parent.id.length === 0 ||
+        originals.length > 16 ||
+        originals.filter((row: any) => isDeepStrictEqual(row, parent)).length !== 1 ||
+        new Set(originals.map((row: any) => row.id)).size !== originals.length ||
+        !Number.isSafeInteger(parent.messageTimestamp) ||
+        parent.messageTimestamp <= 0 ||
+        originals.some((row: any) => row.id !== parent.id && !albumMetadataCompanion(row, parent))
+      )
+        fail();
+      return { parent, sameKeyNativeRows: originals, count, containerOnly: true as const };
+    }
     if (originals.length !== 1 || !isDeepStrictEqual(originals[0], parent)) fail();
     // Do not filter peer/direction/type: contradictory associations must remain visible and refuse.
     const children = await repository.findMany({
@@ -323,6 +370,34 @@ export async function preserveAlbumContainers(
   for (const parent of parents) {
     const snapshot = await read(parent);
     snapshots.set(parent.id, snapshot);
+    if ('containerOnly' in snapshot) {
+      const sourceNativeJSON = JSON.stringify(parent);
+      const sameKeyNativeJSON = JSON.stringify(snapshot.sameKeyNativeRows);
+      proofs.set('WAID:' + parent.key.id, {
+        version: 2,
+        disposition: 'container_only',
+        accountID,
+        inboxID,
+        parentSourceID: 'WAID:' + parent.key.id,
+        parentNativeID: parent.id,
+        parentVersionSHA256: hash({
+          key: parent.key,
+          message: parent.message,
+          messageTimestamp: parent.messageTimestamp,
+          messageType: parent.messageType,
+          status: parent.status,
+        }),
+        expectedImages: snapshot.count,
+        expectedVideos: 0,
+        childrenComplete: false,
+        childrenQueried: false,
+        sourceNativeJSON,
+        sourceNativeSHA256: rawHash(sourceNativeJSON),
+        sameKeyNativeJSON,
+        sameKeyNativeSHA256: rawHash(sameKeyNativeJSON),
+      });
+      continue;
+    }
     proofs.set('WAID:' + parent.key.id, {
       version: 1,
       accountID,
