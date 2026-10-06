@@ -556,3 +556,12 @@ single-body refusal and leaves retained source/gap data intact. Focused checks:
 `npx tsx --test tests/chatwoot-authenticated-history-edit.test.ts`,
 `npx tsc --noEmit --incremental false`, normal ESLint on the helper, and an exact
 candidate network-isolated synthetic lab before immutable production readback.
+
+
+### Missing retained PDF document edit payload
+
+Cached recovery explicitly preserves a NULL edited document only when the existing public destination is unique for its source/account/inbox/direction, authenticated peer and bound message/display IDs, with exactly one file attachment backed by nonempty PDF blob metadata. It emits the existing unresolved payload-unavailable outcome, keeps original content/context/media and never claims the edit or blob content was recovered. Unknown types, non-NULL malformed documents and ambiguous targets still stop the whole batch. No provider sends, routing change, dependency upgrade or migration.
+
+Source: `chatwoot-cached-history-record.ts`, `chatwoot-import-helper.ts`, and `chatwoot.service.ts` under `src/api/integrations/chatbot/chatwoot/`. Reapply these focused branches after upstream changes to recovery classification/edit reconciliation; reverting restores safe refusal. Deploy the matching official cache document gap validator before acknowledging this new outcome. Focused regression: `node node_modules/tsx/dist/cli.mjs --test --test-name-pattern="NULL edited PDF" tests/chatwoot-authenticated-history-edit.test.ts`.
+
+Native source-bound pointer IDs remain mandatory: absent or stale pointers refuse. A saved storage existence check alone never establishes native-pointer eligibility or recovered edit content.
