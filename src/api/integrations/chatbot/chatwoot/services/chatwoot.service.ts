@@ -20,6 +20,7 @@ import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/
 import {
   nativeCachedMediaPayload,
   prepareCachedRecoveryMedia,
+  readRetainedRecoveryVideo,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
 import {
@@ -70,6 +71,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import {
   assertIgnoredEditOriginalIdentity,
+  CONFLICTING_TEXT_EDIT_REJECTION,
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
@@ -132,6 +134,11 @@ import {
   whatsappQuotedMessageContent,
   whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
+import {
+  retainedHistoryDisplayBody,
+  retainedHistoryMedia,
+  retainedTemplate,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
@@ -1880,6 +1887,7 @@ export class ChatwootService {
       size: number;
       sha256: string;
       mediaType: string;
+      nativeSource?: { message_type: string; sha256: string };
     },
   ) {
     if (sourceId && this.isImportHistoryAvailable()) {
@@ -1928,6 +1936,10 @@ export class ChatwootService {
                 participant: messageBody.key.participant ?? messageBody.participant ?? null,
                 participant_alt: messageBody.key.participantAlt ?? null,
                 push_name: messageBody.pushName ?? null,
+                ...(recovery.nativeSource ? { source: recovery.nativeSource } : {}),
+                ...(messageBody.message?.templateMessage
+                  ? { template: retainedTemplate(messageBody.message).metadata }
+                  : {}),
               },
             }
           : {}),
@@ -2042,7 +2054,7 @@ export class ChatwootService {
       const sourceId = toChatwootSourceId(row.source_id);
       const message = bySource.get(sourceId);
       const sha256 = row.attachment_meta?.whatsapp_history_sha256;
-      const mediaType = message?.messageType?.replace(/Message$/, '');
+      const mediaType = message ? retainedHistoryMedia(message).type.replace(/Message$/, '') : undefined;
       const nativeMedia = message ? nativeCachedMediaPayload(message) : null;
       const nativePeers = message ? Array.from(chatwootImport.createMessagesMapByIdentity([message]).keys()) : [];
       if (
@@ -2170,7 +2182,7 @@ export class ChatwootService {
         ([key, value]) => !isDeepStrictEqual(row.content_attributes?.[key], value),
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
-      row.attachment_meta?.whatsapp_history_media_type !== message.messageType.replace(/Message$/, '') ||
+      row.attachment_meta?.whatsapp_history_media_type !== retainedHistoryMedia(message).type.replace(/Message$/, '') ||
       row.content_type !== descriptor.mimetype ||
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
@@ -5930,7 +5942,8 @@ export class ChatwootService {
           (classification === 'ordinary' ||
             classification === 'unavailable_image_edit' ||
             classification === 'unavailable_text_edit' ||
-            classification === 'unavailable_document_edit')
+            classification === 'unavailable_document_edit' ||
+            classification === 'unavailable_audio_edit')
         );
       });
       const encryptedEdits = authoritativeMessages.filter(
@@ -5977,6 +5990,16 @@ export class ChatwootService {
         string,
         { envelope: MessageModel; target: MessageModel; kind: IgnoredHistoryEditKind; rejection: string }
       >();
+      for (const message of authoritativeMessages) {
+        const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+        if (classifications.get(sourceId) === 'conflicting_text_edit')
+          ignoredEdits.set(sourceId, {
+            envelope: message,
+            target: message,
+            kind: 'conflicting',
+            rejection: CONFLICTING_TEXT_EDIT_REJECTION,
+          });
+      }
       for (const envelope of encryptedEdits) {
         const targetKey = (envelope.message as any).secretEncryptedMessage.targetMessageKey;
         const matches = await this.prismaRepository.message.findMany({
@@ -6050,10 +6073,14 @@ export class ChatwootService {
       const preparedBySourceId = new Map(
         ordinaryMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+          const display =
+            message.messageType === 'associatedChildMessage'
+              ? { ...message, messageType: 'videoMessage', message: retainedHistoryDisplayBody(message) }
+              : message;
           const prepared =
             data.recoveryMode === 'maximize'
-              ? prepareStoredHistoryRecoveryMessage(message)
-              : { message, recovery: 'native' as const, reason: 'standard_mode' };
+              ? prepareStoredHistoryRecoveryMessage(display)
+              : { message: display, recovery: 'native' as const, reason: 'standard_mode' };
           return [sourceId, prepared] as const;
         }),
       );
@@ -6124,6 +6151,7 @@ export class ChatwootService {
         (message) =>
           this.prismaRepository.media.findFirst({ where: { messageId: message.id, instanceId: message.instanceId } }),
         (name, limit, mime) => this.readCachedRecoveryObject(name, limit, mime),
+        (message) => readRetainedRecoveryVideo(message),
       );
       if (cachedMedia.size) {
         const config = this.configService.get<Chatwoot>('CHATWOOT');
@@ -6189,7 +6217,8 @@ export class ChatwootService {
         this,
       );
       const importableMessages = missingMessages.filter(
-        (message: any) => !cachedMedia.has(message.id) && Boolean(chatwootImport.getContentMessage(this, message)),
+        (message: any) =>
+          !cachedMedia.has(message.id) && Boolean(chatwootImport.getContentMessage(this, message, true)),
       );
       const importableSourceIds = new Set(
         importableMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
@@ -6252,7 +6281,10 @@ export class ChatwootService {
         const displayId = Number(canonical.rows[0]?.display_id);
         if (canonical.rows.length !== 1 || !Number.isSafeInteger(displayId) || displayId < 1)
           throw new Error('cached_media_canonical_destination_unavailable');
-        const content = this.getConversationMessage(message.message);
+        const content =
+          message.messageType === 'templateMessage'
+            ? retainedTemplate(message.message).text
+            : this.getConversationMessage(message.message);
         const uploaded = await this.sendData(
           displayId,
           Readable.from(cached.bytes),
@@ -6272,7 +6304,15 @@ export class ChatwootService {
             mimetype: cached.descriptor.mimetype,
             size: cached.descriptor.size,
             sha256: cached.descriptor.digest.toString('hex'),
-            mediaType: cached.media.type.replace(/Message$/, ''),
+            mediaType: retainedHistoryMedia(original).type.replace(/Message$/, ''),
+            ...(['associatedChildMessage', 'templateMessage'].includes(original.messageType)
+              ? {
+                  nativeSource: {
+                    message_type: original.messageType,
+                    sha256: createHash('sha256').update(JSON.stringify(original)).digest('hex'),
+                  },
+                }
+              : {}),
           },
         );
         await this.verifyRecoveryMediaDestination(message, provider, inbox.id, cached.descriptor, cached.bytes, {
@@ -6316,10 +6356,33 @@ export class ChatwootService {
             ),
           );
       }
+      for (const [sourceId, ignored] of ignoredEdits) {
+        if (classifications.get(sourceId) === 'conflicting_text_edit') {
+          const current = await this.prismaRepository.message.findUnique({ where: { id: ignored.envelope.id } });
+          if (!isDeepStrictEqual(current, ignored.envelope))
+            throw new Error('Ignored provider edit native source rotated');
+          ignoredEditProofs.set(
+            sourceId,
+            await chatwootImport.captureIgnoredHistoryEdit(
+              ignored.envelope,
+              ignored.target,
+              inbox.id,
+              provider,
+              ignored.kind,
+              ignored.rejection,
+            ),
+          );
+        }
+      }
       for (const envelope of encryptedEdits)
         await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       await albumPreservation.assertCurrent();
       for (const [sourceId, ignored] of ignoredEdits) {
+        if (classifications.get(sourceId) === 'conflicting_text_edit') {
+          const source = await this.prismaRepository.message.findUnique({ where: { id: ignored.envelope.id } });
+          if (!isDeepStrictEqual(source, ignored.envelope))
+            throw new Error('Ignored provider edit native source rotated');
+        }
         const current = await chatwootImport.captureIgnoredHistoryEdit(
           ignored.envelope,
           ignored.target,
@@ -6359,7 +6422,7 @@ export class ChatwootService {
             recovery: 'unsupported',
             albumPreservation: albumPreservation.proofs.get(sourceId),
           };
-        if (classification === 'encrypted_edit') {
+        if (classification === 'encrypted_edit' || classification === 'conflicting_text_edit') {
           const ignoredEditPreservation = ignoredEditProofs.get(sourceId);
           if (ignoredEditPreservation)
             return {
@@ -6378,7 +6441,11 @@ export class ChatwootService {
             reason: `preserved_unsupported_${classification}`,
             recovery: 'unsupported',
           };
-        if (classification === 'reaction_control' || classification === 'encryption_control') {
+        if (
+          classification === 'reaction_control' ||
+          classification === 'encryption_control' ||
+          classification === 'metadata_control'
+        ) {
           return { sourceId, status: 'skipped', reason: `known_${classification}`, recovery: 'unsupported' };
         }
         if (preservedEdits.has(sourceId)) {

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { Message } from '@prisma/client';
 
 export const IGNORED_HISTORY_EDIT_REASON = 'preserved_existing_ignored_provider_edit';
@@ -7,6 +9,7 @@ export type IgnoredHistoryEditProof = {
   version: 1;
   kind: IgnoredHistoryEditKind;
   rejection: string;
+  editRepresentation?: 'same_native_type_conflict';
   editSourceId: string;
   editNativeId: string;
   targetSourceId: string;
@@ -21,11 +24,45 @@ export type IgnoredHistoryEditProof = {
   destinationVersionSHA256: string;
 };
 
+export const CONFLICTING_TEXT_EDIT_REJECTION = 'Retained provider edit body conflicts with its declared original type';
+
+export function isSameNativeTextEditConflict(message: Message): boolean {
+  const body = message.message as any;
+  return (
+    message.status === 'EDITED' &&
+    message.messageType === 'conversation' &&
+    body &&
+    typeof body === 'object' &&
+    !Array.isArray(body) &&
+    Object.keys(body).includes('extendedTextMessage') &&
+    Object.keys(body).every((key) =>
+      ['extendedTextMessage', 'messageContextInfo', 'senderKeyDistributionMessage', 'mediaUrl'].includes(key),
+    ) &&
+    typeof body.extendedTextMessage?.text === 'string'
+  );
+}
+
 /** The rejected edit's target metadata never grants authority to change a message. */
 export function assertIgnoredEditOriginalIdentity(envelope: Message, original: Message): void {
   const key = envelope.key as any;
   const originalKey = original.key as any;
   const encrypted = (envelope.message as any)?.secretEncryptedMessage;
+  if (
+    envelope.id === original.id &&
+    envelope.instanceId === original.instanceId &&
+    isSameNativeTextEditConflict(envelope) &&
+    isSameNativeTextEditConflict(original) &&
+    isDeepStrictEqual(envelope, original) &&
+    typeof key?.id === 'string' &&
+    key.id.length > 0 &&
+    key.id === originalKey?.id &&
+    typeof key.fromMe === 'boolean' &&
+    key.fromMe === originalKey.fromMe &&
+    typeof key.remoteJid === 'string' &&
+    key.remoteJid.length > 0 &&
+    key.remoteJid === originalKey.remoteJid
+  )
+    return;
   if (
     envelope.instanceId !== original.instanceId ||
     encrypted?.secretEncType !== 2 ||

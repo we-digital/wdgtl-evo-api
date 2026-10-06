@@ -1,6 +1,21 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
+const validSenderKeySidecar = (body: any) => {
+  const value = body?.senderKeyDistributionMessage;
+  return (
+    value === undefined ||
+    (value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Object.keys(value).every((key) => ['groupId', 'axolotlSenderKeyDistributionMessage'].includes(key)) &&
+      typeof value.groupId === 'string' &&
+      value.groupId.length > 0 &&
+      typeof value.axolotlSenderKeyDistributionMessage === 'string' &&
+      value.axolotlSenderKeyDistributionMessage.length > 0)
+  );
+};
+
 const fail = () => {
   throw new Error('Album container dependencies or preserved destination are unproved');
 };
@@ -31,6 +46,63 @@ const hash = (value: any) =>
     .update(JSON.stringify(sorted(value)))
     .digest('hex');
 
+const albumContextInfo = (value: any) => {
+  if (value === undefined) return true;
+  if (
+    !object(value) ||
+    !Object.keys(value).every((key) =>
+      ['messageSecret', 'threadId', 'deviceListMetadata', 'deviceListMetadataVersion', 'limitSharingV2'].includes(key),
+    )
+  )
+    return false;
+  const base = Object.fromEntries(Object.entries(value).filter(([key]) => ['messageSecret', 'threadId'].includes(key)));
+  if (!metadata(base)) return false;
+  const long = (v: any, unsigned: boolean) =>
+    object(v) &&
+    Object.keys(v).sort().join(',') === 'high,low,unsigned' &&
+    Number.isInteger(v.low) &&
+    v.low >= -2147483648 &&
+    v.low <= 2147483647 &&
+    Number.isInteger(v.high) &&
+    v.high >= 0 &&
+    v.high <= 2097151 &&
+    v.unsigned === unsigned;
+  const hash10 = (v: any) =>
+    typeof v === 'string' &&
+    Buffer.from(v, 'base64').length === 10 &&
+    Buffer.from(v, 'base64').toString('base64') === v;
+  const device = value.deviceListMetadata;
+  if (device !== undefined) {
+    if (
+      value.deviceListMetadataVersion !== 2 ||
+      !object(device) ||
+      Object.keys(device).sort().join(',') !==
+        'recipientKeyHash,recipientKeyIndexes,recipientTimestamp,senderKeyHash,senderKeyIndexes,senderTimestamp' ||
+      !hash10(device.senderKeyHash) ||
+      !hash10(device.recipientKeyHash) ||
+      !long(device.senderTimestamp, true) ||
+      !long(device.recipientTimestamp, true) ||
+      !Array.isArray(device.senderKeyIndexes) ||
+      device.senderKeyIndexes.length !== 0 ||
+      !Array.isArray(device.recipientKeyIndexes) ||
+      device.recipientKeyIndexes.length !== 0
+    )
+      return false;
+  } else if (value.deviceListMetadataVersion !== undefined) return false;
+  const limit = value.limitSharingV2;
+  if (
+    limit !== undefined &&
+    (!object(limit) ||
+      Object.keys(limit).sort().join(',') !== 'initiatedByMe,limitSharingSettingTimestamp,sharingLimited,trigger' ||
+      limit.trigger !== 1 ||
+      limit.initiatedByMe !== false ||
+      limit.sharingLimited !== true ||
+      !long(limit.limitSharingSettingTimestamp, false))
+  )
+    return false;
+  return true;
+};
+
 export function albumImageCount(record: any): number {
   const body = record.message;
   const album = body?.albumMessage;
@@ -38,7 +110,10 @@ export function albumImageCount(record: any): number {
     record.messageType !== 'albumMessage' ||
     !object(body) ||
     !object(album) ||
-    !Object.keys(body).every((key) => ['albumMessage', 'messageContextInfo'].includes(key)) ||
+    !Object.keys(body).every((key) =>
+      ['albumMessage', 'messageContextInfo', 'senderKeyDistributionMessage'].includes(key),
+    ) ||
+    !validSenderKeySidecar(body) ||
     !Object.keys(album).every((key) => ['expectedImageCount', 'expectedVideoCount', 'contextInfo'].includes(key)) ||
     !Number.isInteger(album.expectedImageCount) ||
     album.expectedImageCount < 1 ||
@@ -54,12 +129,24 @@ export function albumImageCount(record: any): number {
             'groupMentions',
             'forwardingScore',
             'statusAttributions',
+            'stanzaId',
+            'participant',
+            'quotedType',
+            'quotedMessage',
           ].includes(key),
         ))) ||
-    (body.messageContextInfo !== undefined &&
-      (!object(body.messageContextInfo) ||
-        !metadata(body.messageContextInfo) ||
-        !Object.keys(body.messageContextInfo).every((key) => ['messageSecret', 'threadId'].includes(key))))
+    (album.contextInfo !== undefined &&
+      ['stanzaId', 'participant', 'quotedType', 'quotedMessage'].some((key) => album.contextInfo[key] !== undefined) &&
+      (typeof album.contextInfo.stanzaId !== 'string' ||
+        album.contextInfo.stanzaId.length === 0 ||
+        typeof album.contextInfo.participant !== 'string' ||
+        album.contextInfo.participant.length === 0 ||
+        album.contextInfo.quotedType !== 0 ||
+        !object(album.contextInfo.quotedMessage) ||
+        Object.keys(album.contextInfo.quotedMessage).join(',') !== 'extendedTextMessage' ||
+        !object(album.contextInfo.quotedMessage.extendedTextMessage) ||
+        typeof album.contextInfo.quotedMessage.extendedTextMessage.text !== 'string')) ||
+    !albumContextInfo(body.messageContextInfo)
   )
     fail();
   return album.expectedImageCount;

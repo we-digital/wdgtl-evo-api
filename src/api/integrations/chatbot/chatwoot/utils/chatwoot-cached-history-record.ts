@@ -1,4 +1,9 @@
 import { albumImageCount } from './chatwoot-history-album';
+import {
+  knownHistoryMetadataControl,
+  retainedHistoryMedia,
+  retainedTemplate,
+} from './chatwoot-retained-history-formats';
 
 const ordinaryTypes = new Set([
   'conversation',
@@ -9,6 +14,21 @@ const ordinaryTypes = new Set([
   'documentMessage',
   'stickerMessage',
 ]);
+const validSenderKeySidecar = (body: any) => {
+  const value = body?.senderKeyDistributionMessage;
+  return (
+    value === undefined ||
+    (value &&
+      typeof value === 'object' &&
+      !Array.isArray(value) &&
+      Object.keys(value).every((key) => ['groupId', 'axolotlSenderKeyDistributionMessage'].includes(key)) &&
+      typeof value.groupId === 'string' &&
+      value.groupId.length > 0 &&
+      typeof value.axolotlSenderKeyDistributionMessage === 'string' &&
+      value.axolotlSenderKeyDistributionMessage.length > 0)
+  );
+};
+
 const auxiliaryKeys = new Set(['mediaUrl', 'messageContextInfo', 'senderKeyDistributionMessage']);
 
 export function classifyCachedHistoryRecord(
@@ -20,10 +40,13 @@ export function classifyCachedHistoryRecord(
 ):
   | 'ordinary'
   | 'reaction_control'
+  | 'metadata_control'
   | 'encryption_control'
   | 'unavailable_image_edit'
   | 'unavailable_text_edit'
   | 'unavailable_document_edit'
+  | 'unavailable_audio_edit'
+  | 'conflicting_text_edit'
   | 'encrypted_edit'
   | 'pin_control'
   | 'poll_control'
@@ -39,6 +62,13 @@ export function classifyCachedHistoryRecord(
     ['conversation', 'extendedTextMessage'].includes(record.messageType)
   )
     return 'unavailable_text_edit';
+  if (
+    edited &&
+    record.messageType === 'audioMessage' &&
+    (payload === null ||
+      (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0))
+  )
+    return 'unavailable_audio_edit';
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Cached history payload is unclassifiable');
   }
@@ -47,6 +77,26 @@ export function classifyCachedHistoryRecord(
     return 'album_container';
   }
   const keys = Object.keys(payload);
+  if (knownHistoryMetadataControl(record)) return 'metadata_control';
+  if (
+    record.messageType === 'templateMessage' &&
+    Object.keys(payload).every((key) => key === 'templateMessage' || auxiliaryKeys.has(key))
+  ) {
+    retainedTemplate(payload);
+    return 'ordinary';
+  }
+  if (record.messageType === 'associatedChildMessage') {
+    retainedHistoryMedia(record as any);
+    return 'ordinary';
+  }
+  if (
+    record.messageType === 'contactMessage' &&
+    keys.includes('contactMessage') &&
+    keys.every((key) => key === 'contactMessage' || auxiliaryKeys.has(key)) &&
+    typeof (payload as any).contactMessage?.vcard === 'string' &&
+    /^BEGIN:VCARD\r?\n[\s\S]+\r?\nEND:VCARD\s*$/.test((payload as any).contactMessage.vcard)
+  )
+    return 'ordinary';
   if (keys.length === 0 && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
   if (
     record.messageType === 'reactionMessage' &&
@@ -58,7 +108,7 @@ export function classifyCachedHistoryRecord(
       reaction &&
       typeof reaction === 'object' &&
       !Array.isArray(reaction) &&
-      typeof reaction.text === 'string' &&
+      (reaction.text == null || typeof reaction.text === 'string') &&
       typeof reaction.key?.id === 'string' &&
       reaction.key.id.length > 0 &&
       typeof reaction.key?.remoteJid === 'string'
@@ -66,6 +116,14 @@ export function classifyCachedHistoryRecord(
       return 'reaction_control';
     throw new Error('Cached reaction control is unclassifiable');
   }
+  if (
+    edited &&
+    record.messageType === 'conversation' &&
+    keys.includes('extendedTextMessage') &&
+    keys.every((key) => key === 'extendedTextMessage' || auxiliaryKeys.has(key)) &&
+    typeof (payload as any).extendedTextMessage?.text === 'string'
+  )
+    return 'conflicting_text_edit';
   const primary = (payload as Record<string, any>)[record.messageType];
   const validTarget = (key: any) =>
     key &&
@@ -75,7 +133,10 @@ export function classifyCachedHistoryRecord(
     typeof key.fromMe === 'boolean';
   if (
     record.messageType === 'secretEncryptedMessage' &&
-    keys.every((key) => key === record.messageType || key === 'messageContextInfo') &&
+    keys.every(
+      (key) => key === record.messageType || key === 'messageContextInfo' || key === 'senderKeyDistributionMessage',
+    ) &&
+    validSenderKeySidecar(payload) &&
     primary?.secretEncType === 2 &&
     validTarget(primary.targetMessageKey) &&
     primary.encIv != null &&
@@ -84,7 +145,10 @@ export function classifyCachedHistoryRecord(
     return 'encrypted_edit';
   if (
     record.messageType === 'pinInChatMessage' &&
-    keys.every((key) => key === record.messageType || key === 'messageContextInfo') &&
+    keys.every(
+      (key) => key === record.messageType || key === 'messageContextInfo' || key === 'senderKeyDistributionMessage',
+    ) &&
+    validSenderKeySidecar(payload) &&
     validTarget(primary?.key) &&
     [1, 2].includes(primary.type)
   )

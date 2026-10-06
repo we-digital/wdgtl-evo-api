@@ -8,6 +8,7 @@ import pg from 'pg';
 import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { prepareCachedRecoveryMedia } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { retainedTemplate } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 
 const bytes = Buffer.from('synthetic-owned-pdf');
 function doc(type = 'documentMessage') {
@@ -140,6 +141,9 @@ test('literal whole250 service preflights before writes and uses silent original
   service.getConversationMessage = () => 'synthetic-caption';
   service.waMonitor = { waInstances: {} };
   let stored = false;
+  let wireType = 'document';
+  let currentMedia = media;
+  let expectedContent = 'synthetic-caption';
   let corruptStored = false;
   let persistedEpoch = 1700000000.321;
   let proofs = 0;
@@ -163,7 +167,7 @@ test('literal whole250 service preflights before writes and uses silent original
       findUnique: async ({ where }: any) => rows.find((row) => row.id === where.id),
     },
     messageUpdate: { findMany: async () => [] },
-    media: { findFirst: async () => media },
+    media: { findFirst: async () => currentMedia },
   };
   const methods = [
     'activateHistorySourceGuards',
@@ -213,17 +217,17 @@ test('literal whole250 service preflights before writes and uses silent original
                   attachment_id: 8,
                   source_id: 'WAID:doc',
                   peer: doc().key.remoteJid,
-                  file_type: 3,
+                  file_type: wireType === 'video' ? 2 : 3,
                   message_type: rows[249].key.fromMe ? 1 : 0,
                   private: false,
                   account_id: 1,
                   conversation_account: 1,
                   conversation_inbox: 99,
                   byte_size: bytes.length,
-                  content_type: 'application/pdf',
+                  content_type: currentMedia.mimetype,
                   filename: 'synthetic.pdf',
                   attachment_meta: {
-                    whatsapp_history_media_type: 'document',
+                    whatsapp_history_media_type: wireType,
                     whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
                   },
                   checksum: createHash('md5').update(bytes).digest('base64'),
@@ -231,7 +235,7 @@ test('literal whole250 service preflights before writes and uses silent original
                   created_at_epoch: persistedEpoch,
                   conversation_id: 123,
                   display_id: 345,
-                  content: 'synthetic-caption',
+                  content: expectedContent,
                   content_attributes: {
                     in_reply_to_external_id: 'quoted',
                     synthetic_author: 'preserved',
@@ -242,6 +246,17 @@ test('literal whole250 service preflights before writes and uses silent original
                       participant: null,
                       participant_alt: null,
                       push_name: null,
+                      ...(['associatedChildMessage', 'templateMessage'].includes(rows[249].messageType)
+                        ? {
+                            source: {
+                              message_type: rows[249].messageType,
+                              sha256: createHash('sha256').update(JSON.stringify(rows[249])).digest('hex'),
+                            },
+                          }
+                        : {}),
+                      ...(rows[249].message.templateMessage
+                        ? { template: retainedTemplate(rows[249].message).metadata }
+                        : {}),
                     },
                   },
                 },
@@ -265,7 +280,7 @@ test('literal whole250 service preflights before writes and uses silent original
             message_id: 7,
             source_id: 'WAID:doc',
             attachment_id: 8,
-            media_type: 'document',
+            media_type: wireType,
             sha256: createHash('sha256').update(bytes).digest('hex'),
             byte_size: bytes.length,
           },
@@ -296,7 +311,7 @@ test('literal whole250 service preflights before writes and uses silent original
       'in_reply_to_external_id',
       'synthetic_author',
       'WAID:doc',
-      'synthetic-caption',
+      expectedContent,
     ])
       assert.equal(body.includes(value), true, value);
     if (unknownWrite) throw new Error('synthetic response lost');
@@ -371,6 +386,61 @@ test('literal whole250 service preflights before writes and uses silent original
   );
   assert.equal(outgoing.importedMessages, 1);
   assert.equal(posts, 2);
+  for (const wrapper of ['associatedChildMessage', 'templateMessage']) {
+    stored = false;
+    wireType = 'video';
+    const video = { ...doc().message.documentMessage, mimetype: 'video/mp4', caption: 'synthetic-caption' };
+    currentMedia = {
+      ...media,
+      type: 'videoMessage',
+      mimetype: 'video/mp4',
+      fileName: media.fileName.replace('/documentMessage/', '/videoMessage/'),
+    };
+    const flow = {
+      buttons: [
+        {
+          name: 'cta_url',
+          buttonParamsJson: JSON.stringify({ display_text: 'button', url: 'https://example.test/path' }),
+        },
+      ],
+      messageParamsJson: JSON.stringify({ bottom_sheet: true }),
+    };
+    rows[249] = {
+      ...doc(),
+      messageType: wrapper,
+      message:
+        wrapper === 'associatedChildMessage'
+          ? { associatedChildMessage: { message: { videoMessage: video } } }
+          : {
+              templateMessage: {
+                templateId: 'synthetic',
+                interactiveMessageTemplate: {
+                  body: { text: 'body' },
+                  header: { hasMediaAttachment: true, videoMessage: video },
+                  nativeFlowMessage: flow,
+                },
+              },
+            },
+    };
+    expectedContent = wrapper === 'templateMessage' ? 'body\nbutton: https://example.test/path' : 'synthetic-caption';
+    const before = JSON.stringify(rows);
+    const imported = await service.syncStoredHistoryRecoveryBatch(
+      { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+      request(),
+    );
+    assert.equal(imported.importedMessages, 1);
+    const postCount = posts;
+    const replay = await service.syncStoredHistoryRecoveryBatch(
+      { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+      request(),
+    );
+    assert.equal(replay.importedMessages, 0);
+    assert.equal(posts, postCount);
+    assert.equal(JSON.stringify(rows), before);
+  }
+  wireType = 'document';
+  currentMedia = media;
+  expectedContent = 'synthetic-caption';
   guards = 0;
   editCalls = 0;
   posts = 0;
