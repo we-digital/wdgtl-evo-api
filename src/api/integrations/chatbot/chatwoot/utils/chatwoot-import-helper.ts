@@ -558,8 +558,8 @@ class ChatwootImport {
                    JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
                      AND asa.record_id = a.id AND asa.name = 'file'
                    JOIN active_storage_blobs b ON b.id = asa.blob_id
-                   WHERE a.message_id = m.id AND a.file_type = 3 AND b.content_type = 'application/pdf'
-                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_pdf_document,
+                   WHERE a.message_id = m.id AND a.file_type = 3 AND b.content_type IN ('application/pdf', 'application/msword')
+                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_preservable_document,
                ((SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) = 1
                  AND (SELECT COUNT(*) FROM attachments a
                    JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
@@ -590,7 +590,7 @@ class ChatwootImport {
                 message.chatwootInboxId == null ||
                 message.chatwootConversationId == null
               : documentEdit
-                ? target.has_pdf_document !== true
+                ? target.has_preservable_document !== true
                 : audioEdit
                   ? target.has_audio !== true
                   : target.has_image !== true) ||
@@ -608,7 +608,7 @@ class ChatwootImport {
               Number(message.chatwootConversationId) !== Number(target.display_id))
           ) {
             throw new Error(
-              'Empty provider edit lacks a unique matching destination image, text, audio or PDF document',
+              'Empty provider edit lacks a unique matching destination image, text, audio or supported document',
             );
           }
           await client.query('COMMIT');
