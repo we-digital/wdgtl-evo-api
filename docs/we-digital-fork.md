@@ -620,3 +620,10 @@ Reapply the bounded reaction text condition in `chatwoot-cached-history-record.t
 - Focused validation covers nullable protobuf reactions, exact control shapes and malformed negatives, two edit preservation paths, native templates/wrappers and original whole250 silent media import/replay/postimage guards. Production source/image/readback, current receiver and full source/destination proofs remain separate.
 
 The retained encrypted-edit preservation path accepts a native LID phone alias only when the native `remoteJidAlt` agrees with the current scoped WhatsApp conversation binding and its contact/inbox relation. The original native key, peer, and full native/destination version hashes remain intact; foreign or absent bindings refuse preservation.
+
+
+### Missing native JPEG cache authority (264)
+
+A current native plain `imageMessage` with JPEG MIME may use the existing necessary, bounded descriptor download when its unique same-instance `Media` relation is absent. Owned cached media remains the first choice; a corrupt or unavailable owned object does not trigger a provider fallback. The native key/direction and full plaintext SHA-256/length are mandatory, with the existing fixed HTTPS WhatsApp host, no redirects/reupload/retry, five-second abort, 8 MiB file and 16 MiB batch limits. All missing media is verified before any edit, source guard, import or processed outcome. Unknown kinds/MIME, malformed descriptors, incorrect bytes and uncertain results stop. No socket operation, provider send, read acknowledgement, cache mutation, dependency or schema change is added.
+
+Reapply only `chatwoot-cached-media.ts` and its service callback; rollback restores missing-image refusal. Focused synthetic JPEG tests cover the missing-row path, native envelope retention, cache-first/no-fallback, corrupt SHA/length, host/kind/MIME refusal and the existing deadline. Exact candidate lab and immutable runtime readback remain required before recovery.
