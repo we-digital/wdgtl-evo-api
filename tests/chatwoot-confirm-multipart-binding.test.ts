@@ -178,7 +178,16 @@ test('original confirm consumer persists both acknowledged parts while CW retain
 test('original confirm consumer refuses the later part after receipt rotation and preserves its first confirmed binding', () =>
   runOriginalConsumer(true));
 
-for (const defect of ['missing', 'extra', 'partKey', 'source', 'index', 'incoming', 'noExpectedParts']) {
+for (const defect of [
+  'missing',
+  'extra',
+  'partKey',
+  'source',
+  'index',
+  'incoming',
+  'incomingNull',
+  'noExpectedParts',
+]) {
   test(`later-part mapping refuses ${defect} before native write`, async () => {
     const attrs: any = receipt();
     const expected = structuredClone(parts);
@@ -199,8 +208,8 @@ for (const defect of ['missing', 'extra', 'partKey', 'source', 'index', 'incomin
                 rows: [
                   {
                     conversation_id: 8,
-                    source_id: 'A',
-                    message_type: defect === 'incoming' ? 0 : 1,
+                    source_id: defect === 'incomingNull' ? null : 'A',
+                    message_type: defect.startsWith('incoming') ? 0 : 1,
                     additional_attributes: attrs,
                   },
                 ],

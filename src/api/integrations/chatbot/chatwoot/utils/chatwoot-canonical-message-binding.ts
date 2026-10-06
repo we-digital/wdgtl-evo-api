@@ -46,6 +46,7 @@ export async function withCanonicalChatwootMessageBinding<T>(
       acknowledgedMultipartPartsMatch(message.additional_attributes, message.source_id, scope.acknowledgedParts);
     if (
       original.rows.length !== 1 ||
+      (scope.acknowledgedParts && message.message_type !== 1) ||
       (original.rows[0].source_id &&
         ![scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(original.rows[0].source_id) &&
         !acknowledgedPart)
