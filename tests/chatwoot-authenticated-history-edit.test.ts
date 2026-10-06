@@ -420,3 +420,96 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
   );
   assert.equal(calls, 1);
 });
+
+test('NULL edited PDF document preservation never clears content and rejects foreign or unproved targets', async () => {
+  assert.equal(
+    classifyCachedHistoryRecord({ messageType: 'documentMessage', message: null }, true),
+    'unavailable_document_edit',
+  );
+  for (const record of [
+    { messageType: 'documentMessage', message: null },
+    { messageType: 'audioMessage', message: null },
+    { messageType: 'unknown', message: null },
+  ])
+    assert.throws(() => classifyCachedHistoryRecord(record, false));
+  assert.throws(() => classifyCachedHistoryRecord({ messageType: 'documentMessage', message: {} }, true));
+  const oldPool = postgresClient.getChatwootConnection;
+  const valid = {
+    id: 314,
+    message_type: 0,
+    display_id: 40,
+    private: false,
+    content: '',
+    content_attributes: { in_reply_to: 11 },
+    provider_peer: '123456@g.us',
+    has_pdf_document: true,
+  };
+  const source: any = {
+    id: 'document-source',
+    key: { id: 'document', fromMe: false, remoteJid: '123456@g.us' },
+    messageType: 'documentMessage',
+    message: null,
+    chatwootMessageId: 314,
+    chatwootInboxId: 99,
+    chatwootConversationId: 40,
+  };
+  const variants = [
+    { rows: [valid], message: source, allowed: true },
+    { rows: [], message: source },
+    { rows: [valid, valid], message: source },
+    ...[
+      { has_pdf_document: false },
+      { provider_peer: 'foreign@g.us' },
+      { private: true },
+      { id: 315 },
+      { message_type: 1 },
+      { display_id: 140 },
+      { content_attributes: { deleted: true } },
+    ].map((delta) => ({ rows: [{ ...valid, ...delta }], message: source })),
+    ...['chatwootMessageId', 'chatwootInboxId', 'chatwootConversationId'].map((field) => ({
+      rows: [valid],
+      message: { ...source, [field]: null },
+    })),
+    { rows: [valid], message: { ...source, message: {} } },
+  ];
+  try {
+    for (const variant of variants) {
+      const queries: string[] = [];
+      let releases = 0;
+      postgresClient.getChatwootConnection = (() => ({
+        connect: async () => ({
+          query: async (sql: string) => {
+            queries.push(sql);
+            if (sql.includes('SELECT m.id')) {
+              assert.match(sql, /c\.display_id/);
+              assert.match(sql, /a\.file_type = 3 AND b\.content_type = 'application\/pdf'/);
+              assert.match(sql, /b\.byte_size > 0 AND length\(b\.key\) > 0/);
+            }
+            return { rows: sql.includes('SELECT m.id') ? variant.rows : [] };
+          },
+          release: () => {
+            releases++;
+          },
+        }),
+      })) as any;
+      const before = JSON.stringify(variant);
+      const pending = chatwootImport.reconcileProviderHistoryEdits(
+        [variant.message],
+        99,
+        { accountId: '1' } as any,
+        { applyWhatsappProviderEdit: () => assert.fail('NULL document never clears or sends') } as any,
+      );
+      if ('allowed' in variant)
+        assert.equal((await pending).get('WAID:document'), 'preserved_existing_source_payload_unavailable');
+      else await assert.rejects(pending);
+      assert.equal(JSON.stringify(variant), before);
+      assert.equal(
+        queries.some((sql) => /^(UPDATE|INSERT|DELETE)/.test(sql)),
+        false,
+      );
+      assert.equal(releases, variant.message.message === null ? 1 : 0);
+    }
+  } finally {
+    postgresClient.getChatwootConnection = oldPool;
+  }
+});

@@ -5671,7 +5671,8 @@ export class ChatwootService {
           (message.status === 'EDITED' || editedIds.has(message.id)) &&
           (classification === 'ordinary' ||
             classification === 'unavailable_image_edit' ||
-            classification === 'unavailable_text_edit')
+            classification === 'unavailable_text_edit' ||
+            classification === 'unavailable_document_edit')
         );
       });
       const encryptedEdits = authoritativeMessages.filter(

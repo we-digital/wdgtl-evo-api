@@ -21,11 +21,13 @@ export function classifyCachedHistoryRecord(
   | 'encryption_control'
   | 'unavailable_image_edit'
   | 'unavailable_text_edit'
+  | 'unavailable_document_edit'
   | 'encrypted_edit'
   | 'pin_control'
   | 'poll_control' {
   const payload = record.message;
-  // SQL JSON null is an unavailable retained edit, never an instruction to clear an image.
+  // SQL JSON null is an unavailable retained edit, never an instruction to clear its destination.
+  if (payload === null && edited && record.messageType === 'documentMessage') return 'unavailable_document_edit';
   if (payload === null && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
   if (
     (payload === null ||

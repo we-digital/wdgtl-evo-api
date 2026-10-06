@@ -427,8 +427,9 @@ class ChatwootImport {
         (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0)
       ) {
         const textEdit = ['conversation', 'extendedTextMessage'].includes(message.messageType);
-        if (message.messageType !== 'imageMessage' && !textEdit)
-          throw new Error('Empty provider edit is not a known image or text');
+        const documentEdit = message.messageType === 'documentMessage' && payload === null;
+        if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit)
+          throw new Error('Empty provider edit is not a known image, text or NULL document');
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
@@ -438,7 +439,14 @@ class ChatwootImport {
                  JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
                    AND asa.record_id = a.id AND asa.name = 'file'
                  JOIN active_storage_blobs b ON b.id = asa.blob_id
-                 WHERE a.message_id = m.id AND a.file_type = 0 AND b.content_type LIKE 'image/%') AS has_image
+                 WHERE a.message_id = m.id AND a.file_type = 0 AND b.content_type LIKE 'image/%') AS has_image,
+               ((SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) = 1
+                 AND (SELECT COUNT(*) FROM attachments a
+                   JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
+                     AND asa.record_id = a.id AND asa.name = 'file'
+                   JOIN active_storage_blobs b ON b.id = asa.blob_id
+                   WHERE a.message_id = m.id AND a.file_type = 3 AND b.content_type = 'application/pdf'
+                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_pdf_document
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
              WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
@@ -461,7 +469,15 @@ class ChatwootImport {
                 message.chatwootMessageId == null ||
                 message.chatwootInboxId == null ||
                 message.chatwootConversationId == null
-              : target.has_image !== true) ||
+              : documentEdit
+                ? target.has_pdf_document !== true
+                : target.has_image !== true) ||
+            (documentEdit &&
+              (!key.remoteJid ||
+                target.provider_peer !== key.remoteJid ||
+                message.chatwootMessageId == null ||
+                message.chatwootInboxId == null ||
+                message.chatwootConversationId == null)) ||
             attributes?.deleted === true ||
             Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
             (message.chatwootMessageId != null && Number(message.chatwootMessageId) !== Number(target.id)) ||
@@ -469,7 +485,7 @@ class ChatwootImport {
             (message.chatwootConversationId != null &&
               Number(message.chatwootConversationId) !== Number(target.display_id))
           ) {
-            throw new Error('Empty provider edit lacks a unique matching destination image or text');
+            throw new Error('Empty provider edit lacks a unique matching destination image, text or PDF document');
           }
           await client.query('COMMIT');
           preserved.set(sourceId, 'preserved_existing_source_payload_unavailable');
