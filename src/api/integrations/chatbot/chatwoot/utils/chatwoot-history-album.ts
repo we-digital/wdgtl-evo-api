@@ -1,0 +1,270 @@
+import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
+
+const fail = () => {
+  throw new Error('Album container dependencies or preserved destination are unproved');
+};
+const object = (value: any) => value && typeof value === 'object' && !Array.isArray(value);
+const sorted = (value: any): any =>
+  value instanceof Date
+    ? value.toISOString()
+    : Array.isArray(value)
+      ? value.map(sorted)
+      : object(value)
+        ? Object.fromEntries(
+            Object.keys(value)
+              .sort()
+              .map((key) => [key, sorted(value[key])]),
+          )
+        : value;
+const metadata = (value: any) =>
+  value === undefined ||
+  (object(value) &&
+    Object.keys(value).every((key) => ['messageSecret', 'threadId', 'messageAssociation'].includes(key)) &&
+    (value.messageSecret === undefined ||
+      (typeof value.messageSecret === 'string' &&
+        Buffer.from(value.messageSecret, 'base64').length === 32 &&
+        Buffer.from(value.messageSecret, 'base64').toString('base64') === value.messageSecret)) &&
+    (value.threadId === undefined || (Array.isArray(value.threadId) && value.threadId.length === 0)));
+const hash = (value: any) =>
+  createHash('sha256')
+    .update(JSON.stringify(sorted(value)))
+    .digest('hex');
+
+export function albumImageCount(record: any): number {
+  const body = record.message;
+  const album = body?.albumMessage;
+  if (
+    record.messageType !== 'albumMessage' ||
+    !object(body) ||
+    !object(album) ||
+    !Object.keys(body).every((key) => ['albumMessage', 'messageContextInfo'].includes(key)) ||
+    !Object.keys(album).every((key) => ['expectedImageCount', 'expectedVideoCount', 'contextInfo'].includes(key)) ||
+    !Number.isInteger(album.expectedImageCount) ||
+    album.expectedImageCount < 1 ||
+    album.expectedImageCount > 13 ||
+    album.expectedVideoCount !== 0 ||
+    (album.contextInfo !== undefined &&
+      (!object(album.contextInfo) ||
+        !Object.keys(album.contextInfo).every((key) =>
+          [
+            'isForwarded',
+            'mentionedJid',
+            'forwardOrigin',
+            'groupMentions',
+            'forwardingScore',
+            'statusAttributions',
+          ].includes(key),
+        ))) ||
+    (body.messageContextInfo !== undefined &&
+      (!object(body.messageContextInfo) ||
+        !metadata(body.messageContextInfo) ||
+        !Object.keys(body.messageContextInfo).every((key) => ['messageSecret', 'threadId'].includes(key))))
+  )
+    fail();
+  return album.expectedImageCount;
+}
+
+const bytes = (value: any) => {
+  if (Number.isSafeInteger(value) && value > 0) return BigInt(value);
+  if (
+    object(value) &&
+    Number.isInteger(value.low) &&
+    Number.isInteger(value.high) &&
+    value.low >= -2147483648 &&
+    value.low <= 2147483647 &&
+    value.high >= -2147483648 &&
+    value.high <= 2147483647 &&
+    value.unsigned === true
+  )
+    return (BigInt(value.high >>> 0) << 32n) | BigInt(value.low >>> 0);
+  return fail();
+};
+
+export async function preserveAlbumContainers(
+  parents: any[],
+  repository: any,
+  pool: any,
+  accountID: number,
+  inboxID: number,
+) {
+  const snapshots = new Map<string, any>();
+  const proofs = new Map<string, any>();
+  const read = async (parent: any) => {
+    const count = albumImageCount(parent);
+    const key = parent.key;
+    if (
+      !parent.instanceId ||
+      typeof key?.id !== 'string' ||
+      !key.id ||
+      key.fromMe !== false ||
+      typeof key.remoteJid !== 'string' ||
+      !key.remoteJid.endsWith('@g.us') ||
+      typeof key.participant !== 'string' ||
+      !key.participant
+    )
+      fail();
+    const originals = await repository.findMany({
+      where: { instanceId: parent.instanceId, key: { path: ['id'], equals: key.id } },
+      take: 2,
+    });
+    if (originals.length !== 1 || !isDeepStrictEqual(originals[0], parent)) fail();
+    // Do not filter peer/direction/type: contradictory associations must remain visible and refuse.
+    const children = await repository.findMany({
+      where: {
+        instanceId: parent.instanceId,
+        message: { path: ['messageContextInfo', 'messageAssociation', 'parentMessageKey', 'id'], equals: key.id },
+      },
+      take: count + 1,
+      orderBy: { id: 'asc' },
+    });
+    if (
+      children.length !== count ||
+      new Set(children.map((child: any) => child.id)).size !== count ||
+      new Set(children.map((child: any) => child.key?.id)).size !== count
+    )
+      fail();
+    for (const child of children) {
+      const association = child.message?.messageContextInfo?.messageAssociation;
+      const nested = association?.parentMessageKey;
+      const image = child.message?.imageMessage;
+      if (
+        child.instanceId !== parent.instanceId ||
+        child.messageType !== 'imageMessage' ||
+        !object(image) ||
+        !object(child.message) ||
+        !Object.keys(child.message).every((name) =>
+          ['imageMessage', 'messageContextInfo', 'mediaUrl'].includes(name),
+        ) ||
+        child.key?.fromMe !== false ||
+        child.key.remoteJid !== key.remoteJid ||
+        child.key.participant !== key.participant ||
+        child.key.participantAlt !== key.participantAlt ||
+        typeof child.key.id !== 'string' ||
+        !child.key.id ||
+        !metadata(child.message.messageContextInfo) ||
+        !object(association) ||
+        !Object.keys(association).every((name) => ['associationType', 'parentMessageKey'].includes(name)) ||
+        association.associationType !== 1 ||
+        nested?.id !== key.id ||
+        nested.remoteJid !== key.remoteJid ||
+        !Object.prototype.hasOwnProperty.call(nested, 'fromMe') ||
+        typeof nested.fromMe !== 'boolean' ||
+        !Number.isSafeInteger(child.chatwootMessageId) ||
+        child.chatwootMessageId <= 0 ||
+        child.chatwootInboxId !== inboxID ||
+        !Number.isSafeInteger(child.chatwootConversationId) ||
+        child.chatwootConversationId <= 0 ||
+        image.mimetype !== 'image/jpeg' ||
+        bytes(image.fileLength) <= 0n
+      )
+        fail();
+    }
+    const versions = await repository.findMany({
+      where: {
+        instanceId: parent.instanceId,
+        OR: children.map((child: any) => ({ key: { path: ['id'], equals: child.key.id } })),
+      },
+      take: count + 1,
+      orderBy: { id: 'asc' },
+    });
+    if (!isDeepStrictEqual(versions, children)) fail();
+    const client = await pool.connect();
+    let targets: any[];
+    try {
+      await client.query('BEGIN READ ONLY');
+      await client.query("SET LOCAL statement_timeout = '5s'");
+      const result = await client.query(
+        `SELECT to_jsonb(m) AS message, to_jsonb(c) AS conversation,
+        to_jsonb(ci) AS contact_inbox, to_jsonb(ct) AS contact, to_jsonb(b) AS binding,
+        COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment',to_jsonb(a),'storage',to_jsonb(s),'blob',to_jsonb(bl)) ORDER BY a.id,s.id)
+          FROM attachments a LEFT JOIN active_storage_attachments s ON s.record_type='Attachment' AND s.record_id=a.id
+          LEFT JOIN active_storage_blobs bl ON bl.id=s.blob_id WHERE a.message_id=m.id),'[]'::jsonb) AS media
+        FROM messages m JOIN conversations c ON c.id=m.conversation_id
+        JOIN contact_inboxes ci ON ci.id=c.contact_inbox_id JOIN contacts ct ON ct.id=c.contact_id
+        LEFT JOIN provider_conversation_bindings b ON b.conversation_id=c.id AND b.account_id=c.account_id AND b.inbox_id=c.inbox_id
+        WHERE m.inbox_id=$1 AND m.source_id=ANY($2::text[]) ORDER BY m.id`,
+        [inboxID, children.flatMap((child: any) => ['WAID:' + child.key.id, child.key.id])],
+      );
+      targets = result.rows;
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+    if (targets.length !== count) fail();
+    for (const child of children) {
+      const matches = targets.filter((row) => ['WAID:' + child.key.id, child.key.id].includes(row.message.source_id));
+      if (matches.length !== 1) fail();
+      const { message: m, conversation: c, contact_inbox: ci, contact: ct, binding: b, media } = matches[0];
+      const attributes =
+        typeof m.content_attributes === 'string' ? JSON.parse(m.content_attributes) : m.content_attributes;
+      if (
+        m.id !== child.chatwootMessageId ||
+        m.account_id !== accountID ||
+        m.inbox_id !== inboxID ||
+        m.message_type !== 0 ||
+        m.private !== false ||
+        c.account_id !== accountID ||
+        c.inbox_id !== inboxID ||
+        c.display_id !== child.chatwootConversationId ||
+        ci.inbox_id !== inboxID ||
+        ci.contact_id !== c.contact_id ||
+        ct.id !== c.contact_id ||
+        ct.account_id !== accountID ||
+        b?.provider !== 'whatsapp' ||
+        b.peer !== key.remoteJid ||
+        attributes?.deleted === true ||
+        attributes?.we_digital_ingress?.version !== 2 ||
+        attributes.we_digital_ingress.provider !== 'evo_whatsapp' ||
+        attributes.we_digital_ingress.scope !== 'group' ||
+        attributes.we_digital_ingress.direction !== 'inbound' ||
+        attributes.we_digital_ingress.from_me !== false ||
+        !Array.isArray(media) ||
+        media.length !== 1 ||
+        media[0].attachment.file_type !== 0 ||
+        media[0].storage?.name !== 'file' ||
+        media[0].blob?.content_type !== child.message.imageMessage.mimetype ||
+        BigInt(media[0].blob?.byte_size || 0) !== bytes(child.message.imageMessage.fileLength)
+      )
+        fail();
+    }
+    return { parent, children, targets };
+  };
+  for (const parent of parents) {
+    const snapshot = await read(parent);
+    snapshots.set(parent.id, snapshot);
+    proofs.set('WAID:' + parent.key.id, {
+      version: 1,
+      accountID,
+      inboxID,
+      parentSourceID: 'WAID:' + parent.key.id,
+      parentVersionSHA256: hash({
+        key: parent.key,
+        message: parent.message,
+        messageTimestamp: parent.messageTimestamp,
+        messageType: parent.messageType,
+        status: parent.status,
+      }),
+      expectedImages: snapshot.children.length,
+      expectedVideos: 0,
+      unresolvedSemantics: 'nested_sender_relative_direction_not_normalized',
+      children: snapshot.children.map((child: any) => ({
+        sourceID: 'WAID:' + child.key.id,
+        nativeVersionSHA256: hash(child),
+        destinationMessageID: child.chatwootMessageId,
+        destinationDisplayID: child.chatwootConversationId,
+        nestedFromMe: child.message.messageContextInfo.messageAssociation.parentMessageKey.fromMe,
+      })),
+      destinationSnapshotSHA256: hash(snapshot.targets),
+    });
+  }
+  return {
+    proofs,
+    assertCurrent: async () => {
+      for (const parent of parents) if (!isDeepStrictEqual(snapshots.get(parent.id), await read(parent))) fail();
+    },
+  };
+}

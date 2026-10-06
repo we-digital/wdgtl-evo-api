@@ -1,3 +1,5 @@
+import { albumImageCount } from './chatwoot-history-album';
+
 const ordinaryTypes = new Set([
   'conversation',
   'extendedTextMessage',
@@ -24,7 +26,8 @@ export function classifyCachedHistoryRecord(
   | 'unavailable_document_edit'
   | 'encrypted_edit'
   | 'pin_control'
-  | 'poll_control' {
+  | 'poll_control'
+  | 'album_container' {
   const payload = record.message;
   // SQL JSON null is an unavailable retained edit, never an instruction to clear its destination.
   if (payload === null && edited && record.messageType === 'documentMessage') return 'unavailable_document_edit';
@@ -38,6 +41,10 @@ export function classifyCachedHistoryRecord(
     return 'unavailable_text_edit';
   if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
     throw new Error('Cached history payload is unclassifiable');
+  }
+  if (record.messageType === 'albumMessage') {
+    albumImageCount(record);
+    return 'album_container';
   }
   const keys = Object.keys(payload);
   if (keys.length === 0 && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';

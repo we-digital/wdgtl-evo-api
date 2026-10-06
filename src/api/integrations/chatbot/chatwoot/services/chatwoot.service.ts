@@ -39,6 +39,7 @@ import {
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
+import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
@@ -5740,10 +5741,24 @@ export class ChatwootService {
         encryptedTargets.set(target.id, target);
         recoveredEdits.push(recovered);
       }
+      const albumParents = authoritativeMessages.filter(
+        (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'album_container',
+      );
+      const albumPreservation = await preserveAlbumContainers(
+        albumParents,
+        this.prismaRepository.message,
+        postgresClient.getChatwootConnection(),
+        Number(provider.accountId),
+        inbox.id,
+      );
       const ordinaryMessages = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
       );
-      await chatwootImport.activateHistorySourceGuards(Array.from(requestedSourceIds), inbox.id);
+      await albumPreservation.assertCurrent();
+      await chatwootImport.activateHistorySourceGuards(
+        Array.from(requestedSourceIds).filter((id) => !albumPreservation.proofs.has(id)),
+        inbox.id,
+      );
       const preparedBySourceId = new Map(
         ordinaryMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
@@ -5881,9 +5896,18 @@ export class ChatwootService {
         )
           throw new Error('Retained encrypted edit source or original rotated during reconciliation');
       }
+      await albumPreservation.assertCurrent();
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
+        if (classification === 'album_container')
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: 'preserved_unsupported_album_container',
+            recovery: 'unsupported',
+            albumPreservation: albumPreservation.proofs.get(sourceId),
+          };
         if (classification === 'encrypted_edit')
           return { sourceId, status: 'existing', reason: 'authenticated_provider_edit_reconciled', recovery: 'native' };
         if (classification === 'pin_control' || classification === 'poll_control')
