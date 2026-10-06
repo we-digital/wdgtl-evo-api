@@ -556,3 +556,21 @@ single-body refusal and leaves retained source/gap data intact. Focused checks:
 `npx tsx --test tests/chatwoot-authenticated-history-edit.test.ts`,
 `npx tsc --noEmit --incremental false`, normal ESLint on the helper, and an exact
 candidate network-isolated synthetic lab before immutable production readback.
+
+
+### Missing retained PDF document edit payload
+
+Cached recovery explicitly preserves a NULL edited document only when the existing public destination is unique for its source/account/inbox/direction, authenticated peer and bound message/display IDs, with exactly one file attachment backed by nonempty PDF blob metadata. It emits the existing unresolved payload-unavailable outcome, keeps original content/context/media and never claims the edit or blob content was recovered. Unknown types, non-NULL malformed documents and ambiguous targets still stop the whole batch. No provider sends, routing change, dependency upgrade or migration.
+
+Source: `chatwoot-cached-history-record.ts`, `chatwoot-import-helper.ts`, and `chatwoot.service.ts` under `src/api/integrations/chatbot/chatwoot/`. Reapply these focused branches after upstream changes to recovery classification/edit reconciliation; reverting restores safe refusal. Deploy the matching official cache document gap validator before acknowledging this new outcome. Focused regression: `node node_modules/tsx/dist/cli.mjs --test --test-name-pattern="NULL edited PDF" tests/chatwoot-authenticated-history-edit.test.ts`.
+
+Native source-bound pointer IDs remain mandatory: absent or stale pointers refuse. A saved storage existence check alone never establishes native-pointer eligibility or recovered edit content.
+
+
+### Typed album-container preservation (259)
+
+Recovery recognizes only bounded incoming group image albums (1–13 declared JPEG images, no videos). Before any batch effect it validates the complete current same-instance association set, unique native keys, authoritative outer participant/direction and each existing scoped CW pointer/binding/media destination. Full native and destination snapshots are checked again before accounting. Nested sender-relative `fromMe` bits remain raw; no normalization policy, media availability or restored album UX is asserted. Unknown variants/missing/extra/conflicting dependencies refuse; no parent bubble/import/edit/media write or provider send occurs.
+
+The official history schema5 adds only `recovery_album_gaps`; prior schema4 tables/data remain. A skipped preserve-only outcome stores the exact parent and dependency proof as an unresolved gap, atomically with version-CAS processed bookkeeping. New source versions invalidate ACK. Existing SQLite backup, jobs/leases/cache/other gaps are retained. Deploy new history schema5 before activating EFO album support, through exact PR→synthetic lab→main→immutable readback. Rollback must preserve the new table/gaps; older readers cannot claim schema5 compatibility. Do not replay ambiguous effects.
+
+Source areas: EFO `chatwoot-history-album.ts`, `chatwoot-cached-history-record.ts`, `chatwoot.service.ts`; history `cache/album-preservation.ts`, `cache/sqlite-cache-store.ts`, `evolution/evolution-client.ts`. Focused checks: EFO `node --import tsx --test tests/chatwoot-album-preservation.test.ts` and `node node_modules/typescript/bin/tsc --noEmit`; history `node node_modules/vitest/vitest.mjs run test/album-preservation.test.ts` and `node node_modules/typescript/bin/tsc --noEmit`. Runtime lint: EFO normal ESLint on the three named runtime files. No dependency/provider upgrade.
