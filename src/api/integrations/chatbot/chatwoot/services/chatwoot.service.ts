@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
 import { InstanceDto } from '@api/dto/instance.dto';
@@ -16,6 +17,7 @@ import {
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import { prepareCachedRecoveryMedia } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
 import {
   buildWhatsappGroupParticipantSnapshots,
@@ -131,6 +133,7 @@ import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
+import { readStoredFile } from '@api/integrations/storage/s3/libs/minio.server';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
 import { WAMonitoringService } from '@api/services/monitor.service';
@@ -1866,11 +1869,21 @@ export class ChatwootService {
     quotedMsg?: MessageModel,
     provider?: ChatwootModel,
     clientSent = false,
+    recovery?: {
+      inboxId: number;
+      timestamp: number;
+      peer: string;
+      mimetype: string;
+      size: number;
+      sha256: string;
+      mediaType: string;
+    },
   ) {
     if (sourceId && this.isImportHistoryAvailable()) {
       const messageAlreadySaved = await chatwootImport.getExistingSourceIds([sourceId], conversationId);
       if (messageAlreadySaved) {
         if (messageAlreadySaved.size > 0) {
+          if (recovery) throw new Error('cached_media_destination_rotated_before_import');
           this.logger.warn('Message already saved on chatwoot');
           return null;
         }
@@ -1884,8 +1897,12 @@ export class ChatwootService {
 
     data.append('message_type', messageType);
 
-    data.append('attachments[]', fileStream, { filename: fileName });
+    data.append('attachments[]', fileStream, {
+      filename: fileName,
+      ...(recovery ? { contentType: recovery.mimetype } : {}),
+    });
 
+    let expectedContentAttributes: Record<string, unknown> = {};
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     if (!provider) {
@@ -1899,7 +1916,20 @@ export class ChatwootService {
       const contentAttributes = JSON.stringify({
         ...replyToIds,
         ...ingressAttributes,
+        ...(recovery
+          ? {
+              provider_history_native: {
+                message_id: messageBody.id,
+                from_me: messageBody.key.fromMe,
+                remote_jid: messageBody.key.remoteJid,
+                participant: messageBody.key.participant ?? messageBody.participant ?? null,
+                participant_alt: messageBody.key.participantAlt ?? null,
+                push_name: messageBody.pushName ?? null,
+              },
+            }
+          : {}),
       });
+      expectedContentAttributes = JSON.parse(contentAttributes);
       data.append('content_attributes', contentAttributes);
     }
 
@@ -1911,12 +1941,40 @@ export class ChatwootService {
       data.append('source_id', sourceId);
     }
 
+    if (recovery) {
+      if (!['incoming', 'outgoing'].includes(messageType) || !instance || !sourceId || !provider)
+        throw new Error('cached_media_silent_import_unavailable');
+      data.append('external_created_at', String(recovery.timestamp));
+      data.append('private', 'false');
+      data.append('provider_peer', recovery.peer);
+      data.append('provider_file_sha256', recovery.sha256);
+      data.append('provider_file_bytes', String(recovery.size));
+      data.append('provider_media_type', recovery.mediaType);
+      data.append('provider_instance_id', instance.instanceId || messageBody.instanceId);
+      data.append('provider_instance_name', instance.instanceName);
+      const binding = await this.assertSilentHistoryMediaCapability(instance, provider, recovery.inboxId);
+      data.append('provider_receiver_fingerprint', binding.receiver_fingerprint);
+    }
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+      url: recovery
+        ? requireTrustedChatwootUrl(
+            provider.url,
+            this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL,
+            `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+          )
+        : `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+      ...(recovery ? { timeout: 30_000, maxRedirects: 0 } : {}),
       headers: {
         'api-access-token': provider.token,
+        ...(recovery
+          ? {
+              'X-Chatwoot-Native-Bridge-Token': this.configService.get<Chatwoot>('CHATWOOT').NATIVE_BRIDGE_TOKEN,
+              'X-Chatwoot-History-Import': '1',
+              'X-Chatwoot-History-Inbox-Id': String(recovery.inboxId),
+            }
+          : {}),
         ...data.getHeaders(),
       },
       data: data,
@@ -1925,12 +1983,74 @@ export class ChatwootService {
     try {
       const { data } = await axios.request(config);
 
-      await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId);
+      if (!recovery) await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId);
 
-      return data;
+      return recovery ? { message: data, expectedContentAttributes } : data;
     } catch (error) {
+      if (recovery) throw new Error('cached_media_import_write_outcome_unconfirmed');
       this.logger.error(error);
     }
+  }
+
+  private readCachedRecoveryObject(name: string, limit: number, mime: string) {
+    return readStoredFile(name, limit, mime);
+  }
+
+  private async assertSilentHistoryMediaCapability(instance: InstanceDto, provider: ChatwootModel, inboxId: number) {
+    const payload = await this.providerConversationRequest(provider, 'GET', { inbox_id: inboxId });
+    const binding = this.buildEvoRouteBinding(instance, provider, inboxId);
+    if (
+      payload?.enabled !== true ||
+      payload?.provider !== 'whatsapp' ||
+      payload?.whatsapp_history_import_contract_version !== 1 ||
+      !binding ||
+      !chatwootEvoRouteBindingsEqual(binding, payload.binding)
+    )
+      throw new Error('cached_media_silent_import_unavailable');
+    return binding;
+  }
+
+  private async verifyRecoveryMediaDestination(
+    message: MessageModel,
+    provider: ChatwootModel,
+    inboxId: number,
+    descriptor: { filename: string; mimetype: string; size: number; digest: Buffer },
+    bytes: Buffer,
+    expected: { conversationId: number; displayId: number; content: string; attributes: Record<string, unknown> },
+  ) {
+    const rows = await postgresClient.getChatwootConnection().query(
+      `SELECT m.id, m.message_type, m.private, m.account_id, m.inbox_id, m.created_at, m.content, m.content_attributes, c.id AS conversation_id, c.display_id,
+         c.account_id AS conversation_account, c.inbox_id AS conversation_inbox,
+         b.byte_size, b.content_type, b.filename, b.checksum, b.metadata
+       FROM messages m JOIN conversations c ON c.id=m.conversation_id
+       JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
+       JOIN active_storage_attachments sa ON sa.record_type='Attachment' AND sa.record_id=a.id AND sa.name='file'
+       JOIN active_storage_blobs b ON b.id=sa.blob_id
+       WHERE m.inbox_id=$1 AND m.source_id=ANY($2::text[])`,
+      [inboxId, [toChatwootSourceId((message.key as { id: string }).id), (message.key as { id: string }).id]],
+    );
+    const row = rows.rows[0];
+    if (
+      rows.rows.length !== 1 ||
+      Number(row.message_type) !== ((message.key as { fromMe: boolean }).fromMe ? 1 : 0) ||
+      row.private !== false ||
+      Number(row.account_id) !== Number(provider.accountId) ||
+      Number(row.conversation_account) !== Number(provider.accountId) ||
+      Number(row.conversation_inbox) !== inboxId ||
+      Number(row.byte_size) !== bytes.length ||
+      Number(row.conversation_id) !== expected.conversationId ||
+      Number(row.display_id) !== expected.displayId ||
+      row.content !== (expected.content || null) ||
+      Object.entries(expected.attributes).some(
+        ([key, value]) => !isDeepStrictEqual(row.content_attributes?.[key], value),
+      ) ||
+      row.metadata?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
+      row.content_type !== descriptor.mimetype ||
+      row.filename !== descriptor.filename ||
+      row.checksum !== createHash('md5').update(bytes).digest('base64') ||
+      new Date(row.created_at).getTime() !== message.messageTimestamp * 1000
+    )
+      throw new Error('cached_media_import_postimage_unconfirmed');
   }
 
   public async createBotQr(
@@ -5799,17 +5919,6 @@ export class ChatwootService {
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
       );
       await albumPreservation.assertCurrent();
-      await chatwootImport.activateHistorySourceGuards(
-        Array.from(
-          new Set([
-            ...requestedSourceIds,
-            ...Array.from(encryptedTargets.values()).map((target) =>
-              toChatwootSourceId((target.key as { id: string }).id),
-            ),
-          ]),
-        ).filter((id) => !albumPreservation.proofs.has(id)),
-        inbox.id,
-      );
       const preparedBySourceId = new Map(
         ordinaryMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
@@ -5853,26 +5962,53 @@ export class ChatwootService {
       );
       const { messages: uniqueMessages, duplicateMessages: duplicateSourceMessagesSkipped } =
         dedupeHistoryMessagesBySourceId(scopedMessages);
-      const outboundBridgeSourceIds = await chatwootImport.reconcileOutboundHistoryBindings(
-        authoritativeMessages,
-        inbox.id,
-      );
       const existingSourceIds = await chatwootImport.getVerifiedRecoverySourceIds(
         authoritativeMessages,
         inbox.id,
         provider,
       );
-      for (const sourceId of outboundBridgeSourceIds) {
-        existingSourceIds.add(sourceId);
+      const initiallyMissing = uniqueMessages.filter(
+        (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
+      );
+      const cachedMedia = await prepareCachedRecoveryMedia(
+        initiallyMissing.map((message) => storedById.get(message.id)!),
+        (message) =>
+          this.prismaRepository.media.findFirst({ where: { messageId: message.id, instanceId: message.instanceId } }),
+        (name, limit, mime) => this.readCachedRecoveryObject(name, limit, mime),
+      );
+      if (cachedMedia.size) {
+        const config = this.configService.get<Chatwoot>('CHATWOOT');
+        if (!config.PROVIDER_CONVERSATION_BINDINGS || !config.NATIVE_BRIDGE_TOKEN)
+          throw new Error('cached_media_silent_import_unavailable');
+        await this.assertSilentHistoryMediaCapability(instance, provider, inbox.id);
       }
+      const currentWholeSource = await this.prismaRepository.message.findMany({
+        where: { Instance: { name: instance.instanceName }, id: { in: Array.from(requestedDatabaseIds) } },
+      });
+      if (
+        currentWholeSource.length !== authoritativeMessages.length ||
+        currentWholeSource.some((row) => !isDeepStrictEqual(row, storedById.get(row.id)))
+      )
+        throw new Error('cached_media_whole_source_rotated_before_import');
+      await chatwootImport.activateHistorySourceGuards(
+        Array.from(
+          new Set([
+            ...requestedSourceIds,
+            ...Array.from(encryptedTargets.values()).map((target) =>
+              toChatwootSourceId((target.key as { id: string }).id),
+            ),
+          ]),
+        ).filter((id) => !albumPreservation.proofs.has(id)),
+        inbox.id,
+      );
+      const outboundBridgeSourceIds = await chatwootImport.reconcileOutboundHistoryBindings(
+        authoritativeMessages,
+        inbox.id,
+      );
+      for (const sourceId of outboundBridgeSourceIds) existingSourceIds.add(sourceId);
       const missingMessages = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
-      // This native SQL importer cannot materialize media blobs. Existence of a
-      // placeholder must not be mistaken for a completely recovered attachment.
-      if (missingMessages.some((message) => !['conversation', 'extendedTextMessage'].includes(message.messageType))) {
-        throw new Error('Cached recovery cannot prove complete media import; keep the job paused');
-      }
       // Retained edits are updates, even when the original source already exists.
       // Confirm them before acknowledging this batch so the ordinary worker can retry failures.
       const editedSourceIds = new Set(
@@ -5903,8 +6039,8 @@ export class ChatwootService {
         provider,
         this,
       );
-      const importableMessages = missingMessages.filter((message: any) =>
-        Boolean(chatwootImport.getContentMessage(this, message)),
+      const importableMessages = missingMessages.filter(
+        (message: any) => !cachedMedia.has(message.id) && Boolean(chatwootImport.getContentMessage(this, message)),
       );
       const importableSourceIds = new Set(
         importableMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
@@ -5931,6 +6067,75 @@ export class ChatwootService {
         }
         appliedMessages = appliedSourceIds.size;
         await this.waMonitor.waInstances[instance.instanceName]?.clearCacheChatwoot?.();
+      }
+
+      for (const message of missingMessages) {
+        const cached = cachedMedia.get(message.id);
+        if (!cached) continue;
+        const sourceId = toChatwootSourceId((message.key as { id: string }).id);
+        if ((await chatwootImport.getVerifiedRecoverySourceIds([message], inbox.id, provider)).has(sourceId))
+          throw new Error('cached_media_destination_rotated_before_import');
+        const current = await this.prismaRepository.message.findUnique({ where: { id: message.id } });
+        const original = storedById.get(message.id);
+        const currentMedia = await this.prismaRepository.media.findFirst({
+          where: { messageId: message.id, instanceId: message.instanceId },
+        });
+        if (!isDeepStrictEqual(current, original) || !isDeepStrictEqual(currentMedia, cached.media))
+          throw new Error('cached_media_source_rotated_before_import');
+        const mapped = chatwootImport.createMessagesMapByIdentity([message]);
+        const peer = [...mapped.keys()][0];
+        const fks = await chatwootImport.selectOrCreateFksFromChatwoot(
+          provider,
+          inbox,
+          new Map([[peer, { first: message.messageTimestamp, last: message.messageTimestamp }]]),
+          mapped,
+          await this.getGroupIdentityNames(instance, [message]),
+        );
+        const conversationId = Number(fks.get(peer)?.conversation_id);
+        if (!Number.isSafeInteger(conversationId) || conversationId < 1)
+          throw new Error('cached_media_canonical_destination_unavailable');
+        const canonical = await postgresClient.getChatwootConnection().query(
+          `SELECT c.id, c.display_id FROM conversations c JOIN provider_conversation_bindings b
+           ON b.conversation_id=c.id AND b.account_id=c.account_id AND b.inbox_id=c.inbox_id
+           WHERE c.id=$1 AND c.account_id=$2 AND c.inbox_id=$3 AND b.provider='whatsapp' AND b.peer=$4`,
+          [conversationId, Number(provider.accountId), inbox.id, peer],
+        );
+        const displayId = Number(canonical.rows[0]?.display_id);
+        if (canonical.rows.length !== 1 || !Number.isSafeInteger(displayId) || displayId < 1)
+          throw new Error('cached_media_canonical_destination_unavailable');
+        const content = this.getConversationMessage(message.message);
+        const uploaded = await this.sendData(
+          displayId,
+          Readable.from(cached.bytes),
+          cached.descriptor.filename,
+          (message.key as { fromMe: boolean }).fromMe ? 'outgoing' : 'incoming',
+          content,
+          instance,
+          message,
+          sourceId,
+          undefined,
+          provider,
+          false,
+          {
+            inboxId: inbox.id,
+            timestamp: message.messageTimestamp,
+            peer,
+            mimetype: cached.descriptor.mimetype,
+            size: cached.descriptor.size,
+            sha256: cached.descriptor.digest.toString('hex'),
+            mediaType: cached.media.type,
+          },
+        );
+        await this.verifyRecoveryMediaDestination(message, provider, inbox.id, cached.descriptor, cached.bytes, {
+          conversationId,
+          displayId,
+          content,
+          attributes: uploaded.expectedContentAttributes,
+        });
+        appliedSourceIds.add(sourceId);
+        importableSourceIds.add(sourceId);
+        importedMessages++;
+        appliedMessages++;
       }
 
       await chatwootImport.reconcileProviderHistoryEdits(
@@ -5977,6 +6182,14 @@ export class ChatwootService {
       }
       for (const envelope of encryptedEdits)
         await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
+      for (const [id, cached] of cachedMedia) {
+        const current = await this.prismaRepository.message.findUnique({ where: { id } });
+        const media = await this.prismaRepository.media.findFirst({
+          where: { messageId: id, instanceId: current?.instanceId },
+        });
+        if (!isDeepStrictEqual(current, storedById.get(id)) || !isDeepStrictEqual(media, cached.media))
+          throw new Error('cached_media_source_rotated_before_acknowledgement');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);

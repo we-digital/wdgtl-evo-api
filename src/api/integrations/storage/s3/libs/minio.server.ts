@@ -124,6 +124,37 @@ const uploadTempFile = async (
   }
 };
 
+// Read only an authenticated native Media object. Recovery never follows a
+// payload URL or asks WhatsApp to refresh/download expired provider media.
+const readStoredFile = async (fileName: string, limit: number, mime: string): Promise<Buffer> => {
+  if (!minioClient || !Number.isSafeInteger(limit) || limit < 1 || limit > 8 * 1024 * 1024) {
+    throw new Error('cached_media_storage_unavailable');
+  }
+  try {
+    const objectName = join('evolution-api', fileName);
+    const stat = await minioClient.statObject(bucketName, objectName);
+    if (stat.size !== limit || stat.metaData?.['content-type'] !== mime) {
+      throw new Error('cached_media_storage_metadata_mismatch');
+    }
+    const stream = await minioClient.getObject(bucketName, objectName);
+    const chunks: Buffer[] = [];
+    let size = 0;
+    try {
+      for await (const chunk of stream) {
+        const bytes = Buffer.from(chunk);
+        size += bytes.length;
+        if (size > limit) throw new Error('cached_media_storage_bound');
+        chunks.push(bytes);
+      }
+    } finally {
+      stream.destroy();
+    }
+    return Buffer.concat(chunks);
+  } catch {
+    throw new Error('cached_media_storage_read_unconfirmed');
+  }
+};
+
 const deleteFile = async (folder: string, fileName: string) => {
   if (minioClient) {
     const objectName = join(folder, fileName);
@@ -136,4 +167,4 @@ const deleteFile = async (folder: string, fileName: string) => {
   }
 };
 
-export { BUCKET, deleteFile, getObjectUrl, uploadFile, uploadTempFile };
+export { BUCKET, deleteFile, getObjectUrl, readStoredFile, uploadFile, uploadTempFile };

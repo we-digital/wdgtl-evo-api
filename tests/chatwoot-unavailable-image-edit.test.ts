@@ -70,7 +70,14 @@ test('empty edited image proves one destination and leaves all message fields un
       [{}, null].map((body) => [direction, body] as const),
     )) {
       const queries: string[] = [];
-      const target = { id: 314, message_type: fromMe ? 1 : 0, conversation_id: 140, display_id: 40, private: false, has_image: true };
+      const target = {
+        id: 314,
+        message_type: fromMe ? 1 : 0,
+        conversation_id: 140,
+        display_id: 40,
+        private: false,
+        has_image: true,
+      };
       const client = {
         query: async (sql: string) => {
           queries.push(sql);
@@ -225,6 +232,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   service.prismaRepository = {
     message: { findMany: async () => authoritative },
     messageUpdate: { findMany: async () => [] },
+    media: { findFirst: async () => null },
   };
   const methods = [
     'activateHistorySourceGuards',
@@ -332,7 +340,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   };
   await assert.rejects(
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, mediaRequest),
-    /cannot prove complete media import/,
+    /cached_media_authority_unavailable/,
   );
   assert.equal(importCalls, 1);
 
@@ -348,7 +356,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, request),
     (error: any) => error.message?.[0]?.includes('source version changed'),
   );
-  assert.equal(guardCalls, 5);
+  assert.equal(guardCalls, 4); // Missing owned media now refuses before source-guard writes.
   authoritative = messages.map((message) =>
     message.id === 'db-control'
       ? {
@@ -369,7 +377,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, unknownRequest),
     /unknown or contradictory/,
   );
-  assert.equal(guardCalls, 5);
+  assert.equal(guardCalls, 4); // Missing owned media now refuses before source-guard writes.
 });
 
 test('recovery verifies every destination alias and direction instead of counting existence', async () => {
