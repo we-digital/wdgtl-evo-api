@@ -17,14 +17,18 @@ release does not require an application image recreation.
 
 Use the authenticated native database connection without logging its URI or
 credentials. Capture the real server version and select its matching official
-documentation. The proposal and synthetic checks cover PostgreSQL 17 and 18; an
+documentation. The proposal covers PostgreSQL 16, 17 and 18; real synthetic checks passed on
+PostgreSQL 16.15 and 17.11. An
 unreviewed major stops. Confirm the configured namespace is `public` and uniquely
 owns the regular, nonpartitioned `Message` table. Confirm `instanceId` is text and
 `message` is JSONB, database/table ownership, and the existing index definitions.
 Retain database, heap and total table sizes, the actual database/tablespace/WAL
-filesystem free bytes, replication lag if configured, long-running transactions,
+filesystem free bytes or managed-database storage metrics, replication lag if configured, long-running transactions,
 table locks and `pg_stat_progress_create_index` state. These are facts to review,
-not a claim that the proposed indexes are small.
+not a claim that the proposed indexes are small. Database free space must come
+from the actual database host or managed database service; application-host free
+space is not a substitute. A proxy or loopback database address does not prove
+that the database files are on the application host.
 
 Approve a conservative disk/WAL allowance for three serial builds and an
 operational free-space reserve using those actual values. Concurrent builds make
@@ -89,6 +93,10 @@ unchanged full rows and actual conditioned index plans. Production performance
 and successful recovery are established only by the later genuine read.
 
 ## PostgreSQL documentation
+
+- [PostgreSQL 16 CREATE INDEX](https://www.postgresql.org/docs/16/sql-createindex.html)
+- [Indexes on expressions (16)](https://www.postgresql.org/docs/16/indexes-expressional.html)
+- [CREATE INDEX progress (16)](https://www.postgresql.org/docs/16/progress-reporting.html#CREATE-INDEX-PROGRESS-REPORTING)
 
 - [PostgreSQL 17 CREATE INDEX](https://www.postgresql.org/docs/17/sql-createindex.html)
 - [PostgreSQL 18 CREATE INDEX](https://www.postgresql.org/docs/18/sql-createindex.html)
