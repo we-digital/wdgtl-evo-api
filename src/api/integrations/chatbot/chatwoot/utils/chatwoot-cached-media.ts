@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 
 import { Media, Message } from '@prisma/client';
 import { downloadContentFromMessage } from 'baileys';
+import { Agent, fetch as fetchMedia } from 'undici';
 
 import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-history-formats';
 
@@ -91,6 +92,7 @@ function retainedDownloadDescriptor(message: Message) {
 export async function readRetainedRecoveryMedia(
   message: Message,
   download = downloadContentFromMessage,
+  fetchEncrypted = fetchMedia,
 ): Promise<Buffer> {
   const expected = retainedDownloadDescriptor(message);
   const { descriptor } = retainedHistoryMedia(message);
@@ -98,31 +100,89 @@ export async function readRetainedRecoveryMedia(
     typeof descriptor.mediaKey === 'string'
       ? Buffer.from(descriptor.mediaKey, 'base64')
       : Buffer.from(descriptor.mediaKey?.data || Object.values(descriptor.mediaKey || {}));
-  if (key.length !== 32 || typeof descriptor.url !== 'string')
+  if (key.length !== 32) throw new Error('cached_media_provider_descriptor_unavailable');
+  // Select the current native pointer once; never retry a rejected stored URL.
+  const direct = descriptor.directPath;
+  if (
+    direct !== undefined &&
+    (typeof direct !== 'string' || !direct.startsWith('/') || direct.startsWith('//') || /[\\\s]/.test(direct))
+  )
     throw new Error('cached_media_provider_descriptor_unavailable');
-  const url = new URL(descriptor.url);
+  const pointer = direct === undefined ? descriptor.url : `https://mmg.whatsapp.net${direct}`;
+  if (typeof pointer !== 'string') throw new Error('cached_media_provider_descriptor_unavailable');
+  const url = new URL(pointer);
   if (
     url.protocol !== 'https:' ||
     url.hostname !== 'mmg.whatsapp.net' ||
     url.port ||
     url.username ||
     url.password ||
-    url.hash
+    url.hash ||
+    url.toString() !== pointer
   )
     throw new Error('cached_media_provider_descriptor_unavailable');
   const controller = new AbortController();
   let stream: Awaited<ReturnType<typeof download>> | undefined;
+  let agent: Agent | undefined;
+  let destroyPromise: Promise<void> | undefined;
+  const closeAgent = () => {
+    if (agent && !destroyPromise) destroyPromise = agent.destroy();
+    return destroyPromise;
+  };
   const abort = () => {
     controller.abort();
+    void closeAgent()?.catch(() => {});
     stream?.destroy(new Error('cached_media_provider_read_deadline'));
   };
   const timer = setTimeout(abort, 5000);
   try {
+    let dispatcher: any;
+    if (download === downloadContentFromMessage) {
+      // Installed Baileys forwards dispatcher, but drops signal and redirect.
+      // Read one bounded ciphertext first, then retain its original decryption.
+      agent = new Agent({
+        connections: 1,
+        pipelining: 0,
+        connect: { rejectUnauthorized: true, timeout: 5000 },
+        headersTimeout: 5000,
+        bodyTimeout: 5000,
+      });
+      const response = await fetchEncrypted(url.toString(), {
+        method: 'GET',
+        headers: { Origin: 'https://web.whatsapp.com' },
+        signal: controller.signal,
+        redirect: 'error',
+        dispatcher: agent,
+      });
+      if (!response.ok || !response.body) throw new Error('cached_media_provider_read_refused');
+      const encrypted: Buffer[] = [];
+      let size = 0;
+      for await (const chunk of response.body) {
+        const bytes = Buffer.from(chunk);
+        size += bytes.length;
+        if (size > expected.size + 1024) throw new Error('cached_media_bytes_mismatch');
+        encrypted.push(bytes);
+      }
+      const ciphertext = Buffer.concat(encrypted);
+      let delivered = false;
+      dispatcher = {
+        dispatch(options: any, handler: any) {
+          if (delivered || options.method !== 'GET' || `${options.origin}${options.path}` !== url.toString())
+            throw new Error('cached_media_provider_descriptor_unavailable');
+          delivered = true;
+          handler.onConnect(() => {});
+          handler.onHeaders(200, ['content-type', 'application/octet-stream'], () => {}, 'OK');
+          handler.onData(ciphertext);
+          handler.onComplete([]);
+          return true;
+        },
+      };
+    }
     stream = await download(
       { mediaKey: key, url: url.toString() },
       retainedHistoryMedia(message).type === 'imageMessage' ? 'image' : 'video',
       {
-        options: { signal: controller.signal, redirect: 'error' },
+        options: { signal: controller.signal, redirect: 'error', dispatcher } as any,
       },
     );
     if (controller.signal.aborted) {
@@ -142,6 +202,7 @@ export async function readRetainedRecoveryMedia(
     clearTimeout(timer);
     controller.abort();
     stream?.destroy();
+    await closeAgent();
   }
 }
 
