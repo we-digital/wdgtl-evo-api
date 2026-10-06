@@ -1,3 +1,9 @@
+### Native JPEG cryptographic key-family selection (265)
+
+A missing-cache native plain JPEG can retain an image envelope while its authenticated encrypted bytes use WhatsApp Document keys. The bounded default read authenticates the native Image MAC first. Only if that fails does it select Document decryption, requiring the exact native encrypted SHA-256, AES block shape and Document MAC from the same native media key and the same single fetched ciphertext. The original Baileys decryptor still produces bytes that must match the full native plaintext SHA-256 and size before any history write. Missing/corrupt digest, wrong keys/MAC, wrong plaintext or uncertain reads refuse; no second GET, key rewrite, MIME/source-kind change, retry or provider send is introduced. Owned media remains first, and video formats are unchanged.
+
+Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focused whole250/native-envelope regression after upstream changes. Rollback restores strict safe refusal for mismatched JPEG cryptographic families without modifying native rows, stored attachments, cache records or acknowledgements. Verify the original installed SDK with synthetic Image/Document encryption, negative encrypted/plaintext hashes and MAC/key/size, one-read bounds, unchanged MIME/envelopes, cache-first handling and the exact synthetic candidate lab before immutable deployment. Real private retained ciphertext fixtures are separate local evidence and are never committed.
+
 # we:Digital Evolution API fork
 
 ## Unavailable native edit originals without a destination (2026-10-07)
