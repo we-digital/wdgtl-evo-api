@@ -1,8 +1,8 @@
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import { basename } from 'node:path';
 
 import { Media, Message } from '@prisma/client';
-import { downloadContentFromMessage } from 'baileys';
+import { downloadContentFromMessage, getMediaKeys } from 'baileys';
 import { Agent, fetch as fetchMedia } from 'undici';
 
 import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-history-formats';
@@ -137,6 +137,8 @@ export async function readRetainedRecoveryMedia(
   const timer = setTimeout(abort, 5000);
   try {
     let dispatcher: any;
+    let decryptType: 'image' | 'video' | 'document' =
+      retainedHistoryMedia(message).type === 'imageMessage' ? 'image' : 'video';
     if (download === downloadContentFromMessage) {
       // Installed Baileys forwards dispatcher, but drops signal and redirect.
       // Read one bounded ciphertext first, then retain its original decryption.
@@ -164,6 +166,34 @@ export async function readRetainedRecoveryMedia(
         encrypted.push(bytes);
       }
       const ciphertext = Buffer.concat(encrypted);
+      if (decryptType === 'image') {
+        const body = ciphertext.subarray(0, -10);
+        const mac = ciphertext.subarray(-10);
+        const authenticates = async (type: 'image' | 'document') => {
+          const keys = await getMediaKeys(key, type);
+          const expectedMAC = createHmac('sha256', keys.macKey)
+            .update(Buffer.concat([keys.iv, body]))
+            .digest()
+            .subarray(0, 10);
+          return mac.length === 10 && timingSafeEqual(mac, expectedMAC);
+        };
+        if (!(await authenticates('image'))) {
+          const encryptedDigest =
+            typeof descriptor.fileEncSha256 === 'string'
+              ? Buffer.from(descriptor.fileEncSha256, 'base64')
+              : Buffer.from(descriptor.fileEncSha256?.data || Object.values(descriptor.fileEncSha256 || {}));
+          if (
+            ciphertext.length <= 10 ||
+            body.length % 16 !== 0 ||
+            encryptedDigest.length !== 32 ||
+            !createHash('sha256').update(ciphertext).digest().equals(encryptedDigest) ||
+            !(await authenticates('document'))
+          )
+            throw new Error('cached_media_crypto_family_unavailable');
+          // Authentication selects only decryption keys; the native image envelope is unchanged.
+          decryptType = 'document';
+        }
+      }
       let delivered = false;
       dispatcher = {
         dispatch(options: any, handler: any) {
@@ -178,13 +208,9 @@ export async function readRetainedRecoveryMedia(
         },
       };
     }
-    stream = await download(
-      { mediaKey: key, url: url.toString() },
-      retainedHistoryMedia(message).type === 'imageMessage' ? 'image' : 'video',
-      {
-        options: { signal: controller.signal, redirect: 'error', dispatcher } as any,
-      },
-    );
+    stream = await download({ mediaKey: key, url: url.toString() }, decryptType, {
+      options: { signal: controller.signal, redirect: 'error', dispatcher } as any,
+    });
     if (controller.signal.aborted) {
       stream.destroy();
       throw new Error('cached_media_provider_read_deadline');
