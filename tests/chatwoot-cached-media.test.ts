@@ -141,6 +141,7 @@ test('literal whole250 service preflights before writes and uses silent original
   service.waMonitor = { waInstances: {} };
   let stored = false;
   let corruptStored = false;
+  let persistedEpoch = 1700000000.321;
   let proofs = 0;
   let rows = [
     ...Array.from({ length: 249 }, (_, i) => ({
@@ -227,7 +228,7 @@ test('literal whole250 service preflights before writes and uses silent original
                   },
                   checksum: createHash('md5').update(bytes).digest('base64'),
                   created_at: pg.types.getTypeParser(1114)('2023-11-14 22:13:20'),
-                  created_at_epoch: 1700000000,
+                  created_at_epoch: persistedEpoch,
                   conversation_id: 123,
                   display_id: 345,
                   content: 'synthetic-caption',
@@ -326,6 +327,26 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(posts, 1);
   assert.equal(result.outcomes.find((outcome: any) => outcome.sourceId === 'WAID:doc').status, 'imported');
   assert.equal(proofs, 2);
+  for (const invalidEpoch of [1700000001.321, Number.NaN]) {
+    persistedEpoch = invalidEpoch;
+    await assert.rejects(
+      service.verifyRecoveryMediaDestination(
+        rows[249],
+        provider,
+        99,
+        {
+          filename: 'synthetic.pdf',
+          mimetype: 'application/pdf',
+          size: bytes.length,
+          digest: createHash('sha256').update(bytes).digest(),
+        },
+        bytes,
+        { conversationId: 123, displayId: 345, content: 'synthetic-caption', attributes: {} },
+      ),
+      /cached_media_import_postimage_unconfirmed/,
+    );
+  }
+  persistedEpoch = 1700000000.321;
   const retained = await service.syncStoredHistoryRecoveryBatch(
     { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
     request(),
@@ -416,7 +437,7 @@ test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay
     message_type: 0,
     private: false,
     created_at: pgDate,
-    created_at_epoch: 1700000000,
+    created_at_epoch: 1700000000.321,
     display_id: 345,
     peer: message.key.remoteJid,
     byte_size: bytes.length,
@@ -458,6 +479,13 @@ test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay
     /tagged_destination_unconfirmed/,
   );
   row.created_at_epoch--;
+  const correctEpoch = row.created_at_epoch;
+  row.created_at_epoch = Number.NaN;
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /tagged_destination_unconfirmed/,
+  );
+  row.created_at_epoch = correctEpoch;
   row.attachment_meta.whatsapp_history_media_type = 'image';
   await assert.rejects(
     service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),

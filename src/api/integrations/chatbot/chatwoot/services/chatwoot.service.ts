@@ -2063,7 +2063,8 @@ export class ChatwootService {
         Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
         row.private !== false ||
         typeof row.created_at_epoch !== 'number' ||
-        row.created_at_epoch !== message.messageTimestamp ||
+        !Number.isFinite(row.created_at_epoch) ||
+        Math.floor(row.created_at_epoch) !== message.messageTimestamp ||
         !Number.isSafeInteger(Number(row.display_id)) ||
         Number(row.display_id) < 1 ||
         typeof row.peer !== 'string' ||
@@ -2174,7 +2175,8 @@ export class ChatwootService {
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
       typeof row.created_at_epoch !== 'number' ||
-      row.created_at_epoch !== message.messageTimestamp
+      !Number.isFinite(row.created_at_epoch) ||
+      Math.floor(row.created_at_epoch) !== message.messageTimestamp
     )
       throw new Error('cached_media_import_postimage_unconfirmed');
   }
