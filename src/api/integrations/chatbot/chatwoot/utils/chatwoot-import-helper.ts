@@ -20,6 +20,8 @@ import {
   IgnoredHistoryEditKind,
   IgnoredHistoryEditProof,
   isSameNativeTextEditConflict,
+  unavailableOriginalEditProof,
+  UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
 import { retainedTemplate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
@@ -415,6 +417,23 @@ class ChatwootImport {
     } finally {
       client.release();
     }
+  }
+
+  public async captureUnavailableOriginalEdit(
+    source: Message,
+    target: Message,
+    state: UnavailableOriginalEditState,
+    inboxId: number,
+    provider: ChatwootModel,
+  ) {
+    const proof = unavailableOriginalEditProof(source, target, state, Number(provider.accountId), inboxId);
+    const aliases = [proof.targetSourceId, (target.key as { id: string }).id];
+    const result = await postgresClient
+      .getChatwootConnection()
+      .query('SELECT id FROM messages WHERE inbox_id = $1 AND source_id = ANY($2::text[])', [inboxId, aliases]);
+    if (result.rows.length !== 0)
+      throw new Error('Unavailable edit original has a destination; preserve the existing original instead');
+    return proof;
   }
 
   public async captureIgnoredHistoryEdit(
