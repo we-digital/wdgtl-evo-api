@@ -1,5 +1,12 @@
 # we:Digital Evolution API fork
 
+## Unavailable native edit originals without a destination (2026-10-07)
+
+- A retained edited image whose authoritative native payload is JSON null and whose native Chatwoot pointers are null can be acknowledged as `ignored_unavailable_provider_edit_original` only after exact source identity, one retained EDITED update and scoped destination absence are proved and rechecked.
+- An encrypted edit of that same unavailable original records the complete envelope, original and ordering evidence without claiming successful decryption or a preserved destination. A target-key direction discrepancy is explicitly retained. Competing edits, identity changes, available originals and ambiguous destinations stop recovery.
+- The outcome is skipped with a version-bound unavailable-original gap. The History service stores it in a separate schema-7 gap family; old preservation records retain their meaning. A changed source payload/version becomes eligible for reconciliation again. Ordinary missing media continues through authenticated media recovery and is never skipped by this branch.
+- Existing unique destinations retain the previous preservation path. No provider sends, replacement content, placeholder imports or manual processed markers are introduced.
+
 ## Rails JSON store representation in recovery media proof (2026-10-07)
 
 - The media import postimage reader accepts Chatwoot content attributes as a plain object or one JSON-encoded plain object, matching the Rails JSON store representation. It retains every field and compares every expected native/ingress attribute exactly. Malformed, null, array, double-encoded and changed attributes refuse before acceptance.

@@ -75,6 +75,10 @@ import {
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
+  isUnavailableNullImageOriginal,
+  UNAVAILABLE_ORIGINAL_EDIT_REASON,
+  UnavailableOriginalEditProof,
+  UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
@@ -5998,6 +6002,17 @@ export class ChatwootService {
       };
       const encryptedTargets = new Map<string, MessageModel>();
       const encryptedStates = new Map<string, Awaited<ReturnType<typeof readEncryptedEditState>>>();
+      const unavailableOriginalTargets = new Set<string>();
+      const unavailableOriginalEdits = new Map<
+        string,
+        {
+          source: MessageModel;
+          target: MessageModel;
+          state: UnavailableOriginalEditState;
+          proof: UnavailableOriginalEditProof;
+        }
+      >();
+
       const recoveredEdits: Array<{ envelope: MessageModel; target: MessageModel; recovered: MessageModel }> = [];
       const ignoredEdits = new Map<
         string,
@@ -6029,8 +6044,25 @@ export class ChatwootService {
         )
           throw new Error('Retained encrypted edit source or original rotated');
         const verified = await chatwootImport.getVerifiedRecoverySourceIds([target], inbox.id, provider);
-        if (!verified.has(toChatwootSourceId((target.key as { id: string }).id)))
-          throw new Error('Retained encrypted edit requires an existing unique destination original');
+        if (!verified.has(toChatwootSourceId((target.key as { id: string }).id))) {
+          if (!isUnavailableNullImageOriginal(target))
+            throw new Error('Retained encrypted edit requires an existing unique destination original');
+          if (
+            encryptedEdits.filter(
+              (edit) => (edit.message as any).secretEncryptedMessage.targetMessageKey.id === (target.key as any).id,
+            ).length !== 1
+          )
+            throw new Error('Unavailable encrypted edit original has competing requested edits');
+          const proof = await chatwootImport.captureUnavailableOriginalEdit(
+            envelope,
+            target,
+            state,
+            inbox.id,
+            provider,
+          );
+          unavailableOriginalEdits.set(proof.sourceId, { source: envelope, target, state, proof });
+          unavailableOriginalTargets.add(target.id);
+        }
         encryptedTargets.set(envelope.id, target);
         encryptedStates.set(envelope.id, state);
       }
@@ -6041,6 +6073,7 @@ export class ChatwootService {
       for (const envelope of encryptedEdits) {
         const target = encryptedTargets.get(envelope.id)!;
         const state = encryptedStates.get(envelope.id)!;
+        if (unavailableOriginalTargets.has(target.id)) continue;
         const sameTarget = encryptedEdits.filter((edit) => encryptedTargets.get(edit.id)?.id === target.id);
         if (
           sameTarget.length > 1 ||
@@ -6156,6 +6189,28 @@ export class ChatwootService {
         inbox.id,
         provider,
       );
+      const readUnavailableImageState = async (target: MessageModel): Promise<UnavailableOriginalEditState> => {
+        const [current, updates] = await Promise.all([
+          this.prismaRepository.message.findUnique({ where: { id: target.id } }),
+          this.prismaRepository.messageUpdate.findMany({
+            where: { instanceId: target.instanceId, messageId: target.id, status: 'EDITED' },
+          }),
+        ]);
+        if (!isDeepStrictEqual(current, target)) throw new Error('Unavailable image original native source rotated');
+        return {
+          sourceRows: [current],
+          targetUpdates: updates.sort((a, b) => a.id.localeCompare(b.id)),
+          competitors: [],
+        };
+      };
+      for (const target of editedMessages) {
+        const sourceId = toChatwootSourceId((target.key as { id: string }).id);
+        if (!existingSourceIds.has(sourceId) && isUnavailableNullImageOriginal(target)) {
+          const state = await readUnavailableImageState(target);
+          const proof = await chatwootImport.captureUnavailableOriginalEdit(target, target, state, inbox.id, provider);
+          unavailableOriginalEdits.set(sourceId, { source: target, target, state, proof });
+        }
+      }
       const initiallyMissing = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
@@ -6224,7 +6279,9 @@ export class ChatwootService {
         }
       }
       const preservedEdits = await chatwootImport.reconcileProviderHistoryEdits(
-        editedMessages,
+        editedMessages.filter(
+          (message) => !unavailableOriginalEdits.has(toChatwootSourceId((message.key as { id: string }).id)),
+        ),
         inbox.id,
         provider,
         this,
@@ -6424,9 +6481,35 @@ export class ChatwootService {
         inbox.id,
         taggedMediaSourceIds,
       );
+      for (const [sourceId, unavailable] of unavailableOriginalEdits) {
+        const state =
+          unavailable.source.id === unavailable.target.id
+            ? await readUnavailableImageState(unavailable.target)
+            : await readEncryptedEditState(unavailable.source, unavailable.target);
+        if (!isDeepStrictEqual(state, unavailable.state))
+          throw new Error('Unavailable edit original ordering or source rotated before acknowledgement');
+        const proof = await chatwootImport.captureUnavailableOriginalEdit(
+          unavailable.source,
+          unavailable.target,
+          state,
+          inbox.id,
+          provider,
+        );
+        if (!isDeepStrictEqual(proof, unavailable.proof) || proof.sourceId !== sourceId)
+          throw new Error('Unavailable edit original dependency proof rotated before acknowledgement');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
+        const unavailableOriginalEdit = unavailableOriginalEdits.get(sourceId)?.proof;
+        if (unavailableOriginalEdit)
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: UNAVAILABLE_ORIGINAL_EDIT_REASON,
+            recovery: 'unsupported',
+            unavailableOriginalEdit,
+          };
         if (classification === 'album_container')
           return {
             sourceId,
