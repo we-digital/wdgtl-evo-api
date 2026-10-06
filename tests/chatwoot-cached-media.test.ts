@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import test from 'node:test';
 
 import axios from 'axios';
+import pg from 'pg';
 
 import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { prepareCachedRecoveryMedia } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
@@ -225,7 +226,8 @@ test('literal whole250 service preflights before writes and uses silent original
                     whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
                   },
                   checksum: createHash('md5').update(bytes).digest('base64'),
-                  created_at: new Date(1700000000000),
+                  created_at: pg.types.getTypeParser(1114)('2023-11-14 22:13:20'),
+                  created_at_epoch: 1700000000,
                   conversation_id: 123,
                   display_id: 345,
                   content: 'synthetic-caption',
@@ -371,7 +373,15 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(posts, 1);
 });
 
-test('tagged document wire kind remains document when Chatwoot presents its MIME as image', async (t) => {
+test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay and MIME presentation', async (t) => {
+  const previousTZ = process.env.TZ;
+  process.env.TZ = 'America/Sao_Paulo';
+  const pgDate = pg.types.getTypeParser(1114)('2023-11-14 22:13:20') as Date;
+  assert.equal(pgDate.getTime(), 1700000000000 + 3 * 3600 * 1000);
+  t.after(() => {
+    if (previousTZ === undefined) delete process.env.TZ;
+    else process.env.TZ = previousTZ;
+  });
   const modulePath = require.resolve('../src/api/server.module.ts');
   const previousModule = require.cache[modulePath];
   require.cache[modulePath] = {
@@ -405,7 +415,8 @@ test('tagged document wire kind remains document when Chatwoot presents its MIME
     source_id: 'WAID:doc',
     message_type: 0,
     private: false,
-    created_at: new Date(1700000000000),
+    created_at: pgDate,
+    created_at_epoch: 1700000000,
     display_id: 345,
     peer: message.key.remoteJid,
     byte_size: bytes.length,
@@ -439,6 +450,14 @@ test('tagged document wire kind remains document when Chatwoot presents its MIME
     99,
   );
   assert.equal(gets, 1);
+  await service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99);
+  assert.equal(gets, 2);
+  row.created_at_epoch++;
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /tagged_destination_unconfirmed/,
+  );
+  row.created_at_epoch--;
   row.attachment_meta.whatsapp_history_media_type = 'image';
   await assert.rejects(
     service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
@@ -465,5 +484,5 @@ test('tagged document wire kind remains document when Chatwoot presents its MIME
     service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
     /tagged_destination_unconfirmed/,
   );
-  assert.equal(gets, 1);
+  assert.equal(gets, 2);
 });
