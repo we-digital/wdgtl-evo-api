@@ -351,6 +351,8 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
           provider_peer: peer,
           content,
           content_attributes: { edited },
+          attachments: [],
+          message_snapshot: { content, edited },
         },
       ],
     }),
@@ -383,16 +385,17 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
   assert.equal(content, 'before');
   drift = false;
   competingEdit = true;
-  await assert.rejects(service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request), /ordering/);
+  const ignoredOrder = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request);
+  assert.equal(ignoredOrder.outcomes[0].reason, 'preserved_existing_ignored_provider_edit');
+  assert.equal(ignoredOrder.outcomes[0].ignoredEditPreservation.kind, 'conflicting');
   assert.equal(calls, 0);
   assert.equal(content, 'before');
   competingEdit = false;
   content = 'newer edit';
   edited = true;
-  await assert.rejects(
-    service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request),
-    /different existing edit/,
-  );
+  const ignoredConflict = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request);
+  assert.equal(ignoredConflict.outcomes[0].reason, 'preserved_existing_ignored_provider_edit');
+  assert.equal(ignoredConflict.outcomes[0].ignoredEditPreservation.kind, 'conflicting');
   assert.equal(calls, 0);
   assert.equal(content, 'newer edit');
   content = 'before';
@@ -419,6 +422,32 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
     /binding differs/,
   );
   assert.equal(calls, 1);
+  peer = original.key.remoteJid;
+  const encrypted = envelope.message.secretEncryptedMessage;
+  const priorPayload = encrypted.encPayload;
+  encrypted.encPayload = Buffer.alloc(32, 0).toString('base64');
+  const ignoredUnavailable = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request);
+  assert.equal(ignoredUnavailable.outcomes[0].status, 'skipped');
+  assert.equal(ignoredUnavailable.outcomes[0].ignoredEditPreservation.kind, 'unavailable');
+  assert.equal(content, 'authenticated after');
+  assert.equal(calls, 1);
+  let destinationReads = 0;
+  const existingCapture = chatwootImport.captureIgnoredHistoryEdit;
+  chatwootImport.captureIgnoredHistoryEdit = async (...args) => {
+    const proof = await existingCapture.apply(chatwootImport, args);
+    destinationReads++;
+    return destinationReads === 2 ? { ...proof, destinationVersionSHA256: 'c'.repeat(64) } : proof;
+  };
+  try {
+    await assert.rejects(
+      service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request),
+      /destination or media rotated/,
+    );
+    assert.equal(calls, 1);
+  } finally {
+    chatwootImport.captureIgnoredHistoryEdit = existingCapture;
+  }
+  encrypted.encPayload = priorPayload;
 });
 
 test('NULL edited PDF document preservation never clears content and rejects foreign or unproved targets', async () => {

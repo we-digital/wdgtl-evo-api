@@ -63,6 +63,12 @@ import {
   enqueueIncrementalHistorySync,
   tryAcquireHistoryWriter,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
+import {
+  assertIgnoredEditOriginalIdentity,
+  IGNORED_HISTORY_EDIT_REASON,
+  ignoredHistoryEditFailure,
+  IgnoredHistoryEditKind,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
   ChatwootIngressDeliveryFence,
@@ -2455,6 +2461,7 @@ export class ChatwootService {
           contactInboxSourceId: origin.contactInboxSourceId,
         },
         instance,
+        callbackParts,
       );
       if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
@@ -3471,6 +3478,7 @@ export class ChatwootService {
     whatsappMessageId: string,
     chatwootMessageIds: ChatwootMessage,
     instance: InstanceDto,
+    acknowledgedParts?: ChatwootProviderDeliveryPart[],
   ): Promise<number> {
     const persist = async (binding: ChatwootMessage): Promise<number> =>
       this.prismaRepository.$transaction(
@@ -3508,6 +3516,7 @@ export class ChatwootService {
         messageId: Number(chatwootMessageIds.messageId),
         whatsappMessageId,
         claimedConversationId: chatwootMessageIds.conversationId,
+        acknowledgedParts,
       },
       persist,
     );
@@ -5679,7 +5688,7 @@ export class ChatwootService {
       const encryptedEdits = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'encrypted_edit',
       );
-      const assertEncryptedEditCurrent = async (envelope: MessageModel, target: MessageModel) => {
+      const readEncryptedEditState = async (envelope: MessageModel, target: MessageModel) => {
         const [sourceRows, targetUpdates, competitors] = await Promise.all([
           this.prismaRepository.message.findMany({
             where: { instanceId: envelope.instanceId, id: { in: [envelope.id, target.id] } },
@@ -5710,36 +5719,71 @@ export class ChatwootService {
             },
           }),
         ]);
-        if (
-          sourceRows.length !== 2 ||
-          !sourceRows.some((row) => isDeepStrictEqual(row, envelope)) ||
-          !sourceRows.some((row) => isDeepStrictEqual(row, target)) ||
-          targetUpdates.length ||
-          competitors.length
-        )
-          throw new Error('Retained encrypted edit source, ordering or current original rotated');
+        const byId = (rows: any[]) => [...rows].sort((a, b) => a.id.localeCompare(b.id));
+        return { sourceRows: byId(sourceRows), targetUpdates: byId(targetUpdates), competitors: byId(competitors) };
       };
       const encryptedTargets = new Map<string, MessageModel>();
-      const recoveredEdits: MessageModel[] = [];
+      const encryptedStates = new Map<string, Awaited<ReturnType<typeof readEncryptedEditState>>>();
+      const recoveredEdits: Array<{ envelope: MessageModel; target: MessageModel; recovered: MessageModel }> = [];
+      const ignoredEdits = new Map<
+        string,
+        { envelope: MessageModel; target: MessageModel; kind: IgnoredHistoryEditKind; rejection: string }
+      >();
       for (const envelope of encryptedEdits) {
         const targetKey = (envelope.message as any).secretEncryptedMessage.targetMessageKey;
         const matches = await this.prismaRepository.message.findMany({
-          where: {
-            instanceId: envelope.instanceId,
-            key: { path: ['id'], equals: targetKey.id },
-          },
+          where: { instanceId: envelope.instanceId, key: { path: ['id'], equals: targetKey.id } },
         });
         if (matches.length !== 1) throw new Error('Retained encrypted edit original is missing or ambiguous');
         const target = matches[0];
-        if (encryptedTargets.has(target.id))
-          throw new Error('Multiple retained encrypted edits require ordered reconciliation');
-        const recovered = recoverEncryptedHistoryEdit(envelope, target);
-        await assertEncryptedEditCurrent(envelope, target);
-        const verified = await chatwootImport.getVerifiedRecoverySourceIds([recovered], inbox.id, provider);
+        assertIgnoredEditOriginalIdentity(envelope, target);
+        const state = await readEncryptedEditState(envelope, target);
+        if (
+          state.sourceRows.length !== 2 ||
+          !state.sourceRows.some((row) => isDeepStrictEqual(row, envelope)) ||
+          !state.sourceRows.some((row) => isDeepStrictEqual(row, target))
+        )
+          throw new Error('Retained encrypted edit source or original rotated');
+        const verified = await chatwootImport.getVerifiedRecoverySourceIds([target], inbox.id, provider);
         if (!verified.has(toChatwootSourceId((target.key as { id: string }).id)))
           throw new Error('Retained encrypted edit requires an existing unique destination original');
-        encryptedTargets.set(target.id, target);
-        recoveredEdits.push(recovered);
+        encryptedTargets.set(envelope.id, target);
+        encryptedStates.set(envelope.id, state);
+      }
+      const assertEncryptedEditCurrent = async (envelope: MessageModel, target: MessageModel) => {
+        if (!isDeepStrictEqual(await readEncryptedEditState(envelope, target), encryptedStates.get(envelope.id)))
+          throw new Error('Retained encrypted edit source, ordering or current original rotated');
+      };
+      for (const envelope of encryptedEdits) {
+        const target = encryptedTargets.get(envelope.id)!;
+        const state = encryptedStates.get(envelope.id)!;
+        const sameTarget = encryptedEdits.filter((edit) => encryptedTargets.get(edit.id)?.id === target.id);
+        if (
+          sameTarget.length > 1 ||
+          state.targetUpdates.length ||
+          state.competitors.length ||
+          target.status === 'EDITED'
+        ) {
+          ignoredEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), {
+            envelope,
+            target,
+            kind: 'conflicting',
+            rejection: 'retained_edit_order_conflict',
+          });
+          continue;
+        }
+        try {
+          recoveredEdits.push({ envelope, target, recovered: recoverEncryptedHistoryEdit(envelope, target) });
+        } catch (error) {
+          const kind = ignoredHistoryEditFailure(error);
+          if (!kind) throw error;
+          ignoredEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), {
+            envelope,
+            target,
+            kind,
+            rejection: (error as Error).message,
+          });
+        }
       }
       const albumParents = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'album_container',
@@ -5756,7 +5800,14 @@ export class ChatwootService {
       );
       await albumPreservation.assertCurrent();
       await chatwootImport.activateHistorySourceGuards(
-        Array.from(requestedSourceIds).filter((id) => !albumPreservation.proofs.has(id)),
+        Array.from(
+          new Set([
+            ...requestedSourceIds,
+            ...Array.from(encryptedTargets.values()).map((target) =>
+              toChatwootSourceId((target.key as { id: string }).id),
+            ),
+          ]),
+        ).filter((id) => !albumPreservation.proofs.has(id)),
         inbox.id,
       );
       const preparedBySourceId = new Map(
@@ -5827,11 +5878,24 @@ export class ChatwootService {
       const editedSourceIds = new Set(
         editedMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
       );
-      for (let index = 0; index < recoveredEdits.length; index++) {
-        const envelope = encryptedEdits[index];
-        const target = encryptedTargets.get(recoveredEdits[index].id)!;
+      for (const { envelope, target, recovered } of recoveredEdits) {
         await assertEncryptedEditCurrent(envelope, target);
-        await chatwootImport.reconcileProviderHistoryEdits([recoveredEdits[index]], inbox.id, provider, this, true);
+        try {
+          await chatwootImport.reconcileProviderHistoryEdits([recovered], inbox.id, provider, this, true);
+        } catch (error) {
+          // This exact rejection occurs before applyWhatsappProviderEdit. Unknown write outcomes still stop.
+          if (
+            !(error instanceof Error) ||
+            error.message !== 'Authenticated provider edit cannot replace a different existing edit'
+          )
+            throw error;
+          ignoredEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), {
+            envelope,
+            target,
+            kind: 'conflicting',
+            rejection: error.message,
+          });
+        }
       }
       const preservedEdits = await chatwootImport.reconcileProviderHistoryEdits(
         editedMessages,
@@ -5878,25 +5942,41 @@ export class ChatwootService {
         this,
       );
 
-      // Do not acknowledge a control if its native ciphertext/original changed during reconciliation.
-      if (encryptedEdits.length) {
-        const before = [...encryptedEdits, ...encryptedTargets.values()];
-        const after = await this.prismaRepository.message.findMany({
-          where: { instanceId: before[0].instanceId, id: { in: before.map((message) => message.id) } },
-        });
-        if (
-          after.length !== before.length ||
-          before.some(
-            (message) =>
-              !isDeepStrictEqual(
-                message,
-                after.find((row) => row.id === message.id),
-              ),
-          )
-        )
-          throw new Error('Retained encrypted edit source or original rotated during reconciliation');
+      const ignoredEditProofs = new Map();
+      for (const envelope of encryptedEdits) {
+        const target = encryptedTargets.get(envelope.id)!;
+        await assertEncryptedEditCurrent(envelope, target);
+        const ignored = ignoredEdits.get(toChatwootSourceId((envelope.key as { id: string }).id));
+        if (ignored)
+          ignoredEditProofs.set(
+            toChatwootSourceId((envelope.key as { id: string }).id),
+            await chatwootImport.captureIgnoredHistoryEdit(
+              envelope,
+              target,
+              inbox.id,
+              provider,
+              ignored.kind,
+              ignored.rejection,
+            ),
+          );
       }
+      for (const envelope of encryptedEdits)
+        await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       await albumPreservation.assertCurrent();
+      for (const [sourceId, ignored] of ignoredEdits) {
+        const current = await chatwootImport.captureIgnoredHistoryEdit(
+          ignored.envelope,
+          ignored.target,
+          inbox.id,
+          provider,
+          ignored.kind,
+          ignored.rejection,
+        );
+        if (!isDeepStrictEqual(current, ignoredEditProofs.get(sourceId)))
+          throw new Error('Ignored provider edit destination or media rotated before acknowledgement');
+      }
+      for (const envelope of encryptedEdits)
+        await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
@@ -5908,8 +5988,18 @@ export class ChatwootService {
             recovery: 'unsupported',
             albumPreservation: albumPreservation.proofs.get(sourceId),
           };
-        if (classification === 'encrypted_edit')
+        if (classification === 'encrypted_edit') {
+          const ignoredEditPreservation = ignoredEditProofs.get(sourceId);
+          if (ignoredEditPreservation)
+            return {
+              sourceId,
+              status: 'skipped',
+              reason: IGNORED_HISTORY_EDIT_REASON,
+              recovery: 'unsupported',
+              ignoredEditPreservation,
+            };
           return { sourceId, status: 'existing', reason: 'authenticated_provider_edit_reconciled', recovery: 'native' };
+        }
         if (classification === 'pin_control' || classification === 'poll_control')
           return {
             sourceId,
