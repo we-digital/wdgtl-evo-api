@@ -16,10 +16,13 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import {
   assertIgnoredEditOriginalIdentity,
+  CONFLICTING_TEXT_EDIT_REJECTION,
   IgnoredHistoryEditKind,
   IgnoredHistoryEditProof,
+  isSameNativeTextEditConflict,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
+import { retainedTemplate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -423,17 +426,27 @@ class ChatwootImport {
     rejection: string,
   ): Promise<IgnoredHistoryEditProof> {
     assertIgnoredEditOriginalIdentity(envelope, original);
-    const key = original.key as { id: string; remoteJid: string; fromMe: boolean };
+    const sameNativeConflict = envelope.id === original.id && isSameNativeTextEditConflict(envelope);
+    if (sameNativeConflict && (kind !== 'conflicting' || rejection !== CONFLICTING_TEXT_EDIT_REJECTION))
+      throw new Error('Ignored provider edit representation differs');
+    const key = original.key as { id: string; remoteJid: string; remoteJidAlt?: string; fromMe: boolean };
+    const nativeAlias =
+      isLidJid(key.remoteJid) && isPhoneJid(key.remoteJidAlt) ? toCanonicalHistoryJid(key.remoteJidAlt) : undefined;
     const sourceId = toChatwootSourceId(key.id);
     const result = await postgresClient.getChatwootConnection().query(
       `SELECT m.id, m.message_type, m.private, m.content, m.content_attributes,
          to_jsonb(m) AS message_snapshot, c.display_id, contact.identifier AS provider_peer,
+         pc.peer AS bound_peer, to_jsonb(pc) AS binding_snapshot, to_jsonb(ci) AS contact_inbox_snapshot,
+         (ci.id IS NOT NULL AND ci.contact_id = contact.id AND ci.inbox_id = c.inbox_id) AS contact_inbox_matches,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment', to_jsonb(a), 'blob', to_jsonb(b)) ORDER BY a.id)
            FROM attachments a
            LEFT JOIN active_storage_attachments asa ON asa.record_type = 'Attachment' AND asa.record_id = a.id AND asa.name = 'file'
            LEFT JOIN active_storage_blobs b ON b.id = asa.blob_id WHERE a.message_id = m.id), '[]'::jsonb) AS attachments
        FROM messages m JOIN conversations c ON c.id = m.conversation_id
        JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+       LEFT JOIN provider_conversation_bindings pc ON pc.conversation_id = c.id
+         AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'
+       LEFT JOIN contact_inboxes ci ON ci.id = c.contact_inbox_id
        WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2 AND c.inbox_id = $2
          AND m.source_id = ANY($3::text[])`,
       [Number(provider.accountId), inboxId, [sourceId, key.id]],
@@ -448,7 +461,13 @@ class ChatwootImport {
       result.rows.length !== 1 ||
       target.private !== false ||
       attributes?.deleted === true ||
-      target.provider_peer !== key.remoteJid ||
+      (target.provider_peer !== key.remoteJid &&
+        (!nativeAlias ||
+          target.provider_peer !== nativeAlias ||
+          target.bound_peer !== nativeAlias ||
+          target.contact_inbox_matches !== true ||
+          !target.binding_snapshot ||
+          !target.contact_inbox_snapshot)) ||
       Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
       original.chatwootMessageId == null ||
       original.chatwootInboxId == null ||
@@ -463,6 +482,7 @@ class ChatwootImport {
       throw new Error('Ignored provider edit lacks a unique current scoped original destination');
     return {
       version: 1,
+      ...(sameNativeConflict ? { editRepresentation: 'same_native_type_conflict' as const } : {}),
       kind,
       rejection,
       editSourceId: toChatwootSourceId((envelope.key as { id: string }).id),
@@ -501,8 +521,9 @@ class ChatwootImport {
       ) {
         const textEdit = ['conversation', 'extendedTextMessage'].includes(message.messageType);
         const documentEdit = message.messageType === 'documentMessage' && payload === null;
-        if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit)
-          throw new Error('Empty provider edit is not a known image, text or NULL document');
+        const audioEdit = message.messageType === 'audioMessage';
+        if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit && !audioEdit)
+          throw new Error('Empty provider edit is not a known image, text, audio or NULL document');
         const client = await pool.connect();
         try {
           await client.query('BEGIN');
@@ -519,7 +540,14 @@ class ChatwootImport {
                      AND asa.record_id = a.id AND asa.name = 'file'
                    JOIN active_storage_blobs b ON b.id = asa.blob_id
                    WHERE a.message_id = m.id AND a.file_type = 3 AND b.content_type = 'application/pdf'
-                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_pdf_document
+                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_pdf_document,
+               ((SELECT COUNT(*) FROM attachments a WHERE a.message_id = m.id) = 1
+                 AND (SELECT COUNT(*) FROM attachments a
+                   JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
+                     AND asa.record_id = a.id AND asa.name = 'file'
+                   JOIN active_storage_blobs b ON b.id = asa.blob_id
+                   WHERE a.message_id = m.id AND a.file_type = 1 AND b.content_type LIKE 'audio/%'
+                     AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_audio
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
              WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
@@ -544,8 +572,10 @@ class ChatwootImport {
                 message.chatwootConversationId == null
               : documentEdit
                 ? target.has_pdf_document !== true
-                : target.has_image !== true) ||
-            (documentEdit &&
+                : audioEdit
+                  ? target.has_audio !== true
+                  : target.has_image !== true) ||
+            ((documentEdit || audioEdit) &&
               (!key.remoteJid ||
                 target.provider_peer !== key.remoteJid ||
                 message.chatwootMessageId == null ||
@@ -558,7 +588,9 @@ class ChatwootImport {
             (message.chatwootConversationId != null &&
               Number(message.chatwootConversationId) !== Number(target.display_id))
           ) {
-            throw new Error('Empty provider edit lacks a unique matching destination image, text or PDF document');
+            throw new Error(
+              'Empty provider edit lacks a unique matching destination image, text, audio or PDF document',
+            );
           }
           await client.query('COMMIT');
           preserved.set(sourceId, 'preserved_existing_source_payload_unavailable');
@@ -746,7 +778,11 @@ class ChatwootImport {
         undefined,
         inbox.id,
       );
-      const contentByMessage = this.getImportableHistoryMessages(chatwootService, messagesOrdered);
+      const contentByMessage = this.getImportableHistoryMessages(
+        chatwootService,
+        messagesOrdered,
+        Boolean(options.messages),
+      );
       messagesOrdered = filterImportableHistoryMessages(messagesOrdered, existingSourceIds, (message) =>
         contentByMessage.get(message),
       );
@@ -824,9 +860,18 @@ class ChatwootImport {
               bindInsertMsg.push(message.messageTimestamp as number);
               const bindmessageTimestamp = `$${bindInsertMsg.length}`;
 
+              bindInsertMsg.push(
+                JSON.stringify(
+                  message.message?.templateMessage
+                    ? { provider_history_template: retainedTemplate(message.message).metadata }
+                    : {},
+                ),
+              );
+              const bindAttributes = `$${bindInsertMsg.length}`;
+
               sqlValues += `(${bindContent}::text, $1::bigint, $2::bigint, ${bindConversationId}::bigint,
                   ${bindMessageType}::integer, ${bindSenderType}::text, ${bindSenderId}::bigint,
-                  ${bindSourceId}::text, ${bindmessageTimestamp}::bigint),`;
+                  ${bindSourceId}::text, ${bindmessageTimestamp}::bigint, ${bindAttributes}::jsonb),`;
             });
           });
           if (bindInsertMsg.length > 2) {
@@ -836,7 +881,7 @@ class ChatwootImport {
 
             const sqlInsertMsg = `INSERT INTO messages
               (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private,
-              content_type, sender_type, sender_id, source_id, created_at, updated_at)
+              content_type, sender_type, sender_id, source_id, created_at, updated_at, content_attributes)
               SELECT DISTINCT ON (candidate.inbox_id, candidate.source_id)
                 candidate.content,
                 candidate.content,
@@ -850,7 +895,8 @@ class ChatwootImport {
                 candidate.sender_id,
                 candidate.source_id,
                 to_timestamp(candidate.message_timestamp),
-                to_timestamp(candidate.message_timestamp)
+                to_timestamp(candidate.message_timestamp),
+                candidate.content_attributes
               FROM (VALUES ${sqlValues}) AS candidate(
                 content,
                 account_id,
@@ -860,7 +906,8 @@ class ChatwootImport {
                 sender_type,
                 sender_id,
                 source_id,
-                message_timestamp
+                message_timestamp,
+                content_attributes
               )
               WHERE NOT EXISTS (
                 SELECT 1
@@ -1214,7 +1261,8 @@ class ChatwootImport {
     }
   }
 
-  public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
+  public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo, retainedTemplates = false) {
+    if (retainedTemplates && msg.message?.templateMessage) return retainedTemplate(msg.message).text;
     const contentMessage = chatwootService.getConversationMessage(msg.message);
     if (contentMessage) {
       return contentMessage;
@@ -1275,8 +1323,8 @@ class ChatwootImport {
     }
   }
 
-  public getHistoryContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
-    const content = this.getContentMessage(chatwootService, msg);
+  public getHistoryContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo, retainedTemplates = false) {
+    const content = this.getContentMessage(chatwootService, msg, retainedTemplates);
     const key = msg.key as {
       remoteJid?: string;
       participant?: string;
@@ -1300,7 +1348,11 @@ class ChatwootImport {
     return `**${participantLabel}:**\n\n${content}`;
   }
 
-  public getImportableHistoryMessages(chatwootService: ChatwootService, messages: Message[]) {
+  public getImportableHistoryMessages(
+    chatwootService: ChatwootService,
+    messages: Message[],
+    retainedTemplates = false,
+  ) {
     const contentByMessage = new Map<Message, string>();
 
     for (const message of messages) {
@@ -1308,7 +1360,11 @@ class ChatwootImport {
         continue;
       }
 
-      const content = this.getHistoryContentMessage(chatwootService, message as unknown as IWebMessageInfo);
+      const content = this.getHistoryContentMessage(
+        chatwootService,
+        message as unknown as IWebMessageInfo,
+        retainedTemplates,
+      );
       if (content) {
         contentByMessage.set(message, content);
       }
