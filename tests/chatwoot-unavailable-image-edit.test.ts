@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+
 import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/postgres.client';
-import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 
 test('cached controls stay controls and empty images require retained edit evidence', () => {
   assert.equal(
@@ -70,7 +71,14 @@ test('empty edited image proves one destination and leaves all message fields un
       [{}, null].map((body) => [direction, body] as const),
     )) {
       const queries: string[] = [];
-      const target = { id: 314, message_type: fromMe ? 1 : 0, conversation_id: 140, display_id: 40, private: false, has_image: true };
+      const target = {
+        id: 314,
+        message_type: fromMe ? 1 : 0,
+        conversation_id: 140,
+        display_id: 40,
+        private: false,
+        has_image: true,
+      };
       const client = {
         query: async (sql: string) => {
           queries.push(sql);
@@ -177,7 +185,13 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     if (previousModule) require.cache[modulePath] = previousModule;
     else delete require.cache[modulePath];
   });
+  // eslint-disable-next-line @typescript-eslint/no-require-imports -- Load only after the inert server fixture is installed.
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const originalPool = postgresClient.getChatwootConnection;
+  postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [] }) })) as any;
+  t.after(() => {
+    postgresClient.getChatwootConnection = originalPool;
+  });
   const service = Object.create(ChatwootService.prototype) as any;
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.isImportHistoryAvailable = () => true;
@@ -225,6 +239,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   service.prismaRepository = {
     message: { findMany: async () => authoritative },
     messageUpdate: { findMany: async () => [] },
+    media: { findFirst: async () => null },
   };
   const methods = [
     'activateHistorySourceGuards',
@@ -332,7 +347,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   };
   await assert.rejects(
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, mediaRequest),
-    /cannot prove complete media import/,
+    /cached_media_authority_unavailable/,
   );
   assert.equal(importCalls, 1);
 
@@ -348,7 +363,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, request),
     (error: any) => error.message?.[0]?.includes('source version changed'),
   );
-  assert.equal(guardCalls, 5);
+  assert.equal(guardCalls, 4); // Missing owned media now refuses before source-guard writes.
   authoritative = messages.map((message) =>
     message.id === 'db-control'
       ? {
@@ -369,7 +384,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, unknownRequest),
     /unknown or contradictory/,
   );
-  assert.equal(guardCalls, 5);
+  assert.equal(guardCalls, 4); // Missing owned media now refuses before source-guard writes.
 });
 
 test('recovery verifies every destination alias and direction instead of counting existence', async () => {
