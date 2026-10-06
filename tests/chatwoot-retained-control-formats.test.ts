@@ -76,6 +76,22 @@ test('known native metadata controls retain only their exact protocol shape', ()
     message: { messageContextInfo: context, messageHistoryNotice: notice },
   };
   assert.equal(classifyCachedHistoryRecord(noticeRecord, false), 'metadata_control');
+  for (const low of [-2147483649, 2147483648])
+    assert.throws(() =>
+      classifyCachedHistoryRecord(
+        {
+          ...noticeRecord,
+          message: {
+            ...noticeRecord.message,
+            messageHistoryNotice: {
+              messageHistoryMetadata: { ...notice.messageHistoryMetadata, messageCount: { ...long, low } },
+            },
+          },
+        },
+        false,
+      ),
+    );
+
   const limitRecord = {
     messageType: 'unknown',
     message: {

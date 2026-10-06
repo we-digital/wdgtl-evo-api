@@ -429,17 +429,24 @@ class ChatwootImport {
     const sameNativeConflict = envelope.id === original.id && isSameNativeTextEditConflict(envelope);
     if (sameNativeConflict && (kind !== 'conflicting' || rejection !== CONFLICTING_TEXT_EDIT_REJECTION))
       throw new Error('Ignored provider edit representation differs');
-    const key = original.key as { id: string; remoteJid: string; fromMe: boolean };
+    const key = original.key as { id: string; remoteJid: string; remoteJidAlt?: string; fromMe: boolean };
+    const nativeAlias =
+      isLidJid(key.remoteJid) && isPhoneJid(key.remoteJidAlt) ? toCanonicalHistoryJid(key.remoteJidAlt) : undefined;
     const sourceId = toChatwootSourceId(key.id);
     const result = await postgresClient.getChatwootConnection().query(
       `SELECT m.id, m.message_type, m.private, m.content, m.content_attributes,
          to_jsonb(m) AS message_snapshot, c.display_id, contact.identifier AS provider_peer,
+         pc.peer AS bound_peer, to_jsonb(pc) AS binding_snapshot, to_jsonb(ci) AS contact_inbox_snapshot,
+         (ci.id IS NOT NULL AND ci.contact_id = contact.id AND ci.inbox_id = c.inbox_id) AS contact_inbox_matches,
          COALESCE((SELECT jsonb_agg(jsonb_build_object('attachment', to_jsonb(a), 'blob', to_jsonb(b)) ORDER BY a.id)
            FROM attachments a
            LEFT JOIN active_storage_attachments asa ON asa.record_type = 'Attachment' AND asa.record_id = a.id AND asa.name = 'file'
            LEFT JOIN active_storage_blobs b ON b.id = asa.blob_id WHERE a.message_id = m.id), '[]'::jsonb) AS attachments
        FROM messages m JOIN conversations c ON c.id = m.conversation_id
        JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+       LEFT JOIN provider_conversation_bindings pc ON pc.conversation_id = c.id
+         AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'
+       LEFT JOIN contact_inboxes ci ON ci.id = c.contact_inbox_id
        WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2 AND c.inbox_id = $2
          AND m.source_id = ANY($3::text[])`,
       [Number(provider.accountId), inboxId, [sourceId, key.id]],
@@ -454,7 +461,13 @@ class ChatwootImport {
       result.rows.length !== 1 ||
       target.private !== false ||
       attributes?.deleted === true ||
-      target.provider_peer !== key.remoteJid ||
+      (target.provider_peer !== key.remoteJid &&
+        (!nativeAlias ||
+          target.provider_peer !== nativeAlias ||
+          target.bound_peer !== nativeAlias ||
+          target.contact_inbox_matches !== true ||
+          !target.binding_snapshot ||
+          !target.contact_inbox_snapshot)) ||
       Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
       original.chatwootMessageId == null ||
       original.chatwootInboxId == null ||

@@ -8,6 +8,8 @@ const long = (value: any) =>
   (object(value) &&
     only(value, ['low', 'high', 'unsigned']) &&
     Number.isInteger(value.low) &&
+    value.low >= -2147483648 &&
+    value.low <= 2147483647 &&
     Number.isInteger(value.high) &&
     value.high >= 0 &&
     value.high <= 2097151 &&

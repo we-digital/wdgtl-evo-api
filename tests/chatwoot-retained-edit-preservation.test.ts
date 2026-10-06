@@ -131,3 +131,79 @@ test('unavailable audio edit requires a unique live public audio destination wit
     postgresClient.getChatwootConnection = originalPool;
   }
 });
+
+test('ignored encrypted LID edit requires authenticated native phone alias plus exact scoped binding and contact inbox', async () => {
+  const previous = postgresClient.getChatwootConnection;
+  const original: any = {
+    ...message,
+    messageType: 'conversation',
+    message: { conversation: 'original' },
+    key: { id: 'source', remoteJid: '12345@lid', remoteJidAlt: '123456789@s.whatsapp.net', fromMe: false },
+  };
+  const envelope: any = {
+    ...original,
+    id: 'edit',
+    key: { ...original.key, id: 'edit' },
+    message: { secretEncryptedMessage: { secretEncType: 2, targetMessageKey: { id: 'source' } } },
+  };
+  const row = {
+    ...target,
+    provider_peer: original.key.remoteJidAlt,
+    bound_peer: original.key.remoteJidAlt,
+    contact_inbox_matches: true,
+    binding_snapshot: { peer: original.key.remoteJidAlt },
+    contact_inbox_snapshot: { id: 8 },
+  };
+  const before = JSON.stringify({ original, envelope, row });
+  try {
+    for (const changed of [
+      null,
+      { bound_peer: 'foreign@s.whatsapp.net' },
+      { provider_peer: 'foreign@s.whatsapp.net' },
+      { contact_inbox_matches: false },
+      { binding_snapshot: null },
+      { contact_inbox_snapshot: null },
+    ]) {
+      postgresClient.getChatwootConnection = (() => ({
+        query: async (sql: string) => {
+          assert.match(sql, /pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'/);
+          assert.match(sql, /ci.contact_id = contact.id AND ci.inbox_id = c.inbox_id/);
+          assert.doesNotMatch(sql, /^\s*(UPDATE|INSERT|DELETE)/);
+          return { rows: [{ ...row, ...changed }] };
+        },
+      })) as any;
+      const run = () =>
+        chatwootImport.captureIgnoredHistoryEdit(
+          envelope,
+          original,
+          9,
+          { accountId: '1' } as any,
+          'conflicting',
+          'Retained encrypted edit target identity differs',
+        );
+      if (changed === null) {
+        const proof = await run();
+        assert.equal(proof.peer, original.key.remoteJid);
+        assert.equal(proof.targetNativeId, original.id);
+        assert.equal(JSON.stringify({ original, envelope, row }), before);
+      } else await assert.rejects(run, /unique current scoped/);
+    }
+    for (const alias of [undefined, 'foreign@s.whatsapp.net', '12345@lid']) {
+      postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [row] }) })) as any;
+      await assert.rejects(
+        () =>
+          chatwootImport.captureIgnoredHistoryEdit(
+            envelope,
+            { ...original, key: { ...original.key, remoteJidAlt: alias } },
+            9,
+            { accountId: '1' } as any,
+            'conflicting',
+            'Retained encrypted edit target identity differs',
+          ),
+        /unique current scoped/,
+      );
+    }
+  } finally {
+    postgresClient.getChatwootConnection = previous;
+  }
+});
