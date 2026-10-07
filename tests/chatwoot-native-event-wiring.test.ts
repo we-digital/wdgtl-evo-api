@@ -63,3 +63,38 @@ test('read/delete wiring passes full event key; deletion only drops exact native
   assert.match(deleteBranch, /path: \['remoteJid'\], equals: \(message\.key as WAMessageKey\)\.remoteJid/);
   assert.match(deleteBranch, /path: \['fromMe'\], equals: \(message\.key as WAMessageKey\)\.fromMe/);
 });
+
+
+test('actual ingress existing-row lookup and fence do not suppress another group or direction', async (t) => {
+  const modulePath = require.resolve('../src/api/server.module.ts');
+  const previous = require.cache[modulePath];
+  require.cache[modulePath] = { id: modulePath, filename: modulePath, loaded: true,
+    exports: new Proxy({}, { get: () => ({}) }), children: [], paths: [] } as NodeModule;
+  t.after(() => { if (previous) require.cache[modulePath] = previous; else delete require.cache[modulePath]; });
+  const { ChatwootService } = require(servicePath);
+  const { ChatwootIngressDeliveryFence } = require('../src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-delivery-fence');
+  const service = Object.create(ChatwootService.prototype) as any;
+  service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
+  const peer = '120363000000001@g.us'; const otherPeer = '120363000000002@g.us';
+  const queries: any[] = []; const deliveries: any[] = [];
+  service.prismaRepository = { message: { findFirst: async (query: any) => {
+    queries.push(query);
+    assert.equal(query.where.instanceId, 'instance-1');
+    assert.deepEqual(query.where.AND[0], { key: { path: ['id'], equals: 'SAME' } });
+    assert.equal(query.where.AND[1].key.path[0], 'remoteJid');
+    assert.equal(query.where.AND[2].key.path[0], 'fromMe');
+    return query.where.AND[1].key.equals === peer && query.where.AND[2].key.equals === false
+      ? { chatwootMessageId: 101, chatwootConversationId: 37, chatwootInboxId: 42 } : null;
+  } } };
+  service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
+    deliveries.push(body.key); return { id: 102 };
+  };
+  const instance = { instanceId: 'instance-1' };
+  const body = (remoteJid: string, fromMe: boolean) => ({ key: { id: 'SAME', remoteJid, fromMe } });
+  await Promise.all([service.eventWhatsapp('messages.upsert', instance, body(peer, false)),
+    service.eventWhatsapp('messages.upsert', instance, body(peer, false)),
+    service.eventWhatsapp('messages.upsert', instance, body(otherPeer, false)),
+    service.eventWhatsapp('messages.upsert', instance, body(peer, true))]);
+  assert.equal(queries.length, 3);
+  assert.deepEqual(deliveries, [body(otherPeer, false).key, body(peer, true).key]);
+});

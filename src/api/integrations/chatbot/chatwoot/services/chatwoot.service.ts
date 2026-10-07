@@ -4944,6 +4944,8 @@ export class ChatwootService {
       event,
       instanceId: instance.instanceId,
       whatsappMessageId: body?.key?.id,
+      remoteJid: body?.key?.remoteJid,
+      fromMe: body?.key?.fromMe,
     });
     if (!deliveryKey) return this.processWhatsappEvent(event, instance, body);
 
@@ -4951,7 +4953,11 @@ export class ChatwootService {
       const existing = await this.prismaRepository.message.findFirst({
         where: {
           instanceId: instance.instanceId,
-          key: { path: ['id'], equals: body.key.id },
+          AND: [
+            { key: { path: ['id'], equals: body.key.id } },
+            { key: { path: ['remoteJid'], equals: body.key.remoteJid } },
+            { key: { path: ['fromMe'], equals: body.key.fromMe } },
+          ],
           chatwootMessageId: { not: null },
         },
         orderBy: { messageTimestamp: 'desc' },
