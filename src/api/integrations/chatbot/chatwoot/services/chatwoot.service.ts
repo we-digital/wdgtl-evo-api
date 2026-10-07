@@ -6111,6 +6111,7 @@ export class ChatwootService {
         postgresClient.getChatwootConnection(),
         Number(provider.accountId),
         inbox.id,
+        'container_only',
       );
       const ordinaryMessages = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
