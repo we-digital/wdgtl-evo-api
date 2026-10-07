@@ -112,11 +112,16 @@ import {
   unwrapChatwootPayload,
   updateChatwootMessageJson,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
+import { reconcileNativeEventBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-event-binding';
 import {
   resolveNativeChatProbeId,
   shouldAttemptNativeForward,
   whatsappIdFromSourceId,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
+import {
+  findNativeMessageByKey,
+  NativeMessageKeyScope,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-message-key';
 import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
@@ -4184,16 +4189,32 @@ export class ChatwootService {
     );
   }
 
-  private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
-    // Use raw SQL query to avoid JSON path issues with Prisma
-    const messages = await this.prismaRepository.$queryRaw`
-      SELECT * FROM "Message" 
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${keyId}
-      LIMIT 1
-    `;
+  private async getMessageByKeyId(
+    instance: InstanceDto,
+    keyId: string,
+    scope?: NativeMessageKeyScope,
+  ): Promise<MessageModel | null> {
+    return findNativeMessageByKey(this.prismaRepository, instance.instanceId, keyId, scope);
+  }
 
-    return (messages as MessageModel[])[0] || null;
+  private async getNativeEventTarget(
+    instance: InstanceDto,
+    keyId: string,
+    scope?: NativeMessageKeyScope,
+  ): Promise<MessageModel | null> {
+    const source = await this.getMessageByKeyId(instance, keyId, scope);
+    if (!source || !this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) return source;
+    if (!this.isImportHistoryAvailable()) throw new Error('Native event mapping database is not configured');
+    const provider = await this.getProvider(instance);
+    const inbox = provider?.enabled && (await this.getStoredHistoryRecoveryInbox(provider));
+    if (!inbox) throw new Error('Native event mapping provider inbox is not qualified');
+    return reconcileNativeEventBinding(
+      postgresClient.getChatwootConnection(),
+      this.prismaRepository,
+      source,
+      Number(provider.accountId),
+      inbox.id,
+    );
   }
 
   private async getReplyToIds(msg: any, instance: InstanceDto): Promise<Record<string, string | number>> {
@@ -4206,7 +4227,7 @@ export class ChatwootService {
       // Chatwoot Evolution messages use source_id `WAID:<stanzaId>`.
       inReplyToExternalId = toChatwootWhatsappSourceId(stanzaId);
       if (stanzaId) {
-        const message = await this.getMessageByKeyId(instance, stanzaId);
+        const message = await this.getMessageByKeyId(instance, stanzaId, { remoteJid: msg?.key?.remoteJid });
         if (message?.chatwootMessageId) {
           inReplyTo = message.chatwootMessageId;
         }
@@ -4620,10 +4641,13 @@ export class ChatwootService {
     instance: InstanceDto,
     conversationId: number,
     body: any,
-    reactionMessage: { key: { id: string }; text?: string },
+    reactionMessage: { key: WAMessageKey; text?: string },
   ): Promise<boolean> {
-    const target = await this.getMessageByKeyId(instance, reactionMessage.key.id);
-    if (!target?.chatwootMessageId) {
+    const target = await this.getNativeEventTarget(instance, reactionMessage.key.id, {
+      remoteJid: reactionMessage.key.remoteJid ?? body?.key?.remoteJid,
+      fromMe: reactionMessage.key.fromMe,
+    });
+    if (!target?.chatwootMessageId || !target.chatwootConversationId) {
       this.logger.warn(
         JSON.stringify({
           event: 'chatwoot_reaction_target_missing',
@@ -4643,7 +4667,7 @@ export class ChatwootService {
     try {
       await this.privilegedChatwootRequest(provider, {
         method: 'POST',
-        path: `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages/${target.chatwootMessageId}/react`,
+        path: `/api/v1/accounts/${provider.accountId}/conversations/${target.chatwootConversationId}/messages/${target.chatwootMessageId}/react`,
         data: {
           emoji,
           ...actor,
@@ -4920,6 +4944,8 @@ export class ChatwootService {
       event,
       instanceId: instance.instanceId,
       whatsappMessageId: body?.key?.id,
+      remoteJid: body?.key?.remoteJid,
+      fromMe: body?.key?.fromMe,
     });
     if (!deliveryKey) return this.processWhatsappEvent(event, instance, body);
 
@@ -4927,7 +4953,11 @@ export class ChatwootService {
       const existing = await this.prismaRepository.message.findFirst({
         where: {
           instanceId: instance.instanceId,
-          key: { path: ['id'], equals: body.key.id },
+          AND: [
+            { key: { path: ['id'], equals: body.key.id } },
+            { key: { path: ['remoteJid'], equals: body.key.remoteJid } },
+            { key: { path: ['fromMe'], equals: body.key.fromMe } },
+          ],
           chatwootMessageId: { not: null },
         },
         orderBy: { messageTimestamp: 'desc' },
@@ -5330,7 +5360,7 @@ export class ChatwootService {
             return;
           }
 
-          const message = await this.getMessageByKeyId(instance, body.key.id);
+          const message = await this.getMessageByKeyId(instance, body.key.id, body.key);
 
           if (message?.chatwootMessageId && message?.chatwootConversationId) {
             await confirmProviderDeletionBeforeDroppingMapping({
@@ -5343,11 +5373,12 @@ export class ChatwootService {
               dropMapping: () =>
                 this.prismaRepository.message.deleteMany({
                   where: {
-                    key: {
-                      path: ['id'],
-                      equals: body.key.id,
-                    },
                     instanceId: instance.instanceId,
+                    AND: [
+                      { key: { path: ['id'], equals: body.key.id } },
+                      { key: { path: ['remoteJid'], equals: (message.key as WAMessageKey).remoteJid } },
+                      { key: { path: ['fromMe'], equals: (message.key as WAMessageKey).fromMe } },
+                    ],
                   },
                 }),
             });
@@ -5367,7 +5398,7 @@ export class ChatwootService {
 
         if (typeof editedMessageContentRaw !== 'string') return;
 
-        const message = await this.getMessageByKeyId(instance, body?.key?.id);
+        const message = await this.getNativeEventTarget(instance, body?.key?.id, body?.key);
         if (!message?.chatwootConversationId || !message?.chatwootMessageId) {
           throw new Error('Provider edit has no mapped Chatwoot message');
         }
@@ -5389,7 +5420,7 @@ export class ChatwootService {
           return;
         }
 
-        const message = await this.getMessageByKeyId(instance, body.key.id);
+        const message = await this.getMessageByKeyId(instance, body.key.id, body.key);
         const conversationId = message?.chatwootConversationId;
         const contactInboxSourceId = message?.chatwootContactInboxSourceId;
 

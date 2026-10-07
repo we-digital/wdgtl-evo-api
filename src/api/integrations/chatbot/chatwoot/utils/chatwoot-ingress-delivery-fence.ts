@@ -4,11 +4,18 @@ export const chatwootIngressDeliveryKey = (params: {
   event: unknown;
   instanceId: unknown;
   whatsappMessageId: unknown;
+  remoteJid?: unknown;
+  fromMe?: unknown;
 }): string | null => {
   if (params.event !== 'messages.upsert' && params.event !== 'send.message') return null;
   if (typeof params.instanceId !== 'string' || params.instanceId.trim().length === 0) return null;
   if (typeof params.whatsappMessageId !== 'string' || params.whatsappMessageId.trim().length === 0) return null;
 
+  if ('remoteJid' in params || 'fromMe' in params) {
+    if (typeof params.remoteJid !== 'string' || !params.remoteJid.length || typeof params.fromMe !== 'boolean')
+      return null;
+    return JSON.stringify([params.instanceId, params.whatsappMessageId, params.remoteJid, params.fromMe]);
+  }
   return `${params.instanceId.trim()}:${params.whatsappMessageId.trim()}`;
 };
 
