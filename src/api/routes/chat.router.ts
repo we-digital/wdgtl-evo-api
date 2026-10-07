@@ -12,6 +12,7 @@ import {
   ProfilePictureDto,
   ProfileStatusDto,
   ReadMessageDto,
+  RequestGroupHistoryDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -36,6 +37,7 @@ import {
   profileSchema,
   profileStatusSchema,
   readMessageSchema,
+  requestGroupHistorySchema,
   updateMessageSchema,
   whatsappNumberSchema,
 } from '@validate/validate.schema';
@@ -47,6 +49,15 @@ export class ChatRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
+      .post(this.routerPath('requestGroupHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<RequestGroupHistoryDto>({
+          request: req,
+          schema: requestGroupHistorySchema,
+          ClassRef: RequestGroupHistoryDto,
+          execute: (instance, data) => chatController.requestGroupHistory(instance, data),
+        });
+        return res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('whatsappNumbers'), ...guards, async (req, res) => {
         try {
           const response = await this.dataValidate<WhatsAppNumberDto>({

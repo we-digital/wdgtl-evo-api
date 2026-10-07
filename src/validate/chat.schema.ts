@@ -339,3 +339,14 @@ export const profileSchema: JSONSchema7 = {
     isBusiness: { type: 'boolean' },
   },
 };
+
+export const requestGroupHistorySchema: JSONSchema7 = {
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    remoteJid: { type: 'string', pattern: '^[0-9-]+@g\\.us$' },
+    messageId: { type: 'string', minLength: 1, maxLength: 255 },
+    count: { type: 'integer', minimum: 1, maximum: 500 },
+  },
+  required: ['remoteJid', 'count'],
+};

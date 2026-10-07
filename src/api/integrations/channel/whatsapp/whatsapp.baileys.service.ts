@@ -11,6 +11,7 @@ import {
   OnWhatsAppDto,
   PrivacySettingDto,
   ReadMessageDto,
+  RequestGroupHistoryDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -56,6 +57,7 @@ import {
   shouldEnrichChatwootContacts,
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
+import { toCanonicalHistoryJid } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
   compactChatwootIngressContext,
@@ -1917,6 +1919,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly groupHandler = {
     'groups.upsert': (groupMetadata: GroupMetadata[]) => {
+      void this.chatwootService.eventWhatsapp(Events.GROUPS_UPSERT, { instanceName: this.instanceName }, groupMetadata);
       this.sendDataWebhook(Events.GROUPS_UPSERT, groupMetadata);
     },
 
@@ -1935,6 +1938,11 @@ export class BaileysStartupService extends ChannelStartupService {
       participants: string[];
       action: ParticipantAction;
     }) => {
+      void this.chatwootService.eventWhatsapp(
+        Events.GROUP_PARTICIPANTS_UPDATE,
+        { instanceName: this.instanceName },
+        participantsUpdate,
+      );
       // ENHANCEMENT: Adds participantsData field while maintaining backward compatibility
       // MAINTAINS: participants: string[] (original JID strings)
       // ADDS: participantsData: { jid: string, phoneNumber: string, name?: string, imgUrl?: string }[]
@@ -4914,6 +4922,39 @@ export class BaileysStartupService extends ChannelStartupService {
       }
       throw new NotFoundException('Error fetching group', error.toString());
     }
+  }
+
+  public async requestGroupHistory(data: RequestGroupHistoryDto) {
+    const me = this.client?.authState?.creds?.me;
+    if (this.localSettings.groupsIgnore || !me?.id) {
+      throw new BadRequestException('Group history requires an authenticated instance with group ingestion enabled');
+    }
+    const group = await this.client.groupMetadata(data.remoteJid);
+    const owners = [me.id, me.lid].filter(Boolean).map(toCanonicalHistoryJid);
+    const member = group.participants.some((participant) =>
+      [participant.id, participant.phoneNumber].some((jid) => jid && owners.includes(toCanonicalHistoryJid(jid))),
+    );
+    if (!member) throw new BadRequestException('The authenticated instance must participate in this group');
+
+    let key: proto.IMessageKey = { remoteJid: data.remoteJid, fromMe: false };
+    let timestamp = Date.now();
+    if (data.messageId) {
+      const messages = await this.prismaRepository.message.findMany({
+        where: { instanceId: this.instanceId, key: { path: ['id'], equals: data.messageId } },
+        take: 2,
+      });
+      const message = messages.length === 1 ? messages[0] : null;
+      const nativeKey = message?.key as proto.IMessageKey;
+      if (!message || nativeKey?.remoteJid !== data.remoteJid || typeof nativeKey.fromMe !== 'boolean') {
+        throw new BadRequestException('One native group message from this instance is required');
+      }
+      key = nativeKey;
+      timestamp = message.messageTimestamp * 1000;
+    }
+    // The protobuf permits an absent oldestMsgId for a timestamp-only query.
+    // The primary device supplies all message keys; no local message is invented.
+    const requestId = await this.client.fetchMessageHistory(data.count, key, timestamp);
+    return { status: 'requested', requestId, remoteJid: data.remoteJid, count: data.count };
   }
 
   public async fetchAllGroups(getParticipants: GetParticipant) {

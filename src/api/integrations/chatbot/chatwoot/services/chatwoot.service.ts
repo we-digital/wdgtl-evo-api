@@ -214,6 +214,12 @@ interface AuthenticatedChatwootClientContext extends ChatwootClientContext {
 // HMAC contract to arbitrary non-empty values.
 const CHATWOOT_WEBHOOK_SECRET_MIN_LENGTH = 24;
 
+let groupSyncActive = 0;
+const groupSyncWaiters: Array<() => void> = [];
+const scheduledGroupSyncs = new Set<string>();
+const pendingGroupSyncs = new Map<string, string[] | undefined>();
+const groupSyncs = new Map<string, Promise<any>>();
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
@@ -502,13 +508,16 @@ export class ChatwootService {
     inboxId: number,
     peer: string,
     body: any,
+    rosterGroup?: { subject?: string },
   ): Promise<number> {
     const remoteLid = isLidJid(body.key.remoteJid) ? toCanonicalHistoryJid(body.key.remoteJid) : null;
     let contact: any = await this.findProviderContact(instance, peer);
     const isGroup = isGroupJid(peer);
     const user = peer.split('@')[0];
     if (!contact) {
-      const group = isGroup ? await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer) : null;
+      const group = isGroup
+        ? rosterGroup || (await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer))
+        : null;
       contact = await this.createContact(
         instance,
         isGroup ? peer : user,
@@ -542,7 +551,7 @@ export class ChatwootService {
     ) {
       throw new Error('Chatwoot canonical provider conversation result is ambiguous');
     }
-    if (provider.conversationPending && resolved.status !== 'open' && resolved.status !== 'pending') {
+    if (!rosterGroup && provider.conversationPending && resolved.status !== 'open' && resolved.status !== 'pending') {
       if (!['resolved', 'snoozed'].includes(resolved.status))
         throw new Error('Provider conversation status is unavailable');
       const context = await this.clientCw(instance);
@@ -552,7 +561,7 @@ export class ChatwootService {
         data: { status: 'pending' },
       });
     }
-    if (isGroup) {
+    if (isGroup && !rosterGroup) {
       await this.ensureProviderGroupParticipant(instance, inboxId, body);
       const rosterKey = `${instance.instanceName}:providerParticipants-${inboxId}-${peer}`;
       if ((await this.cache.get(rosterKey)) !== resolved.id) {
@@ -561,6 +570,126 @@ export class ChatwootService {
       }
     }
     return resolved.id;
+  }
+
+  private async acquireGroupSyncSlot() {
+    if (groupSyncActive < 2) {
+      groupSyncActive++;
+    } else {
+      await new Promise<void>((resolve) => groupSyncWaiters.push(resolve));
+    }
+  }
+
+  private releaseGroupSyncSlot() {
+    const next = groupSyncWaiters.shift();
+    if (next) next();
+    else groupSyncActive--;
+  }
+
+  public async syncParticipatingGroups(instance: InstanceDto, dryRun = true, peers?: string[]) {
+    const active = groupSyncs.get(instance.instanceName);
+    if (active) {
+      await active;
+      return this.syncParticipatingGroups(instance, dryRun, peers);
+    }
+    const task = (async () => {
+      await this.acquireGroupSyncSlot();
+      try {
+        return await this.reconcileParticipatingGroups(instance, dryRun, peers);
+      } finally {
+        this.releaseGroupSyncSlot();
+      }
+    })();
+    groupSyncs.set(instance.instanceName, task);
+    try {
+      return await task;
+    } finally {
+      groupSyncs.delete(instance.instanceName);
+    }
+  }
+
+  private async reconcileParticipatingGroups(instance: InstanceDto, dryRun: boolean, peers?: string[]) {
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    const context = await this.clientCw(instance);
+    const inbox = await this.getInbox(instance);
+    if (!context?.provider?.enabled || !inbox || !waInstance?.client?.authState?.creds?.me?.id)
+      throw new BadRequestException('An authenticated provider and its bound inbox are required');
+    if (waInstance.localSettings?.groupsIgnore)
+      throw new BadRequestException('Group ingestion is disabled for this instance');
+    if (!(await this.providerConversationsEnabled(context.provider, inbox.id)))
+      throw new BadRequestException('Canonical provider conversations are required');
+    const me = waInstance.client.authState.creds.me;
+    const owners = [me.id, me.lid].filter(Boolean).map(toCanonicalHistoryJid);
+    const groups = Object.values(await waInstance.client.groupFetchAllParticipating(false)) as any[];
+    const results = [];
+    for (const group of groups) {
+      if (!isGroupJid(group.id) || (peers && !peers.includes(group.id))) continue;
+      if (
+        !group.participants?.some((participant) =>
+          [participant.id, participant.phoneNumber].some((jid) => jid && owners.includes(toCanonicalHistoryJid(jid))),
+        )
+      )
+        throw new Error('Participating group owner identity is unavailable');
+      const contact = await this.findProviderContact(instance, group.id);
+      const existing = contact
+        ? await this.providerConversationRequest(context.provider, 'GET', {
+            inbox_id: inbox.id,
+            contact_id: contact.id,
+            provider: 'whatsapp',
+            peer: group.id,
+          })
+        : null;
+      const conversation = existing?.conversation;
+      if (
+        conversation &&
+        (conversation.inbox_id !== inbox.id ||
+          conversation.peer !== group.id ||
+          conversation.contact_id !== contact.id ||
+          conversation.provider !== 'whatsapp')
+      )
+        throw new Error('Group conversation identity conflicts');
+      const id =
+        conversation?.id ||
+        (dryRun
+          ? null
+          : await this.canonicalProviderConversation(
+              instance,
+              context.provider,
+              inbox.id,
+              group.id,
+              { key: { remoteJid: group.id } },
+              group,
+            ));
+      results.push({ peer: group.id, subject: group.subject, conversationId: id, missing: !conversation });
+    }
+    return { instance: instance.instanceName, inboxId: inbox.id, dryRun, groups: results };
+  }
+
+  private scheduleParticipatingGroups(instance: InstanceDto, peers?: string[]) {
+    const name = instance.instanceName;
+    const pending = pendingGroupSyncs.get(name);
+    pendingGroupSyncs.set(
+      name,
+      pendingGroupSyncs.has(name) ? (pending && peers ? [...new Set([...pending, ...peers])] : undefined) : peers,
+    );
+    if (scheduledGroupSyncs.has(name)) return;
+    scheduledGroupSyncs.add(name);
+    // Bounded background reconciliation never holds the live ingestion handler.
+    void (async () => {
+      try {
+        while (pendingGroupSyncs.has(name)) {
+          const selected = pendingGroupSyncs.get(name);
+          pendingGroupSyncs.delete(name);
+          try {
+            await this.syncParticipatingGroups(instance, false, selected);
+          } catch (error) {
+            this.logger.error(`Group roster reconciliation failed for ${name}: ${error.message}`);
+          }
+        }
+      } finally {
+        scheduledGroupSyncs.delete(name);
+      }
+    })();
   }
 
   private async ensureProviderGroupParticipant(instance: InstanceDto, inboxId: number, body: any): Promise<void> {
@@ -5073,6 +5202,19 @@ export class ChatwootService {
         return;
       }
 
+      if (event === 'groups.upsert') {
+        this.scheduleParticipatingGroups(
+          instance,
+          (Array.isArray(body) ? body : []).map((group) => group.id),
+        );
+        return;
+      }
+
+      if (event === 'group-participants.update') {
+        this.scheduleParticipatingGroups(instance, [body.id]);
+        return;
+      }
+
       if (event === 'status.instance') {
         const data = body;
         const inbox = await this.getInbox(instance);
@@ -5091,6 +5233,7 @@ export class ChatwootService {
       }
 
       if (event === 'connection.update' && body.status === 'open') {
+        this.scheduleParticipatingGroups(instance);
         const waInstance = this.waMonitor.waInstances[instance.instanceName];
         if (!waInstance) return;
 
