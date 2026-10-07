@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createCipheriv, createHash, createHmac } from 'node:crypto';
+import { getMediaKeys } from 'baileys';
 import { Readable } from 'node:stream';
 import test from 'node:test';
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
@@ -91,4 +92,22 @@ test('unknown preview/edit/image metadata and conflicting target direction canno
   const envelope = edit({ imageMessage: jpeg });
   envelope.message.protocolMessage.key = { ...source.key, fromMe: true };
   assert.throws(() => classifyCachedHistoryRecord(envelope, false));
+});
+
+
+test('associated JPEG real SDK decryption supports the current fetch dispatcher interface without another GET', async () => {
+  const keys = await getMediaKeys(Buffer.from(jpeg.mediaKey, 'base64'), 'image');
+  const cipher = createCipheriv('aes-256-cbc', keys.cipherKey, keys.iv);
+  const encrypted = Buffer.concat([cipher.update(bytes), cipher.final()]);
+  const mac = createHmac('sha256', keys.macKey).update(Buffer.concat([keys.iv, encrypted])).digest().subarray(0, 10);
+  const ciphertext = Buffer.concat([encrypted, mac]);
+  const record = structuredClone(source);
+  record.message.associatedChildMessage.message.imageMessage.fileEncSha256 = createHash('sha256').update(ciphertext).digest('base64');
+  const before = JSON.stringify(record);
+  let reads = 0;
+  assert.deepEqual(await readRetainedRecoveryMedia(record, undefined, (async () => {
+    reads += 1; return new Response(ciphertext);
+  }) as any), bytes);
+  assert.equal(reads, 1);
+  assert.equal(JSON.stringify(record), before);
 });
