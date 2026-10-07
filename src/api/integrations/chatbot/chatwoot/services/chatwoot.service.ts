@@ -618,6 +618,62 @@ export class ChatwootService {
     }
   }
 
+  private async findRosterDestinations(provider: ChatwootModel, inboxId: number, peers: string[]) {
+    if (!this.pgClient || !this.isImportHistoryAvailable()) return null;
+    const destinations = new Map<string, { contact: any; conversation: any }>();
+    if (!peers.length) return destinations;
+    if (peers.length > 10_000) throw new Error('Native group roster exceeds its lookup bound');
+    const accountId = Number(provider.accountId);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0) throw new Error('Roster account is unavailable');
+    const { rows } = await this.pgClient.query(
+      `SELECT ct.id AS contact_id, ct.account_id AS contact_account_id, ct.identifier,
+              c.id AS database_id, c.display_id AS conversation_id,
+              c.account_id AS conversation_account_id, c.inbox_id, c.status,
+              pb.provider AS binding_provider, pb.peer AS binding_peer
+       FROM contacts ct
+       LEFT JOIN conversations c
+         ON c.contact_id = ct.id AND c.account_id = ct.account_id AND c.inbox_id = $2
+       LEFT JOIN provider_conversation_bindings pb
+         ON pb.conversation_id = c.id
+       WHERE ct.account_id = $1 AND ct.identifier = ANY($3::text[])
+       ORDER BY ct.identifier, ct.id, c.id`,
+      [accountId, inboxId, peers],
+    );
+    for (const row of rows) {
+      if (
+        !peers.includes(row.identifier) ||
+        destinations.has(row.identifier) ||
+        row.contact_account_id !== accountId ||
+        !Number.isSafeInteger(row.contact_id) ||
+        row.contact_id <= 0 ||
+        (row.database_id !== null &&
+          (!Number.isSafeInteger(row.database_id) ||
+            row.database_id <= 0 ||
+            !Number.isSafeInteger(row.conversation_id) ||
+            row.conversation_id <= 0 ||
+            row.conversation_account_id !== accountId ||
+            row.inbox_id !== inboxId)) ||
+        (row.binding_provider !== null && (row.binding_provider !== 'whatsapp' || row.binding_peer !== row.identifier))
+      )
+        throw new Error('Group roster destination identity conflicts');
+      destinations.set(row.identifier, {
+        contact: { id: row.contact_id },
+        conversation:
+          row.database_id === null
+            ? null
+            : {
+                id: row.conversation_id,
+                database_id: row.database_id,
+                contact_id: row.contact_id,
+                inbox_id: row.inbox_id,
+                provider: 'whatsapp',
+                peer: row.identifier,
+              },
+      });
+    }
+    return destinations;
+  }
+
   private async reconcileParticipatingGroups(instance: InstanceDto, dryRun: boolean, peers?: string[]) {
     const waInstance = this.waMonitor.waInstances[instance.instanceName];
     const context = await this.clientCw(instance);
@@ -636,6 +692,10 @@ export class ChatwootService {
     const me = waInstance.client.authState.creds.me;
     const owners = [me.id, me.lid].filter(Boolean).map(toCanonicalHistoryJid);
     const groups = Object.values(await waInstance.client.groupFetchAllParticipating(false)) as any[];
+    const rosterPeers = groups
+      .filter((group) => isGroupJid(group.id) && (!peers || peers.includes(group.id)))
+      .map((group) => group.id);
+    const destinations = await this.findRosterDestinations(context.provider, inbox.id, rosterPeers);
     const results = [];
     for (const group of groups) {
       if (!isGroupJid(group.id) || (peers && !peers.includes(group.id))) continue;
@@ -645,15 +705,18 @@ export class ChatwootService {
         )
       )
         throw new Error('Participating group owner identity is unavailable');
-      const contact = await this.findProviderContact(instance, group.id);
-      const existing = contact
-        ? await this.providerConversationRequest(context.provider, 'GET', {
-            inbox_id: inbox.id,
-            contact_id: contact.id,
-            provider: 'whatsapp',
-            peer: group.id,
-          })
-        : null;
+      const destination = destinations?.get(group.id);
+      const contact = destinations ? destination?.contact : await this.findProviderContact(instance, group.id);
+      const existing = destinations
+        ? { conversation: destination?.conversation }
+        : contact
+          ? await this.providerConversationRequest(context.provider, 'GET', {
+              inbox_id: inbox.id,
+              contact_id: contact.id,
+              provider: 'whatsapp',
+              peer: group.id,
+            })
+          : null;
       const conversation = existing?.conversation;
       if (
         conversation &&

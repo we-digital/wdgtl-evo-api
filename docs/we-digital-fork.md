@@ -720,3 +720,7 @@ Contact and canonical conversation requests carry the authenticated native
 bridge plus history-import/inbox headers, suppressing live callbacks; roster
 contact creation does not write labels. Deploy the Chatwoot capability before
 EVO; unsupported runtimes refuse safely and leave live ingress unchanged.
+
+## 2026-10-07 bounded roster lookup
+
+Participating group discovery reuses one bounded account/inbox/native-peer SQL read for destination contacts and conversations when the existing import connection is available. Duplicate contacts/conversations or conflicting canonical bindings stop the operation. Native owner/membership and the registered silent capability remain required. Missing destinations still use the protected canonical API with fresh identity checks; no SQL writes, messages, read-state updates or provider sends. Without the import connection, retain the existing HTTP reader. Exact synthetic PostgreSQL checks cover cross-account/inbox isolation and duplicate identities.
