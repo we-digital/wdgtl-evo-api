@@ -18,10 +18,10 @@ export function historyBindingPeers(message: Message): string[] {
     : [toCanonicalHistoryJid(key.remoteJid)];
 }
 
-export function historyBindingSourceMatches(current: Message, expected: Message): boolean {
+export function historyBindingSourceMatches(current: Message, expected: Message, checkTimestamp = true): boolean {
   return (
     current.instanceId === expected.instanceId &&
-    current.messageTimestamp === expected.messageTimestamp &&
+    (!checkTimestamp || current.messageTimestamp === expected.messageTimestamp) &&
     current.messageType === expected.messageType &&
     isDeepStrictEqual(current.key, expected.key) &&
     isDeepStrictEqual(current.message, expected.message)
@@ -45,7 +45,7 @@ export async function reconcileHistoryMessageBinding(
   boundRows: number;
 }> {
   const peers = historyBindingPeers(source);
-  const key = source.key as { id: string; fromMe: boolean };
+  const key = source.key as { id: string; fromMe: boolean; remoteJid: string };
   const aliases = await pool.query(
     'SELECT id FROM messages WHERE account_id=$1 AND inbox_id=$2 AND source_id=ANY($3::text[])',
     [accountId, inboxId, [key.id, `WAID:${key.id}`]],
@@ -65,12 +65,15 @@ export async function reconcileHistoryMessageBinding(
       prisma.$transaction(
         async (tx) => {
           const rows = await tx.$queryRaw<Message[]>(Prisma.sql`
-        SELECT * FROM "Message" WHERE "instanceId"=${source.instanceId} AND key->>'id'=${key.id} ORDER BY id LIMIT 33 FOR UPDATE`);
+        SELECT * FROM "Message" WHERE "instanceId"=${source.instanceId} AND key->>'id'=${key.id}
+          AND key->>'remoteJid'=${key.remoteJid} AND key->>'fromMe'=${String(key.fromMe)}
+          ORDER BY id LIMIT 33 FOR UPDATE`);
           if (
             rows.length < 1 ||
             rows.length > 32 ||
-            !rows.some((row) => row.id === source.id) ||
-            !rows.every((row) => historyBindingSourceMatches(row, source))
+            !rows.some((row) => row.id === source.id && historyBindingSourceMatches(row, source)) ||
+            // Exact admitted row retains its timestamp guard; equivalent receive copies retain their own timestamps.
+            !rows.every((row) => historyBindingSourceMatches(row, source, false))
           )
             throw new Error('History mapping native source version or uniqueness changed');
           const pointers = {
