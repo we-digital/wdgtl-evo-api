@@ -9,16 +9,23 @@ import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-hist
 
 export const CACHED_MEDIA_BATCH_LIMIT = 32 * 1024 * 1024;
 export const CACHED_MEDIA_FILE_LIMIT = 32 * 1024 * 1024;
-const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage']);
+const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage', 'stickerMessage']);
 // A native document's MIME describes the authenticated bytes; it does not select crypto keys.
 const nativeDocumentMIME = (value: unknown): value is string =>
   typeof value === 'string' &&
   value.length <= 100 &&
   /^(application|text|image|audio|video)\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(value);
 
+// Stickers retain their native source type; Chatwoot stores authenticated WebP bytes as images.
+export function cachedHistoryMediaType(message: Message): string {
+  const { type } = retainedHistoryMedia(message);
+  return type === 'stickerMessage' ? 'image' : type.replace(/Message$/, '');
+}
+
 export function nativeCachedMediaPayload(message: Message) {
   const { type, descriptor } = retainedHistoryMedia(message);
-  if (!types.has(type) || !descriptor) throw new Error('cached_media_native_digest_unavailable');
+  if (!types.has(type) || !descriptor || (type === 'stickerMessage' && descriptor.mimetype !== 'image/webp'))
+    throw new Error('cached_media_native_digest_unavailable');
   const rawLength = descriptor.fileLength;
   const size =
     typeof rawLength === 'number'
@@ -77,6 +84,7 @@ function retainedDownloadDescriptor(message: Message) {
       (['imageMessage', 'templateMessage'].includes(message.messageType) &&
         type === 'imageMessage' &&
         descriptor.mimetype === 'image/jpeg') ||
+      (message.messageType === 'stickerMessage' && type === 'stickerMessage' && descriptor.mimetype === 'image/webp') ||
       (message.messageType === 'lottieStickerMessage' &&
         type === 'documentMessage' &&
         descriptor.mimetype === 'application/was') ||
@@ -96,7 +104,7 @@ function retainedDownloadDescriptor(message: Message) {
     throw new Error('cached_media_authority_unavailable');
   const filename = basename(
     descriptor.fileName ||
-      `${key.id}.${message.messageType === 'lottieStickerMessage' ? 'was' : type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
+      `${key.id}.${message.messageType === 'lottieStickerMessage' ? 'was' : type === 'stickerMessage' ? 'webp' : type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
   );
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
@@ -153,14 +161,15 @@ export async function readRetainedRecoveryMedia(
   const timer = setTimeout(abort, 5000);
   try {
     let dispatcher: any;
-    let decryptType: 'image' | 'video' | 'document' | 'sticker' =
-      message.messageType === 'lottieStickerMessage'
-        ? 'sticker'
-        : retainedHistoryMedia(message).type === 'imageMessage'
-          ? 'image'
-          : retainedHistoryMedia(message).type === 'documentMessage'
-            ? 'document'
-            : 'video';
+    let decryptType: 'image' | 'video' | 'document' | 'sticker' = ['lottieStickerMessage', 'stickerMessage'].includes(
+      message.messageType,
+    )
+      ? 'sticker'
+      : retainedHistoryMedia(message).type === 'imageMessage'
+        ? 'image'
+        : retainedHistoryMedia(message).type === 'documentMessage'
+          ? 'document'
+          : 'video';
     if (download === downloadContentFromMessage) {
       // Installed Baileys forwards dispatcher, but drops signal and redirect.
       // Read one bounded ciphertext first, then retain its original decryption.
@@ -216,7 +225,7 @@ export async function readRetainedRecoveryMedia(
           decryptType = 'document';
         }
       }
-      if (retainedHistoryMedia(message).type === 'documentMessage') {
+      if (retainedHistoryMedia(message).type === 'documentMessage' || message.messageType === 'stickerMessage') {
         const body = ciphertext.subarray(0, -10);
         const mac = ciphertext.subarray(-10);
         const encryptedDigest =

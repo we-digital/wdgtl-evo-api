@@ -19,6 +19,7 @@ import {
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
   CACHED_MEDIA_FILE_LIMIT,
+  cachedHistoryMediaType,
   nativeCachedMediaPayload,
   prepareCachedRecoveryMedia,
   readRetainedRecoveryMedia,
@@ -2063,7 +2064,7 @@ export class ChatwootService {
       const sourceId = toChatwootSourceId(row.source_id);
       const message = bySource.get(sourceId);
       const sha256 = row.attachment_meta?.whatsapp_history_sha256;
-      const mediaType = message ? retainedHistoryMedia(message).type.replace(/Message$/, '') : undefined;
+      const mediaType = message ? cachedHistoryMediaType(message) : undefined;
       const nativeMedia = message ? nativeCachedMediaPayload(message) : null;
       const nativePeers = message ? Array.from(chatwootImport.createMessagesMapByIdentity([message]).keys()) : [];
       if (
@@ -2204,7 +2205,7 @@ export class ChatwootService {
         ([key, value]) => !isDeepStrictEqual((contentAttributes as Record<string, unknown>)[key], value),
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
-      row.attachment_meta?.whatsapp_history_media_type !== retainedHistoryMedia(message).type.replace(/Message$/, '') ||
+      row.attachment_meta?.whatsapp_history_media_type !== cachedHistoryMediaType(message) ||
       (row.content_type !== descriptor.mimetype &&
         !(
           message.messageType === 'lottieStickerMessage' &&
@@ -6438,10 +6439,14 @@ export class ChatwootService {
             mimetype: cached.descriptor.mimetype,
             size: cached.descriptor.size,
             sha256: cached.descriptor.digest.toString('hex'),
-            mediaType: retainedHistoryMedia(original).type.replace(/Message$/, ''),
-            ...(['associatedChildMessage', 'templateMessage', 'lottieStickerMessage', 'ephemeralMessage'].includes(
-              original.messageType,
-            )
+            mediaType: cachedHistoryMediaType(original),
+            ...([
+              'associatedChildMessage',
+              'templateMessage',
+              'lottieStickerMessage',
+              'ephemeralMessage',
+              'stickerMessage',
+            ].includes(original.messageType)
               ? {
                   nativeSource: {
                     message_type: original.messageType,
