@@ -255,6 +255,62 @@ export type IgnoredMissingEncryptedOriginalProof = {
   targetCandidatesNativeSHA256: string;
 };
 
+export type IgnoredMissingPlaintextOriginalProof = Omit<IgnoredMissingEncryptedOriginalProof, 'version' | 'kind'> & {
+  version: 4;
+  kind: 'ignored_missing_plaintext_original';
+};
+
+/** An orphan edit is accounted for without claiming destination preservation or an applied edit. */
+export async function captureMissingPlaintextEditOriginal(
+  envelope: Message,
+  repository: { findUnique: (args: any) => Promise<Message | null>; findMany: (args: any) => Promise<Message[]> },
+  accountId: number,
+  inboxId: number,
+): Promise<IgnoredMissingPlaintextOriginalProof | undefined> {
+  const key = envelope.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
+  const targetKey = (envelope.message as any)?.protocolMessage?.key;
+  if (
+    classifyCachedHistoryRecord(envelope, false) !== 'plaintext_edit' ||
+    ![accountId, inboxId].every((id) => Number.isSafeInteger(id) && id > 0) ||
+    typeof envelope.id !== 'string' ||
+    !envelope.id ||
+    typeof envelope.instanceId !== 'string' ||
+    !envelope.instanceId ||
+    !Number.isSafeInteger(envelope.messageTimestamp) ||
+    envelope.messageTimestamp <= 0
+  )
+    throw new Error('Missing plaintext original lacks exact typed native source identity');
+  const [current, matches] = await Promise.all([
+    repository.findUnique({ where: { id: envelope.id } }),
+    repository.findMany({ where: { instanceId: envelope.instanceId, key: { path: ['id'], equals: targetKey.id } } }),
+  ]);
+  if (!isDeepStrictEqual(current, envelope)) throw new Error('Missing plaintext original native source rotated');
+  if (matches.length === 1) return undefined;
+  if (matches.length !== 0) throw new Error('Retained plaintext edit original is ambiguous');
+  const sourceNativeJSON = JSON.stringify(envelope);
+  const targetCandidatesNativeJSON = JSON.stringify(matches);
+  const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+  return {
+    version: 4,
+    kind: 'ignored_missing_plaintext_original',
+    disposition: 'ignored_unavailable_edit',
+    nativeTargetState: 'missing',
+    destinationState: 'unqualified',
+    sourceId: `WAID:${key.id}`,
+    sourceNativeId: envelope.id,
+    targetSourceId: `WAID:${targetKey.id}`,
+    instanceId: envelope.instanceId,
+    accountId,
+    inboxId,
+    peer: key.remoteJid as string,
+    direction: key.fromMe ? 'outgoing' : 'incoming',
+    sourceNativeJSON,
+    sourceNativeVersionSHA256: sha(sourceNativeJSON),
+    targetCandidatesNativeJSON,
+    targetCandidatesNativeSHA256: sha(targetCandidatesNativeJSON),
+  };
+}
+
 /** Native source-only audit. It never qualifies a destination, decrypts or applies an edit. */
 export async function captureMissingEncryptedEditOriginal(
   envelope: Message,

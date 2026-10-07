@@ -1,5 +1,6 @@
 import { albumImageCount } from './chatwoot-history-album';
 import {
+  boundedRetainedMetadata,
   knownHistoryMetadataControl,
   retainedButtons,
   retainedHistoryMedia,
@@ -32,10 +33,71 @@ const validSenderKeySidecar = (body: any) => {
 
 const auxiliaryKeys = new Set(['mediaUrl', 'messageContextInfo', 'senderKeyDistributionMessage']);
 
+/** A retained plaintext edit is a delta for its explicit target, never a new message. */
+export function isKnownPlaintextHistoryEdit(record: { messageType: string; message: unknown; key?: unknown }): boolean {
+  const body = record.message as any;
+  const source = record.key as any;
+  const protocol = body?.protocolMessage;
+  const target = protocol?.key;
+  const edit = protocol?.editedMessage;
+  const object = (value: any) => value && typeof value === 'object' && !Array.isArray(value);
+  const timestamp = protocol?.timestampMs;
+  const validTimestamp =
+    (Number.isSafeInteger(timestamp) && timestamp > 0) ||
+    (object(timestamp) &&
+      Object.keys(timestamp).every((name) => ['low', 'high', 'unsigned'].includes(name)) &&
+      Number.isInteger(timestamp.low) &&
+      timestamp.low >= -2147483648 &&
+      timestamp.low <= 2147483647 &&
+      Number.isInteger(timestamp.high) &&
+      timestamp.high >= 0 &&
+      timestamp.high <= 2097151 &&
+      typeof timestamp.unsigned === 'boolean' &&
+      timestamp.high * 4294967296 + (timestamp.low >>> 0) > 0);
+  return Boolean(
+    record.messageType === 'protocolMessage' &&
+      object(body) &&
+      boundedRetainedMetadata(body) &&
+      Object.keys(body).every((name) => ['protocolMessage', 'messageContextInfo'].includes(name)) &&
+      object(protocol) &&
+      Object.keys(protocol).every((name) => ['type', 'key', 'timestampMs', 'editedMessage'].includes(name)) &&
+      protocol.type === 14 &&
+      validTimestamp &&
+      object(source) &&
+      typeof source.id === 'string' &&
+      source.id.length > 0 &&
+      typeof source.remoteJid === 'string' &&
+      source.remoteJid.length > 0 &&
+      typeof source.fromMe === 'boolean' &&
+      object(target) &&
+      Object.keys(target).every((name) => ['id', 'remoteJid', 'fromMe', 'participant'].includes(name)) &&
+      typeof target.id === 'string' &&
+      target.id.length > 0 &&
+      target.id !== source.id &&
+      target.remoteJid === source.remoteJid &&
+      target.fromMe === source.fromMe &&
+      (target.participant === undefined || (typeof target.participant === 'string' && target.participant.length > 0)) &&
+      object(edit) &&
+      Object.keys(edit).length === 1 &&
+      ((typeof edit.conversation === 'string' && edit.conversation.length > 0) ||
+        (object(edit.extendedTextMessage) &&
+          Object.keys(edit.extendedTextMessage).every((name) =>
+            ['text', 'contextInfo', 'endCardTiles'].includes(name),
+          ) &&
+          typeof edit.extendedTextMessage.text === 'string' &&
+          edit.extendedTextMessage.text.length > 0 &&
+          (edit.extendedTextMessage.contextInfo === undefined || object(edit.extendedTextMessage.contextInfo)) &&
+          (edit.extendedTextMessage.endCardTiles === undefined ||
+            (Array.isArray(edit.extendedTextMessage.endCardTiles) &&
+              edit.extendedTextMessage.endCardTiles.length === 0)))),
+  );
+}
+
 export function classifyCachedHistoryRecord(
   record: {
     messageType: string;
     message: unknown;
+    key?: unknown;
   },
   edited: boolean,
 ):
@@ -50,6 +112,7 @@ export function classifyCachedHistoryRecord(
   | 'unavailable_other_edit'
   | 'conflicting_text_edit'
   | 'encrypted_edit'
+  | 'plaintext_edit'
   | 'pin_control'
   | 'poll_control'
   | 'album_container' {
@@ -81,6 +144,7 @@ export function classifyCachedHistoryRecord(
     return 'album_container';
   }
   const keys = Object.keys(payload);
+  if (isKnownPlaintextHistoryEdit(record)) return 'plaintext_edit';
   if (knownHistoryMetadataControl(record)) return 'metadata_control';
   if (
     record.messageType === 'templateMessage' &&

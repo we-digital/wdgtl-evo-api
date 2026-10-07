@@ -75,11 +75,13 @@ import {
 import {
   assertIgnoredEditOriginalIdentity,
   captureMissingEncryptedEditOriginal,
+  captureMissingPlaintextEditOriginal,
   CONFLICTING_TEXT_EDIT_REJECTION,
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
   IgnoredMissingEncryptedOriginalProof,
+  IgnoredMissingPlaintextOriginalProof,
   IgnoredNullEditProof,
   ignoredNullEditProof,
   isUnavailableNullEditOriginal,
@@ -6235,6 +6237,25 @@ export class ChatwootService {
           classifyCachedHistoryRecord(message, message.status === 'EDITED' || editedIds.has(message.id)),
         ]),
       );
+      const missingPlaintextOriginals = new Map<
+        string,
+        { source: MessageModel; proof: IgnoredMissingPlaintextOriginalProof }
+      >();
+      for (const source of authoritativeMessages) {
+        const sourceId = toChatwootSourceId((source.key as { id: string }).id);
+        if (classifications.get(sourceId) !== 'plaintext_edit') continue;
+        const proof = await captureMissingPlaintextEditOriginal(
+          source,
+          this.prismaRepository.message,
+          Number(provider.accountId),
+          inbox.id,
+        );
+        if (!proof)
+          throw new Error(
+            'Retained plaintext edit has an original; explicit latest-version reconciliation is required',
+          );
+        missingPlaintextOriginals.set(sourceId, { source, proof });
+      }
       const editedMessages = authoritativeMessages.filter((message) => {
         const classification = classifications.get(toChatwootSourceId((message.key as { id: string }).id));
         return (
@@ -6915,7 +6936,26 @@ export class ChatwootService {
         if (!isDeepStrictEqual(proof, missing.proof))
           throw new Error('Missing encrypted edit original or source rotated before acknowledgement');
       }
+      for (const missing of missingPlaintextOriginals.values()) {
+        const proof = await captureMissingPlaintextEditOriginal(
+          missing.source,
+          this.prismaRepository.message,
+          Number(provider.accountId),
+          inbox.id,
+        );
+        if (!isDeepStrictEqual(proof, missing.proof))
+          throw new Error('Missing plaintext edit original or source rotated before acknowledgement');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
+        const missingPlaintextOriginal = missingPlaintextOriginals.get(sourceId)?.proof;
+        if (missingPlaintextOriginal)
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: UNAVAILABLE_ORIGINAL_EDIT_REASON,
+            recovery: 'unsupported',
+            unavailableOriginalEdit: missingPlaintextOriginal,
+          };
         const missingEncryptedOriginal = missingEncryptedOriginals.get(sourceId)?.proof;
         if (missingEncryptedOriginal)
           return {
