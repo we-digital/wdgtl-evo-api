@@ -75,6 +75,8 @@ import {
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
+  IgnoredNullEditProof,
+  ignoredNullEditProof,
   isUnavailableNullEditOriginal,
   UNAVAILABLE_ORIGINAL_EDIT_REASON,
   UnavailableOriginalEditProof,
@@ -6223,14 +6225,16 @@ export class ChatwootService {
           competitors: [],
         };
       };
-      for (const target of editedMessages) {
-        const sourceId = toChatwootSourceId((target.key as { id: string }).id);
-        if (!existingSourceIds.has(sourceId) && isUnavailableNullEditOriginal(target)) {
-          const state = await readUnavailableOriginalState(target);
-          const proof = await chatwootImport.captureUnavailableOriginalEdit(target, target, state, inbox.id, provider);
-          unavailableOriginalEdits.set(sourceId, { source: target, target, state, proof });
-        }
+      // Preserve the previously proven unavailable encrypted original dependencies.
+      for (const target of editedMessages.filter((row) => unavailableOriginalTargets.has(row.id))) {
+        const state = await readUnavailableOriginalState(target);
+        const proof = await chatwootImport.captureUnavailableOriginalEdit(target, target, state, inbox.id, provider);
+        unavailableOriginalEdits.set(proof.sourceId, { source: target, target, state, proof });
       }
+      const ignoredNullEdits = new Map<
+        string,
+        { source: MessageModel; state: UnavailableOriginalEditState; proof: IgnoredNullEditProof }
+      >();
       const initiallyMissing = uniqueMessages.filter(
         (message: any) => !existingSourceIds.has(toChatwootSourceId(message.key.id)),
       );
@@ -6307,6 +6311,13 @@ export class ChatwootService {
         inbox.id,
         provider,
         this,
+        false,
+        undefined,
+        async (source) => {
+          const state = await readUnavailableOriginalState(source);
+          const proof = ignoredNullEditProof(source, state, Number(provider.accountId), inbox.id);
+          ignoredNullEdits.set(proof.sourceId, { source, state, proof });
+        },
       );
       const importableMessages = missingMessages.filter(
         (message: any) =>
@@ -6578,7 +6589,22 @@ export class ChatwootService {
         if (!isDeepStrictEqual(proof, unavailable.proof) || proof.sourceId !== sourceId)
           throw new Error('Unavailable edit original dependency proof rotated before acknowledgement');
       }
+      for (const ignored of ignoredNullEdits.values()) {
+        const state = await readUnavailableOriginalState(ignored.source);
+        const proof = ignoredNullEditProof(ignored.source, state, Number(provider.accountId), inbox.id);
+        if (!isDeepStrictEqual(state, ignored.state) || !isDeepStrictEqual(proof, ignored.proof))
+          throw new Error('Ignored NULL edit source or provenance rotated before acknowledgement');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
+        const ignoredNullEdit = ignoredNullEdits.get(sourceId)?.proof;
+        if (ignoredNullEdit)
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: UNAVAILABLE_ORIGINAL_EDIT_REASON,
+            recovery: 'unsupported',
+            unavailableOriginalEdit: ignoredNullEdit,
+          };
         const preparation = preparedBySourceId.get(sourceId);
         const classification = classifications.get(sourceId);
         const unavailableOriginalEdit = unavailableOriginalEdits.get(sourceId)?.proof;
