@@ -781,3 +781,9 @@ After authenticated bytes are read, only the fresh HTTPS WhatsApp URL/directPath
 The installed SDK receipt HKDF requires a 32-byte key. Persisted native media JSON stores that key as canonical base64; passing the string directly produced an empty SDK key derivation input and an unauthenticatable receipt. The qualified refresh path now decodes the already-validated key only in a detached SDK message. Canonical source JSON, its full version guards, caption, author, reply and timestamps remain unchanged. No cached-apply fallback, deadline extension or automatic provider retry is introduced.
 
 A deterministic installed-SDK regression proves the raw string receipt fails authentication under the native key, the decoded receipt authenticates the exact original stanza, and neither original nor input message JSON is mutated. Focused refresh coverage now has 25 passing cases; actual provider refresh requires a fresh guarded operator request after immutable release.
+
+### Omitted native album counters (276)
+
+The installed protobuf represents omitted optional album counts as absent JSON properties. Explicit container-only accounting accepts those omissions without inferring children or importing a visible message. A version3 durable proof records nativeImageCountPresent/nativeVideoCountPresent and the exact original source JSON/hash; zero is only the bookkeeping bound when a count is unavailable. Existing explicit-count version2 proofs and legacy child-preservation rules remain unchanged. Explicit null, malformed counts, nonzero video counts and unknown payload keys refuse. Release the paired History version3 receiver first; no schema migration or provider action.
+
+Verification: 44 focused synthetic album/format cases, including actual installed protobuf omission, preserved JSON, changing presence/source, explicit malformed counters and unchanged legacy refusal.

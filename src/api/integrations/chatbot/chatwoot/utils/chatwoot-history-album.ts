@@ -134,6 +134,18 @@ const boundedAlbumContext = (value: any): boolean => {
 export function albumImageCount(record: any, disposition: 'legacy' | 'container_only' = 'legacy'): number {
   const body = record.message;
   const album = body?.albumMessage;
+  const count =
+    object(album) && Object.prototype.hasOwnProperty.call(album, 'expectedImageCount')
+      ? album.expectedImageCount
+      : disposition === 'container_only'
+        ? 0
+        : undefined;
+  const videos =
+    object(album) && Object.prototype.hasOwnProperty.call(album, 'expectedVideoCount')
+      ? album.expectedVideoCount
+      : disposition === 'container_only'
+        ? 0
+        : undefined;
   if (
     (disposition !== 'legacy' && disposition !== 'container_only') ||
     record.messageType !== 'albumMessage' ||
@@ -144,10 +156,10 @@ export function albumImageCount(record: any, disposition: 'legacy' | 'container_
     ) ||
     !validSenderKeySidecar(body) ||
     !Object.keys(album).every((key) => ['expectedImageCount', 'expectedVideoCount', 'contextInfo'].includes(key)) ||
-    !Number.isInteger(album.expectedImageCount) ||
-    album.expectedImageCount < (disposition === 'container_only' ? 0 : 1) ||
-    album.expectedImageCount > 13 ||
-    album.expectedVideoCount !== 0 ||
+    !Number.isInteger(count) ||
+    count < (disposition === 'container_only' ? 0 : 1) ||
+    count > 13 ||
+    videos !== 0 ||
     (disposition === 'legacy' &&
       album.contextInfo !== undefined &&
       (!object(album.contextInfo) ||
@@ -183,7 +195,7 @@ export function albumImageCount(record: any, disposition: 'legacy' | 'container_
       : body.messageContextInfo !== undefined && !boundedAlbumContext(body.messageContextInfo))
   )
     fail();
-  return album.expectedImageCount;
+  return count;
 }
 
 const bytes = (value: any) => {
@@ -422,8 +434,18 @@ export async function preserveAlbumContainers(
     if ('containerOnly' in snapshot) {
       const sourceNativeJSON = JSON.stringify(parent);
       const sameKeyNativeJSON = JSON.stringify(snapshot.sameKeyNativeRows);
+      const nativeImageCountPresent = Object.prototype.hasOwnProperty.call(
+        parent.message.albumMessage,
+        'expectedImageCount',
+      );
+      const nativeVideoCountPresent = Object.prototype.hasOwnProperty.call(
+        parent.message.albumMessage,
+        'expectedVideoCount',
+      );
+      const omittedCounts = !nativeImageCountPresent || !nativeVideoCountPresent;
       proofs.set('WAID:' + parent.key.id, {
-        version: 2,
+        version: omittedCounts ? 3 : 2,
+        ...(omittedCounts ? { nativeImageCountPresent, nativeVideoCountPresent } : {}),
         disposition: 'container_only',
         accountID,
         inboxID,
