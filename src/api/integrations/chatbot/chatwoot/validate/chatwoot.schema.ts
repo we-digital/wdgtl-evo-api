@@ -161,3 +161,46 @@ export const chatwootHistoryRecoveryBatchSchema: JSONSchema7 = {
     'messages',
   ],
 };
+
+export const chatwootHistoryMappingReconcileSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  additionalProperties: false,
+  properties: {
+    contractVersion: { type: 'string', enum: ['2026-10-08'] },
+    dryRun: { type: 'boolean' },
+    expectedDestinationKey: { type: 'string', minLength: 1, maxLength: 255 },
+    expectedInboxId: { type: 'integer', minimum: 1 },
+    messages: {
+      ...(chatwootHistoryRecoveryBatchSchema.properties.messages as JSONSchema7),
+      maxItems: 250,
+      items: {
+        ...((chatwootHistoryRecoveryBatchSchema.properties.messages as JSONSchema7).items as JSONSchema7),
+        properties: {
+          sourceId: { type: 'string', pattern: '^WAID:[^\\s]+$', maxLength: 255 },
+          expectedDirection: { type: 'string', enum: ['incoming', 'outgoing'] },
+          message: {
+            type: 'object',
+            properties: {
+              id: { type: 'string', minLength: 1, maxLength: 255 },
+              messageType: { type: 'string', minLength: 1, maxLength: 100 },
+              messageTimestamp: { type: 'integer', minimum: 0 },
+              key: {
+                type: 'object',
+                properties: {
+                  id: { type: 'string', minLength: 1, maxLength: 255 },
+                  remoteJid: { type: 'string', minLength: 1, maxLength: 255 },
+                  fromMe: { type: 'boolean' },
+                },
+                required: ['id', 'remoteJid', 'fromMe'],
+              },
+              message: { type: 'object' },
+            },
+            required: ['id', 'key', 'messageType', 'messageTimestamp', 'message'],
+          },
+        },
+      },
+    },
+  },
+  required: ['contractVersion', 'dryRun', 'expectedDestinationKey', 'expectedInboxId', 'messages'],
+};

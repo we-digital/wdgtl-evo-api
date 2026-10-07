@@ -2,6 +2,7 @@ import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto } from '@api/dto/instance.dto';
 import {
   ChatwootDto,
+  ChatwootHistoryMappingReconcileDto,
   ChatwootHistoryRecoveryBatchDto,
   ChatwootHistorySyncBatchDto,
   ChatwootHistorySyncDto,
@@ -9,6 +10,7 @@ import {
 import { HttpStatus } from '@api/routes/index.router';
 import { chatwootController } from '@api/server.module';
 import {
+  chatwootHistoryMappingReconcileSchema,
   chatwootHistoryRecoveryBatchSchema,
   chatwootHistorySyncBatchSchema,
   chatwootHistorySyncSchema,
@@ -76,6 +78,15 @@ export class ChatwootRouter extends RouterBroker {
           maxBatchSize: 500,
           operation: 'bounded-cached-apply',
         });
+      })
+      .post(this.routerPath('historyMappings/reconcile'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<ChatwootHistoryMappingReconcileDto>({
+          request: req,
+          schema: chatwootHistoryMappingReconcileSchema,
+          ClassRef: ChatwootHistoryMappingReconcileDto,
+          execute: (instance, data) => chatwootController.reconcileHistoryMappings(instance, data),
+        });
+        res.status(HttpStatus.OK).json(response);
       })
       .post(this.routerPath('historySyncBatch/v2'), ...guards, async (req, res) => {
         const response = await this.dataValidate<ChatwootHistoryRecoveryBatchDto>({
