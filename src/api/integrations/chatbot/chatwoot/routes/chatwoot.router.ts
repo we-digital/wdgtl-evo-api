@@ -41,6 +41,15 @@ export class ChatwootRouter extends RouterBroker {
 
         res.status(HttpStatus.OK).json(response);
       })
+      .post(this.routerPath('syncGroups'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<{ dryRun?: boolean }>({
+          request: req,
+          schema: instanceSchema,
+          ClassRef: InstanceDto,
+          execute: (instance, data) => chatwootController.syncGroups(instance, data),
+        });
+        res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('historySync'), ...guards, async (req, res) => {
         const response = await this.dataValidate<ChatwootHistorySyncDto>({
           request: req,

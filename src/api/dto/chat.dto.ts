@@ -141,3 +141,9 @@ export class FindMessagesCursorDto {
   remoteJid?: string;
   cursor?: MessageCursorDto;
 }
+
+export class RequestGroupHistoryDto {
+  remoteJid: string;
+  messageId?: string;
+  count: number;
+}

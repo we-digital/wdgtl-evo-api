@@ -96,6 +96,13 @@ export class ChatwootController {
     return this.chatwootService.authenticateOutboundWebhook(instanceName, rawBody, headers);
   }
 
+  public async syncGroups(instance: InstanceDto, data: { dryRun?: boolean }) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
+    if (data.dryRun !== undefined && typeof data.dryRun !== 'boolean')
+      throw new BadRequestException('dryRun must be boolean');
+    return this.chatwootService.syncParticipatingGroups(instance, data.dryRun !== false);
+  }
+
   public async syncHistory(instance: InstanceDto, data: ChatwootHistorySyncDto) {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 

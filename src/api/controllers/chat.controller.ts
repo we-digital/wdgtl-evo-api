@@ -11,6 +11,7 @@ import {
   ProfilePictureDto,
   ProfileStatusDto,
   ReadMessageDto,
+  RequestGroupHistoryDto,
   SendPresenceDto,
   UpdateMessageDto,
   WhatsAppNumberDto,
@@ -33,6 +34,10 @@ export class ChatController {
     private readonly waMonitor: WAMonitoringService,
     private readonly prismaRepository: PrismaRepository,
   ) {}
+
+  public async requestGroupHistory({ instanceName }: InstanceDto, data: RequestGroupHistoryDto) {
+    return this.waMonitor.waInstances[instanceName].requestGroupHistory(data);
+  }
 
   public async whatsappNumber({ instanceName }: InstanceDto, data: WhatsAppNumberDto) {
     return await this.waMonitor.waInstances[instanceName].whatsappNumber(data);

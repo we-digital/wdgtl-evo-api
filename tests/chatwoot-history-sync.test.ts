@@ -59,7 +59,9 @@ test('normalizes Chatwoot source ids exactly once', () => {
 
 test('retains verified LID provenance only for canonical provider conversation resolution', async () => {
   const original = message({ id: 'alias', remoteJid: '999999@lid', remoteJidAlt: '628100000001@s.whatsapp.net' });
-  const enabled = await normalizeStoredHistoryMessages([original], [original], undefined, { retainProviderAliases: true });
+  const enabled = await normalizeStoredHistoryMessages([original], [original], undefined, {
+    retainProviderAliases: true,
+  });
   assert.equal((enabled.messages[0].key as any).remoteJid, '628100000001@s.whatsapp.net');
   assert.equal((enabled.messages[0].key as any).historyOriginalRemoteJid, '999999@lid');
   assert.equal((original.key as any).remoteJid, '999999@lid');
@@ -455,10 +457,11 @@ test('legacy full-history import creates FKs only for identities with importable
     assert.equal(insertedParams.length, 1);
     assert.ok(insertedParams[0].includes('WAID:supported'));
     assert.ok(!insertedParams[0].includes('WAID:unsupported-mixed'));
-    assert.equal(transactionQueries[0], 'BEGIN');
-    assert.equal(transactionQueries[1], 'LOCK TABLE messages IN SHARE ROW EXCLUSIVE MODE');
-    assert.match(transactionQueries[2], /^INSERT INTO messages/);
-    assert.equal(transactionQueries[3], 'COMMIT');
+    assert.equal(transactionQueries[0], 'BEGIN ISOLATION LEVEL READ COMMITTED');
+    assert.ok(transactionQueries.some((sql) => sql.includes('pg_advisory_xact_lock')));
+    assert.ok(!transactionQueries.some((sql) => sql.startsWith('LOCK TABLE')));
+    assert.ok(transactionQueries.some((sql) => /^INSERT INTO messages/.test(sql)));
+    assert.equal(transactionQueries.at(-1), 'COMMIT');
   } finally {
     postgresClient.getChatwootConnection = originalGetConnection;
     chatwootImport.getChatwootUser = originalGetChatwootUser;
@@ -596,9 +599,13 @@ test('rejects authoritative direction drift before destination mutation and acce
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
   const service = Object.create(ChatwootService.prototype) as any;
   service.isImportHistoryAvailable = () => true;
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
+  service.assertTaggedHistoryMediaStored = async () => new Set();
   service.getProvider = async () => ({ accountId: '1', importMessages: true });
   service.getStoredHistoryRecoveryInbox = async () => ({ id: 99 });
 
+  const originalVerifiedRecovery = chatwootImport.getVerifiedRecoverySourceIds;
+  chatwootImport.getVerifiedRecoverySourceIds = async () => new Set();
   const originalActivateGuards = chatwootImport.activateHistorySourceGuards;
   const originalReconcileOutbound = chatwootImport.reconcileOutboundHistoryBindings;
   const originalImportHistory = chatwootImport.importHistoryMessages;
@@ -685,6 +692,7 @@ test('rejects authoritative direction drift before destination mutation and acce
     );
     assert.deepEqual({ guardCalls, reconcileCalls, importCalls }, { guardCalls: 1, reconcileCalls: 0, importCalls: 0 });
   } finally {
+    chatwootImport.getVerifiedRecoverySourceIds = originalVerifiedRecovery;
     chatwootImport.activateHistorySourceGuards = originalActivateGuards;
     chatwootImport.reconcileOutboundHistoryBindings = originalReconcileOutbound;
     chatwootImport.importHistoryMessages = originalImportHistory;

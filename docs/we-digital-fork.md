@@ -689,3 +689,34 @@ Explicit recovery SQL imports now propagate only a fixed phase and bounded Postg
 Recovery accepts authenticated zero-count album headers only through the explicit version-2 container-only audit, with full source and same-key row fingerprints and no child-completeness claim. NULL EDITED contact and album bodies use the existing versioned ignored-edit disposition; all current native source/update proofs remain mandatory and no destination preservation is asserted.
 
 Known protocol history bundles/notices are metadata controls with exact typed descriptors and bounded retained sidecars; their payloads are neither downloaded nor written as customer messages. Hydrated/interactive JPEG templates retain their body and URL-button text plus native header image. Plain buttons retain body, footer and response labels without executing actions. Lottie sticker wrappers retain the original WAS file as a document attachment with a native-source fingerprint; the same bounded native download authenticates encrypted SHA and Image/Sticker MAC before SDK decryption and verifies native plaintext size/SHA. Existing source scope, identity, direction, version, cache-first authority, 32 MiB bounds and official ACK paths remain mandatory. Unknown contradictory outer payloads still refuse.
+
+## Group recovery and native message lookup performance (2026-10-07)
+
+The authenticated `POST /chat/requestGroupHistory/:instance` accepts a native
+group JID, a bounded count (1–500), and optionally a native anchor message ID
+belonging to that instance. Current native group membership is checked. Without
+an anchor, it requests recent history before the current timestamp using the
+optional protobuf cursor. Group ingestion must be enabled, and the existing Baileys
+primary-device history request is used. No customer message is sent and no
+local checkpoint or source payload is fabricated; returned primary history
+uses the normal cache, idempotent importer and canonical conversation binding.
+Request acknowledgement is not evidence that the primary returned history.
+
+The additive concurrent PostgreSQL Message index matches Prisma's JSONB `#>`
+source-key lookup and timestamp ordering, avoiding an instance-wide scan that
+the existing text `->>` expression index cannot serve. Retain the old index.
+Rollback can keep this additive index; the group request endpoint has no
+automatic callers. Preserve these paths during upstream reapply.
+
+## Participating WhatsApp group conversations (2026-10-07)
+
+- Authenticated `chatwoot/syncGroups/:instance` defaults to dry-run and reads the existing socket's current participating groups. The current owner must match a native participant phone/LID; each group resolves only in the provider's verified bound inbox. Existing conversations/statuses are reused, and missing group contacts/conversations are created through the canonical resolver. No message, unread state, source identity, attachment or provider send is synthesized.
+- Connection-open, group-upsert and participant events schedule coalesced background reconciliation. All service instances share a two-operation limit and per-instance serialization; live message handlers never await roster work. New live messages keep the existing peer resolver and deduplication.
+- Keep these event hooks alongside the protected provider conversation contract when rebasing. Rollback removes automatic discovery/endpoint; already-created valid group conversations remain usable and cannot be deleted by rollback. Known group-ignore settings still explicitly disable ingestion.
+- Validation: participating-groups synthetic tests include two inboxes for one group, reuse, owner/inbox conflicts, no customer-send path and bounded primary-history requests. Recovery remains a separate guarded operation after actual primary history is received.
+
+Roster creation requires Chatwoot whatsapp_group_roster_contract_version=1.
+Contact and canonical conversation requests carry the authenticated native
+bridge plus history-import/inbox headers, suppressing live callbacks; roster
+contact creation does not write labels. Deploy the Chatwoot capability before
+EVO; unsupported runtimes refuse safely and leave live ingress unchanged.
