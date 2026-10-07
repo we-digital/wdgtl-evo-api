@@ -73,6 +73,7 @@ async function assertMixedIgnoredNullBatch(t: TestContext) {
       messageType: 'conversation',
       key: { ...f.target.key, id: `ordinary-key-${i}` },
       message: { conversation: 'synthetic' },
+      chatwootMessageId: null, chatwootInboxId: null, chatwootConversationId: null, chatwootContactInboxSourceId: null,
     })),
   ];
   const service = Object.create(ChatwootService.prototype) as any;
@@ -109,6 +110,14 @@ async function assertMixedIgnoredNullBatch(t: TestContext) {
       ],
     },
     media: { findFirst: async () => assert.fail('No media GET') },
+    $transaction: async (work: any) => work({
+      $queryRaw: async (sql: any) => rows.filter((row) => row.key.id === sql.values[1]),
+      message: { updateMany: async ({ where, data }: any) => {
+        const selected = rows.filter((row) => where.id.in.includes(row.id));
+        selected.forEach((row) => Object.assign(row, data));
+        return { count: selected.length };
+      } },
+    }),
   };
   const names = [
     'activateHistorySourceGuards',
@@ -137,20 +146,35 @@ async function assertMixedIgnoredNullBatch(t: TestContext) {
         .map((row) => `WAID:${row.key.id}`),
     );
   chatwootImport.importHistoryMessages = async () => assert.fail('No replacement/placeholder import');
+  const alias = (values: any[]) => {
+    const index = Number(String(values[2][0]).replace(/^WAID:/, '').split('-').pop());
+    return { rows: Number.isInteger(index) && String(values[2][0]).includes('ordinary-key-') ? [{ id: 1000 + index }] : [] };
+  };
   postgresClient.getChatwootConnection = (() => ({
-    query: async (sql: string) => {
+    query: async (sql: string, values: any[]) => {
       assert.equal(sql.trim().startsWith('SELECT'), true);
       captures++;
-      return { rows: [] };
+      return sql.startsWith('SELECT id FROM messages') ? alias(values) : { rows: [] };
     },
-    connect: async () => ({
-      query: async (sql: string) => {
-        captures++;
-        assert.ok(['BEGIN', 'COMMIT', 'ROLLBACK'].includes(sql) || sql.startsWith('SELECT'));
-        return { rows: [] };
-      },
-      release() {},
-    }),
+    connect: async () => {
+      let nativeIndex = -1;
+      return {
+        query: async (sql: string, values: any[]) => {
+          captures++;
+          assert.ok(['COMMIT', 'ROLLBACK'].includes(sql) || sql.startsWith('BEGIN') || sql.startsWith('SELECT') || sql.startsWith('SET LOCAL'));
+          if (sql.startsWith('SELECT conversation_id')) {
+            nativeIndex = Number(values[0]) - 1000;
+            return { rows: [{ conversation_id: 8, source_id: `WAID:ordinary-key-${nativeIndex}`, message_type: 0, private: false }] };
+          }
+          if (sql.startsWith('SELECT public.provider_message_conversation_route')) return { rows: [{ id: 8 }] };
+          if (sql.startsWith('SELECT id FROM messages')) return alias(values);
+          if (sql.startsWith('SELECT c.id')) return { rows: [{ id: 8, display_id: 8, inbox_id: 99, source_id: 'synthetic-ci' }] };
+          if (sql.includes('SELECT b.peer')) return { rows: [{ peer: '123@g.us' }] };
+          return { rows: [] };
+        },
+        release() {},
+      };
+    },
   })) as any;
   const input = {
     contractVersion: '2026-08-28',
@@ -170,6 +194,10 @@ async function assertMixedIgnoredNullBatch(t: TestContext) {
   assert.equal(guards, 1);
   assert.ok(captures >= 6);
   assert.equal(result.importedMessages, 0);
+  assert.equal(result.nativeBindings.length, 248);
+  assert.equal(result.nativeBindings.every((binding: any) => binding.status === 'bound'), true);
+  assert.equal(rows.slice(2).every((row: any, index: number) => row.chatwootMessageId === 1000 + index && row.chatwootInboxId === 99), true);
+  assert.equal(f.target.chatwootInboxId, null); // Ignored NULL edit is never presented as a bound destination.
   assert.equal(result.outcomes.length, 250);
   assert.equal(result.outcomes.filter((o: any) => o.status === 'existing').length, 248);
   for (const outcome of result.outcomes.filter((o: any) => o.status === 'skipped')) {

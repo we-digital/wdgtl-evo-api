@@ -1,6 +1,7 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import {
   ChatwootDto,
+  ChatwootHistoryMappingReconcileDto,
   ChatwootHistoryRecoveryBatchDto,
   ChatwootHistorySyncBatchDto,
   ChatwootHistorySyncDto,
@@ -119,6 +120,11 @@ export class ChatwootController {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 
     return this.chatwootService.getStoredHistoryRecoveryCapability(instance);
+  }
+
+  public async reconcileHistoryMappings(instance: InstanceDto, data: ChatwootHistoryMappingReconcileDto) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
+    return this.chatwootService.reconcileStoredHistoryMappings(instance, data);
   }
 
   public async syncHistoryRecoveryBatch(instance: InstanceDto, data: ChatwootHistoryRecoveryBatchDto) {

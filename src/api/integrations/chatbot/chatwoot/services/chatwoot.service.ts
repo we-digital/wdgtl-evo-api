@@ -7,6 +7,7 @@ import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/wha
 import { persistNativeForwardMessage } from '@api/integrations/channel/whatsapp/persist-native-forward-message';
 import {
   ChatwootDto,
+  ChatwootHistoryMappingReconcileDto,
   ChatwootHistoryRecoveryBatchDto,
   ChatwootHistorySyncBatchDto,
   ChatwootHistorySyncDto,
@@ -50,6 +51,7 @@ import {
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
 import { formatWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
+import { reconcileHistoryMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-message-binding';
 import {
   buildStoredLidMap,
   chatwootInboxCacheKey,
@@ -6223,6 +6225,88 @@ export class ChatwootService {
     };
   }
 
+  public async reconcileStoredHistoryMappings(instance: InstanceDto, data: ChatwootHistoryMappingReconcileDto) {
+    if (
+      !this.isImportHistoryAvailable() ||
+      !this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS ||
+      data.contractVersion !== '2026-10-08' ||
+      typeof data.dryRun !== 'boolean' ||
+      !Array.isArray(data.messages) ||
+      data.messages.length < 1 ||
+      data.messages.length > 250
+    )
+      throw new BadRequestException('Invalid bounded history mapping contract');
+    const releaseWriter = tryAcquireHistoryWriter(instance.instanceName);
+    if (!releaseWriter) throw new BadRequestException('Chatwoot history writer is already running');
+    try {
+      const provider = await this.getProvider(instance);
+      if (!provider?.enabled || !provider.importMessages)
+        throw new BadRequestException('Chatwoot history import is disabled');
+      const inbox = await this.getStoredHistoryRecoveryInbox(provider);
+      if (
+        !inbox ||
+        !matchesHistoryRecoveryDestination(
+          data.expectedDestinationKey,
+          data.expectedInboxId,
+          provider.accountId,
+          inbox.id,
+        )
+      )
+        throw new BadRequestException('Chatwoot history mapping destination changed');
+      const ids = data.messages.map((entry) => String(entry.message?.id || ''));
+      const sources = data.messages.map((entry) => entry.sourceId);
+      if (ids.some((id) => !id) || new Set(ids).size !== ids.length || new Set(sources).size !== sources.length)
+        throw new BadRequestException('History mapping batch contains duplicate or absent identities');
+      const stored = await this.prismaRepository.message.findMany({
+        where: { Instance: { name: instance.instanceName }, id: { in: ids } },
+      });
+      const updates = await this.prismaRepository.messageUpdate.findMany({
+        where: { Instance: { name: instance.instanceName }, messageId: { in: ids }, status: 'EDITED' },
+        select: { messageId: true },
+      });
+      const edited = new Set(updates.map((row) => row.messageId));
+      const selected = data.messages.map((entry) => {
+        const row = stored.find((item) => item.id === entry.message.id);
+        const key = row?.key as { id?: string; fromMe?: boolean };
+        if (
+          !row ||
+          typeof key?.id !== 'string' ||
+          typeof key.fromMe !== 'boolean' ||
+          toChatwootSourceId(key.id) !== entry.sourceId ||
+          (key.fromMe ? 'outgoing' : 'incoming') !== entry.expectedDirection ||
+          row.messageTimestamp !== entry.message.messageTimestamp ||
+          row.messageType !== entry.message.messageType ||
+          !isDeepStrictEqual(row.key, entry.message.key) ||
+          !isDeepStrictEqual(row.message, entry.message.message) ||
+          classifyCachedHistoryRecord(row, row.status === 'EDITED' || edited.has(row.id)) !== 'ordinary'
+        )
+          throw new BadRequestException('History mapping requires the current exact ordinary source version');
+        return row;
+      });
+      const outcomes = [];
+      for (const row of selected)
+        outcomes.push(
+          await reconcileHistoryMessageBinding(
+            postgresClient.getChatwootConnection(),
+            this.prismaRepository,
+            row,
+            Number(provider.accountId),
+            inbox.id,
+            data.dryRun,
+          ),
+        );
+      return {
+        contractVersion: data.contractVersion,
+        dryRun: data.dryRun,
+        ...historyRecoveryDestination(provider.accountId, inbox.id),
+        selectedMessages: selected.length,
+        outcomes,
+      };
+    } finally {
+      releaseWriter();
+    }
+  }
+
   public async syncStoredHistoryRecoveryBatch(instance: InstanceDto, data: ChatwootHistoryRecoveryBatchDto) {
     if (!this.isImportHistoryAvailable()) {
       throw new BadRequestException('Chatwoot history import database connection is not configured');
@@ -7134,6 +7218,31 @@ export class ChatwootService {
         (outcome) => outcome.status === 'imported' && outcome.recovery === 'placeholder',
       ).length;
 
+      // Complete dependency recaptures before changing native pointer-only metadata.
+      // Skipped edits and controls do not represent a destination message to bind.
+      const nativeBindings = [];
+      for (const row of authoritativeMessages) {
+        if (!this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) break;
+        const sourceId = toChatwootSourceId((row.key as { id: string }).id);
+        if (
+          classifications.get(sourceId) !== 'ordinary' ||
+          !outcomes.some(
+            (outcome) => outcome.sourceId === sourceId && ['existing', 'imported'].includes(outcome.status),
+          )
+        )
+          continue;
+        nativeBindings.push(
+          await reconcileHistoryMessageBinding(
+            postgresClient.getChatwootConnection(),
+            this.prismaRepository,
+            row,
+            Number(provider.accountId),
+            inbox.id,
+            false,
+          ),
+        );
+      }
+
       if (data.scope === 'all' && data.unresolvedLidMode === 'provisional') {
         await this.enableExtendedHistorySync(instance);
       }
@@ -7158,6 +7267,7 @@ export class ChatwootService {
         placeholderMessages,
         duplicateSourceMessagesSkipped,
         processedSourceIds: Array.from(requestedSourceIds),
+        nativeBindings,
         outcomes,
       };
     } finally {
