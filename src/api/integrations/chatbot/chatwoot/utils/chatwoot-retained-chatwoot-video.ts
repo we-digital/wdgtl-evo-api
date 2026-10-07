@@ -53,38 +53,42 @@ export async function readRetainedChatwootGroupVideo(
   const expected = nativeCachedMediaPayload(target);
   for (const copy of copies) {
     const matches = natives.filter((candidate) => candidate.instanceId === copy.instance_id);
-    if (matches.length !== 1) throw new Error('retained_cw_video_ambiguous_native');
-    const native = matches[0];
-    const nativeKey = native?.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
+    if (!matches.length) throw new Error('retained_cw_video_native_unavailable');
     if (
-      !native ||
-      native.messageType !== target.messageType ||
-      native.messageTimestamp !== target.messageTimestamp ||
-      nativeKey.id !== key.id ||
-      nativeKey.remoteJid !== key.remoteJid ||
-      typeof nativeKey.fromMe !== 'boolean' ||
       copy.account_id !== accountId ||
       copy.private !== false ||
       copy.peer !== key.remoteJid ||
       ![key.id, `WAID:${key.id}`].includes(copy.source_id) ||
-      copy.message_type !== (nativeKey.fromMe ? 1 : 0) ||
       ![copy.id, copy.inbox_id, copy.display_id, copy.attachment_id].every((id) => Number.isSafeInteger(id) && id > 0)
     )
       throw new Error('retained_cw_video_copy_authority');
-    if (copies.filter((candidate) => candidate.inbox_id === copy.inbox_id).length !== 1)
-      throw new Error('retained_cw_video_ambiguous_copy');
-    const nativeExpected = nativeCachedMediaPayload(native);
-    const nativeMedia = retainedHistoryMedia(native);
-    if (
-      nativeMedia.type !== 'videoMessage' ||
-      !canonicalDigest(nativeMedia.descriptor) ||
-      nativeMedia.descriptor.mimetype !== 'video/mp4' ||
-      copy.content_type !== 'video/mp4' ||
-      Number(copy.byte_size) !== expected.size ||
-      nativeExpected.size !== expected.size ||
-      !nativeExpected.digest.equals(expected.digest)
-    )
-      throw new Error('retained_cw_video_digest_authority');
+    // Receive timestamps and duplicate row IDs are not byte identities. Validate
+    // every retained native row, while preserving its own full source snapshot.
+    for (const native of matches) {
+      const nativeKey = native.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
+      if (
+        native.messageType !== target.messageType ||
+        !Number.isSafeInteger(native.messageTimestamp) ||
+        native.messageTimestamp < 1 ||
+        nativeKey.id !== key.id ||
+        nativeKey.remoteJid !== key.remoteJid ||
+        typeof nativeKey.fromMe !== 'boolean' ||
+        copy.message_type !== (nativeKey.fromMe ? 1 : 0)
+      )
+        throw new Error('retained_cw_video_copy_authority');
+      const nativeExpected = nativeCachedMediaPayload(native);
+      const nativeMedia = retainedHistoryMedia(native);
+      if (
+        nativeMedia.type !== 'videoMessage' ||
+        !canonicalDigest(nativeMedia.descriptor) ||
+        nativeMedia.descriptor.mimetype !== 'video/mp4' ||
+        copy.content_type !== 'video/mp4' ||
+        Number(copy.byte_size) !== expected.size ||
+        nativeExpected.size !== expected.size ||
+        !nativeExpected.digest.equals(expected.digest)
+      )
+        throw new Error('retained_cw_video_digest_authority');
+    }
   }
   return copies.length
     ? verifyCachedMediaBytes(await readAttachment(copies[0], expected.size), {

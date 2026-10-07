@@ -81,7 +81,7 @@ test('wrong native identity, time, digest or MIME refuses before any object read
   for (const altered of [
     { ...native, key: { ...native.key, remoteJid: '120363999999@g.us' } },
     { ...native, key: { ...native.key, id: 'foreign-source' } },
-    { ...native, messageTimestamp: native.messageTimestamp + 1 },
+    { ...native, messageTimestamp: 0 },
     {
       ...native,
       message: { videoMessage: { ...native.message.videoMessage, fileSha256: Buffer.alloc(32).toString('base64') } },
@@ -95,7 +95,7 @@ test('wrong native identity, time, digest or MIME refuses before any object read
     );
 });
 
-test('foreign account, direction, peer, source, size or duplicate attachment refuses', async () => {
+test('foreign account, direction, peer, source or size refuses', async () => {
   for (const change of [
     { account_id: 2 },
     { message_type: 0 },
@@ -110,15 +110,11 @@ test('foreign account, direction, peer, source, size or duplicate attachment ref
         assert.fail('unverified read');
       }),
     );
-  await assert.rejects(
-    readRetainedChatwootGroupVideo(target, [native], [copy, copy], 1, async () => bytes),
-    /ambiguous/,
-  );
-  await assert.rejects(
-    readRetainedChatwootGroupVideo(target, [native, native], [copy], 1, async () => bytes),
-    /ambiguous_native/,
-  );
-  const conflictingNative = { ...native, instanceId: 'second-instance', messageTimestamp: target.messageTimestamp + 1 };
+  const conflictingNative = {
+    ...native,
+    instanceId: 'second-instance',
+    key: { ...native.key, fromMe: false },
+  };
   await assert.rejects(
     readRetainedChatwootGroupVideo(
       target,
@@ -129,6 +125,60 @@ test('foreign account, direction, peer, source, size or duplicate attachment ref
         assert.fail('all copies must be verified before read');
       },
     ),
+  );
+});
+
+test('eleven native copies with observed per-inbox timestamp offsets and duplicate rows reuse only verified bytes', async () => {
+  const offsets = [-8, -8, -8, -3, -29, -2, -8, -8, -8, -8, 0];
+  const instances = [0, 1, 2, 3, 3, 4, 4, 5, 6, 7, 8];
+  const natives = offsets.map((offset, index) => ({
+    ...native,
+    id: `synthetic-copy-${index}`,
+    instanceId: `synthetic-instance-${instances[index]}`,
+    messageTimestamp: target.messageTimestamp + offset,
+    key: { ...native.key, fromMe: instances[index] === 3 },
+  }));
+  const copies = Array.from({ length: 8 }, (_, index) => ({
+    ...copy,
+    id: 500 + index,
+    inbox_id: 600 + index,
+    attachment_id: 700 + index,
+    instance_id: `synthetic-instance-${index}`,
+    message_type: index === 3 ? 1 : 0,
+  }));
+  copies.push({ ...copies[0], id: 1500, attachment_id: 1700 });
+  const before = JSON.stringify(target);
+  let reads = 0;
+  assert.deepEqual(
+    await readRetainedChatwootGroupVideo(target, natives, copies, 1, async () => {
+      reads++;
+      return bytes;
+    }),
+    bytes,
+  );
+  assert.equal(reads, 1);
+  assert.equal(JSON.stringify(target), before, 'target timestamp, direction and caption remain unchanged');
+});
+
+test('every duplicate native and CW copy must agree with the authenticated byte authority', async () => {
+  for (const changed of [
+    { ...native, key: { ...native.key, fromMe: false } },
+    { ...native, messageTimestamp: -1 },
+    {
+      ...native,
+      message: { videoMessage: { ...native.message.videoMessage, fileSha256: Buffer.alloc(32).toString('base64') } },
+    },
+    { ...native, messageType: 'unknown' },
+  ])
+    await assert.rejects(
+      readRetainedChatwootGroupVideo(target, [native, changed], [copy], 1, async () => {
+        assert.fail('conflicting duplicate must refuse before byte read');
+      }),
+    );
+  await assert.rejects(
+    readRetainedChatwootGroupVideo(target, [native], [copy, { ...copy, id: 102, message_type: 0 }], 1, async () => {
+      assert.fail('conflicting retained message must refuse');
+    }),
   );
 });
 
@@ -215,9 +265,15 @@ test('literal service reuses proxy bytes and rejects native, CW or route rotatio
   let rotation = '';
   service.prismaRepository = {
     message: {
-      findMany: async () => {
+      findMany: async ({ where }: any) => {
         nativeReads++;
-        return rotation === 'native' && nativeReads > 1 ? [{ ...native, status: 'EDITED' }] : [native];
+        if (nativeReads === 1) {
+          assert.equal(where.messageTimestamp, undefined, 'receive timestamp must not hide a retained byte authority');
+          assert.equal(where.messageType, undefined, 'contradictory same-source envelopes must remain visible');
+        }
+        if (nativeReads > 1 && rotation === 'native') return [{ ...native, status: 'EDITED' }];
+        if (nativeReads > 1 && rotation === 'native_add') return [native, { ...native, id: 'new-native-copy' }];
+        return [native];
       },
     },
     chatwoot: { findMany: async () => (rotation === 'route' ? [] : [{ instanceId: native.instanceId }]) },
@@ -234,7 +290,9 @@ test('literal service reuses proxy bytes and rejects native, CW or route rotatio
           [native.instanceId],
         ]);
         cwReads++;
-        return { rows: rotation === 'cw' && cwReads > 1 ? [{ ...copy, blob_id: 'rotated-blob' }] : [copy] };
+        if (cwReads > 1 && rotation === 'cw') return { rows: [{ ...copy, blob_id: 'rotated-blob' }] };
+        if (cwReads > 1 && rotation === 'cw_add') return { rows: [copy, { ...copy, id: 102 }] };
+        return { rows: [copy] };
       },
     }) as any;
   axios.request = (async (request: any) => {
@@ -257,7 +315,7 @@ test('literal service reuses proxy bytes and rejects native, CW or route rotatio
   assert.equal(proxyReads, 1);
   assert.equal(nativeReads, 2);
   assert.equal(cwReads, 2);
-  for (rotation of ['native', 'cw', 'route']) {
+  for (rotation of ['native', 'native_add', 'cw', 'cw_add', 'route']) {
     nativeReads = 0;
     cwReads = 0;
     await assert.rejects(service.readRecoveryChatwootVideo(target, provider, [native.instanceId]), /source_rotated/);
