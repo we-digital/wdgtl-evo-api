@@ -147,6 +147,11 @@ import {
   whatsappQuotedMessageContent,
   whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
+import {
+  readRetainedChatwootGroupVideo,
+  RetainedChatwootVideo,
+  retainedVideoProxyUrl,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video';
 import { readRetainedGroupMedia } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-group-media';
 import {
   retainedHistoryDisplayBody,
@@ -2277,8 +2282,109 @@ export class ChatwootService {
         if (!isDeepStrictEqual(current, candidates)) throw new Error('cached_media_retained_source_rotated');
         return bytes;
       }
+      if (message.messageType === 'videoMessage') {
+        const retained = await this.readRecoveryChatwootVideo(
+          message,
+          provider,
+          routes.map((route) => route.instanceId),
+        );
+        if (retained) return retained;
+      }
     }
     return readRetainedRecoveryMedia(message);
+  }
+
+  private async readRecoveryChatwootVideo(message: MessageModel, provider: ChatwootModel, instanceIds: string[]) {
+    const key = message.key as { id: string; remoteJid: string };
+    const nativeCandidates = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: { in: instanceIds },
+        messageType: message.messageType,
+        messageTimestamp: message.messageTimestamp,
+        AND: [{ key: { path: ['id'], equals: key.id } }, { key: { path: ['remoteJid'], equals: key.remoteJid } }],
+      },
+      take: 26,
+      orderBy: { id: 'asc' },
+    });
+    const readCopies = async () =>
+      (
+        await postgresClient.getChatwootConnection().query(
+          `SELECT m.id,m.account_id,m.inbox_id,m.source_id,m.message_type,m.private,
+             extract(epoch from m.created_at)::double precision AS created_at_epoch,c.display_id,
+             b.peer,ch.additional_attributes->'we_digital_route_binding'->>'instance_id' AS instance_id,
+             a.id AS attachment_id,bl.id::text AS blob_id,bl.key,bl.byte_size::text,bl.content_type,bl.checksum
+           FROM messages m JOIN conversations c ON c.id=m.conversation_id
+             AND c.account_id=m.account_id AND c.inbox_id=m.inbox_id
+           JOIN provider_conversation_bindings b ON b.conversation_id=c.id
+             AND b.account_id=c.account_id AND b.inbox_id=c.inbox_id AND b.provider='whatsapp'
+           JOIN contacts ct ON ct.id=c.contact_id AND ct.account_id=c.account_id
+           JOIN contact_inboxes ci ON ci.id=c.contact_inbox_id AND ci.contact_id=ct.id AND ci.inbox_id=c.inbox_id
+           JOIN inboxes i ON i.id=c.inbox_id AND i.account_id=c.account_id AND i.channel_type='Channel::Api'
+           JOIN channel_api ch ON ch.id=i.channel_id AND ch.account_id=c.account_id
+           JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
+           JOIN active_storage_attachments sa ON sa.record_type='Attachment' AND sa.record_id=a.id AND sa.name='file'
+           JOIN active_storage_blobs bl ON bl.id=sa.blob_id
+           WHERE m.account_id=$1 AND m.source_id=ANY($2::text[]) AND b.peer=$3 AND ct.identifier=$3
+             AND ch.additional_attributes->>'we_digital_provider'='evo_whatsapp'
+             AND ch.additional_attributes->'we_digital_route_binding'->>'instance_id'=ANY($4::text[])
+           ORDER BY m.id,a.id LIMIT 26`,
+          [Number(provider.accountId), [key.id, toChatwootSourceId(key.id)], key.remoteJid, instanceIds],
+        )
+      ).rows as RetainedChatwootVideo[];
+    const copies = await readCopies();
+    const trusted = this.configService.get<Chatwoot>('CHATWOOT');
+    const bytes = await readRetainedChatwootGroupVideo(
+      message,
+      nativeCandidates,
+      copies,
+      Number(provider.accountId),
+      async (copy, limit) => {
+        const response = await axios.request({
+          method: 'GET',
+          url: requireTrustedChatwootUrl(
+            provider.url,
+            trusted.TRUSTED_BASE_URL,
+            `/api/v1/accounts/${provider.accountId}/conversations/${copy.display_id}/messages`,
+          ),
+          params: { source_ids: [copy.source_id] },
+          headers: {
+            'api-access-token': provider.token,
+            'X-Chatwoot-Native-Bridge-Token': trusted.NATIVE_BRIDGE_TOKEN,
+          },
+          timeout: 15_000,
+          maxRedirects: 0,
+          maxContentLength: 1024 * 1024,
+        });
+        const url = retainedVideoProxyUrl(copy, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin);
+        const stored = await axios.request({
+          method: 'GET',
+          url,
+          responseType: 'arraybuffer',
+          timeout: 15_000,
+          maxRedirects: 0,
+          maxContentLength: limit,
+        });
+        if (stored.headers['content-type']?.split(';')[0] !== copy.content_type)
+          throw new Error('retained_cw_video_response_mime');
+        return Buffer.from(stored.data);
+      },
+    );
+    if (!bytes) return null;
+    const current = await this.prismaRepository.message.findMany({
+      where: { id: { in: nativeCandidates.map((candidate) => candidate.id) } },
+      orderBy: { id: 'asc' },
+    });
+    const currentRoutes = await this.prismaRepository.chatwoot.findMany({
+      where: { enabled: true, accountId: provider.accountId, url: provider.url },
+      select: { instanceId: true },
+    });
+    if (
+      !isDeepStrictEqual(current, nativeCandidates) ||
+      !isDeepStrictEqual(await readCopies(), copies) ||
+      !isDeepStrictEqual(currentRoutes.map((route) => route.instanceId).sort(), [...instanceIds].sort())
+    )
+      throw new Error('retained_cw_video_source_rotated');
+    return bytes;
   }
 
   private async assertSilentHistoryMediaCapability(instance: InstanceDto, provider: ChatwootModel, inboxId: number) {
