@@ -616,7 +616,10 @@ class ChatwootImport {
       ) {
         const textEdit = ['conversation', 'extendedTextMessage'].includes(message.messageType);
         const nativeAlias =
-          textEdit && payload === null && isLidJid(key.remoteJid) && isPhoneJid(key.remoteJidAlt)
+          ['conversation', 'extendedTextMessage', 'documentMessage', 'audioMessage'].includes(message.messageType) &&
+          payload === null &&
+          isLidJid(key.remoteJid) &&
+          isPhoneJid(key.remoteJidAlt)
             ? toCanonicalHistoryJid(key.remoteJidAlt)
             : undefined;
         const documentEdit = message.messageType === 'documentMessage' && payload === null;
@@ -689,7 +692,7 @@ class ChatwootImport {
                   : target.has_image !== true) ||
             ((documentEdit || audioEdit) &&
               (!key.remoteJid ||
-                target.provider_peer !== key.remoteJid ||
+                !nativePeerMatches ||
                 message.chatwootMessageId == null ||
                 message.chatwootInboxId == null ||
                 message.chatwootConversationId == null)) ||
