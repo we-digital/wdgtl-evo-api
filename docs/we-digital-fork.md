@@ -724,3 +724,11 @@ EVO; unsupported runtimes refuse safely and leave live ingress unchanged.
 ## 2026-10-07 bounded roster lookup
 
 Participating group discovery reuses one bounded account/inbox/native-peer SQL read for destination contacts and conversations when the existing import connection is available. Duplicate contacts/conversations or conflicting canonical bindings stop the operation. Native owner/membership and the registered silent capability remain required. Missing destinations still use the protected canonical API with fresh identity checks; no SQL writes, messages, read-state updates or provider sends. Without the import connection, retain the existing HTTP reader. Exact synthetic PostgreSQL checks cover cross-account/inbox isolation and duplicate identities.
+
+### Participating group coverage and retained media reuse270
+
+Group roster reconciliation trusts the authenticated fresh `groupFetchAllParticipating(false)` joined-group IQ after the bound inbox/capability checks. Community and LID metadata can omit the receiving number; this does not invalidate that server membership proof. No groups.update fanout or provider message send is introduced. History requests retain their existing explicit membership guards.
+
+Missing group media first searches registered enabled routes on the same Chatwoot URL/account for the exact group/source/type/timestamp. Only stored bytes with the target's native size, MIME and SHA256 are reused; the target retains its author, direction, caption and source. Retained candidate snapshots are reread around the bounded storage read. Missing or conflicting source bytes still stop recovery; source/cache markers and native media rows are not fabricated. This avoids expired WhatsApp CDN pointers when another participating inbox already retained the file.
+
+Validation:20 focused cases, including exact PG roster scope lab, omitted receiver metadata, same group media copies, cross-peer/source isolation, corrupted bytes, provider transport and source-size limits; TypeScript and staged source lint. Production replay uses the existing guarded cached worker only.

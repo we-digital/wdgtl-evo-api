@@ -73,7 +73,7 @@ test('dry-run does not create and apply remains scoped to each participating inb
   }
 });
 
-test('reuses an existing conversation and rejects another inbox or unknown owner', async () => {
+test('reuses an existing conversation and rejects another inbox or an unauthenticated session', async () => {
   const f = fixture();
   f.service.findProviderContact = async () => ({ id: 10 });
   const conversation = { id: 4000, inbox_id: 40, contact_id: 10, peer: group, provider: 'whatsapp' };
@@ -83,9 +83,24 @@ test('reuses an existing conversation and rejects another inbox or unknown owner
   assert.equal(f.creations(), 0);
   conversation.inbox_id = 42;
   await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /identity conflicts/);
-  f.service.waMonitor.waInstances.synthetic.client.authState.creds.me = { id: '628100000099@s.whatsapp.net' };
-  await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /owner identity/);
+  f.service.waMonitor.waInstances.synthetic.client.authState.creds.me = null;
+  await assert.rejects(
+    f.service.syncParticipatingGroups(f.instance, false),
+    (error: any) =>
+      error.status === 400 && error.message?.includes('An authenticated provider and its bound inbox are required'),
+  );
   assert.equal(f.creations(), 0);
+});
+
+test('fresh authenticated joined-group membership works when metadata omits the receiver participant', async () => {
+  const f = fixture();
+  f.service.waMonitor.waInstances.synthetic.client.groupFetchAllParticipating = async (emitUpdates) => {
+    assert.equal(emitUpdates, false);
+    return { [group]: { id: group, subject: 'Synthetic group', participants: [] } };
+  };
+  const result = await f.service.syncParticipatingGroups(f.instance, false);
+  assert.equal(result.groups[0].conversationId, 4000);
+  assert.equal(f.creations(), 1);
 });
 
 test('primary history request requires current membership and a unique same-instance native anchor', async () => {
