@@ -70,6 +70,9 @@ function retainedDownloadDescriptor(message: Message) {
   if (
     !(
       (message.messageType === 'imageMessage' && type === 'imageMessage' && descriptor.mimetype === 'image/jpeg') ||
+      (message.messageType === 'documentMessage' &&
+        type === 'documentMessage' &&
+        descriptor.mimetype === 'application/pdf') ||
       (['associatedChildMessage', 'templateMessage'].includes(message.messageType) &&
         type === 'videoMessage' &&
         descriptor.mimetype === 'video/mp4')
@@ -81,7 +84,9 @@ function retainedDownloadDescriptor(message: Message) {
     typeof key.fromMe !== 'boolean'
   )
     throw new Error('cached_media_authority_unavailable');
-  const filename = basename(descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : 'mp4'}`);
+  const filename = basename(
+    descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'pdf' : 'mp4'}`,
+  );
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
   return { size, digest, filename, mimetype: descriptor.mimetype, objectName: '' };
@@ -138,7 +143,11 @@ export async function readRetainedRecoveryMedia(
   try {
     let dispatcher: any;
     let decryptType: 'image' | 'video' | 'document' =
-      retainedHistoryMedia(message).type === 'imageMessage' ? 'image' : 'video';
+      retainedHistoryMedia(message).type === 'imageMessage'
+        ? 'image'
+        : retainedHistoryMedia(message).type === 'documentMessage'
+          ? 'document'
+          : 'video';
     if (download === downloadContentFromMessage) {
       // Installed Baileys forwards dispatcher, but drops signal and redirect.
       // Read one bounded ciphertext first, then retain its original decryption.
@@ -193,6 +202,28 @@ export async function readRetainedRecoveryMedia(
           // Authentication selects only decryption keys; the native image envelope is unchanged.
           decryptType = 'document';
         }
+      }
+      if (retainedHistoryMedia(message).type === 'documentMessage') {
+        const body = ciphertext.subarray(0, -10);
+        const mac = ciphertext.subarray(-10);
+        const encryptedDigest =
+          typeof descriptor.fileEncSha256 === 'string'
+            ? Buffer.from(descriptor.fileEncSha256, 'base64')
+            : Buffer.from(descriptor.fileEncSha256?.data || Object.values(descriptor.fileEncSha256 || {}));
+        const keys = await getMediaKeys(key, 'document');
+        const expectedMAC = createHmac('sha256', keys.macKey)
+          .update(Buffer.concat([keys.iv, body]))
+          .digest()
+          .subarray(0, 10);
+        if (
+          ciphertext.length <= 10 ||
+          body.length % 16 !== 0 ||
+          encryptedDigest.length !== 32 ||
+          !createHash('sha256').update(ciphertext).digest().equals(encryptedDigest) ||
+          mac.length !== 10 ||
+          !timingSafeEqual(mac, expectedMAC)
+        )
+          throw new Error('cached_media_crypto_family_unavailable');
       }
       let delivered = false;
       dispatcher = {

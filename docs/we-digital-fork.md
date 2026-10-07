@@ -665,3 +665,10 @@ This disposition preserves the raw container as an unsupported versioned gap. De
 ### Preserve unavailable retained Word document edits (266)
 
 A NULL retained document edit may preserve its uniquely bound existing PDF or Word (`application/msword`) attachment. The existing single document attachment/file relation, positive durable blob/key, public direction, peer, complete native pointers and undeleted destination checks remain mandatory. Unknown MIME, ambiguous or absent destinations and malformed pointers refuse. This keeps the complete existing content and attachment intact, applies no edit, and uses the existing version-bound unavailable-payload disposition; ordinary missing media is never skipped. No History contract, schema, provider request or destination write is added. Reapply only the document preservation predicate together with its focused regression; exact synthetic lab and immutable source/runtime readback precede recovery.
+
+
+### Missing native PDF cache authority (267)
+
+A plain native `documentMessage` with exact `application/pdf` MIME may use the existing bounded necessary download only when its same-instance Media relation is absent. Its current native key, direction, media key, plaintext length/SHA and selected native version remain mandatory; recovery retains the full source envelope and caption. Owned media stays first, and an unavailable or corrupt owned object never falls back to a provider request.
+
+The single validated native pointer is read through the existing five-second TLS/redirect/size bounded transport. Native encrypted SHA and Document MAC authenticate those same ciphertext bytes before the original Baileys Document decryptor; full plaintext length and SHA remain required before any history write. No alternate pointer, retry, socket, send, read acknowledgement, cache mutation, dependency or schema change is added. Other missing document MIME/kinds refuse. Reapply only the cached-media helper with the focused native-PDF/cache-first/whole250/default-SDK crypto/abort regression; exact synthetic candidate lab and immutable runtime readback remain separate requirements.
