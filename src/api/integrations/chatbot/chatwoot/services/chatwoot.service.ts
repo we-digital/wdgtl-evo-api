@@ -2296,16 +2296,16 @@ export class ChatwootService {
 
   private async readRecoveryChatwootVideo(message: MessageModel, provider: ChatwootModel, instanceIds: string[]) {
     const key = message.key as { id: string; remoteJid: string };
-    const nativeCandidates = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: { in: instanceIds },
-        messageType: message.messageType,
-        messageTimestamp: message.messageTimestamp,
-        AND: [{ key: { path: ['id'], equals: key.id } }, { key: { path: ['remoteJid'], equals: key.remoteJid } }],
-      },
-      take: 26,
-      orderBy: { id: 'asc' },
-    });
+    const readNatives = () =>
+      this.prismaRepository.message.findMany({
+        where: {
+          instanceId: { in: instanceIds },
+          AND: [{ key: { path: ['id'], equals: key.id } }, { key: { path: ['remoteJid'], equals: key.remoteJid } }],
+        },
+        take: 26,
+        orderBy: { id: 'asc' },
+      });
+    const nativeCandidates = await readNatives();
     const readCopies = async () =>
       (
         await postgresClient.getChatwootConnection().query(
@@ -2370,10 +2370,7 @@ export class ChatwootService {
       },
     );
     if (!bytes) return null;
-    const current = await this.prismaRepository.message.findMany({
-      where: { id: { in: nativeCandidates.map((candidate) => candidate.id) } },
-      orderBy: { id: 'asc' },
-    });
+    const current = await readNatives();
     const currentRoutes = await this.prismaRepository.chatwoot.findMany({
       where: { enabled: true, accountId: provider.accountId, url: provider.url },
       select: { instanceId: true },
