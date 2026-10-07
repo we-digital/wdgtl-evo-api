@@ -1,6 +1,7 @@
 import { albumImageCount } from './chatwoot-history-album';
 import {
   knownHistoryMetadataControl,
+  retainedButtons,
   retainedHistoryMedia,
   retainedTemplate,
 } from './chatwoot-retained-history-formats';
@@ -46,6 +47,7 @@ export function classifyCachedHistoryRecord(
   | 'unavailable_text_edit'
   | 'unavailable_document_edit'
   | 'unavailable_audio_edit'
+  | 'unavailable_other_edit'
   | 'conflicting_text_edit'
   | 'encrypted_edit'
   | 'pin_control'
@@ -53,6 +55,8 @@ export function classifyCachedHistoryRecord(
   | 'album_container' {
   const payload = record.message;
   // SQL JSON null is an unavailable retained edit, never an instruction to clear its destination.
+  if (payload === null && edited && ['contactMessage', 'albumMessage'].includes(record.messageType))
+    return 'unavailable_other_edit';
   if (payload === null && edited && record.messageType === 'documentMessage') return 'unavailable_document_edit';
   if (payload === null && edited && record.messageType === 'imageMessage') return 'unavailable_image_edit';
   if (
@@ -85,7 +89,11 @@ export function classifyCachedHistoryRecord(
     retainedTemplate(payload);
     return 'ordinary';
   }
-  if (record.messageType === 'associatedChildMessage') {
+  if (record.messageType === 'buttonsMessage') {
+    retainedButtons(payload);
+    return 'ordinary';
+  }
+  if (['associatedChildMessage', 'lottieStickerMessage'].includes(record.messageType)) {
     retainedHistoryMedia(record as any);
     return 'ordinary';
   }

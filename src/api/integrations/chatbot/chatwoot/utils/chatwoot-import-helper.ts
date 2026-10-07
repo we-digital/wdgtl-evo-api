@@ -25,7 +25,10 @@ import {
   UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
-import { retainedTemplate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
+import {
+  retainedButtons,
+  retainedTemplate,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -626,6 +629,14 @@ class ChatwootImport {
             : undefined;
         const documentEdit = message.messageType === 'documentMessage' && payload === null;
         const audioEdit = message.messageType === 'audioMessage';
+        if (
+          ['contactMessage', 'albumMessage'].includes(message.messageType) &&
+          onUnqualifiedNullEdit &&
+          isKnownUnavailableNullEdit(message)
+        ) {
+          await onUnqualifiedNullEdit(message);
+          continue;
+        }
         if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit && !audioEdit)
           throw new Error('Empty provider edit is not a known image, text, audio or NULL document');
         const client = await pool.connect();
@@ -883,6 +894,7 @@ class ChatwootImport {
     options: HistoryMessageImportOptions = {},
   ) {
     const usesBufferedHistory = options.messages === undefined;
+    let recoveryPhase = 'user_lookup';
     try {
       const chatwootUser = await this.getChatwootUser(provider);
       if (!chatwootUser) {
@@ -913,11 +925,13 @@ class ChatwootImport {
         return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
+      recoveryPhase = 'source_lookup';
       const existingSourceIds = await this.getExistingSourceIds(
         messagesOrdered.map((message: any) => message.key.id),
         undefined,
         inbox.id,
       );
+      recoveryPhase = 'content_projection';
       const contentByMessage = this.getImportableHistoryMessages(
         chatwootService,
         messagesOrdered,
@@ -955,6 +969,7 @@ class ChatwootImport {
         const messagesByIdentity = this.createMessagesMapByIdentity(messagesChunk);
 
         if (messagesByIdentity.size > 0) {
+          recoveryPhase = 'provider_identity';
           const fksByIdentity = await this.selectOrCreateFksFromChatwoot(
             provider,
             inbox,
@@ -1004,7 +1019,9 @@ class ChatwootImport {
                 JSON.stringify(
                   message.message?.templateMessage
                     ? { provider_history_template: retainedTemplate(message.message).metadata }
-                    : {},
+                    : message.message?.buttonsMessage
+                      ? { provider_history_buttons: retainedButtons(message.message).metadata }
+                      : {},
                 ),
               );
               const bindAttributes = `$${bindInsertMsg.length}`;
@@ -1057,6 +1074,7 @@ class ChatwootImport {
               )
               ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
 
+            recoveryPhase = 'message_insert';
             totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg, {
               accountId: Number(provider.accountId),
               inboxId: Number(inbox.id),
@@ -1083,6 +1101,16 @@ class ChatwootImport {
       return totalMessagesImported;
     } catch (error) {
       this.logger.error(`Error on import history messages: ${error.toString()}`);
+      if (!usesBufferedHistory) {
+        const fields = ['code', 'constraint', 'routine'].flatMap((name) => {
+          const value = error?.[name];
+          const valid = name === 'code' ? /^[0-9A-Z]{5}$/ : /^[A-Za-z_][A-Za-z0-9_$]{0,127}$/;
+          return typeof value === 'string' && valid.test(value) ? [`${name}=${value}`] : [];
+        });
+        throw new Error(
+          `Chatwoot recovery import refused phase=${recoveryPhase}${fields.length ? ` ${fields.join(' ')}` : ''}`,
+        );
+      }
       if (usesBufferedHistory) this.clearAll(instance);
     }
   }
@@ -1402,6 +1430,7 @@ class ChatwootImport {
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo, retainedTemplates = false) {
+    if (retainedTemplates && msg.message?.buttonsMessage) return retainedButtons(msg.message).text;
     if (retainedTemplates && msg.message?.templateMessage) return retainedTemplate(msg.message).text;
     const contentMessage = chatwootService.getConversationMessage(msg.message);
     if (contentMessage) {

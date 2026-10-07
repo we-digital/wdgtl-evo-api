@@ -145,7 +145,7 @@ export function albumImageCount(record: any, disposition: 'legacy' | 'container_
     !validSenderKeySidecar(body) ||
     !Object.keys(album).every((key) => ['expectedImageCount', 'expectedVideoCount', 'contextInfo'].includes(key)) ||
     !Number.isInteger(album.expectedImageCount) ||
-    album.expectedImageCount < 1 ||
+    album.expectedImageCount < (disposition === 'container_only' ? 0 : 1) ||
     album.expectedImageCount > 13 ||
     album.expectedVideoCount !== 0 ||
     (disposition === 'legacy' &&

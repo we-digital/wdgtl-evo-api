@@ -166,9 +166,15 @@ export function isKnownUnavailableNullEdit(message: Message): boolean {
   return (
     message.status === 'EDITED' &&
     message.message === null &&
-    ['conversation', 'extendedTextMessage', 'imageMessage', 'documentMessage', 'audioMessage'].includes(
-      message.messageType,
-    ) &&
+    [
+      'conversation',
+      'extendedTextMessage',
+      'imageMessage',
+      'documentMessage',
+      'audioMessage',
+      'contactMessage',
+      'albumMessage',
+    ].includes(message.messageType) &&
     typeof message.id === 'string' &&
     message.id.length > 0 &&
     typeof message.instanceId === 'string' &&

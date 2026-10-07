@@ -182,7 +182,7 @@ test('album native device, limit-sharing and quoted-reply sidecars retain depend
     const before = JSON.stringify(record);
     assert.equal(classifyCachedHistoryRecord(record, false), 'album_container');
     assert.equal(JSON.stringify(record), before);
-    assert.throws(() =>
+    assert.equal(
       classifyCachedHistoryRecord(
         {
           ...record,
@@ -196,6 +196,7 @@ test('album native device, limit-sharing and quoted-reply sidecars retain depend
         },
         false,
       ),
+      'album_container',
     );
   }
   const invalid = {
@@ -205,5 +206,8 @@ test('album native device, limit-sharing and quoted-reply sidecars retain depend
       messageContextInfo: { ...contexts[0], deviceListMetadataVersion: 3 },
     },
   };
-  assert.throws(() => classifyCachedHistoryRecord(invalid, false));
+  assert.equal(classifyCachedHistoryRecord(invalid, false), 'album_container');
+  assert.throws(() =>
+    classifyCachedHistoryRecord({ ...invalid, message: { ...invalid.message, messageContextInfo: [] } }, false),
+  );
 });
