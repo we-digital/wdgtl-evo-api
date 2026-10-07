@@ -103,10 +103,39 @@ const albumContextInfo = (value: any) => {
   return true;
 };
 
-export function albumImageCount(record: any): number {
+const boundedAlbumContext = (value: any): boolean => {
+  if (!object(value) || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) return false;
+  let nodes = 0;
+  const valid = (item: any, depth: number): boolean => {
+    if (++nodes > 4096 || depth > 16) return false;
+    if (item === null || typeof item === 'boolean') return true;
+    if (typeof item === 'number') return Number.isFinite(item);
+    if (typeof item === 'string') return Buffer.byteLength(item, 'utf8') <= 65536;
+    if (!item || typeof item !== 'object') return false;
+    const array = Array.isArray(item);
+    if (array && ![Array.prototype, null].includes(Object.getPrototypeOf(item))) return false;
+    if (!array && ![Object.prototype, null].includes(Object.getPrototypeOf(item))) return false;
+    const keys = Reflect.ownKeys(item);
+    if (keys.some((key) => typeof key !== 'string')) return false;
+    const descriptors = Object.getOwnPropertyDescriptors(item);
+    if (Object.values(descriptors).some((entry) => !('value' in entry))) return false;
+    if (array) {
+      if (item.length > 512 || keys.length !== item.length + 1) return false;
+      return Array.from({ length: item.length }, (_, i) => descriptors[String(i)]).every(
+        (entry) => entry && valid(entry.value, depth + 1),
+      );
+    }
+    if (keys.length > 256 || keys.some((key) => Buffer.byteLength(String(key), 'utf8') > 256)) return false;
+    return Object.values(descriptors).every((entry) => valid(entry.value, depth + 1));
+  };
+  return valid(value, 0) && Buffer.byteLength(JSON.stringify(value), 'utf8') <= 65536;
+};
+
+export function albumImageCount(record: any, disposition: 'legacy' | 'container_only' = 'legacy'): number {
   const body = record.message;
   const album = body?.albumMessage;
   if (
+    (disposition !== 'legacy' && disposition !== 'container_only') ||
     record.messageType !== 'albumMessage' ||
     !object(body) ||
     !object(album) ||
@@ -119,7 +148,8 @@ export function albumImageCount(record: any): number {
     album.expectedImageCount < 1 ||
     album.expectedImageCount > 13 ||
     album.expectedVideoCount !== 0 ||
-    (album.contextInfo !== undefined &&
+    (disposition === 'legacy' &&
+      album.contextInfo !== undefined &&
       (!object(album.contextInfo) ||
         !Object.keys(album.contextInfo).every((key) =>
           [
@@ -135,7 +165,8 @@ export function albumImageCount(record: any): number {
             'quotedMessage',
           ].includes(key),
         ))) ||
-    (album.contextInfo !== undefined &&
+    (disposition === 'legacy' &&
+      album.contextInfo !== undefined &&
       ['stanzaId', 'participant', 'quotedType', 'quotedMessage'].some((key) => album.contextInfo[key] !== undefined) &&
       (typeof album.contextInfo.stanzaId !== 'string' ||
         album.contextInfo.stanzaId.length === 0 ||
@@ -146,7 +177,10 @@ export function albumImageCount(record: any): number {
         Object.keys(album.contextInfo.quotedMessage).join(',') !== 'extendedTextMessage' ||
         !object(album.contextInfo.quotedMessage.extendedTextMessage) ||
         typeof album.contextInfo.quotedMessage.extendedTextMessage.text !== 'string')) ||
-    !albumContextInfo(body.messageContextInfo)
+    (disposition === 'container_only' && album.contextInfo !== undefined && !boundedAlbumContext(album.contextInfo)) ||
+    (disposition === 'legacy'
+      ? !albumContextInfo(body.messageContextInfo)
+      : body.messageContextInfo !== undefined && !boundedAlbumContext(body.messageContextInfo))
   )
     fail();
   return album.expectedImageCount;
@@ -211,7 +245,7 @@ export async function preserveAlbumContainers(
   const snapshots = new Map<string, any>();
   const proofs = new Map<string, any>();
   const read = async (parent: any) => {
-    const count = albumImageCount(parent);
+    const count = albumImageCount(parent, disposition);
     const key = parent.key;
     if (disposition === 'container_only') {
       // This is versioned container bookkeeping, not proof of children or their destination.
