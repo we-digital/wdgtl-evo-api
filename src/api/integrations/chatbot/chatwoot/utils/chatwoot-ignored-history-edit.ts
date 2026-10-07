@@ -117,7 +117,11 @@ export type UnavailableOriginalEditState = {
 
 export type UnavailableOriginalEditProof = {
   version: 1;
-  kind: 'null_image_original' | 'encrypted_edit_null_image_original';
+  kind:
+    | 'null_image_original'
+    | 'encrypted_edit_null_image_original'
+    | 'null_text_original'
+    | 'encrypted_edit_null_text_original';
   sourceId: string;
   sourceNativeId: string;
   targetSourceId: string;
@@ -160,6 +164,33 @@ export function isUnavailableNullImageOriginal(message: Message): boolean {
   );
 }
 
+export function isUnavailableNullTextOriginal(message: Message): boolean {
+  if (!['conversation', 'extendedTextMessage'].includes(message.messageType)) return false;
+  const key = message.key as { id?: unknown; fromMe?: unknown; remoteJid?: unknown };
+  return (
+    message.status === 'EDITED' &&
+    message.message === null &&
+    typeof message.id === 'string' &&
+    message.id.length > 0 &&
+    typeof message.instanceId === 'string' &&
+    message.instanceId.length > 0 &&
+    typeof key?.id === 'string' &&
+    key.id.length > 0 &&
+    typeof key.fromMe === 'boolean' &&
+    typeof key.remoteJid === 'string' &&
+    key.remoteJid.length > 0 &&
+    Number.isSafeInteger(message.messageTimestamp) &&
+    message.messageTimestamp > 0 &&
+    message.chatwootMessageId === null &&
+    message.chatwootConversationId === null &&
+    message.chatwootInboxId === null
+  );
+}
+
+export function isUnavailableNullEditOriginal(message: Message): boolean {
+  return isUnavailableNullImageOriginal(message) || isUnavailableNullTextOriginal(message);
+}
+
 /** Records unavailable native evidence; it never asserts a decrypted edit or preserved destination. */
 export function unavailableOriginalEditProof(
   source: Message,
@@ -169,7 +200,7 @@ export function unavailableOriginalEditProof(
   inboxId: number,
 ): UnavailableOriginalEditProof {
   if (
-    !isUnavailableNullImageOriginal(target) ||
+    !isUnavailableNullEditOriginal(target) ||
     ![accountId, inboxId].every((id) => Number.isSafeInteger(id) && id > 0) ||
     state.competitors.length !== 0 ||
     state.targetUpdates.length !== 1 ||
@@ -184,7 +215,7 @@ export function unavailableOriginalEditProof(
   let discrepancy: UnavailableOriginalEditProof['targetDirectionDiscrepancy'];
   if (sameSource) {
     if (!isDeepStrictEqual(source, target) || state.sourceRows.length !== 1)
-      throw new Error('Unavailable image original source is ambiguous');
+      throw new Error('Unavailable edit original source is ambiguous');
   } else {
     assertIgnoredEditOriginalIdentity(source, target);
     const encrypted = (source.message as any)?.secretEncryptedMessage;
@@ -211,7 +242,13 @@ export function unavailableOriginalEditProof(
   const sha = (value: string) => createHash('sha256').update(value).digest('hex');
   return {
     version: 1,
-    kind: sameSource ? 'null_image_original' : 'encrypted_edit_null_image_original',
+    kind: isUnavailableNullTextOriginal(target)
+      ? sameSource
+        ? 'null_text_original'
+        : 'encrypted_edit_null_text_original'
+      : sameSource
+        ? 'null_image_original'
+        : 'encrypted_edit_null_image_original',
     sourceId: `WAID:${key.id}`,
     sourceNativeId: source.id,
     targetSourceId: `WAID:${targetKey.id}`,
