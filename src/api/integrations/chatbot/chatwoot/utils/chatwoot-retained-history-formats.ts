@@ -40,6 +40,66 @@ const bytes32 = (value: any) =>
   Buffer.from(value, 'base64').length === 32 &&
   Buffer.from(value, 'base64').toString('base64') === value;
 
+// Closed JPEG metadata shape observed in associated image children and image edit deltas.
+// These native fields authorize only verified bytes; sidecars are never executed.
+export function retainedNativeJPEGDescriptor(value: any): boolean {
+  if (!object(value) || !boundedRetainedMetadata(value)) return false;
+  const size =
+    typeof value.fileLength === 'number'
+      ? value.fileLength
+      : object(value.fileLength) &&
+          only(value.fileLength, ['low', 'high', 'unsigned']) &&
+          value.fileLength.high === 0 &&
+          typeof value.fileLength.unsigned === 'boolean'
+        ? value.fileLength.low
+        : NaN;
+  return (
+    only(value, [
+      'url',
+      'width',
+      'height',
+      'caption',
+      'mediaKey',
+      'mimetype',
+      'directPath',
+      'fileLength',
+      'fileSha256',
+      'annotations',
+      'contextInfo',
+      'scanLengths',
+      'scansSidecar',
+      'fileEncSha256',
+      'mediaKeyTimestamp',
+      'midQualityFileSha256',
+      'interactiveAnnotations',
+    ]) &&
+    value.mimetype === 'image/jpeg' &&
+    bytes32(value.fileSha256) &&
+    bytes32(value.mediaKey) &&
+    bytes32(value.fileEncSha256) &&
+    Number.isSafeInteger(size) &&
+    size > 0 &&
+    size <= 64 * 1024 * 1024 &&
+    [value.width, value.height].every(
+      (dimension) => Number.isInteger(dimension) && dimension > 0 && dimension <= 65535,
+    ) &&
+    typeof value.url === 'string' &&
+    /^https:\/\//.test(value.url) &&
+    typeof value.directPath === 'string' &&
+    value.directPath.startsWith('/') &&
+    !value.directPath.startsWith('//') &&
+    !/[\\\s]/.test(value.directPath) &&
+    long(value.mediaKeyTimestamp) &&
+    (value.caption === undefined || typeof value.caption === 'string') &&
+    (value.contextInfo === undefined || object(value.contextInfo)) &&
+    ['annotations', 'scanLengths', 'interactiveAnnotations'].every(
+      (name) => value[name] === undefined || Array.isArray(value[name]),
+    ) &&
+    (value.scansSidecar === undefined || typeof value.scansSidecar === 'string') &&
+    (value.midQualityFileSha256 === undefined || bytes32(value.midQualityFileSha256))
+  );
+}
+
 const placeholderContext = (context: any) => {
   if (context === undefined) return true;
   if (
@@ -461,11 +521,16 @@ export function retainedHistoryMedia(message: Message): { type: string; descript
       !object(child) ||
       !only(child, ['message']) ||
       !object(child.message) ||
-      !only(child.message, ['videoMessage']) ||
-      !object(child.message.videoMessage)
+      Object.keys(child.message).length !== 1 ||
+      !(
+        (object(child.message.videoMessage) && only(child.message, ['videoMessage'])) ||
+        (only(child.message, ['imageMessage']) && retainedNativeJPEGDescriptor(child.message.imageMessage))
+      )
     )
       throw new Error('Retained associated media wrapper is unsupported');
-    return { type: 'videoMessage', descriptor: child.message.videoMessage };
+    return child.message.imageMessage
+      ? { type: 'imageMessage', descriptor: child.message.imageMessage }
+      : { type: 'videoMessage', descriptor: child.message.videoMessage };
   }
   if (message.messageType === 'templateMessage') {
     const template = retainedTemplate(body);
@@ -479,7 +544,7 @@ export function retainedHistoryMedia(message: Message): { type: string; descript
 export function retainedHistoryDisplayBody(message: Message): any {
   if (message.messageType === 'associatedChildMessage')
     return {
-      videoMessage: retainedHistoryMedia(message).descriptor,
+      [retainedHistoryMedia(message).type]: retainedHistoryMedia(message).descriptor,
       ...((message.message as any)?.messageContextInfo
         ? { messageContextInfo: (message.message as any).messageContextInfo }
         : {}),

@@ -2285,9 +2285,14 @@ export class ChatwootService {
         return bytes;
       }
       if (
-        ['videoMessage', 'documentMessage', 'imageMessage', 'audioMessage', 'stickerMessage'].includes(
-          message.messageType,
-        )
+        [
+          'videoMessage',
+          'documentMessage',
+          'imageMessage',
+          'audioMessage',
+          'stickerMessage',
+          'associatedChildMessage',
+        ].includes(message.messageType)
       ) {
         const retained = await this.readRecoveryChatwootVideo(
           message,

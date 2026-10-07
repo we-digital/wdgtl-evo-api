@@ -96,7 +96,7 @@ function retainedDownloadDescriptor(message: Message) {
   const { size, digest } = nativeCachedMediaPayload(message);
   if (
     !(
-      (['imageMessage', 'templateMessage'].includes(message.messageType) &&
+      (['imageMessage', 'templateMessage', 'associatedChildMessage'].includes(message.messageType) &&
         type === 'imageMessage' &&
         descriptor.mimetype === 'image/jpeg') ||
       (message.messageType === 'stickerMessage' && type === 'stickerMessage' && descriptor.mimetype === 'image/webp') ||
