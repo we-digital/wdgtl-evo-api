@@ -177,6 +177,7 @@ import { v4 } from 'uuid';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
+import { expiredNativeMediaStatus, refreshExpiredNativeMedia } from './native-media-refresh';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 import {
@@ -4299,6 +4300,8 @@ export class BaileysStartupService extends ChannelStartupService {
         throw 'Message not found';
       }
 
+      const nativeMediaEnvelope = structuredClone(msg);
+
       for (const subtype of MessageSubtype) {
         if (msg.message[subtype]) {
           msg.message = msg.message[subtype].message;
@@ -4350,37 +4353,88 @@ export class BaileysStartupService extends ChannelStartupService {
       let buffer: Buffer;
 
       try {
-        buffer = await downloadMediaMessage(
-          { key: msg?.key, message: msg?.message },
-          'buffer',
-          {},
-          { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-        );
-      } catch {
-        this.logger.error('Download Media failed, trying to retry in 5 seconds...');
-        await new Promise((resolve) => setTimeout(resolve, 5000));
-        const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
-        if (!mediaType) throw new Error('Could not determine mediaType for fallback');
-
-        try {
-          const media = await downloadContentFromMessage(
-            {
-              mediaKey: msg.message?.[mediaType]?.mediaKey,
-              directPath: msg.message?.[mediaType]?.directPath,
-              url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
+        buffer = await downloadMediaMessage({ key: msg?.key, message: msg?.message }, 'buffer', {});
+      } catch (error) {
+        if (expiredNativeMediaStatus(error)) {
+          buffer = await refreshExpiredNativeMedia({
+            error,
+            instanceId: this.instanceId,
+            original: nativeMediaEnvelope,
+            requestedKey: m?.key,
+            message: { ...msg, key: msg.key as WAMessageKey },
+            type: mediaType,
+            readSource: () =>
+              this.prismaRepository.message.findMany({
+                where: {
+                  instanceId: this.instanceId,
+                  AND: [
+                    { key: { path: ['id'], equals: nativeMediaEnvelope.key.id } },
+                    { key: { path: ['remoteJid'], equals: nativeMediaEnvelope.key.remoteJid } },
+                    { key: { path: ['fromMe'], equals: nativeMediaEnvelope.key.fromMe } },
+                  ],
+                },
+                take: 2,
+              }),
+            refresh: (message) => this.client.updateMediaMessage(message),
+            persistPointers: async (source, pointers) => {
+              const message = structuredClone(source.message) as Record<string, any>;
+              message[mediaType] = { ...message[mediaType], ...pointers };
+              const saved = await this.prismaRepository.message.updateMany({
+                where: {
+                  id: source.id,
+                  instanceId: this.instanceId,
+                  key: { equals: source.key },
+                  message: { equals: source.message },
+                  messageType: source.messageType,
+                  messageTimestamp: source.messageTimestamp,
+                },
+                data: { message },
+              });
+              if (saved.count !== 1) throw new Error('native_media_refresh_persistence_CAS_refused');
             },
-            await this.mapMediaType(mediaType),
-            {},
-          );
-          const chunks = [];
-          for await (const chunk of media) {
-            chunks.push(chunk);
+            download: async (message, byteLimit) => {
+              const stream = await downloadMediaMessage(message, 'stream', {});
+              const chunks: Buffer[] = [];
+              let bytes = 0;
+              try {
+                for await (const chunk of stream) {
+                  bytes += chunk.length;
+                  if (bytes > byteLimit) throw new Error('native_media_refresh_bytes_exceeded');
+                  chunks.push(Buffer.from(chunk));
+                }
+                return Buffer.concat(chunks);
+              } catch (failure) {
+                stream.destroy();
+                throw failure;
+              }
+            },
+          });
+        } else {
+          this.logger.error('Download Media failed, trying to retry in 5 seconds...');
+          await new Promise((resolve) => setTimeout(resolve, 5000));
+          const mediaType = Object.keys(msg.message).find((key) => key.endsWith('Message'));
+          if (!mediaType) throw new Error('Could not determine mediaType for fallback');
+
+          try {
+            const media = await downloadContentFromMessage(
+              {
+                mediaKey: msg.message?.[mediaType]?.mediaKey,
+                directPath: msg.message?.[mediaType]?.directPath,
+                url: `https://mmg.whatsapp.net${msg?.message?.[mediaType]?.directPath}`,
+              },
+              await this.mapMediaType(mediaType),
+              {},
+            );
+            const chunks = [];
+            for await (const chunk of media) {
+              chunks.push(chunk);
+            }
+            buffer = Buffer.concat(chunks);
+            this.logger.info('Download Media with downloadContentFromMessage was successful!');
+          } catch (fallbackErr) {
+            this.logger.error('Download Media with downloadContentFromMessage also failed!');
+            throw fallbackErr;
           }
-          buffer = Buffer.concat(chunks);
-          this.logger.info('Download Media with downloadContentFromMessage was successful!');
-        } catch (fallbackErr) {
-          this.logger.error('Download Media with downloadContentFromMessage also failed!');
-          throw fallbackErr;
         }
       }
       const typeMessage = getContentType(msg.message);
