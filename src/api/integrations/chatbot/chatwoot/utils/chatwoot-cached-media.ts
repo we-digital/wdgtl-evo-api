@@ -7,8 +7,8 @@ import { Agent, fetch as fetchMedia } from 'undici';
 
 import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-history-formats';
 
-export const CACHED_MEDIA_BATCH_LIMIT = 16 * 1024 * 1024;
-export const CACHED_MEDIA_FILE_LIMIT = 8 * 1024 * 1024;
+export const CACHED_MEDIA_BATCH_LIMIT = 32 * 1024 * 1024;
+export const CACHED_MEDIA_FILE_LIMIT = 32 * 1024 * 1024;
 const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage']);
 // A native document's MIME describes the authenticated bytes; it does not select crypto keys.
 const nativeDocumentMIME = (value: unknown): value is string =>

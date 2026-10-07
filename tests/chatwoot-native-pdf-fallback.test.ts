@@ -124,7 +124,7 @@ test('native PDF fallback refuses malformed MIME, wrong kind and malformed owner
     if (mutation === 'peer') f.row.key.remoteJid = '';
     if (mutation === 'path') d.directPath = '//foreign.invalid/object';
     if (mutation === 'key') d.mediaKey = Buffer.alloc(31).toString('base64');
-    if (mutation === 'length') d.fileLength.low = 8 * 1024 * 1024 + 1;
+    if (mutation === 'length') d.fileLength.low = 32 * 1024 * 1024 + 1;
     if (mutation === 'digest') d.fileSha256 = Buffer.alloc(31).toString('base64');
     await assert.rejects(() =>
       readRetainedRecoveryMedia(f.row, undefined, (async () => assert.fail(`No request for ${mutation}`)) as any),

@@ -6,8 +6,8 @@ import {
   prepareCachedRecoveryMedia,
   readRetainedRecoveryMedia,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
-async function fixture() {
-  const plaintext = Buffer.alloc(1322681, 37);
+async function fixture(size = 1322681) {
+  const plaintext = Buffer.alloc(size, 37);
   const key = Buffer.alloc(32, 43);
   const keys = await getMediaKeys(key, 'document');
   const cipher = createCipheriv('aes-256-cbc', keys.cipherKey, keys.iv);
@@ -122,4 +122,36 @@ test('native document missing filename uses honest generic extension without ass
     async (message) => readRetainedRecoveryMedia(message, undefined, (async () => new Response(f.ciphertext)) as any),
   );
   assert.equal(result.get(f.row.id)!.descriptor.filename, 'SYNTHETICPDF.bin');
+});
+
+test('native 9,177,575-byte PDF retains encrypted/plain SHA and MAC through the bounded default path', async () => {
+  const f = await fixture(9177575);
+  let gets = 0;
+  const prepared = await prepareCachedRecoveryMedia(
+    [f.row],
+    async () => null,
+    async () => assert.fail('No owned object'),
+    async (message) =>
+      readRetainedRecoveryMedia(message, undefined, (async () => {
+        gets++;
+        return new Response(f.ciphertext);
+      }) as any),
+  );
+  assert.equal(gets, 1);
+  assert.equal(prepared.get(f.row.id)!.descriptor.size, 9177575);
+  assert(prepared.get(f.row.id)!.bytes.equals(f.plaintext));
+  const corrupt = structuredClone(f.row);
+  corrupt.message.documentMessage.fileSha256 = Buffer.alloc(32, 9).toString('base64');
+  await assert.rejects(
+    () => readRetainedRecoveryMedia(corrupt, undefined, (async () => new Response(f.ciphertext)) as any),
+    /cached_media_bytes_mismatch/,
+  );
+  const oversized = structuredClone(f.row);
+  oversized.message.documentMessage.fileLength.low = 32 * 1024 * 1024 + 1;
+  await assert.rejects(
+    () =>
+      readRetainedRecoveryMedia(oversized, undefined, (async () =>
+        assert.fail('Oversized descriptor must refuse before GET')) as any),
+    /cached_media_size_or_digest_unavailable/,
+  );
 });
