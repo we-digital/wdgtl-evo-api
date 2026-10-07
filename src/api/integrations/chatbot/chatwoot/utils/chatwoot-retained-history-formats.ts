@@ -72,8 +72,10 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       'mediaKeyTimestamp',
       'midQualityFileSha256',
       'interactiveAnnotations',
+      'imageSourceType',
     ]) &&
     value.mimetype === 'image/jpeg' &&
+    (value.imageSourceType === undefined || [0, 1, 2, 3].includes(value.imageSourceType)) &&
     bytes32(value.fileSha256) &&
     bytes32(value.mediaKey) &&
     bytes32(value.fileEncSha256) &&
