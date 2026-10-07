@@ -6003,6 +6003,8 @@ export class ChatwootService {
       const encryptedTargets = new Map<string, MessageModel>();
       const encryptedStates = new Map<string, Awaited<ReturnType<typeof readEncryptedEditState>>>();
       const unavailableOriginalTargets = new Set<string>();
+      const selectedEncryptedOriginals = new Set<string>();
+      const existingSelectedEncryptedOriginals = new Set<string>();
       const unavailableOriginalEdits = new Map<
         string,
         {
@@ -6044,24 +6046,41 @@ export class ChatwootService {
         )
           throw new Error('Retained encrypted edit source or original rotated');
         const verified = await chatwootImport.getVerifiedRecoverySourceIds([target], inbox.id, provider);
-        if (!verified.has(toChatwootSourceId((target.key as { id: string }).id))) {
-          if (!isUnavailableNullEditOriginal(target))
-            throw new Error('Retained encrypted edit requires an existing unique destination original');
-          if (
-            encryptedEdits.filter(
-              (edit) => (edit.message as any).secretEncryptedMessage.targetMessageKey.id === (target.key as any).id,
-            ).length !== 1
-          )
-            throw new Error('Unavailable encrypted edit original has competing requested edits');
-          const proof = await chatwootImport.captureUnavailableOriginalEdit(
-            envelope,
-            target,
-            state,
-            inbox.id,
-            provider,
-          );
-          unavailableOriginalEdits.set(proof.sourceId, { source: envelope, target, state, proof });
-          unavailableOriginalTargets.add(target.id);
+        const targetSourceId = toChatwootSourceId((target.key as { id: string }).id);
+        const selectedTarget = authoritativeMessages.filter((message) => message.id === target.id);
+        const selectedAvailableOriginal =
+          selectedTarget.length === 1 &&
+          isDeepStrictEqual(selectedTarget[0], target) &&
+          classifications.get(targetSourceId) === 'ordinary' &&
+          target.chatwootMessageId == null &&
+          target.chatwootInboxId == null &&
+          target.chatwootConversationId == null;
+        if (verified.has(targetSourceId) && selectedAvailableOriginal) {
+          selectedEncryptedOriginals.add(target.id);
+          existingSelectedEncryptedOriginals.add(target.id);
+        }
+        if (!verified.has(targetSourceId)) {
+          if (!isUnavailableNullEditOriginal(target)) {
+            if (!selectedAvailableOriginal)
+              throw new Error('Retained encrypted edit requires an existing unique destination original');
+            selectedEncryptedOriginals.add(target.id);
+          } else {
+            if (
+              encryptedEdits.filter(
+                (edit) => (edit.message as any).secretEncryptedMessage.targetMessageKey.id === (target.key as any).id,
+              ).length !== 1
+            )
+              throw new Error('Unavailable encrypted edit original has competing requested edits');
+            const proof = await chatwootImport.captureUnavailableOriginalEdit(
+              envelope,
+              target,
+              state,
+              inbox.id,
+              provider,
+            );
+            unavailableOriginalEdits.set(proof.sourceId, { source: envelope, target, state, proof });
+            unavailableOriginalTargets.add(target.id);
+          }
         }
         encryptedTargets.set(envelope.id, target);
         encryptedStates.set(envelope.id, state);
@@ -6260,7 +6279,9 @@ export class ChatwootService {
       const editedSourceIds = new Set(
         editedMessages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
       );
-      for (const { envelope, target, recovered } of recoveredEdits) {
+      for (const { envelope, target, recovered } of recoveredEdits.filter(
+        ({ target }) => !selectedEncryptedOriginals.has(target.id),
+      )) {
         await assertEncryptedEditCurrent(envelope, target);
         try {
           await chatwootImport.reconcileProviderHistoryEdits([recovered], inbox.id, provider, this, true);
@@ -6400,6 +6421,62 @@ export class ChatwootService {
         appliedMessages++;
       }
 
+      const importedEditOriginals = new Map<
+        string,
+        Awaited<ReturnType<typeof chatwootImport.verifyImportedHistoryEditOriginal>>
+      >();
+      for (const envelope of encryptedEdits) {
+        const target = encryptedTargets.get(envelope.id)!;
+        if (!selectedEncryptedOriginals.has(target.id)) continue;
+        await assertEncryptedEditCurrent(envelope, target);
+        const sourceId = toChatwootSourceId((target.key as { id: string }).id);
+        const newlyImported = appliedSourceIds.has(sourceId) && importableSourceIds.has(sourceId);
+        const verifiedPreviousImport =
+          existingSelectedEncryptedOriginals.has(target.id) &&
+          existingSourceIds.has(sourceId) &&
+          (![
+            'imageMessage',
+            'audioMessage',
+            'videoMessage',
+            'documentMessage',
+            'associatedChildMessage',
+            'templateMessage',
+          ].includes(target.messageType) ||
+            taggedMediaSourceIds.has(sourceId));
+        if (!newlyImported && !verifiedPreviousImport)
+          throw new Error('Retained encrypted edit original was not imported and verified in this batch');
+        const verified = await chatwootImport.getVerifiedRecoverySourceIds([target], inbox.id, provider);
+        if (!verified.has(sourceId))
+          throw new Error('Retained encrypted edit requires an existing unique destination original');
+        importedEditOriginals.set(
+          target.id,
+          await chatwootImport.verifyImportedHistoryEditOriginal(target, inbox.id, provider),
+        );
+      }
+      for (const { envelope, target, recovered } of recoveredEdits.filter(({ target }) =>
+        selectedEncryptedOriginals.has(target.id),
+      )) {
+        await assertEncryptedEditCurrent(envelope, target);
+        try {
+          await chatwootImport.reconcileProviderHistoryEdits([recovered], inbox.id, provider, this, true, {
+            ...importedEditOriginals.get(target.id)!,
+            recoveredVersionSHA256: createHash('sha256').update(JSON.stringify(recovered)).digest('hex'),
+          });
+        } catch (error) {
+          // This exact rejection occurs before applyWhatsappProviderEdit. Unknown write outcomes still stop.
+          if (
+            !(error instanceof Error) ||
+            error.message !== 'Authenticated provider edit cannot replace a different existing edit'
+          )
+            throw error;
+          ignoredEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), {
+            envelope,
+            target,
+            kind: 'conflicting',
+            rejection: error.message,
+          });
+        }
+      }
       await chatwootImport.reconcileProviderHistoryEdits(
         editedMessages.filter((message) =>
           appliedSourceIds.has(toChatwootSourceId((message.key as { id: string }).id)),
@@ -6424,6 +6501,7 @@ export class ChatwootService {
               provider,
               ignored.kind,
               ignored.rejection,
+              importedEditOriginals.get(target.id),
             ),
           );
       }
@@ -6461,6 +6539,7 @@ export class ChatwootService {
           provider,
           ignored.kind,
           ignored.rejection,
+          importedEditOriginals.get(ignored.target.id),
         );
         if (!isDeepStrictEqual(current, ignoredEditProofs.get(sourceId)))
           throw new Error('Ignored provider edit destination or media rotated before acknowledgement');

@@ -341,20 +341,22 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
     peer = original.key.remoteJid,
     calls = 0;
   postgresClient.getChatwootConnection = (() => ({
-    query: async () => ({
-      rows: [
-        {
-          id: 314,
-          private: false,
-          display_id: 40,
-          message_type: 0,
-          provider_peer: peer,
-          content,
-          content_attributes: { edited },
-          attachments: [],
-          message_snapshot: { content, edited },
-        },
-      ],
+    query: async (sql: string) => ({
+      rows: sql.includes("a.meta ? 'whatsapp_history_sha256'")
+        ? []
+        : [
+            {
+              id: 314,
+              private: false,
+              display_id: 40,
+              message_type: 0,
+              provider_peer: peer,
+              content,
+              content_attributes: { edited },
+              attachments: [],
+              message_snapshot: { content, edited },
+            },
+          ],
     }),
   })) as any;
   service.applyWhatsappProviderEdit = async (_provider: any, target: any) => {
