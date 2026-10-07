@@ -217,7 +217,7 @@ test('literal whole250 service preflights before writes and uses silent original
                   attachment_id: 8,
                   source_id: 'WAID:doc',
                   peer: doc().key.remoteJid,
-                  file_type: wireType === 'video' ? 2 : 3,
+                  file_type: wireType === 'video' ? 2 : wireType === 'image' ? 0 : 3,
                   message_type: rows[249].key.fromMe ? 1 : 0,
                   private: false,
                   account_id: 1,
@@ -246,7 +246,9 @@ test('literal whole250 service preflights before writes and uses silent original
                       participant: null,
                       participant_alt: null,
                       push_name: null,
-                      ...(['associatedChildMessage', 'templateMessage'].includes(rows[249].messageType)
+                      ...(['associatedChildMessage', 'templateMessage', 'stickerMessage'].includes(
+                        rows[249].messageType,
+                      )
                         ? {
                             source: {
                               message_type: rows[249].messageType,
@@ -311,7 +313,7 @@ test('literal whole250 service preflights before writes and uses silent original
       'in_reply_to_external_id',
       'synthetic_author',
       'WAID:doc',
-      expectedContent,
+      ...(expectedContent ? [expectedContent] : []),
     ])
       assert.equal(body.includes(value), true, value);
     if (unknownWrite) throw new Error('synthetic response lost');
@@ -438,6 +440,31 @@ test('literal whole250 service preflights before writes and uses silent original
     assert.equal(posts, postCount);
     assert.equal(JSON.stringify(rows), before);
   }
+  stored = false;
+  wireType = 'image';
+  currentMedia = {
+    ...media,
+    type: 'stickerMessage',
+    mimetype: 'image/webp',
+    fileName: media.fileName.replace('/documentMessage/', '/stickerMessage/'),
+  };
+  rows[249] = {
+    ...doc('stickerMessage'),
+    message: { stickerMessage: { ...doc().message.documentMessage, mimetype: 'image/webp' } },
+  };
+  expectedContent = service.getConversationMessage(rows[249].message);
+  const stickerImport = await service.syncStoredHistoryRecoveryBatch(
+    { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+    request(),
+  );
+  assert.equal(stickerImport.importedMessages, 1);
+  const stickerPostCount = posts;
+  const stickerReplay = await service.syncStoredHistoryRecoveryBatch(
+    { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+    request(),
+  );
+  assert.equal(stickerReplay.importedMessages, 0);
+  assert.equal(posts, stickerPostCount);
   wireType = 'document';
   currentMedia = media;
   expectedContent = 'synthetic-caption';
