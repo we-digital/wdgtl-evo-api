@@ -129,7 +129,10 @@ export async function refreshExpiredNativeMedia(input: {
   try {
     return await Promise.race([
       (async () => {
-        const refreshed = await input.refresh(input.message);
+        // The SDK's receipt HKDF expects bytes; persisted native JSON contains base64.
+        const refreshMessage = structuredClone(input.message);
+        refreshMessage.message[input.type].mediaKey = Buffer.from(native.mediaKey, 'base64');
+        const refreshed = await input.refresh(refreshMessage);
         if (expired) throw new Error('native_media_refresh_deadline_unknown_no_retry');
         if (
           !isDeepStrictEqual(refreshed.key, key) ||
