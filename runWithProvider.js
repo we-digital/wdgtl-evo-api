@@ -44,8 +44,17 @@ if (command.includes('rmdir') && existsSync('prisma\\migrations')) {
   console.warn(`Directory 'prisma\\migrations' does not exist, skipping removal.`);
 }
 
+// Session advisory locks must use a direct migration connection, while the
+// application and client generation retain their configured pooled connection.
+const isMigrationDeploy = /(?:^|&&)\s*npx\s+prisma\s+migrate\s+deploy(?:\s|$)/.test(command);
+const migrationConnectionURI = process.env.DATABASE_MIGRATION_CONNECTION_URI;
+const commandEnv =
+  isMigrationDeploy && migrationConnectionURI
+    ? { ...process.env, DATABASE_CONNECTION_URI: migrationConnectionURI }
+    : process.env;
+
 try {
-  execSync(command, { stdio: 'inherit' });
+  execSync(command, { stdio: 'inherit', env: commandEnv });
 } catch (error) {
   console.error(`Error executing command: ${command}`);
   process.exit(1);

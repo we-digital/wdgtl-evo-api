@@ -9,7 +9,6 @@ fi
 if [[ "$DATABASE_PROVIDER" == "postgresql" || "$DATABASE_PROVIDER" == "mysql" || "$DATABASE_PROVIDER" == "psql_bouncer" ]]; then
     export DATABASE_URL
     echo "Deploying migrations for $DATABASE_PROVIDER"
-    echo "Database URL: $DATABASE_URL"
     # App Platform can restart multiple services at once. If another instance is
     # already running Prisma migrations, retry instead of failing the whole deploy
     # on a transient advisory lock timeout.
