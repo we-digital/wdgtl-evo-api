@@ -2282,7 +2282,11 @@ export class ChatwootService {
         if (!isDeepStrictEqual(current, candidates)) throw new Error('cached_media_retained_source_rotated');
         return bytes;
       }
-      if (message.messageType === 'videoMessage') {
+      if (
+        ['videoMessage', 'documentMessage', 'imageMessage', 'audioMessage', 'stickerMessage'].includes(
+          message.messageType,
+        )
+      ) {
         const retained = await this.readRecoveryChatwootVideo(
           message,
           provider,

@@ -321,3 +321,41 @@ test('literal service reuses proxy bytes and rejects native, CW or route rotatio
     await assert.rejects(service.readRecoveryChatwootVideo(target, provider, [native.instanceId]), /source_rotated/);
   }
 });
+
+test('stored PDF, image and audio reuse authenticates bytes without copying receive time, direction or caption', async () => {
+  for (const [type, mime, fileType] of [
+    ['documentMessage', 'application/pdf', 'file'],
+    ['imageMessage', 'image/jpeg', 'image'],
+    ['audioMessage', 'audio/ogg', 'audio'],
+    ['stickerMessage', 'image/webp', 'image'],
+  ]) {
+    const source = {
+      ...target,
+      messageType: type,
+      message: { [type]: { ...target.message.videoMessage, mimetype: mime } },
+    };
+    const other = {
+      ...source,
+      id: 'other',
+      instanceId: native.instanceId,
+      messageTimestamp: target.messageTimestamp + 29,
+      key: native.key,
+    };
+    const stored = { ...copy, content_type: mime };
+    const before = JSON.stringify(source);
+    assert.deepEqual(await readRetainedChatwootGroupVideo(source, [other], [stored], 1, async () => bytes), bytes);
+    assert.equal(JSON.stringify(source), before);
+    const api = [
+      { ...payload[0], attachments: [{ ...payload[0].attachments[0], content_type: mime, file_type: fileType }] },
+    ];
+    assert.match(retainedVideoProxyUrl(stored, api, 'https://cw.example'), /blobs\/proxy/);
+    await assert.rejects(
+      readRetainedChatwootGroupVideo(source, [other], [{ ...stored, content_type: 'foreign/mime' }], 1, async () =>
+        assert.fail('foreign MIME read'),
+      ),
+    );
+    await assert.rejects(
+      readRetainedChatwootGroupVideo(source, [other], [stored], 1, async () => Buffer.alloc(bytes.length)),
+    );
+  }
+});
