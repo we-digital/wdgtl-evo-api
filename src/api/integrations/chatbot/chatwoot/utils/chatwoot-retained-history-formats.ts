@@ -253,6 +253,93 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
       image: hydrated.imageMessage,
     };
   }
+  // Text-only CTA templates retain their source metadata; no media or actions are executed.
+  if (
+    hydrated === undefined &&
+    object(interactive) &&
+    object(interactive.header) &&
+    interactive.header.hasMediaAttachment !== true &&
+    interactive.header.imageMessage === undefined &&
+    interactive.header.videoMessage === undefined
+  ) {
+    const header = interactive.header;
+    const footer = interactive.footer;
+    const flow = interactive.nativeFlowMessage;
+    if (
+      !only(interactive, ['body', 'header', 'footer', 'nativeFlowMessage']) ||
+      !boundedRetainedMetadata(interactive) ||
+      !object(interactive.body) ||
+      !only(interactive.body, ['text']) ||
+      typeof interactive.body.text !== 'string' ||
+      !interactive.body.text ||
+      !only(header, ['title', 'hasMediaAttachment']) ||
+      (header.title !== undefined && typeof header.title !== 'string') ||
+      (header.hasMediaAttachment !== undefined && header.hasMediaAttachment !== false) ||
+      (footer !== undefined && (!object(footer) || !only(footer, ['text']) || typeof footer.text !== 'string')) ||
+      !object(flow) ||
+      !only(flow, ['buttons', 'messageParamsJson']) ||
+      !Array.isArray(flow.buttons) ||
+      flow.buttons.length !== 1 ||
+      !object(flow.buttons[0]) ||
+      !only(flow.buttons[0], ['name', 'buttonParamsJson']) ||
+      flow.buttons[0].name !== 'cta_url' ||
+      typeof flow.buttons[0].buttonParamsJson !== 'string' ||
+      typeof flow.messageParamsJson !== 'string'
+    )
+      throw new Error('Retained text template content is unsupported');
+    const button = JSON.parse(flow.buttons[0].buttonParamsJson);
+    const params = JSON.parse(flow.messageParamsJson);
+    const safeURL = (value: any): boolean => {
+      if (
+        typeof value !== 'string' ||
+        !value ||
+        /\s/.test(value) ||
+        [...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
+      )
+        return false;
+      try {
+        const url = new URL(value);
+        return ['http:', 'https:'].includes(url.protocol) && !!url.hostname && !url.username && !url.password;
+      } catch {
+        return false;
+      }
+    };
+    if (
+      !boundedRetainedMetadata(button) ||
+      !only(button, [
+        'display_text',
+        'url',
+        'consented_users_url',
+        'webview_presentation',
+        'payment_link_preview',
+        'merchant_payment_link_preview',
+        'landing_page_url',
+        'webview_interaction',
+      ]) ||
+      typeof button.display_text !== 'string' ||
+      !button.display_text ||
+      !safeURL(button.url) ||
+      ['consented_users_url', 'landing_page_url'].some((key) => button[key] !== undefined && !safeURL(button[key])) ||
+      (button.webview_presentation !== undefined && button.webview_presentation !== null) ||
+      ['payment_link_preview', 'merchant_payment_link_preview', 'webview_interaction'].some(
+        (key) => button[key] !== undefined && typeof button[key] !== 'boolean',
+      ) ||
+      !boundedRetainedMetadata(params) ||
+      !only(params, [
+        'bottom_sheet',
+        'tap_target_configuration',
+        'tap_target_list',
+        'text_truncation_length_limit_in_lines',
+      ])
+    )
+      throw new Error('Retained text template actions are unsupported');
+    return {
+      text: [header.title, interactive.body.text, footer?.text, `${button.display_text}: ${button.url}`]
+        .filter(Boolean)
+        .join('\n'),
+      metadata: { template_id: template.templateId, header, body: interactive.body, footer, native_flow: flow },
+    };
+  }
   if (
     hydrated !== undefined ||
     !object(interactive) ||
