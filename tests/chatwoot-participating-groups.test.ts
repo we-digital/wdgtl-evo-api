@@ -314,3 +314,55 @@ test(
     }
   },
 );
+
+test('existing unbound group keeps its ID in dry-run and repairs only through the protected canonical apply', async () => {
+  const f = fixture();
+  f.service.isImportHistoryAvailable = () => true;
+  const row = {
+    contact_id: 10,
+    contact_account_id: 1,
+    identifier: group,
+    database_id: 40000,
+    conversation_id: 4000,
+    conversation_account_id: 1,
+    inbox_id: 40,
+    binding_provider: null,
+    binding_peer: null,
+  };
+  f.service.pgClient = { query: async () => ({ rows: [row] }) };
+  const dry = await f.service.syncParticipatingGroups(f.instance);
+  assert.equal(dry.groups[0].conversationId, 4000);
+  assert.equal(dry.groups[0].missing, false);
+  assert.equal(f.creations(), 0, 'dry-run never repairs metadata');
+  const applied = await f.service.syncParticipatingGroups(f.instance, false);
+  assert.equal(applied.groups[0].conversationId, 4000);
+  assert.equal(f.creations(), 1, 'only protected canonical API may install the absent binding');
+  row.binding_provider = 'whatsapp';
+  row.binding_peer = group;
+  await f.service.syncParticipatingGroups(f.instance, false);
+  assert.equal(f.creations(), 1, 'an exact existing binding needs no metadata write');
+});
+
+test('unbound group refuses a changed canonical ID after the protected resolver', async () => {
+  const f = fixture();
+  f.service.isImportHistoryAvailable = () => true;
+  f.service.pgClient = {
+    query: async () => ({
+      rows: [
+        {
+          contact_id: 10,
+          contact_account_id: 1,
+          identifier: group,
+          database_id: 40000,
+          conversation_id: 4000,
+          conversation_account_id: 1,
+          inbox_id: 40,
+          binding_provider: null,
+          binding_peer: null,
+        },
+      ],
+    }),
+  };
+  f.service.canonicalProviderConversation = async () => 4001;
+  await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /canonical conversation changed/);
+});
