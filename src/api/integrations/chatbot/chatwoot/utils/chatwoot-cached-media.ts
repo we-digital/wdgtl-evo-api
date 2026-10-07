@@ -32,7 +32,7 @@ export function cachedMediaMIMEsEqual(type: string, native: string, stored: stri
           ['application/rar', 'application/vnd.rar'],
         ]
       : type === 'audioMessage'
-        ? [['audio/ogg', 'audio/ogg; codecs=opus']]
+        ? [['audio/ogg', 'audio/ogg; codecs=opus', 'audio/opus']]
         : [];
   return aliases.some((pair) => pair.includes(native) && pair.includes(stored));
 }
