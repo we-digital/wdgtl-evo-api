@@ -114,17 +114,17 @@ test('owned PDF remains cache-first and a corrupt owned object never falls back 
   );
 });
 
-test('native PDF fallback refuses unsupported MIME, wrong kind and malformed ownership or pointer before a request', async () => {
+test('native PDF fallback refuses malformed MIME, wrong kind and malformed ownership or pointer before a request', async () => {
   for (const mutation of ['mime', 'kind', 'direction', 'peer', 'path', 'key', 'length', 'digest']) {
     const f = await fixture();
     const d = f.row.message.documentMessage;
-    if (mutation === 'mime') d.mimetype = 'application/msword';
+    if (mutation === 'mime') d.mimetype = 'application/pdf; injected=1';
     if (mutation === 'kind') f.row.messageType = 'unknown';
     if (mutation === 'direction') f.row.key.fromMe = null;
     if (mutation === 'peer') f.row.key.remoteJid = '';
     if (mutation === 'path') d.directPath = '//foreign.invalid/object';
     if (mutation === 'key') d.mediaKey = Buffer.alloc(31).toString('base64');
-    if (mutation === 'length') d.fileLength.low = 8 * 1024 * 1024 + 1;
+    if (mutation === 'length') d.fileLength.low = 32 * 1024 * 1024 + 1;
     if (mutation === 'digest') d.fileSha256 = Buffer.alloc(31).toString('base64');
     await assert.rejects(() =>
       readRetainedRecoveryMedia(f.row, undefined, (async () => assert.fail(`No request for ${mutation}`)) as any),

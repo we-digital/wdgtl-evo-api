@@ -18,6 +18,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
+  CACHED_MEDIA_FILE_LIMIT,
   nativeCachedMediaPayload,
   prepareCachedRecoveryMedia,
   readRetainedRecoveryMedia,
@@ -2076,7 +2077,7 @@ export class ChatwootService {
         nativePeers[0] !== row.peer ||
         !Number.isSafeInteger(Number(row.byte_size)) ||
         Number(row.byte_size) < 1 ||
-        Number(row.byte_size) > 8 * 1024 * 1024 ||
+        Number(row.byte_size) > CACHED_MEDIA_FILE_LIMIT ||
         typeof (message.key as any).fromMe !== 'boolean' ||
         Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
         row.private !== false ||

@@ -526,8 +526,8 @@ test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay
           message_id: 7,
           source_id: 'WAID:doc',
           attachment_id: 8,
-          sha256: digest,
-          byte_size: bytes.length,
+          sha256: row.attachment_meta.whatsapp_history_sha256,
+          byte_size: row.byte_size,
           media_type: 'document',
         },
       },
@@ -583,4 +583,20 @@ test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay
     /tagged_destination_unconfirmed/,
   );
   assert.equal(gets, 2);
+  // Postimage verification uses the same bounded native-file limit as preparation.
+  row.peer = message.key.remoteJid;
+  const large = Buffer.alloc(9177575, 3);
+  message.message.documentMessage.fileLength = { low: large.length, high: 0, unsigned: true };
+  message.message.documentMessage.fileSha256 = createHash('sha256').update(large).digest('base64');
+  row.byte_size = large.length;
+  row.attachment_meta.whatsapp_history_sha256 = createHash('sha256').update(large).digest('hex');
+  await service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99);
+  assert.equal(gets, 3);
+  message.message.documentMessage.fileLength.low = 32 * 1024 * 1024 + 1;
+  row.byte_size = message.message.documentMessage.fileLength.low;
+  await assert.rejects(
+    service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
+    /cached_media_size_or_digest_unavailable/,
+  );
+  assert.equal(gets, 3);
 });
