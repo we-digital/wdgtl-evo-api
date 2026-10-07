@@ -25,6 +25,14 @@ export function cachedHistoryMediaType(message: Message): string {
 // Storage sniffing canonicalizes only these exact, observed native MIME aliases.
 export function cachedMediaMIMEsEqual(type: string, native: string, stored: string): boolean {
   if (native === stored) return true;
+  // A retained native Word envelope may use the generic Word MIME while
+  // storage identifies its OOXML bytes. Native SHA and size proof is still required.
+  if (
+    type === 'documentMessage' &&
+    native === 'application/msword' &&
+    stored === 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+  )
+    return true;
   const aliases =
     type === 'documentMessage'
       ? [

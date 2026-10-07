@@ -6,6 +6,12 @@ Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focus
 
 # we:Digital Evolution API fork
 
+## Retained Word document storage presentation (2026-10-08)
+
+- Reuse a source-bound Word document whose native envelope declares `application/msword` while storage identifies the exact same bytes as OOXML Word. Retained CW media reuse now applies the existing MIME presentation comparison, with this one observed directional presentation exception.
+- Native source key, account/group ownership, every native SHA and size remain required; the actual attachment bytes must still match the exact native SHA and size. Other mismatches refuse. Preserve the native MIME and full source envelope; storage presentation never grants source identity or permission.
+- Reapply the shared MIME comparison and retained-CW reader together with correct-byte, corrupt-byte, wrong-size and unrelated-MIME regressions. No schema, dependencies, provider requests or sends change.
+
 ## Associated JPEG native source metadata (2026-10-08)
 
 - Retain the installed WhatsApp protobuf's optional `imageSourceType` enum (0 through 3) on associated JPEG records. This metadata does not alter image bytes, caption, author, timestamp, direction, source fingerprint or cache ownership.

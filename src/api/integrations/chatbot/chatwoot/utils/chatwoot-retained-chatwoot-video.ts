@@ -1,6 +1,6 @@
 import { Message } from '@prisma/client';
 
-import { nativeCachedMediaPayload, verifyCachedMediaBytes } from './chatwoot-cached-media';
+import { cachedMediaMIMEsEqual, nativeCachedMediaPayload, verifyCachedMediaBytes } from './chatwoot-cached-media';
 import { retainedHistoryMedia } from './chatwoot-retained-history-formats';
 
 export interface RetainedChatwootVideo {
@@ -96,7 +96,7 @@ export async function readRetainedChatwootGroupVideo(
         nativeMedia.type !== media.type ||
         !canonicalDigest(nativeMedia.descriptor) ||
         nativeMedia.descriptor.mimetype !== media.descriptor.mimetype ||
-        copy.content_type !== media.descriptor.mimetype ||
+        !cachedMediaMIMEsEqual(media.type, media.descriptor.mimetype, copy.content_type) ||
         Number(copy.byte_size) !== expected.size ||
         nativeExpected.size !== expected.size ||
         !nativeExpected.digest.equals(expected.digest)

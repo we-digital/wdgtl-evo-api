@@ -359,3 +359,32 @@ test('stored PDF, image and audio reuse authenticates bytes without copying rece
     );
   }
 });
+
+test('native generic Word MIME can reuse exact OOXML stored bytes without weakening SHA or size proof', async () => {
+  const source = {
+    ...target,
+    messageType: 'documentMessage',
+    message: { documentMessage: { ...target.message.videoMessage, mimetype: 'application/msword' } },
+  };
+  const other = { ...source, id: native.id, instanceId: native.instanceId, key: native.key };
+  const stored = { ...copy, content_type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' };
+  const before = JSON.stringify(source);
+  assert.deepEqual(await readRetainedChatwootGroupVideo(source, [other], [stored], 1, async () => bytes), bytes);
+  assert.equal(JSON.stringify(source), before);
+  await assert.rejects(
+    readRetainedChatwootGroupVideo(source, [other], [stored], 1, async () => Buffer.alloc(bytes.length)),
+    /bytes_mismatch/,
+  );
+  await assert.rejects(
+    readRetainedChatwootGroupVideo(source, [other], [{ ...stored, byte_size: String(bytes.length + 1) }], 1, async () =>
+      assert.fail('wrong size read'),
+    ),
+    /digest_authority/,
+  );
+  await assert.rejects(
+    readRetainedChatwootGroupVideo(source, [other], [{ ...stored, content_type: 'application/pdf' }], 1, async () =>
+      assert.fail('unproved MIME read'),
+    ),
+    /digest_authority/,
+  );
+});
