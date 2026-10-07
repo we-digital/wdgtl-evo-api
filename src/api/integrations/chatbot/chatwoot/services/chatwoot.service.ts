@@ -145,6 +145,7 @@ import {
   whatsappQuotedMessageContent,
   whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
+import { readRetainedGroupMedia } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-group-media';
 import {
   retainedHistoryDisplayBody,
   retainedHistoryMedia,
@@ -689,8 +690,8 @@ export class ChatwootService {
       capability.whatsapp_group_roster_contract_version !== 1
     )
       throw new BadRequestException('The silent canonical WhatsApp group roster contract is required');
-    const me = waInstance.client.authState.creds.me;
-    const owners = [me.id, me.lid].filter(Boolean).map(toCanonicalHistoryJid);
+    // This authenticated IQ returns the current session's joined groups. A community
+    // or LID roster need not repeat the receiver as a PN participant in its metadata.
     const groups = Object.values(await waInstance.client.groupFetchAllParticipating(false)) as any[];
     const rosterPeers = groups
       .filter((group) => isGroupJid(group.id) && (!peers || peers.includes(group.id)))
@@ -699,12 +700,6 @@ export class ChatwootService {
     const results = [];
     for (const group of groups) {
       if (!isGroupJid(group.id) || (peers && !peers.includes(group.id))) continue;
-      if (
-        !group.participants?.some((participant) =>
-          [participant.id, participant.phoneNumber].some((jid) => jid && owners.includes(toCanonicalHistoryJid(jid))),
-        )
-      )
-        throw new Error('Participating group owner identity is unavailable');
       const destination = destinations?.get(group.id);
       const contact = destinations ? destination?.contact : await this.findProviderContact(instance, group.id);
       const existing = destinations
@@ -2242,6 +2237,46 @@ export class ChatwootService {
 
   private readCachedRecoveryObject(name: string, limit: number, mime: string) {
     return readStoredFile(name, limit, mime);
+  }
+
+  private async readRecoveryMedia(message: MessageModel, provider: ChatwootModel): Promise<Buffer> {
+    const key = message.key as { id?: string; remoteJid?: string };
+    if (isGroupJid(key.remoteJid || '') && key.id) {
+      if (!provider.accountId || !provider.url) throw new Error('cached_media_retained_account_unavailable');
+      // Reuse authenticated stored bytes from the same group in this account before a provider download.
+      const routes = await this.prismaRepository.chatwoot.findMany({
+        where: { enabled: true, accountId: provider.accountId, url: provider.url },
+        select: { instanceId: true },
+      });
+      if (routes.length > 100) throw new Error('cached_media_retained_route_limit');
+      const candidates = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: { in: routes.map((route) => route.instanceId) },
+          messageType: message.messageType,
+          messageTimestamp: message.messageTimestamp,
+          AND: [{ key: { path: ['id'], equals: key.id } }, { key: { path: ['remoteJid'], equals: key.remoteJid } }],
+          Media: { isNot: null },
+        },
+        include: { Media: true },
+        take: 26,
+        orderBy: { id: 'asc' },
+      });
+      const bytes = await readRetainedGroupMedia(
+        message,
+        candidates.flatMap(({ Media, ...source }) => (Media ? [{ message: source, media: Media }] : [])),
+        async (name, limit, mime) => this.readCachedRecoveryObject(name, limit, mime),
+      );
+      if (bytes) {
+        const current = await this.prismaRepository.message.findMany({
+          where: { id: { in: candidates.map((candidate) => candidate.id) } },
+          include: { Media: true },
+          orderBy: { id: 'asc' },
+        });
+        if (!isDeepStrictEqual(current, candidates)) throw new Error('cached_media_retained_source_rotated');
+        return bytes;
+      }
+    }
+    return readRetainedRecoveryMedia(message);
   }
 
   private async assertSilentHistoryMediaCapability(instance: InstanceDto, provider: ChatwootModel, inboxId: number) {
@@ -6512,7 +6547,7 @@ export class ChatwootService {
         (message) =>
           this.prismaRepository.media.findFirst({ where: { messageId: message.id, instanceId: message.instanceId } }),
         (name, limit, mime) => this.readCachedRecoveryObject(name, limit, mime),
-        (message) => readRetainedRecoveryMedia(message),
+        (message) => this.readRecoveryMedia(message, provider),
       );
       if (cachedMedia.size) {
         const config = this.configService.get<Chatwoot>('CHATWOOT');
