@@ -267,10 +267,25 @@ export async function readRetainedRecoveryMedia(
           body.length % 16 !== 0 ||
           encryptedDigest.length !== 32 ||
           !createHash('sha256').update(ciphertext).digest().equals(encryptedDigest) ||
-          mac.length !== 10 ||
-          !timingSafeEqual(mac, expectedMAC)
+          mac.length !== 10
         )
           throw new Error('cached_media_crypto_family_unavailable');
+        if (!timingSafeEqual(mac, expectedMAC)) {
+          if (
+            message.messageType !== 'documentMessage' ||
+            descriptor.mimetype !== 'image/jpeg' ||
+            decryptType !== 'document'
+          )
+            throw new Error('cached_media_crypto_family_unavailable');
+          const imageKeys = await getMediaKeys(key, 'image');
+          const imageMAC = createHmac('sha256', imageKeys.macKey)
+            .update(Buffer.concat([imageKeys.iv, body]))
+            .digest()
+            .subarray(0, 10);
+          if (!timingSafeEqual(mac, imageMAC)) throw new Error('cached_media_crypto_family_unavailable');
+          // Authenticate key selection only; the native document envelope and MIME are unchanged.
+          decryptType = 'image';
+        }
       }
       let delivered = false;
       dispatcher = {
