@@ -63,7 +63,12 @@ export function cachedMediaDescriptor(message: Message, media: Media) {
     ) ||
     media.fileName.split('/').some((part) => part === '..' || part === '.') ||
     typeof descriptor.mimetype !== 'string' ||
-    descriptor.mimetype !== media.mimetype
+    !(
+      descriptor.mimetype === media.mimetype ||
+      (type === 'documentMessage' &&
+        ['application/zip', 'application/x-zip-compressed'].includes(descriptor.mimetype) &&
+        ['application/zip', 'application/x-zip-compressed'].includes(media.mimetype))
+    )
   ) {
     throw new Error('cached_media_authority_unavailable');
   }
