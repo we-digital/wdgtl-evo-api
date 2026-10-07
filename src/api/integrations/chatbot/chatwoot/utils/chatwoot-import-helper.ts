@@ -436,6 +436,53 @@ class ChatwootImport {
     return proof;
   }
 
+  public async verifyImportedHistoryEditOriginal(original: Message, inboxId: number, provider: ChatwootModel) {
+    const key = original.key as { id: string; remoteJid: string; remoteJidAlt?: string; fromMe: boolean };
+    if (
+      original.chatwootMessageId != null ||
+      original.chatwootInboxId != null ||
+      original.chatwootConversationId != null
+    )
+      throw new Error('Imported edit original already has native destination pointers');
+    const sourceId = toChatwootSourceId(key.id);
+    const peer =
+      isLidJid(key.remoteJid) && isPhoneJid(key.remoteJidAlt) ? toCanonicalHistoryJid(key.remoteJidAlt) : key.remoteJid;
+    const result = await postgresClient.getChatwootConnection().query(
+      `SELECT m.id, m.message_type, m.private, c.display_id, contact.identifier AS provider_peer,
+        pc.peer AS bound_peer, pc.provider AS bound_provider,
+        (ci.id IS NOT NULL AND ci.contact_id = contact.id AND ci.inbox_id = c.inbox_id) AS contact_inbox_matches
+       FROM messages m JOIN conversations c ON c.id = m.conversation_id
+       JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+       JOIN provider_conversation_bindings pc ON pc.conversation_id = c.id
+         AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'
+       JOIN contact_inboxes ci ON ci.id = c.contact_inbox_id
+       WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2 AND c.inbox_id = $2
+         AND m.source_id = ANY($3::text[])`,
+      [Number(provider.accountId), inboxId, [sourceId, key.id]],
+    );
+    const row = result.rows[0];
+    if (
+      result.rows.length !== 1 ||
+      row.private !== false ||
+      Number(row.message_type) !== (key.fromMe ? 1 : 0) ||
+      row.provider_peer !== peer ||
+      row.bound_peer !== peer ||
+      row.bound_provider !== 'whatsapp' ||
+      row.contact_inbox_matches !== true ||
+      !Number.isSafeInteger(Number(row.id)) ||
+      Number(row.id) < 1 ||
+      !Number.isSafeInteger(Number(row.display_id)) ||
+      Number(row.display_id) < 1
+    )
+      throw new Error('Imported edit original lacks a unique current scoped destination');
+    return {
+      sourceId,
+      nativeVersionSHA256: createHash('sha256').update(JSON.stringify(original)).digest('hex'),
+      destinationMessageId: Number(row.id),
+      destinationConversationId: Number(row.display_id),
+    };
+  }
+
   public async captureIgnoredHistoryEdit(
     envelope: Message,
     original: Message,
@@ -443,6 +490,12 @@ class ChatwootImport {
     provider: ChatwootModel,
     kind: IgnoredHistoryEditKind,
     rejection: string,
+    importedOriginal?: {
+      sourceId: string;
+      nativeVersionSHA256: string;
+      destinationMessageId: number;
+      destinationConversationId: number;
+    },
   ): Promise<IgnoredHistoryEditProof> {
     assertIgnoredEditOriginalIdentity(envelope, original);
     const sameNativeConflict = envelope.id === original.id && isSameNativeTextEditConflict(envelope);
@@ -476,6 +529,28 @@ class ChatwootImport {
         ? JSON.parse(target.content_attributes)
         : target?.content_attributes;
     const attachments = target?.attachments;
+    // Only the same-batch ordinary importer supplies this receipt, after its normal
+    // destination and (for media) physical-byte checks. Keep the authentic native
+    // row unchanged: imported history does not invent native Chatwoot pointers.
+    const importedOriginalMatches =
+      importedOriginal?.sourceId === sourceId &&
+      importedOriginal?.nativeVersionSHA256 === createHash('sha256').update(JSON.stringify(original)).digest('hex') &&
+      original.chatwootMessageId == null &&
+      original.chatwootInboxId == null &&
+      original.chatwootConversationId == null &&
+      importedOriginal.destinationMessageId === Number(target?.id) &&
+      importedOriginal.destinationConversationId === Number(target?.display_id) &&
+      target?.contact_inbox_matches === true &&
+      Boolean(target?.contact_inbox_snapshot) &&
+      target?.binding_snapshot?.provider === 'whatsapp' &&
+      target?.bound_peer === (nativeAlias || key.remoteJid);
+    const nativePointersMatch =
+      original.chatwootMessageId != null &&
+      original.chatwootInboxId != null &&
+      original.chatwootConversationId != null &&
+      Number(original.chatwootMessageId) === Number(target?.id) &&
+      Number(original.chatwootInboxId) === inboxId &&
+      Number(original.chatwootConversationId) === Number(target?.display_id);
     if (
       result.rows.length !== 1 ||
       target.private !== false ||
@@ -488,12 +563,7 @@ class ChatwootImport {
           !target.binding_snapshot ||
           !target.contact_inbox_snapshot)) ||
       Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
-      original.chatwootMessageId == null ||
-      original.chatwootInboxId == null ||
-      original.chatwootConversationId == null ||
-      Number(original.chatwootMessageId) !== Number(target.id) ||
-      Number(original.chatwootInboxId) !== inboxId ||
-      Number(original.chatwootConversationId) !== Number(target.display_id) ||
+      (!nativePointersMatch && !importedOriginalMatches) ||
       !Array.isArray(attachments) ||
       attachments.some((item: any) => !item.blob || !item.blob.key || Number(item.blob.byte_size) <= 0) ||
       (!(typeof target.content === 'string' && target.content.length > 0) && attachments.length === 0)
@@ -525,6 +595,12 @@ class ChatwootImport {
     provider: ChatwootModel,
     evolution: ChatwootService,
     requireExistingTarget = false,
+    importedOriginal?: {
+      sourceId: string;
+      recoveredVersionSHA256: string;
+      destinationMessageId: number;
+      destinationConversationId: number;
+    },
   ): Promise<Map<string, 'preserved_existing_source_payload_unavailable'>> {
     const edited = messages;
     const preserved = new Map<string, 'preserved_existing_source_payload_unavailable'>();
@@ -658,17 +734,27 @@ class ChatwootImport {
       if (!result.rows.length) continue; // A missing original is handled by the normal import below.
       if (result.rows.length !== 1) throw new Error('Provider history edit has conflicting source owners');
       const target = result.rows[0];
+      const importedOriginalMatches =
+        importedOriginal?.sourceId === sourceId &&
+        importedOriginal.recoveredVersionSHA256 ===
+          createHash('sha256').update(JSON.stringify(message)).digest('hex') &&
+        message.chatwootMessageId == null &&
+        message.chatwootInboxId == null &&
+        message.chatwootConversationId == null &&
+        importedOriginal.destinationMessageId === Number(target.id) &&
+        importedOriginal.destinationConversationId === Number(target.display_id);
       if (
         requireExistingTarget &&
         (target.private !== false ||
           !key.remoteJid ||
           target.provider_peer !== key.remoteJid ||
-          message.chatwootMessageId == null ||
-          message.chatwootInboxId == null ||
-          message.chatwootConversationId == null ||
-          Number(message.chatwootMessageId) !== Number(target.id) ||
-          Number(message.chatwootInboxId) !== inboxId ||
-          Number(message.chatwootConversationId) !== Number(target.display_id))
+          (!importedOriginalMatches &&
+            (message.chatwootMessageId == null ||
+              message.chatwootInboxId == null ||
+              message.chatwootConversationId == null ||
+              Number(message.chatwootMessageId) !== Number(target.id) ||
+              Number(message.chatwootInboxId) !== inboxId ||
+              Number(message.chatwootConversationId) !== Number(target.display_id))))
       )
         throw new Error('Authenticated provider edit current destination binding differs');
       if (Number(target.message_type) !== (key.fromMe ? 1 : 0)) {
