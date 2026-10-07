@@ -144,7 +144,7 @@ test('native and current destination rotation refuse the final ACK proof', async
   }
 });
 
-test('literal official batch returns only preserved-container accounting and missing dependency stops before source guard', async (t) => {
+test('literal official batch opts into container bookkeeping and parent rotation stops before source guard', async (t) => {
   const modulePath = require.resolve('../src/api/server.module.ts'),
     previousModule = require.cache[modulePath];
   require.cache[modulePath] = {
@@ -182,7 +182,7 @@ test('literal official batch returns only preserved-container accounting and mis
     names.forEach((name, i) => ((chatwootImport as any)[name] = originals[i]));
     postgresClient.getChatwootConnection = originalPool;
   });
-  postgresClient.getChatwootConnection = (() => f.pool) as any;
+  postgresClient.getChatwootConnection = (() => ({ ...f.pool, query: async () => ({ rows: [] }) })) as any;
   let guards = 0;
   chatwootImport.activateHistorySourceGuards = async (ids) => {
     guards++;
@@ -210,9 +210,12 @@ test('literal official batch returns only preserved-container accounting and mis
   assert.equal(result.appliedMessages, 0);
   assert.equal(result.importedMessages, 0);
   assert.equal(result.outcomes[0].reason, 'preserved_unsupported_album_container');
-  assert.equal(result.outcomes[0].albumPreservation.children.length, 2);
+  assert.equal(result.outcomes[0].albumPreservation.version, 2);
+  assert.equal(result.outcomes[0].albumPreservation.children, undefined);
+  assert.equal(result.outcomes[0].albumPreservation.childrenComplete, false);
+  assert.equal(result.outcomes[0].albumPreservation.childrenQueried, false);
   assert.equal(guards, 1);
-  f.children.pop();
+  f.parent.messageTimestamp++;
   await assert.rejects(service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-album' }, request));
   assert.equal(guards, 1);
 });

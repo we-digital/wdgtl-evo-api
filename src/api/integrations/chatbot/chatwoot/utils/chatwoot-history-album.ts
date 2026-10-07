@@ -206,13 +206,27 @@ export async function preserveAlbumContainers(
   pool: any,
   accountID: number,
   inboxID: number,
+  disposition: 'legacy' | 'container_only' = 'legacy',
 ) {
   const snapshots = new Map<string, any>();
   const proofs = new Map<string, any>();
   const read = async (parent: any) => {
     const count = albumImageCount(parent);
     const key = parent.key;
-    if (
+    if (disposition === 'container_only') {
+      // This is versioned container bookkeeping, not proof of children or their destination.
+      if (
+        typeof parent.instanceId !== 'string' ||
+        !parent.instanceId ||
+        typeof key?.id !== 'string' ||
+        !key.id ||
+        typeof key.fromMe !== 'boolean' ||
+        typeof key.remoteJid !== 'string' ||
+        !/^[^@\s]+@(g\.us|s\.whatsapp\.net|lid)$/.test(key.remoteJid)
+      )
+        fail();
+    } else if (
+      disposition !== 'legacy' ||
       !parent.instanceId ||
       typeof key?.id !== 'string' ||
       !key.id ||
@@ -228,10 +242,11 @@ export async function preserveAlbumContainers(
       take: 17,
       orderBy: { id: 'asc' },
     });
-    if (originals.length > 1) {
+    if (disposition === 'container_only' || originals.length > 1) {
       if (
         typeof parent.id !== 'string' ||
         parent.id.length === 0 ||
+        originals.length < 1 ||
         originals.length > 16 ||
         originals.filter((row: any) => isDeepStrictEqual(row, parent)).length !== 1 ||
         new Set(originals.map((row: any) => row.id)).size !== originals.length ||

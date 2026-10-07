@@ -95,6 +95,75 @@ test('full metadata companion or selected parent rotation refuses final acknowle
   }
 });
 
+test('explicit container-only opt-in accepts exact unique image headers without querying children', async () => {
+  for (const direction of [false, true]) {
+    for (const peer of ['synthetic@g.us', 'synthetic@s.whatsapp.net', 'synthetic@lid']) {
+      const f = fixture();
+      f.parent.key.fromMe = direction;
+      f.parent.key.remoteJid = peer;
+      f.parent.key.participant = '';
+      f.rows.splice(0, 1);
+      const before = structuredClone(f.rows);
+      const result = await preserveAlbumContainers([f.parent], f.repository, f.pool, 1, 108, 'container_only');
+      await result.assertCurrent();
+      const proof = result.proofs.get('WAID:album');
+      assert.equal(proof.version, 2);
+      assert.equal(proof.childrenComplete, false);
+      assert.equal(proof.childrenQueried, false);
+      assert.equal(proof.children, undefined);
+      assert.deepEqual(JSON.parse(proof.sameKeyNativeJSON), [f.parent]);
+      assert.deepEqual(f.rows, before);
+      assert.equal(f.queries(), 2);
+    }
+  }
+});
+
+test('default legacy rejects outgoing/direct headers and still queries required group children', async () => {
+  const outgoing = fixture();
+  outgoing.parent.key.fromMe = true;
+  outgoing.parent.key.remoteJid = 'synthetic@lid';
+  outgoing.parent.key.participant = '';
+  outgoing.rows.splice(0, 1);
+  await assert.rejects(preserveAlbumContainers([outgoing.parent], outgoing.repository, outgoing.pool, 1, 108));
+  assert.equal(outgoing.queries(), 0);
+  const incoming = fixture();
+  incoming.rows.splice(0, 1);
+  let calls = 0;
+  const repository = { findMany: async (args: any) => {
+    calls++;
+    if (calls === 1) return structuredClone(incoming.rows);
+    assert.ok(args.where.message);
+    return [];
+  } };
+  await assert.rejects(preserveAlbumContainers([incoming.parent], repository, incoming.pool, 1, 108));
+  assert.equal(calls, 2);
+});
+
+test('opt-in refuses available competitors, wrong owner/key/direction, unknown shape and full-row rotation', async () => {
+  for (const change of [
+    (f: any) => (f.parent.key.fromMe = 'true'),
+    (f: any) => (f.parent.key.remoteJid = 'synthetic@unknown'),
+    (f: any) => (f.parent.message.albumMessage.expectedVideoCount = 1),
+    (f: any) => (f.parent.message.conversation = 'visible'),
+    (f: any) => (f.rows[0] = { ...f.parent, instanceId: 'foreign' }),
+    (f: any) => (f.rows[0] = { ...f.parent, key: { ...f.parent.key, id: 'foreign' } }),
+    (f: any) => (f.rows[0] = { ...f.parent, key: { ...f.parent.key, fromMe: true } }),
+    (f: any) => (f.rows[0] = { ...f.parent, messageTimestamp: 5 }),
+    (f: any) => f.rows.push({ ...f.parent, id: 'other-visible' }),
+    (f: any) => f.rows.splice(0),
+  ]) {
+    const f = fixture();
+    f.rows.splice(0, 1);
+    change(f);
+    await assert.rejects(preserveAlbumContainers([f.parent], f.repository, f.pool, 1, 108, 'container_only'));
+  }
+  const f = fixture();
+  f.rows.splice(0, 1);
+  const result = await preserveAlbumContainers([f.parent], f.repository, f.pool, 1, 108, 'container_only');
+  f.rows[0] = { ...f.parent, status: 'DELIVERED' };
+  await assert.rejects(result.assertCurrent());
+});
+
 test('literal whole250 retains existing ordinary rows and reports only truthful container-only gap', async (t) => {
   const modulePath = require.resolve('../src/api/server.module.ts'),
     previous = require.cache[modulePath];
@@ -114,6 +183,10 @@ test('literal whole250 retains existing ordinary rows and reports only truthful 
   const { chatwootImport } = await import('../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper');
   const { postgresClient } = await import('../src/api/integrations/chatbot/chatwoot/libs/postgres.client');
   const f = fixture();
+  f.parent.key.fromMe = true;
+  f.parent.key.remoteJid = 'synthetic@lid';
+  f.parent.key.participant = '';
+  f.rows.splice(0, 1);
   const texts = Array.from({ length: 249 }, (_, i) => ({
     id: 'text' + i,
     instanceId: 'owned',
@@ -179,7 +252,7 @@ test('literal whole250 retains existing ordinary rows and reports only truthful 
     expectedDestinationKey: 'chatwoot:1:108',
     messages: selected.map((message) => ({
       sourceId: 'WAID:' + message.key.id,
-      expectedDirection: 'incoming',
+      expectedDirection: message.key.fromMe ? 'outgoing' : 'incoming',
       message: structuredClone(message),
     })),
   };

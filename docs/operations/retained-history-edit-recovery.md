@@ -44,3 +44,9 @@ not proof the CAS ran. Keep recovery paused until this prerequisite and the
 matching official history gap consumer are verified. Native prechecks and the
 final acknowledgement drift check are optimistic cross-database guards, not
 an atomic native/CW snapshot.
+
+### Explicit image-album container bookkeeping
+
+Cached recovery opts into the version2 `container_only` disposition for known image-only album headers. The indexed same-key native set must contain the exact selected parent once and only authenticated metadata companions (1–16 rows). Raw native owner, key, peer, direction, complete row and source version remain bound and rechecked. The proof records declared counts and full native rows; it explicitly records that children were not queried and completeness is false. Ordinary child messages retain their independent recovery flow. The default helper call retains legacy version1 child and destination preservation requirements.
+
+A NULL text edit whose native LID alternate exactly matches the current scoped contact can preserve the existing nonempty payload when its contact-inbox relation is valid. All current scoped bindings are read: an absent binding is recorded as absent in the qualified evidence, while any present binding must be WhatsApp and agree with the native alternate; duplicate or conflicting bindings refuse. This preservation does not create a binding or assert canonical routing. The original source identity, direction, public visibility and three native destination pointers remain mandatory.

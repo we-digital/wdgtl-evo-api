@@ -359,7 +359,7 @@ test('unavailable text never admits ordinary NULL, empty object, available text,
   }
 });
 
-test('existing NULL text preserves authenticated native LID alias only with scoped binding/contact-inbox agreement', async (t) => {
+test('existing NULL text preserves authenticated native LID alias with valid CI and absent or matching binding', async (t) => {
   const pool = postgresClient.getChatwootConnection;
   t.after(() => {
     postgresClient.getChatwootConnection = pool;
@@ -381,7 +381,7 @@ test('existing NULL text preserves authenticated native LID alias only with scop
     provider_peer: message.key.remoteJidAlt,
     bound_peer: message.key.remoteJidAlt,
     contact_inbox_matches: true,
-    binding_snapshot: { id: 'binding' },
+    binding_snapshot: { id: 'binding', provider: 'whatsapp' },
     contact_inbox_snapshot: { id: 'contact-inbox' },
   };
   const queries: string[] = [];
@@ -405,12 +405,18 @@ test('existing NULL text preserves authenticated native LID alias only with scop
   const result = await read();
   assert.equal(result.get('WAID:known-text'), 'preserved_existing_source_payload_unavailable');
   assert.equal(queries.at(-1), 'COMMIT');
-  assert.ok(queries.some((sql) => sql.includes("pc.provider = 'whatsapp'") && sql.includes('FOR UPDATE OF m')));
+  assert.ok(queries.some((sql) => sql.includes('LEFT JOIN provider_conversation_bindings pc') && sql.includes('FOR UPDATE OF m')));
+  assert.ok(queries.filter((sql) => sql.includes('SELECT m.id')).every((sql) => !sql.includes("pc.provider = 'whatsapp'")));
+  rows = [{ ...valid, bound_peer: null, binding_snapshot: null }];
+  const absent = await read();
+  assert.equal(absent.get('WAID:known-text'), 'preserved_existing_source_payload_unavailable');
+  assert.equal(queries.at(-1), 'COMMIT');
   for (const bad of [
     { ...valid, bound_peer: 'foreign@s.whatsapp.net' },
     { ...valid, provider_peer: 'foreign@s.whatsapp.net' },
     { ...valid, contact_inbox_matches: false },
-    { ...valid, binding_snapshot: null },
+    { ...valid, binding_snapshot: { id: 'other-provider', provider: 'telegram' } },
+    { ...valid, binding_snapshot: undefined },
     { ...valid, contact_inbox_snapshot: null },
     { ...valid, id: 18 },
     { ...valid, display_id: 24 },

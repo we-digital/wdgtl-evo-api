@@ -576,7 +576,7 @@ class ChatwootImport {
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
              LEFT JOIN provider_conversation_bindings pc ON pc.conversation_id = c.id
-               AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'
+               AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id
              LEFT JOIN contact_inboxes ci ON ci.id = c.contact_inbox_id
              WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
                AND c.inbox_id = $2 AND m.source_id = ANY($3::text[]) FOR UPDATE OF m`,
@@ -591,10 +591,10 @@ class ChatwootImport {
             target?.provider_peer === key.remoteJid ||
             (nativeAlias &&
               target?.provider_peer === nativeAlias &&
-              target?.bound_peer === nativeAlias &&
               target?.contact_inbox_matches === true &&
-              Boolean(target?.binding_snapshot) &&
-              Boolean(target?.contact_inbox_snapshot));
+              Boolean(target?.contact_inbox_snapshot) &&
+              (target.binding_snapshot === null ||
+                (target.binding_snapshot?.provider === 'whatsapp' && target.bound_peer === nativeAlias)));
           if (
             result.rows.length !== 1 ||
             target.private !== false ||
