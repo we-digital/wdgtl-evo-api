@@ -20,6 +20,7 @@ import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/
 import {
   CACHED_MEDIA_FILE_LIMIT,
   cachedHistoryMediaType,
+  cachedMediaMIMEsEqual,
   nativeCachedMediaPayload,
   prepareCachedRecoveryMedia,
   readRetainedRecoveryMedia,
@@ -2206,7 +2207,7 @@ export class ChatwootService {
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
       row.attachment_meta?.whatsapp_history_media_type !== cachedHistoryMediaType(message) ||
-      (row.content_type !== descriptor.mimetype &&
+      (!cachedMediaMIMEsEqual(retainedHistoryMedia(message).type, descriptor.mimetype, row.content_type) &&
         !(
           message.messageType === 'lottieStickerMessage' &&
           descriptor.mimetype === 'application/was' &&
