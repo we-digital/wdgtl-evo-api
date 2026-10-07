@@ -10,6 +10,11 @@ import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-hist
 export const CACHED_MEDIA_BATCH_LIMIT = 16 * 1024 * 1024;
 export const CACHED_MEDIA_FILE_LIMIT = 8 * 1024 * 1024;
 const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage']);
+// A native document's MIME describes the authenticated bytes; it does not select crypto keys.
+const nativeDocumentMIME = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length <= 100 &&
+  /^(application|text|image|audio|video)\/[a-z0-9][a-z0-9!#$&^_.+-]*$/i.test(value);
 
 export function nativeCachedMediaPayload(message: Message) {
   const { type, descriptor } = retainedHistoryMedia(message);
@@ -72,7 +77,7 @@ function retainedDownloadDescriptor(message: Message) {
       (message.messageType === 'imageMessage' && type === 'imageMessage' && descriptor.mimetype === 'image/jpeg') ||
       (message.messageType === 'documentMessage' &&
         type === 'documentMessage' &&
-        descriptor.mimetype === 'application/pdf') ||
+        nativeDocumentMIME(descriptor.mimetype)) ||
       (['associatedChildMessage', 'templateMessage'].includes(message.messageType) &&
         type === 'videoMessage' &&
         descriptor.mimetype === 'video/mp4')
@@ -85,7 +90,7 @@ function retainedDownloadDescriptor(message: Message) {
   )
     throw new Error('cached_media_authority_unavailable');
   const filename = basename(
-    descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'pdf' : 'mp4'}`,
+    descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
   );
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
