@@ -161,7 +161,19 @@ test('literal whole250 service preflights before writes and uses silent original
     editCalls = 0,
     posts = 0,
     unknownWrite = false;
+  let bindingRow: any;
+  let nativeBindings = 0;
   service.prismaRepository = {
+    $transaction: async (work: any) => work({
+      $queryRaw: async () => [{ ...bindingRow, chatwootMessageId: null, chatwootInboxId: null,
+        chatwootConversationId: null, chatwootContactInboxSourceId: null }],
+      message: { updateMany: async (data: any) => {
+        assert.equal(data.where.id.in[0], bindingRow.id);
+        assert.ok(proofs >= 2, 'Native bindings occur after stored media postimage proof');
+        nativeBindings++;
+        return { count: data.where.id.in.length };
+      } },
+    }),
     message: {
       findMany: async () => rows,
       findUnique: async ({ where }: any) => rows.find((row) => row.id === where.id),
@@ -206,8 +218,23 @@ test('literal whole250 service preflights before writes and uses silent original
     new Map([[doc().key.remoteJid, { identity_key: doc().key.remoteJid, contact_id: '5', conversation_id: '123' }]]);
   // Original sendData duplicate check and literal postimage query remain exercised.
   postgresClient.getChatwootConnection = (() => ({
-    query: async (sql: string) => ({
-      rows:
+    connect: async () => ({
+      query: async (sql: string) => ({ rows:
+        sql.startsWith('SELECT id FROM messages') ? [{ id: 7 }]
+        : sql.startsWith('SELECT conversation_id') ? [{ conversation_id: 123, source_id: `WAID:${bindingRow.key.id}`,
+          message_type: bindingRow.key.fromMe ? 1 : 0, private: false }]
+        : sql.startsWith('SELECT public.provider_message_conversation_route') ? [{ id: 123 }]
+        : sql.startsWith('SELECT c.id') ? [{ id: 123, display_id: 345, inbox_id: 99, source_id: 'synthetic-ci' }]
+        : sql.includes('SELECT b.peer') ? [{ peer: bindingRow.key.remoteJid }] : [] }),
+      release: () => {},
+    }),
+    query: async (sql: string, values?: any[]) => {
+      if (sql.startsWith('SELECT id FROM messages')) {
+        bindingRow = rows.find((row) => row.key.id === values?.[2]?.[0]);
+        assert.ok(bindingRow);
+        return { rows: [{ id: 7 }] };
+      }
+      return { rows:
         sql.includes('a.meta ?') && !stored
           ? []
           : sql.includes('active_storage_blobs')
@@ -266,7 +293,8 @@ test('literal whole250 service preflights before writes and uses silent original
             : sql.includes('provider_conversation_bindings')
               ? [{ id: 123, display_id: 345 }]
               : [],
-    }),
+      };
+    },
   })) as any;
   axios.request = (async (config: any) => {
     if (config.method === 'GET') {
@@ -344,6 +372,7 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(posts, 1);
   assert.equal(result.outcomes.find((outcome: any) => outcome.sourceId === 'WAID:doc').status, 'imported');
   assert.equal(proofs, 2);
+  assert.equal(nativeBindings, 250);
   for (const invalidEpoch of [1700000001.321, Number.NaN]) {
     persistedEpoch = invalidEpoch;
     await assert.rejects(
