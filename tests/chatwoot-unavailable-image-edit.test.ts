@@ -347,7 +347,7 @@ test('batch accounts controls and unavailable edit explicitly; repeat does not i
   };
   await assert.rejects(
     service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic-recovery' }, mediaRequest),
-    /cached_media_authority_unavailable/,
+    /cached_media_size_or_digest_unavailable/,
   );
   assert.equal(importCalls, 1);
 

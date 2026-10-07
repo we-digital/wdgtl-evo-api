@@ -531,7 +531,7 @@ class ChatwootImport {
     if (!edited.length) return preserved;
     const pool = postgresClient.getChatwootConnection();
     for (const message of edited) {
-      const key = message.key as { id: string; fromMe: boolean; remoteJid: string };
+      const key = message.key as { id: string; fromMe: boolean; remoteJid: string; remoteJidAlt?: string };
       const sourceId = toChatwootSourceId(key.id);
       const payload = message.message as any;
       if (
@@ -539,6 +539,10 @@ class ChatwootImport {
         (payload && typeof payload === 'object' && !Array.isArray(payload) && Object.keys(payload).length === 0)
       ) {
         const textEdit = ['conversation', 'extendedTextMessage'].includes(message.messageType);
+        const nativeAlias =
+          textEdit && payload === null && isLidJid(key.remoteJid) && isPhoneJid(key.remoteJidAlt)
+            ? toCanonicalHistoryJid(key.remoteJidAlt)
+            : undefined;
         const documentEdit = message.messageType === 'documentMessage' && payload === null;
         const audioEdit = message.messageType === 'audioMessage';
         if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit && !audioEdit)
@@ -548,6 +552,8 @@ class ChatwootImport {
           await client.query('BEGIN');
           const result = await client.query(
             `SELECT m.id, m.message_type, c.display_id, m.private, m.content_attributes, m.content, contact.identifier AS provider_peer,
+               pc.peer AS bound_peer, to_jsonb(pc) AS binding_snapshot, to_jsonb(ci) AS contact_inbox_snapshot,
+               (ci.id IS NOT NULL AND ci.contact_id = contact.id AND ci.inbox_id = c.inbox_id) AS contact_inbox_matches,
                EXISTS (SELECT 1 FROM attachments a
                  JOIN active_storage_attachments asa ON asa.record_type = 'Attachment'
                    AND asa.record_id = a.id AND asa.name = 'file'
@@ -569,6 +575,9 @@ class ChatwootImport {
                      AND b.byte_size > 0 AND length(b.key) > 0) = 1) AS has_audio
              FROM messages m JOIN conversations c ON c.id = m.conversation_id
              JOIN contacts contact ON contact.id = c.contact_id AND contact.account_id = c.account_id
+             LEFT JOIN provider_conversation_bindings pc ON pc.conversation_id = c.id
+               AND pc.account_id = c.account_id AND pc.inbox_id = c.inbox_id AND pc.provider = 'whatsapp'
+             LEFT JOIN contact_inboxes ci ON ci.id = c.contact_inbox_id
              WHERE m.account_id = $1 AND c.account_id = $1 AND m.inbox_id = $2
                AND c.inbox_id = $2 AND m.source_id = ANY($3::text[]) FOR UPDATE OF m`,
             [Number(provider.accountId), inboxId, [sourceId, key.id]],
@@ -578,6 +587,14 @@ class ChatwootImport {
             typeof target?.content_attributes === 'string'
               ? JSON.parse(target.content_attributes)
               : target?.content_attributes;
+          const nativePeerMatches =
+            target?.provider_peer === key.remoteJid ||
+            (nativeAlias &&
+              target?.provider_peer === nativeAlias &&
+              target?.bound_peer === nativeAlias &&
+              target?.contact_inbox_matches === true &&
+              Boolean(target?.binding_snapshot) &&
+              Boolean(target?.contact_inbox_snapshot));
           if (
             result.rows.length !== 1 ||
             target.private !== false ||
@@ -585,7 +602,7 @@ class ChatwootImport {
               ? typeof target.content !== 'string' ||
                 target.content.length === 0 ||
                 !key.remoteJid ||
-                target.provider_peer !== key.remoteJid ||
+                !nativePeerMatches ||
                 message.chatwootMessageId == null ||
                 message.chatwootInboxId == null ||
                 message.chatwootConversationId == null

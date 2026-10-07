@@ -75,7 +75,7 @@ import {
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
-  isUnavailableNullImageOriginal,
+  isUnavailableNullEditOriginal,
   UNAVAILABLE_ORIGINAL_EDIT_REASON,
   UnavailableOriginalEditProof,
   UnavailableOriginalEditState,
@@ -6045,7 +6045,7 @@ export class ChatwootService {
           throw new Error('Retained encrypted edit source or original rotated');
         const verified = await chatwootImport.getVerifiedRecoverySourceIds([target], inbox.id, provider);
         if (!verified.has(toChatwootSourceId((target.key as { id: string }).id))) {
-          if (!isUnavailableNullImageOriginal(target))
+          if (!isUnavailableNullEditOriginal(target))
             throw new Error('Retained encrypted edit requires an existing unique destination original');
           if (
             encryptedEdits.filter(
@@ -6189,14 +6189,14 @@ export class ChatwootService {
         inbox.id,
         provider,
       );
-      const readUnavailableImageState = async (target: MessageModel): Promise<UnavailableOriginalEditState> => {
+      const readUnavailableOriginalState = async (target: MessageModel): Promise<UnavailableOriginalEditState> => {
         const [current, updates] = await Promise.all([
           this.prismaRepository.message.findUnique({ where: { id: target.id } }),
           this.prismaRepository.messageUpdate.findMany({
             where: { instanceId: target.instanceId, messageId: target.id, status: 'EDITED' },
           }),
         ]);
-        if (!isDeepStrictEqual(current, target)) throw new Error('Unavailable image original native source rotated');
+        if (!isDeepStrictEqual(current, target)) throw new Error('Unavailable edit original native source rotated');
         return {
           sourceRows: [current],
           targetUpdates: updates.sort((a, b) => a.id.localeCompare(b.id)),
@@ -6205,8 +6205,8 @@ export class ChatwootService {
       };
       for (const target of editedMessages) {
         const sourceId = toChatwootSourceId((target.key as { id: string }).id);
-        if (!existingSourceIds.has(sourceId) && isUnavailableNullImageOriginal(target)) {
-          const state = await readUnavailableImageState(target);
+        if (!existingSourceIds.has(sourceId) && isUnavailableNullEditOriginal(target)) {
+          const state = await readUnavailableOriginalState(target);
           const proof = await chatwootImport.captureUnavailableOriginalEdit(target, target, state, inbox.id, provider);
           unavailableOriginalEdits.set(sourceId, { source: target, target, state, proof });
         }
@@ -6484,7 +6484,7 @@ export class ChatwootService {
       for (const [sourceId, unavailable] of unavailableOriginalEdits) {
         const state =
           unavailable.source.id === unavailable.target.id
-            ? await readUnavailableImageState(unavailable.target)
+            ? await readUnavailableOriginalState(unavailable.target)
             : await readEncryptedEditState(unavailable.source, unavailable.target);
         if (!isDeepStrictEqual(state, unavailable.state))
           throw new Error('Unavailable edit original ordering or source rotated before acknowledgement');
