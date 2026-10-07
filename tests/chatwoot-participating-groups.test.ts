@@ -21,6 +21,7 @@ function fixture(inboxId = 40) {
   const service = Object.create(ChatwootService.prototype) as any;
   const provider = { enabled: true, accountId: '1' };
   let creations = 0;
+  service.isImportHistoryAvailable = () => false;
   service.clientCw = async () => ({ provider });
   service.getInbox = async () => ({ id: inboxId });
   service.providerConversationRequest = async () => ({
@@ -212,3 +213,89 @@ test('actual roster writer sends only protected silent contact/conversation meta
     assert.equal(request.body.content, undefined);
   }
 });
+
+test('bulk roster read stays account/inbox/peer scoped and avoids per-group HTTP reads', async () => {
+  const f = fixture();
+  f.service.isImportHistoryAvailable = () => true;
+  const row = {
+    contact_id: 10,
+    contact_account_id: 1,
+    identifier: group,
+    database_id: 40000,
+    conversation_id: 4000,
+    conversation_account_id: 1,
+    inbox_id: 40,
+    binding_provider: 'whatsapp',
+    binding_peer: group,
+  };
+  let reads = 0;
+  f.service.pgClient = {
+    query: async (sql, params) => {
+      assert.match(sql, /ct.account_id = \$1/);
+      assert.match(sql, /c.inbox_id = \$2/);
+      assert.deepEqual(params, [1, 40, [group]]);
+      assert.doesNotMatch(sql, /INSERT|UPDATE|DELETE/);
+      reads++;
+      return { rows: [row] };
+    },
+  };
+  f.service.findProviderContact = () => {
+    throw Error('per-group HTTP read forbidden');
+  };
+  const result = await f.service.syncParticipatingGroups(f.instance, false);
+  assert.equal(result.groups[0].conversationId, 4000);
+  assert.equal(result.groups[0].missing, false);
+  assert.equal(reads, 1);
+  assert.equal(f.creations(), 0);
+  for (const changed of [
+    { ...row, contact_account_id: 2 },
+    { ...row, inbox_id: 42 },
+    { ...row, binding_peer: '120363000000002@g.us' },
+    { ...row, binding_provider: 'telegram_mtproto' },
+  ]) {
+    f.service.pgClient.query = async () => ({ rows: [changed] });
+    await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /identity conflicts/);
+  }
+  f.service.pgClient.query = async () => ({ rows: [row, row] });
+  await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /identity conflicts/);
+});
+
+test(
+  'exact roster SQL on isolated synthetic PostgreSQL preserves routes and rejects duplicate identities',
+  {
+    skip: !process.env.GROUP_ROSTER_LAB_SOCKET,
+  },
+  async () => {
+    const { Client } = require('pg');
+    const client = new Client({ host: process.env.GROUP_ROSTER_LAB_SOCKET, port: 55470, database: 'postgres' });
+    await client.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(`CREATE TEMP TABLE contacts (id integer,account_id integer,identifier text);
+      CREATE TEMP TABLE conversations (id integer,display_id integer,account_id integer,inbox_id integer,contact_id integer,status integer);
+      CREATE TEMP TABLE provider_conversation_bindings (conversation_id integer,provider text,peer text);`);
+      await client.query('INSERT INTO contacts VALUES(10,1,$1),(20,2,$1)', [group]);
+      await client.query(
+        'INSERT INTO conversations VALUES(40000,4000,1,40,10,0),(42000,4200,1,42,10,1),(50000,5000,2,40,20,0)',
+      );
+      await client.query(
+        "INSERT INTO provider_conversation_bindings VALUES(40000,'whatsapp',$1),(42000,'whatsapp',$1),(50000,'whatsapp',$1)",
+        [group],
+      );
+      const f = fixture();
+      f.service.pgClient = client;
+      f.service.isImportHistoryAvailable = () => true;
+      f.service.findProviderContact = () => {
+        throw Error('HTTP lookup forbidden');
+      };
+      assert.equal((await f.service.syncParticipatingGroups(f.instance)).groups[0].conversationId, 4000);
+      f.service.getInbox = async () => ({ id: 42 });
+      assert.equal((await f.service.syncParticipatingGroups(f.instance)).groups[0].conversationId, 4200);
+      await client.query('INSERT INTO contacts VALUES(11,1,$1)', [group]);
+      await assert.rejects(f.service.syncParticipatingGroups(f.instance), /identity conflicts/);
+    } finally {
+      await client.query('ROLLBACK');
+      await client.end();
+    }
+  },
+);
