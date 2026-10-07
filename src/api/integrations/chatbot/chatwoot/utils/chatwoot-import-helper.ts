@@ -835,8 +835,7 @@ class ChatwootImport {
   }
 
   private async insertHistoryMessagesSerialized(
-    sql: string,
-    params: unknown[],
+    statements: Array<{ sql: string; params: unknown[] }>,
     scope: { accountId: number; inboxId: number; peers: string[]; conversationIds: number[] },
   ): Promise<number> {
     const pool = postgresClient.getChatwootConnection();
@@ -884,9 +883,15 @@ class ChatwootImport {
           `provider-conversation:${scope.accountId}:${scope.inboxId}:whatsapp:${peer}`,
         ]);
       }
-      const result = await client.query(sql, params);
+      let inserted = 0;
+      // Each bounded statement has the same deadline; all statements retain
+      // these locks and commit together. A later cancellation rolls back all.
+      for (const statement of statements) {
+        const result = await client.query(statement.sql, statement.params);
+        inserted += result?.rowCount ?? 0;
+      }
       await client.query('COMMIT');
-      return result?.rowCount ?? 0;
+      return inserted;
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -987,8 +992,7 @@ class ChatwootImport {
             options.identityNames || this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
           );
           // inserting messages in chatwoot db
-          let sqlValues = '';
-          const bindInsertMsg = [provider.accountId, inbox.id];
+          const insertChunks: Array<{ values: string; params: unknown[]; rows: number }> = [];
 
           messagesByIdentity.forEach((messages: any[], identityKey: string) => {
             const fksChatwoot = fksByIdentity.get(identityKey);
@@ -1002,6 +1006,13 @@ class ChatwootImport {
               if (!contentMessage) {
                 return;
               }
+
+              let chunk = insertChunks[insertChunks.length - 1];
+              if (!chunk || chunk.rows === 50) {
+                chunk = { values: '', params: [provider.accountId, inbox.id], rows: 0 };
+                insertChunks.push(chunk);
+              }
+              const bindInsertMsg = chunk.params;
 
               bindInsertMsg.push(contentMessage);
               const bindContent = `$${bindInsertMsg.length}`;
@@ -1035,17 +1046,16 @@ class ChatwootImport {
               );
               const bindAttributes = `$${bindInsertMsg.length}`;
 
-              sqlValues += `(${bindContent}::text, $1::bigint, $2::bigint, ${bindConversationId}::bigint,
+              chunk.values += `(${bindContent}::text, $1::bigint, $2::bigint, ${bindConversationId}::bigint,
                   ${bindMessageType}::integer, ${bindSenderType}::text, ${bindSenderId}::bigint,
                   ${bindSourceId}::text, ${bindmessageTimestamp}::bigint, ${bindAttributes}::jsonb),`;
+              chunk.rows += 1;
             });
           });
-          if (bindInsertMsg.length > 2) {
-            if (sqlValues.slice(-1) === ',') {
-              sqlValues = sqlValues.slice(0, -1);
-            }
-
-            const sqlInsertMsg = `INSERT INTO messages
+          if (insertChunks.length > 0) {
+            const statements = insertChunks.map((chunk) => ({
+              params: chunk.params,
+              sql: `INSERT INTO messages
               (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private,
               content_type, sender_type, sender_id, source_id, created_at, updated_at, content_attributes)
               SELECT DISTINCT ON (candidate.inbox_id, candidate.source_id)
@@ -1063,7 +1073,7 @@ class ChatwootImport {
                 to_timestamp(candidate.message_timestamp),
                 to_timestamp(candidate.message_timestamp),
                 candidate.content_attributes
-              FROM (VALUES ${sqlValues}) AS candidate(
+              FROM (VALUES ${chunk.values.slice(0, -1)}) AS candidate(
                 content,
                 account_id,
                 inbox_id,
@@ -1081,10 +1091,11 @@ class ChatwootImport {
                 WHERE existing.inbox_id = candidate.inbox_id
                   AND existing.source_id = candidate.source_id
               )
-              ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
+              ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`,
+            }));
 
             recoveryPhase = 'message_insert';
-            totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg, {
+            totalMessagesImported += await this.insertHistoryMessagesSerialized(statements, {
               accountId: Number(provider.accountId),
               inboxId: Number(inbox.id),
               peers: [...fksByIdentity.keys()],
