@@ -6,6 +6,13 @@ Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focus
 
 # we:Digital Evolution API fork
 
+## Associated JPEG native source metadata (2026-10-08)
+
+- Retain the installed WhatsApp protobuf's optional `imageSourceType` enum (0 through 3) on associated JPEG records. This metadata does not alter image bytes, caption, author, timestamp, direction, source fingerprint or cache ownership.
+- Absent values remain supported; null, strings, unknown enum values and malformed native digests/keys/lengths still refuse. The complete native envelope remains the source version used for recovery acknowledgement.
+- Reapply the narrow descriptor validator with its installed-protobuf roundtrip and negative cache-authority regression. No dependencies, schema, history acknowledgement contract, provider requests or customer sends change. Rollback restores safe refusal for sources carrying this optional field.
+
+
 ## Scoped native event targets and admitted history mapping copies (2026-10-08)
 
 - Resolve known incoming edit/reaction/read/delete/reply targets by instance plus raw provider key and the known target peer/direction. Unscoped ambiguous keys return null; never infer target direction from a reply actor or group title.
