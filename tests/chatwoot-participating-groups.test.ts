@@ -23,7 +23,11 @@ function fixture(inboxId = 40) {
   let creations = 0;
   service.clientCw = async () => ({ provider });
   service.getInbox = async () => ({ id: inboxId });
-  service.providerConversationsEnabled = async () => true;
+  service.providerConversationRequest = async () => ({
+    enabled: true,
+    provider: 'whatsapp',
+    whatsapp_group_roster_contract_version: 1,
+  });
   service.findProviderContact = async () => null;
   service.canonicalProviderConversation = async (_instance, _provider, inbox, peer, _body, metadata) => {
     assert.equal(inbox, inboxId);
@@ -72,7 +76,8 @@ test('reuses an existing conversation and rejects another inbox or unknown owner
   const f = fixture();
   f.service.findProviderContact = async () => ({ id: 10 });
   const conversation = { id: 4000, inbox_id: 40, contact_id: 10, peer: group, provider: 'whatsapp' };
-  f.service.providerConversationRequest = async () => ({ conversation });
+  f.service.providerConversationRequest = async (_provider, _method, data) =>
+    data.peer ? { conversation } : { enabled: true, provider: 'whatsapp', whatsapp_group_roster_contract_version: 1 };
   assert.equal((await f.service.syncParticipatingGroups(f.instance, false)).groups[0].missing, false);
   assert.equal(f.creations(), 0);
   conversation.inbox_id = 42;
@@ -133,5 +138,77 @@ test('history request schema bounds count and prohibits non-group and extra payl
     { remoteJid: group, count: 50, message: 'invented' },
   ]) {
     assert.equal(validate(data, requestGroupHistorySchema).valid, false);
+  }
+});
+
+test('actual roster writer sends only protected silent contact/conversation metadata', async (t) => {
+  const { createServer } = await import('node:http');
+  const requests: any[] = [];
+  const server = createServer(async (req, res) => {
+    let raw = '';
+    for await (const chunk of req) raw += chunk;
+    const body = raw ? JSON.parse(raw) : {};
+    requests.push({ path: req.url, body, headers: req.headers });
+    res.setHeader('Content-Type', 'application/json');
+    if (req.url === '/api/v1/accounts/1/contacts') res.end(JSON.stringify({ payload: { id: 10 } }));
+    else if (req.url === '/api/v1/accounts/1/provider_conversations')
+      res.end(
+        JSON.stringify({
+          id: 4000,
+          database_id: 40000,
+          contact_id: 10,
+          inbox_id: 40,
+          provider: 'whatsapp',
+          peer: group,
+          status: 'open',
+        }),
+      );
+    else {
+      res.statusCode = 400;
+      res.end('{}');
+    }
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve()))));
+  const base = `http://127.0.0.1:${(server.address() as any).port}`;
+  const service = Object.create(ChatwootService.prototype) as any;
+  const provider = { enabled: true, accountId: '1', token: 'synthetic', url: 'https://synthetic.example.test' };
+  service.logger = { warn() {} };
+  service.configService = {
+    get: () => ({ NATIVE_BRIDGE_TOKEN: 's'.repeat(43), TRUSTED_BASE_URL: 'https://synthetic.example.test' }),
+  };
+  service.getClientCwConfig = () => ({ basePath: base, headers: { 'api-access-token': 'synthetic' } });
+  const axios = require('axios').default;
+  const originalRequest = axios.request;
+  axios.request = async (options) => {
+    assert.equal(new URL(options.url).origin, 'https://synthetic.example.test');
+    const response = await fetch(base + new URL(options.url).pathname, {
+      method: options.method,
+      headers: { ...options.headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify(options.data),
+    });
+    return { data: await response.json() };
+  };
+  t.after(() => {
+    axios.request = originalRequest;
+  });
+  service.clientCw = async () => ({ provider });
+  service.findProviderContact = async () => null;
+  const id = await service.canonicalProviderConversation(
+    { instanceName: 'synthetic' },
+    provider,
+    40,
+    group,
+    { key: { remoteJid: group } },
+    { subject: 'Synthetic group' },
+  );
+  assert.equal(id, 4000);
+  assert.equal(requests.length, 2);
+  for (const request of requests) {
+    assert.equal(request.headers['x-chatwoot-history-import'], '1');
+    assert.equal(request.headers['x-chatwoot-history-inbox-id'], '40');
+    assert.equal(request.headers['x-chatwoot-native-bridge-token'], 's'.repeat(43));
+    assert.equal(request.body.message, undefined);
+    assert.equal(request.body.content, undefined);
   }
 });

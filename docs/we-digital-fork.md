@@ -714,3 +714,9 @@ automatic callers. Preserve these paths during upstream reapply.
 - Connection-open, group-upsert and participant events schedule coalesced background reconciliation. All service instances share a two-operation limit and per-instance serialization; live message handlers never await roster work. New live messages keep the existing peer resolver and deduplication.
 - Keep these event hooks alongside the protected provider conversation contract when rebasing. Rollback removes automatic discovery/endpoint; already-created valid group conversations remain usable and cannot be deleted by rollback. Known group-ignore settings still explicitly disable ingestion.
 - Validation: participating-groups synthetic tests include two inboxes for one group, reuse, owner/inbox conflicts, no customer-send path and bounded primary-history requests. Recovery remains a separate guarded operation after actual primary history is received.
+
+Roster creation requires Chatwoot whatsapp_group_roster_contract_version=1.
+Contact and canonical conversation requests carry the authenticated native
+bridge plus history-import/inbox headers, suppressing live callbacks; roster
+contact creation does not write labels. Deploy the Chatwoot capability before
+EVO; unsupported runtimes refuse safely and leave live ingress unchanged.

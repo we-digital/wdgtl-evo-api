@@ -470,6 +470,7 @@ export class ChatwootService {
     provider: ChatwootModel,
     method: 'GET' | 'POST',
     data: Record<string, unknown>,
+    rosterInboxId?: number,
   ): Promise<Record<string, any>> {
     const config = this.configService.get<Chatwoot>('CHATWOOT');
     const url = requireTrustedChatwootUrl(
@@ -485,6 +486,9 @@ export class ChatwootService {
       headers: {
         'api-access-token': provider.token,
         'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+        ...(rosterInboxId
+          ? { 'X-Chatwoot-History-Import': '1', 'X-Chatwoot-History-Inbox-Id': String(rosterInboxId) }
+          : {}),
       },
       timeout: 20_000,
       maxRedirects: 0,
@@ -526,19 +530,25 @@ export class ChatwootService {
         isGroup ? `${group.subject} (GROUP)` : body.pushName || user,
         undefined,
         peer,
+        rosterGroup ? inboxId : undefined,
       );
     }
     const contactId = Number(contact?.payload?.id || contact?.payload?.contact?.id || contact?.id);
     if (!Number.isSafeInteger(contactId) || contactId <= 0)
       throw new Error('Provider contact could not be established');
-    const resolved = await this.providerConversationRequest(provider, 'POST', {
-      inbox_id: inboxId,
-      contact_id: contactId,
-      provider: 'whatsapp',
-      peer,
-      aliases: remoteLid && remoteLid !== peer ? [remoteLid] : [],
-      ...(provider.conversationPending ? { status: 'pending' } : {}),
-    });
+    const resolved = await this.providerConversationRequest(
+      provider,
+      'POST',
+      {
+        inbox_id: inboxId,
+        contact_id: contactId,
+        provider: 'whatsapp',
+        peer,
+        aliases: remoteLid && remoteLid !== peer ? [remoteLid] : [],
+        ...(provider.conversationPending ? { status: 'pending' } : {}),
+      },
+      rosterGroup ? inboxId : undefined,
+    );
     if (
       !Number.isSafeInteger(resolved.id) ||
       resolved.id <= 0 ||
@@ -616,8 +626,13 @@ export class ChatwootService {
       throw new BadRequestException('An authenticated provider and its bound inbox are required');
     if (waInstance.localSettings?.groupsIgnore)
       throw new BadRequestException('Group ingestion is disabled for this instance');
-    if (!(await this.providerConversationsEnabled(context.provider, inbox.id)))
-      throw new BadRequestException('Canonical provider conversations are required');
+    const capability = await this.providerConversationRequest(context.provider, 'GET', { inbox_id: inbox.id });
+    if (
+      capability.enabled !== true ||
+      capability.provider !== 'whatsapp' ||
+      capability.whatsapp_group_roster_contract_version !== 1
+    )
+      throw new BadRequestException('The silent canonical WhatsApp group roster contract is required');
     const me = waInstance.client.authState.creds.me;
     const owners = [me.id, me.lid].filter(Boolean).map(toCanonicalHistoryJid);
     const groups = Object.values(await waInstance.client.groupFetchAllParticipating(false)) as any[];
@@ -1053,6 +1068,7 @@ export class ChatwootService {
     name?: string,
     avatar_url?: string,
     jid?: string,
+    rosterInboxId?: number,
   ) {
     try {
       const context = await this.clientCw(instance);
@@ -1061,7 +1077,21 @@ export class ChatwootService {
         this.logger.warn('client not found');
         return null;
       }
-      const { client, provider } = context;
+      const { provider } = context;
+      const config = this.configService.get<Chatwoot>('CHATWOOT');
+      const client = rosterInboxId
+        ? new ChatwootClient({
+            config: {
+              ...this.getClientCwConfig(provider),
+              headers: {
+                ...this.getClientCwConfig(provider).headers,
+                'X-Chatwoot-Native-Bridge-Token': config.NATIVE_BRIDGE_TOKEN,
+                'X-Chatwoot-History-Import': '1',
+                'X-Chatwoot-History-Inbox-Id': String(rosterInboxId),
+              },
+            },
+          })
+        : context.client;
 
       let data: any = {};
       if (!isGroup) {
@@ -1106,7 +1136,7 @@ export class ChatwootService {
           : await this.findContact(instance, phoneNumber);
       const contactId = createdContactId || persistedContact?.id;
 
-      if (contactId) {
+      if (contactId && !rosterInboxId) {
         await this.addLabelToContact(provider.nameInbox, contactId);
       }
 
@@ -1121,7 +1151,7 @@ export class ChatwootService {
           if (!provider) {
             return null;
           }
-          await this.addLabelToContact(provider.nameInbox, contactId);
+          if (!rosterInboxId) await this.addLabelToContact(provider.nameInbox, contactId);
           return existingContact;
         }
       }
