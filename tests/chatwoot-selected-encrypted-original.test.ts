@@ -112,11 +112,12 @@ test('same-selected available original imports and verifies before recovered edi
     'destination-rotation',
     'competing',
     'already-imported-image',
+    'missing-target',
   ] as const) {
     const image = !['text', 'out-of-batch'].includes(mode),
       { original, envelope, bytes } = nativePair(image);
     const before = JSON.stringify({ original, envelope });
-    const selected = mode === 'out-of-batch' ? [envelope] : [original, envelope];
+    const selected = ['out-of-batch', 'missing-target'].includes(mode) ? [envelope] : [original, envelope];
     let stored = mode === 'already-imported-image',
       edits = 0,
       captures = 0;
@@ -148,11 +149,15 @@ test('same-selected available original imports and verifies before recovered edi
               ? [{ ...envelope, id: 'other-edit' }]
               : []
             : where.key
-              ? [original]
+              ? mode === 'missing-target'
+                ? []
+                : [original]
               : where.instanceId
-                ? [envelope, mode === 'rotated' && stored ? { ...original, messageTimestamp: 101 } : original]
+                ? mode === 'missing-target'
+                  ? [envelope]
+                  : [envelope, mode === 'rotated' && stored ? { ...original, messageTimestamp: 101 } : original]
                 : selected,
-        findUnique: async () => original,
+        findUnique: async ({ where }: any) => (where.id === envelope.id ? envelope : original),
       },
       messageUpdate: { findMany: async () => [] },
       media: { findFirst: async () => (image ? media : null) },
@@ -256,7 +261,18 @@ test('same-selected available original imports and verifies before recovered edi
       })),
     };
     const result = service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request);
-    if (['text', 'image', 'competing', 'already-imported-image'].includes(mode)) {
+    if (mode === 'missing-target') {
+      const done = await result;
+      assert.equal(done.outcomes.length, 1);
+      const outcome = done.outcomes[0];
+      assert.equal(outcome.status, 'skipped');
+      assert.equal(outcome.unavailableOriginalEdit.version, 3);
+      assert.equal(outcome.unavailableOriginalEdit.nativeTargetState, 'missing');
+      assert.equal(outcome.unavailableOriginalEdit.destinationState, 'unqualified');
+      assert.equal(edits, 0);
+      assert.equal(stored, false);
+      assert.equal(events.includes('import'), false);
+    } else if (['text', 'image', 'competing', 'already-imported-image'].includes(mode)) {
       const done = await result;
       assert.equal(
         done.outcomes.find((x: any) => x.sourceId === 'WAID:original').status,

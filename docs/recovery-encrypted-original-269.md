@@ -1,0 +1,5 @@
+Recovery ignores a retained encrypted edit only when the exact current-instance indexed target-key query proves zero native original candidates. The source is reread unchanged and the query is repeated before the official source-version acknowledgment. The durable version3 audit records the complete source and empty target-candidate query fingerprint, without destination, decryption, or applied-content claims. One native original continues the existing guarded path; ambiguity remains a refusal.
+
+A native ephemeralMessage already flattened to a documentMessage body uses the normal document recovery path. Its original wrapper type and full native source remain in the upload fingerprint. Unknown outer payloads remain unsupported; size, native hashes, MAC and destination physical verification remain mandatory.
+
+Validation: 23 focused synthetic checks, typecheck and runtime lint; retained39 two-envelope proof qualifies exactly one absent native target and keeps the other unique target on its original path. Retained41 proves one flattened ordinary document with a valid native size/SHA descriptor and no native Media row; it does not prove downloaded bytes.

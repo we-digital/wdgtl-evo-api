@@ -80,7 +80,7 @@ function retainedDownloadDescriptor(message: Message) {
       (message.messageType === 'lottieStickerMessage' &&
         type === 'documentMessage' &&
         descriptor.mimetype === 'application/was') ||
-      (message.messageType === 'documentMessage' &&
+      (['documentMessage', 'ephemeralMessage'].includes(message.messageType) &&
         type === 'documentMessage' &&
         nativeDocumentMIME(descriptor.mimetype)) ||
       (['associatedChildMessage', 'templateMessage'].includes(message.messageType) &&

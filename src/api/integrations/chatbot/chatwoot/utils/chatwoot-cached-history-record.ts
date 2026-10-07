@@ -93,7 +93,7 @@ export function classifyCachedHistoryRecord(
     retainedButtons(payload);
     return 'ordinary';
   }
-  if (['associatedChildMessage', 'lottieStickerMessage'].includes(record.messageType)) {
+  if (['associatedChildMessage', 'lottieStickerMessage', 'ephemeralMessage'].includes(record.messageType)) {
     retainedHistoryMedia(record as any);
     return 'ordinary';
   }
