@@ -141,6 +141,92 @@ export type UnavailableOriginalEditProof = {
   orderingSHA256: string;
 };
 
+export type IgnoredNullEditProof = {
+  version: 2;
+  kind: 'ignored_null_edit';
+  disposition: 'ignored_unavailable_edit';
+  destinationState: 'unqualified';
+  sourceId: string;
+  sourceNativeId: string;
+  targetSourceId: string;
+  targetNativeId: string;
+  instanceId: string;
+  accountId: number;
+  inboxId: number;
+  peer: string;
+  direction: 'incoming' | 'outgoing';
+  sourceNativeJSON: string;
+  sourceNativeVersionSHA256: string;
+  orderingJSON: string;
+  orderingSHA256: string;
+};
+
+export function isKnownUnavailableNullEdit(message: Message): boolean {
+  const key = message.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
+  return (
+    message.status === 'EDITED' &&
+    message.message === null &&
+    ['conversation', 'extendedTextMessage', 'imageMessage', 'documentMessage', 'audioMessage'].includes(
+      message.messageType,
+    ) &&
+    typeof message.id === 'string' &&
+    message.id.length > 0 &&
+    typeof message.instanceId === 'string' &&
+    message.instanceId.length > 0 &&
+    typeof key?.id === 'string' &&
+    key.id.length > 0 &&
+    typeof key.remoteJid === 'string' &&
+    key.remoteJid.length > 0 &&
+    typeof key.fromMe === 'boolean' &&
+    Number.isSafeInteger(message.messageTimestamp) &&
+    message.messageTimestamp > 0
+  );
+}
+
+/** Explicit ignored edit evidence; it asserts neither destination absence nor preservation. */
+export function ignoredNullEditProof(
+  source: Message,
+  state: UnavailableOriginalEditState,
+  accountId: number,
+  inboxId: number,
+): IgnoredNullEditProof {
+  if (
+    !isKnownUnavailableNullEdit(source) ||
+    ![accountId, inboxId].every((id) => Number.isSafeInteger(id) && id > 0) ||
+    state.sourceRows.length !== 1 ||
+    !isDeepStrictEqual(state.sourceRows[0], source) ||
+    state.competitors.length !== 0 ||
+    state.targetUpdates.length === 0 ||
+    state.targetUpdates.some(
+      (row) => row.instanceId !== source.instanceId || row.messageId !== source.id || row.status !== 'EDITED',
+    )
+  )
+    throw new Error('Ignored NULL edit lacks exact current native EDITED source provenance');
+  const key = source.key as { id: string; remoteJid: string; fromMe: boolean };
+  const sourceNativeJSON = JSON.stringify(source);
+  const orderingJSON = JSON.stringify(state);
+  const sha = (value: string) => createHash('sha256').update(value).digest('hex');
+  return {
+    version: 2,
+    kind: 'ignored_null_edit',
+    disposition: 'ignored_unavailable_edit',
+    destinationState: 'unqualified',
+    sourceId: `WAID:${key.id}`,
+    sourceNativeId: source.id,
+    targetSourceId: `WAID:${key.id}`,
+    targetNativeId: source.id,
+    instanceId: source.instanceId,
+    accountId,
+    inboxId,
+    peer: key.remoteJid,
+    direction: key.fromMe ? 'outgoing' : 'incoming',
+    sourceNativeJSON,
+    sourceNativeVersionSHA256: sha(sourceNativeJSON),
+    orderingJSON,
+    orderingSHA256: sha(orderingJSON),
+  };
+}
+
 export function isUnavailableNullImageOriginal(message: Message): boolean {
   const key = message.key as { id?: unknown; fromMe?: unknown; remoteJid?: unknown };
   return (

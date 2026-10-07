@@ -19,6 +19,7 @@ import {
   CONFLICTING_TEXT_EDIT_REJECTION,
   IgnoredHistoryEditKind,
   IgnoredHistoryEditProof,
+  isKnownUnavailableNullEdit,
   isSameNativeTextEditConflict,
   unavailableOriginalEditProof,
   UnavailableOriginalEditState,
@@ -601,6 +602,7 @@ class ChatwootImport {
       destinationMessageId: number;
       destinationConversationId: number;
     },
+    onUnqualifiedNullEdit?: (message: Message) => Promise<void>,
   ): Promise<Map<string, 'preserved_existing_source_payload_unavailable'>> {
     const edited = messages;
     const preserved = new Map<string, 'preserved_existing_source_payload_unavailable'>();
@@ -662,10 +664,17 @@ class ChatwootImport {
             [Number(provider.accountId), inboxId, [sourceId, key.id]],
           );
           const target = result.rows[0];
-          const attributes =
-            typeof target?.content_attributes === 'string'
-              ? JSON.parse(target.content_attributes)
-              : target?.content_attributes;
+          let attributes: any;
+          let malformedAttributes = false;
+          try {
+            attributes =
+              typeof target?.content_attributes === 'string'
+                ? JSON.parse(target.content_attributes)
+                : target?.content_attributes;
+          } catch (error) {
+            if (!onUnqualifiedNullEdit || !isKnownUnavailableNullEdit(message)) throw error;
+            malformedAttributes = true;
+          }
           const nativePeerMatches =
             target?.provider_peer === key.remoteJid ||
             (nativeAlias &&
@@ -676,6 +685,7 @@ class ChatwootImport {
                 (target.binding_snapshot?.provider === 'whatsapp' && target.bound_peer === nativeAlias)));
           if (
             result.rows.length !== 1 ||
+            malformedAttributes ||
             target.private !== false ||
             (textEdit
               ? typeof target.content !== 'string' ||
@@ -703,6 +713,11 @@ class ChatwootImport {
             (message.chatwootConversationId != null &&
               Number(message.chatwootConversationId) !== Number(target.display_id))
           ) {
+            if (onUnqualifiedNullEdit && isKnownUnavailableNullEdit(message)) {
+              await onUnqualifiedNullEdit(message);
+              await client.query('COMMIT');
+              continue;
+            }
             throw new Error(
               'Empty provider edit lacks a unique matching destination image, text, audio or supported document',
             );
