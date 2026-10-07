@@ -73,7 +73,7 @@ export function classifyCachedHistoryRecord(
     throw new Error('Cached history payload is unclassifiable');
   }
   if (record.messageType === 'albumMessage') {
-    albumImageCount(record);
+    albumImageCount(record, 'container_only');
     return 'album_container';
   }
   const keys = Object.keys(payload);
