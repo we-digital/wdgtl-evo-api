@@ -338,6 +338,16 @@ export function retainedButtons(body: any): { text: string; metadata: Record<str
 
 export function retainedHistoryMedia(message: Message): { type: string; descriptor: any } {
   const body = message.message as any;
+  if (message.messageType === 'ephemeralMessage') {
+    if (
+      !object(body) ||
+      !only(body, ['documentMessage', 'messageContextInfo', 'mediaUrl', 'senderKeyDistributionMessage']) ||
+      !object(body.documentMessage)
+    )
+      throw new Error('Retained flattened ephemeral document is unsupported');
+    // The native wrapper type remains in the full source fingerprint; only display/media type is normalized.
+    return { type: 'documentMessage', descriptor: body.documentMessage };
+  }
   if (message.messageType === 'lottieStickerMessage') {
     const wrapper = body?.lottieStickerMessage;
     const sticker = wrapper?.message?.stickerMessage;

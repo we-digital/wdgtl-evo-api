@@ -72,10 +72,12 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
 import {
   assertIgnoredEditOriginalIdentity,
+  captureMissingEncryptedEditOriginal,
   CONFLICTING_TEXT_EDIT_REJECTION,
   IGNORED_HISTORY_EDIT_REASON,
   ignoredHistoryEditFailure,
   IgnoredHistoryEditKind,
+  IgnoredMissingEncryptedOriginalProof,
   IgnoredNullEditProof,
   ignoredNullEditProof,
   isUnavailableNullEditOriginal,
@@ -2203,7 +2205,12 @@ export class ChatwootService {
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
       row.attachment_meta?.whatsapp_history_media_type !== retainedHistoryMedia(message).type.replace(/Message$/, '') ||
-      row.content_type !== descriptor.mimetype ||
+      (row.content_type !== descriptor.mimetype &&
+        !(
+          message.messageType === 'lottieStickerMessage' &&
+          descriptor.mimetype === 'application/was' &&
+          row.content_type === 'application/zip'
+        )) ||
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
       typeof row.created_at_epoch !== 'number' ||
@@ -6004,6 +6011,10 @@ export class ChatwootService {
         const byId = (rows: any[]) => [...rows].sort((a, b) => a.id.localeCompare(b.id));
         return { sourceRows: byId(sourceRows), targetUpdates: byId(targetUpdates), competitors: byId(competitors) };
       };
+      const missingEncryptedOriginals = new Map<
+        string,
+        { source: MessageModel; proof: IgnoredMissingEncryptedOriginalProof }
+      >();
       const encryptedTargets = new Map<string, MessageModel>();
       const encryptedStates = new Map<string, Awaited<ReturnType<typeof readEncryptedEditState>>>();
       const unavailableOriginalTargets = new Set<string>();
@@ -6039,7 +6050,18 @@ export class ChatwootService {
         const matches = await this.prismaRepository.message.findMany({
           where: { instanceId: envelope.instanceId, key: { path: ['id'], equals: targetKey.id } },
         });
-        if (matches.length !== 1) throw new Error('Retained encrypted edit original is missing or ambiguous');
+        if (matches.length === 0) {
+          const proof = await captureMissingEncryptedEditOriginal(
+            envelope,
+            this.prismaRepository.message,
+            Number(provider.accountId),
+            inbox.id,
+          );
+          if (!proof) throw new Error('Missing encrypted edit original appeared before qualification');
+          missingEncryptedOriginals.set(proof.sourceId, { source: envelope, proof });
+          continue;
+        }
+        if (matches.length !== 1) throw new Error('Retained encrypted edit original is ambiguous');
         const target = matches[0];
         assertIgnoredEditOriginalIdentity(envelope, target);
         const state = await readEncryptedEditState(envelope, target);
@@ -6089,15 +6111,18 @@ export class ChatwootService {
         encryptedTargets.set(envelope.id, target);
         encryptedStates.set(envelope.id, state);
       }
+      const qualifiedEncryptedEdits = encryptedEdits.filter(
+        (envelope) => !missingEncryptedOriginals.has(toChatwootSourceId((envelope.key as { id: string }).id)),
+      );
       const assertEncryptedEditCurrent = async (envelope: MessageModel, target: MessageModel) => {
         if (!isDeepStrictEqual(await readEncryptedEditState(envelope, target), encryptedStates.get(envelope.id)))
           throw new Error('Retained encrypted edit source, ordering or current original rotated');
       };
-      for (const envelope of encryptedEdits) {
+      for (const envelope of qualifiedEncryptedEdits) {
         const target = encryptedTargets.get(envelope.id)!;
         const state = encryptedStates.get(envelope.id)!;
         if (unavailableOriginalTargets.has(target.id)) continue;
-        const sameTarget = encryptedEdits.filter((edit) => encryptedTargets.get(edit.id)?.id === target.id);
+        const sameTarget = qualifiedEncryptedEdits.filter((edit) => encryptedTargets.get(edit.id)?.id === target.id);
         if (
           sameTarget.length > 1 ||
           state.targetUpdates.length ||
@@ -6143,10 +6168,13 @@ export class ChatwootService {
       const preparedBySourceId = new Map(
         ordinaryMessages.map((message) => {
           const sourceId = toChatwootSourceId((message.key as { id: string }).id);
-          const display =
-            message.messageType === 'associatedChildMessage'
-              ? { ...message, messageType: 'videoMessage', message: retainedHistoryDisplayBody(message) }
-              : message;
+          const display = ['associatedChildMessage', 'ephemeralMessage'].includes(message.messageType)
+            ? {
+                ...message,
+                messageType: retainedHistoryMedia(message).type,
+                message: retainedHistoryDisplayBody(message),
+              }
+            : message;
           const prepared =
             data.recoveryMode === 'maximize' &&
             !['lottieStickerMessage', 'buttonsMessage'].includes(message.messageType)
@@ -6411,7 +6439,9 @@ export class ChatwootService {
             size: cached.descriptor.size,
             sha256: cached.descriptor.digest.toString('hex'),
             mediaType: retainedHistoryMedia(original).type.replace(/Message$/, ''),
-            ...(['associatedChildMessage', 'templateMessage', 'lottieStickerMessage'].includes(original.messageType)
+            ...(['associatedChildMessage', 'templateMessage', 'lottieStickerMessage', 'ephemeralMessage'].includes(
+              original.messageType,
+            )
               ? {
                   nativeSource: {
                     message_type: original.messageType,
@@ -6439,7 +6469,7 @@ export class ChatwootService {
         string,
         Awaited<ReturnType<typeof chatwootImport.verifyImportedHistoryEditOriginal>>
       >();
-      for (const envelope of encryptedEdits) {
+      for (const envelope of qualifiedEncryptedEdits) {
         const target = encryptedTargets.get(envelope.id)!;
         if (!selectedEncryptedOriginals.has(target.id)) continue;
         await assertEncryptedEditCurrent(envelope, target);
@@ -6501,7 +6531,7 @@ export class ChatwootService {
       );
 
       const ignoredEditProofs = new Map();
-      for (const envelope of encryptedEdits) {
+      for (const envelope of qualifiedEncryptedEdits) {
         const target = encryptedTargets.get(envelope.id)!;
         await assertEncryptedEditCurrent(envelope, target);
         const ignored = ignoredEdits.get(toChatwootSourceId((envelope.key as { id: string }).id));
@@ -6537,7 +6567,7 @@ export class ChatwootService {
           );
         }
       }
-      for (const envelope of encryptedEdits)
+      for (const envelope of qualifiedEncryptedEdits)
         await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       await albumPreservation.assertCurrent();
       for (const [sourceId, ignored] of ignoredEdits) {
@@ -6558,7 +6588,7 @@ export class ChatwootService {
         if (!isDeepStrictEqual(current, ignoredEditProofs.get(sourceId)))
           throw new Error('Ignored provider edit destination or media rotated before acknowledgement');
       }
-      for (const envelope of encryptedEdits)
+      for (const envelope of qualifiedEncryptedEdits)
         await assertEncryptedEditCurrent(envelope, encryptedTargets.get(envelope.id)!);
       for (const [id, cached] of cachedMedia) {
         const current = await this.prismaRepository.message.findUnique({ where: { id } });
@@ -6598,7 +6628,26 @@ export class ChatwootService {
         if (!isDeepStrictEqual(state, ignored.state) || !isDeepStrictEqual(proof, ignored.proof))
           throw new Error('Ignored NULL edit source or provenance rotated before acknowledgement');
       }
+      for (const missing of missingEncryptedOriginals.values()) {
+        const proof = await captureMissingEncryptedEditOriginal(
+          missing.source,
+          this.prismaRepository.message,
+          Number(provider.accountId),
+          inbox.id,
+        );
+        if (!isDeepStrictEqual(proof, missing.proof))
+          throw new Error('Missing encrypted edit original or source rotated before acknowledgement');
+      }
       const outcomes = Array.from(requestedSourceIds).map((sourceId) => {
+        const missingEncryptedOriginal = missingEncryptedOriginals.get(sourceId)?.proof;
+        if (missingEncryptedOriginal)
+          return {
+            sourceId,
+            status: 'skipped',
+            reason: UNAVAILABLE_ORIGINAL_EDIT_REASON,
+            recovery: 'unsupported',
+            unavailableOriginalEdit: missingEncryptedOriginal,
+          };
         const ignoredNullEdit = ignoredNullEdits.get(sourceId)?.proof;
         if (ignoredNullEdit)
           return {
