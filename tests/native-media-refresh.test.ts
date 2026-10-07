@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 
 import { Boom } from '@hapi/boom';
-import { downloadMediaMessage, encryptMediaRetryRequest, getMediaKeys } from 'baileys';
+import { aesDecryptGCM, downloadMediaMessage, encryptMediaRetryRequest, getMediaKeys, hkdf, proto } from 'baileys';
 import { MockAgent } from 'undici';
 
 import {
@@ -105,6 +105,38 @@ test('stock SDK refresh encrypts a receipt to the own device, retaining the exac
   assert.equal(node.attrs.id, original.key.id);
   const rmr = (node.content as any[]).find((n) => n.tag === 'rmr');
   assert.deepEqual(rmr.attrs, { jid: original.key.remoteJid, from_me: 'false', participant: original.key.participant });
+});
+
+test('persisted base64 media key is decoded for authenticated stock receipts without changing native JSON', async () => {
+  const { original, counts, input } = setup();
+  const nativeBefore = structuredClone(original);
+  const messageBefore = structuredClone(input.message);
+  const own = '999999999@s.whatsapp.net';
+  const retryKey = await hkdf(Buffer.alloc(32, 1), 32, { info: 'WhatsApp Media Retry Notification' });
+  const decrypt = (node: any) => {
+    const encrypted = node.content.find((child: any) => child.tag === 'encrypt').content;
+    const payload = encrypted.find((child: any) => child.tag === 'enc_p').content;
+    const iv = encrypted.find((child: any) => child.tag === 'enc_iv').content;
+    return aesDecryptGCM(payload, retryKey, iv, Buffer.from(original.key.id));
+  };
+  const incorrect = await encryptMediaRetryRequest(original.key, original.message.imageMessage.mediaKey as any, own);
+  assert.throws(() => decrypt(incorrect));
+  const refresh = input.refresh;
+  input.refresh = async (message: any) => {
+    assert(Buffer.isBuffer(message.message.imageMessage.mediaKey));
+    assert.deepEqual(message.message.imageMessage.mediaKey, Buffer.alloc(32, 1));
+    const receipt = await encryptMediaRetryRequest(message.key, message.message.imageMessage.mediaKey, own);
+    assert.equal(proto.ServerErrorReceipt.decode(decrypt(receipt)).stanzaId, original.key.id);
+    assert.equal(receipt.tag, 'receipt');
+    assert.equal(receipt.attrs.to, own);
+    assert.equal(receipt.attrs.type, 'server-error');
+    return refresh(message);
+  };
+  assert.deepEqual(await refreshExpiredNativeMedia(input), bytes);
+  assert.deepEqual(input.original, nativeBefore);
+  assert.deepEqual(input.message, messageBefore);
+  assert.equal(counts.refresh, 1);
+  assert.equal(counts.persist, 1);
 });
 
 test('actual Node26 SDK HTTP403 then decrypts authenticated refreshed ciphertext once in synthetic lab', async () => {
