@@ -48,6 +48,7 @@ import {
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
+import { formatWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import {
   buildStoredLidMap,
@@ -194,7 +195,6 @@ import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
 import FormData from 'form-data';
 import { Jimp, JimpMime } from 'jimp';
-import { parsePhoneNumberFromString } from 'libphonenumber-js';
 import Long from 'long';
 import mimeTypes from 'mime-types';
 import path from 'path';
@@ -5106,22 +5106,9 @@ export class ChatwootService {
           fileStream.push(null);
 
           if (body.key.remoteJid.includes('@g.us')) {
-            const participantName = body.pushName;
-            const rawPhoneNumber =
-              body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt
-                ? body.key.participantAlt.split('@')[0].split(':')[0]
-                : body.key.participant.split('@')[0].split(':')[0];
-            const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
-
-            let content: string;
-
-            if (!body.key.fromMe) {
-              content = chatwootBodyMessage
-                ? `**${formattedPhoneNumber} - ${participantName}:**\n\n${chatwootBodyMessage}`
-                : `**${formattedPhoneNumber} - ${participantName}:**`;
-            } else {
-              content = chatwootBodyMessage || '';
-            }
+            const content = body.key.fromMe
+              ? chatwootBodyMessage || ''
+              : formatWhatsappGroupContent(body, chatwootBodyMessage, i18next.t('cw.contactMessage.contact'));
 
             const send = await this.sendData(
               getConversation,
@@ -5277,20 +5264,9 @@ export class ChatwootService {
         }
 
         if (body.key.remoteJid.includes('@g.us')) {
-          const participantName = body.pushName;
-          const rawPhoneNumber =
-            body.key.addressingMode === 'lid' && !body.key.fromMe && body.key.participantAlt
-              ? body.key.participantAlt.split('@')[0].split(':')[0]
-              : body.key.participant.split('@')[0].split(':')[0];
-          const formattedPhoneNumber = parsePhoneNumberFromString(`+${rawPhoneNumber}`).formatInternational();
-
-          let content: string;
-
-          if (!body.key.fromMe) {
-            content = `**${formattedPhoneNumber} - ${participantName}:**\n\n${chatwootBodyMessage}`;
-          } else {
-            content = `${chatwootBodyMessage}`;
-          }
+          const content = body.key.fromMe
+            ? `${chatwootBodyMessage}`
+            : formatWhatsappGroupContent(body, chatwootBodyMessage, i18next.t('cw.contactMessage.contact'));
 
           const send = await this.createMessage(
             instance,
