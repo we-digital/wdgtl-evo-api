@@ -33,7 +33,9 @@ export async function readRetainedChatwootGroupVideo(
   if (natives.length > 25 || copies.length > 25) throw new Error('retained_cw_video_candidate_bound');
   const key = target.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
   if (
-    target.messageType !== 'videoMessage' ||
+    !['videoMessage', 'documentMessage', 'imageMessage', 'audioMessage', 'stickerMessage'].includes(
+      target.messageType,
+    ) ||
     typeof key.id !== 'string' ||
     !key.id ||
     typeof key.remoteJid !== 'string' ||
@@ -48,7 +50,14 @@ export async function readRetainedChatwootGroupVideo(
     typeof descriptor.fileSha256 === 'string' &&
     Buffer.from(descriptor.fileSha256, 'base64').length === 32 &&
     Buffer.from(descriptor.fileSha256, 'base64').toString('base64') === descriptor.fileSha256;
-  if (media.type !== 'videoMessage' || media.descriptor.mimetype !== 'video/mp4' || !canonicalDigest(media.descriptor))
+  if (
+    !['videoMessage', 'documentMessage', 'imageMessage', 'audioMessage', 'stickerMessage'].includes(media.type) ||
+    typeof media.descriptor.mimetype !== 'string' ||
+    !/^(application|text|image|audio|video)\/[a-z0-9][a-z0-9!#$&^_.+-]*(?:; codecs=opus)?$/i.test(
+      media.descriptor.mimetype,
+    ) ||
+    !canonicalDigest(media.descriptor)
+  )
     throw new Error('retained_cw_video_native_authority');
   const expected = nativeCachedMediaPayload(target);
   for (const copy of copies) {
@@ -79,10 +88,10 @@ export async function readRetainedChatwootGroupVideo(
       const nativeExpected = nativeCachedMediaPayload(native);
       const nativeMedia = retainedHistoryMedia(native);
       if (
-        nativeMedia.type !== 'videoMessage' ||
+        nativeMedia.type !== media.type ||
         !canonicalDigest(nativeMedia.descriptor) ||
-        nativeMedia.descriptor.mimetype !== 'video/mp4' ||
-        copy.content_type !== 'video/mp4' ||
+        nativeMedia.descriptor.mimetype !== media.descriptor.mimetype ||
+        copy.content_type !== media.descriptor.mimetype ||
         Number(copy.byte_size) !== expected.size ||
         nativeExpected.size !== expected.size ||
         !nativeExpected.digest.equals(expected.digest)
@@ -120,7 +129,14 @@ export function retainedVideoProxyUrl(copy: RetainedChatwootVideo, payload: any,
     attachment.id !== copy.attachment_id ||
     attachment.message_id !== copy.id ||
     attachment.account_id !== copy.account_id ||
-    attachment.file_type !== 'video' ||
+    attachment.file_type !==
+      (copy.content_type.startsWith('image/')
+        ? 'image'
+        : copy.content_type.startsWith('audio/')
+          ? 'audio'
+          : copy.content_type.startsWith('video/')
+            ? 'video'
+            : 'file') ||
     attachment.content_type !== copy.content_type ||
     attachment.file_size !== Number(copy.byte_size) ||
     typeof attachment.download_url !== 'string'
