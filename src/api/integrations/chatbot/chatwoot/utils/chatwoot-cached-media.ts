@@ -96,7 +96,7 @@ function retainedDownloadDescriptor(message: Message) {
   const { size, digest } = nativeCachedMediaPayload(message);
   if (
     !(
-      (['imageMessage', 'templateMessage'].includes(message.messageType) &&
+      (['imageMessage', 'templateMessage', 'associatedChildMessage'].includes(message.messageType) &&
         type === 'imageMessage' &&
         descriptor.mimetype === 'image/jpeg') ||
       (message.messageType === 'stickerMessage' && type === 'stickerMessage' && descriptor.mimetype === 'image/webp') ||
@@ -293,10 +293,38 @@ export async function readRetainedRecoveryMedia(
           if (delivered || options.method !== 'GET' || `${options.origin}${options.path}` !== url.toString())
             throw new Error('cached_media_provider_descriptor_unavailable');
           delivered = true;
-          handler.onConnect(() => {});
-          handler.onHeaders(200, ['content-type', 'application/octet-stream'], () => {}, 'OK');
-          handler.onData(ciphertext);
-          handler.onComplete([]);
+          if (typeof handler.onRequestStart === 'function') {
+            // Node26 fetch uses the public controller/response handler interface.
+            // This serves the already authenticated in-memory ciphertext once; no network is opened.
+            const responseController = {
+              paused: false,
+              aborted: false,
+              reason: null as unknown,
+              pause() {
+                this.paused = true;
+              },
+              resume() {
+                this.paused = false;
+              },
+              abort(reason: unknown) {
+                if (this.aborted) return;
+                this.aborted = true;
+                this.reason = reason;
+                handler.onResponseError?.(this, reason);
+              },
+            };
+            handler.onRequestStart(responseController, null);
+            if (!responseController.aborted) {
+              handler.onResponseStart(responseController, 200, { 'content-type': 'application/octet-stream' }, 'OK');
+              handler.onResponseData(responseController, ciphertext);
+              handler.onResponseEnd(responseController, {});
+            }
+          } else {
+            handler.onConnect(() => {});
+            handler.onHeaders(200, ['content-type', 'application/octet-stream'], () => {}, 'OK');
+            handler.onData(ciphertext);
+            handler.onComplete([]);
+          }
           return true;
         },
       };

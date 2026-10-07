@@ -4,6 +4,7 @@ import {
   knownHistoryMetadataControl,
   retainedButtons,
   retainedHistoryMedia,
+  retainedNativeJPEGDescriptor,
   retainedTemplate,
 } from './chatwoot-retained-history-formats';
 
@@ -82,14 +83,30 @@ export function isKnownPlaintextHistoryEdit(record: { messageType: string; messa
       ((typeof edit.conversation === 'string' && edit.conversation.length > 0) ||
         (object(edit.extendedTextMessage) &&
           Object.keys(edit.extendedTextMessage).every((name) =>
-            ['text', 'contextInfo', 'endCardTiles'].includes(name),
+            [
+              'text',
+              'contextInfo',
+              'endCardTiles',
+              'title',
+              'matchedText',
+              'previewType',
+              'inviteLinkGroupTypeV2',
+            ].includes(name),
           ) &&
           typeof edit.extendedTextMessage.text === 'string' &&
           edit.extendedTextMessage.text.length > 0 &&
+          ['title', 'matchedText'].every(
+            (name) =>
+              edit.extendedTextMessage[name] === undefined || typeof edit.extendedTextMessage[name] === 'string',
+          ) &&
+          ['previewType', 'inviteLinkGroupTypeV2'].every(
+            (name) => edit.extendedTextMessage[name] === undefined || edit.extendedTextMessage[name] === 0,
+          ) &&
           (edit.extendedTextMessage.contextInfo === undefined || object(edit.extendedTextMessage.contextInfo)) &&
           (edit.extendedTextMessage.endCardTiles === undefined ||
             (Array.isArray(edit.extendedTextMessage.endCardTiles) &&
-              edit.extendedTextMessage.endCardTiles.length === 0)))),
+              edit.extendedTextMessage.endCardTiles.length === 0))) ||
+        retainedNativeJPEGDescriptor(edit.imageMessage)),
   );
 }
 

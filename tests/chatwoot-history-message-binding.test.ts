@@ -51,8 +51,11 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; canonical?
       $queryRaw: async (sql: any) => {
         events.push('native-lock');
         assert.match(sql.text, /FOR UPDATE/);
-        assert.deepEqual(sql.values, ['instance-1', 'SOURCE1']);
-        return options.nativeRows || [row];
+        assert.deepEqual(sql.values.slice(0, 2), ['instance-1', 'SOURCE1']);
+        assert.match(sql.text, /key->>'remoteJid'/);
+        assert.match(sql.text, /key->>'fromMe'/);
+        return (options.nativeRows || [row]).filter((item) =>
+          item.key.remoteJid === sql.values[2] && String(item.key.fromMe) === sql.values[3]);
       },
       message: { updateMany: async (data: any) => {
         events.push('native-write');
@@ -227,4 +230,28 @@ test('exact duplicate native copies bind together; every pointer must be null or
   assert.equal(result.boundRows, 2);
   assert.deepEqual(f.writes[0].where.id.in, ['native-1', 'native-2']);
   await assert.rejects(fixture({ nativeRows: [rows[0], { ...rows[1], chatwootInboxId: 99 }] }).run(), /conflicting/);
+});
+
+
+test('the same provider ID in another peer or direction is neither locked as a source copy nor modified', async () => {
+  const otherPeer = { ...native(), id: 'other-peer', key: { ...native().key, remoteJid: '120363999999999@g.us' } };
+  const otherDirection = { ...native(), id: 'other-direction', key: { ...native().key, fromMe: true } };
+  const before = structuredClone([otherPeer, otherDirection]);
+  const f = fixture({ nativeRows: [native(), otherPeer, otherDirection] });
+  assert.equal((await f.run()).nativeRows, 1);
+  assert.deepEqual(f.writes[0].where.id.in, ['native-1']);
+  assert.deepEqual([otherPeer, otherDirection], before);
+});
+
+
+test('identical copies with different receive timestamps retain their own source while binding the same native peer', async () => {
+  const copies = [native(), { ...native(), id: 'received-copy', messageTimestamp: 1700000500 }];
+  const before = structuredClone(copies);
+  const f = fixture({ nativeRows: copies });
+  assert.equal((await f.run()).nativeRows, 2);
+  assert.deepEqual(f.writes[0].where.id.in, ['native-1', 'received-copy']);
+  assert.deepEqual(copies, before);
+  const changed = fixture({ nativeRows: [{ ...native(), messageTimestamp: 1700000500 }] });
+  await assert.rejects(changed.run(), /source version/);
+  assert.equal(changed.writes.length, 0);
 });

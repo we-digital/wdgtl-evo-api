@@ -33,9 +33,14 @@ export async function readRetainedChatwootGroupVideo(
   if (natives.length > 25 || copies.length > 25) throw new Error('retained_cw_video_candidate_bound');
   const key = target.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
   if (
-    !['videoMessage', 'documentMessage', 'imageMessage', 'audioMessage', 'stickerMessage'].includes(
-      target.messageType,
-    ) ||
+    ![
+      'videoMessage',
+      'documentMessage',
+      'imageMessage',
+      'audioMessage',
+      'stickerMessage',
+      'associatedChildMessage',
+    ].includes(target.messageType) ||
     typeof key.id !== 'string' ||
     !key.id ||
     typeof key.remoteJid !== 'string' ||
