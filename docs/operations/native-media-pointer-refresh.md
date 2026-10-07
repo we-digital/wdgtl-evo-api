@@ -1,0 +1,9 @@
+# Refresh an expired native media pointer
+
+Use the authenticated official POST `/chat/getBase64FromMediaMessage/:instance` only for an explicitly authorized source whose saved files and provider-bound Chatwoot copies are unavailable. Supply `message.key` with the exact native ID, remoteJid and fromMe; set `convertToMp4:false` to preserve bytes.
+
+Before that one request, retain a private fsynced source/cache version, exact source primary key, destination aliases, zero leases and immutable runtime tuple. The server qualifies one native record in that instance and exact peer/direction. Only actual HTTP403/410 permits stock `updateMediaMessage`: an encrypted server-error media receipt goes to the connected owner's device, with the original stanza/group identity. It sends no ordinary message. The server makes one refreshed download, verifies native byte length and SHA256, and persists only URL/directPath through a full source compare-and-set and readback. A 45-second limit and 64MiB native byte cap apply to refresh; no automatic retry follows failure.
+
+For HTTP200, privately decode the returned base64 and independently compare native SHA256, MIME and length. Read the native source again and prove the refreshed pointers, key, caption, replies and timestamp; then obtain a fresh cache payload through the normal source acquisition path. Requalify cache version, aliases and leases before the official recovery job resume. Never edit processed markers. If HTTP400, timeout, wrong bytes, ambiguous source or an unproved persistence result occurs, read state first and retain the blocked scope as pending. A cancelled recovery job is not a completed scope.
+
+HD dual-upload children (`MessageAssociation.AssociationType=10`) require separate parent/alternative treatment and do not authorize ordinary missing-media placeholders. This procedure does not replace a saved original with a different image or merge parent and child hashes.
