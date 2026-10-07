@@ -883,6 +883,7 @@ class ChatwootImport {
     options: HistoryMessageImportOptions = {},
   ) {
     const usesBufferedHistory = options.messages === undefined;
+    let recoveryPhase = 'user_lookup';
     try {
       const chatwootUser = await this.getChatwootUser(provider);
       if (!chatwootUser) {
@@ -913,11 +914,13 @@ class ChatwootImport {
         return aKey.remoteJid.localeCompare(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
       });
 
+      recoveryPhase = 'source_lookup';
       const existingSourceIds = await this.getExistingSourceIds(
         messagesOrdered.map((message: any) => message.key.id),
         undefined,
         inbox.id,
       );
+      recoveryPhase = 'content_projection';
       const contentByMessage = this.getImportableHistoryMessages(
         chatwootService,
         messagesOrdered,
@@ -955,6 +958,7 @@ class ChatwootImport {
         const messagesByIdentity = this.createMessagesMapByIdentity(messagesChunk);
 
         if (messagesByIdentity.size > 0) {
+          recoveryPhase = 'provider_identity';
           const fksByIdentity = await this.selectOrCreateFksFromChatwoot(
             provider,
             inbox,
@@ -1057,6 +1061,7 @@ class ChatwootImport {
               )
               ORDER BY candidate.inbox_id, candidate.source_id, candidate.message_timestamp`;
 
+            recoveryPhase = 'message_insert';
             totalMessagesImported += await this.insertHistoryMessagesSerialized(sqlInsertMsg, bindInsertMsg, {
               accountId: Number(provider.accountId),
               inboxId: Number(inbox.id),
@@ -1083,6 +1088,16 @@ class ChatwootImport {
       return totalMessagesImported;
     } catch (error) {
       this.logger.error(`Error on import history messages: ${error.toString()}`);
+      if (!usesBufferedHistory) {
+        const fields = ['code', 'constraint', 'routine'].flatMap((name) => {
+          const value = error?.[name];
+          const valid = name === 'code' ? /^[0-9A-Z]{5}$/ : /^[A-Za-z_][A-Za-z0-9_$]{0,127}$/;
+          return typeof value === 'string' && valid.test(value) ? [`${name}=${value}`] : [];
+        });
+        throw new Error(
+          `Chatwoot recovery import refused phase=${recoveryPhase}${fields.length ? ` ${fields.join(' ')}` : ''}`,
+        );
+      }
       if (usesBufferedHistory) this.clearAll(instance);
     }
   }

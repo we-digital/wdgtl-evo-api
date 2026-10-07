@@ -70,6 +70,26 @@ export function knownHistoryMetadataControl(record: { messageType: string; messa
     )
       return false;
   }
+  if (record.messageType === 'keepInChatMessage') {
+    const keep = body.keepInChatMessage;
+    const key = keep?.key;
+    return (
+      only(body, ['keepInChatMessage', 'messageContextInfo']) &&
+      placeholderContext(body.messageContextInfo) &&
+      object(keep) &&
+      only(keep, ['key', 'keepType', 'timestampMs']) &&
+      object(key) &&
+      only(key, ['id', 'remoteJid', 'fromMe']) &&
+      typeof key.id === 'string' &&
+      key.id.length > 0 &&
+      key.id.length <= 256 &&
+      typeof key.remoteJid === 'string' &&
+      /^(?:[1-9]\d{4,19}@(s\.whatsapp\.net|lid)|[1-9]\d{4,19}(?:-\d{1,20})?@g\.us)$/.test(key.remoteJid) &&
+      typeof key.fromMe === 'boolean' &&
+      [1, 2].includes(keep.keepType) &&
+      long(keep.timestampMs)
+    );
+  }
   if (record.messageType === 'placeholderMessage') {
     return (
       placeholderContext(body.messageContextInfo) &&
