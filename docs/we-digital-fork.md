@@ -800,3 +800,10 @@ A deterministic installed-SDK regression proves the raw string receipt fails aut
 The installed protobuf represents omitted optional album counts as absent JSON properties. Explicit container-only accounting accepts those omissions without inferring children or importing a visible message. A version3 durable proof records nativeImageCountPresent/nativeVideoCountPresent and the exact original source JSON/hash; zero is only the bookkeeping bound when a count is unavailable. Existing explicit-count version2 proofs and legacy child-preservation rules remain unchanged. Explicit null, malformed counts, nonzero video counts and unknown payload keys refuse. Release the paired History version3 receiver first; no schema migration or provider action.
 
 Verification: 44 focused synthetic album/format cases, including actual installed protobuf omission, preserved JSON, changing presence/source, explicit malformed counters and unchanged legacy refusal.
+
+
+### Silent roster binding repair (276)
+
+The scoped bulk roster lookup now retains whether an existing conversation has an exact provider binding. Apply routes an unbound existing group through the protected canonical resolver and requires the same conversation ID; dry-run and already bound groups do not write metadata. Authenticated joined-group membership, account/inbox/contact/peer checks and conflict refusal remain unchanged. No messages, source payloads or provider sends are created, and no schema change is required.
+
+Verification: nine focused synthetic tests pass, with the optional isolated-PostgreSQL case not enabled; the new cases cover dry-run, unbound repair, bound reuse and rotated canonical ID refusal. TypeScript, scoped source ESLint and formatting pass.

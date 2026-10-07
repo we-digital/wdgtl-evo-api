@@ -635,7 +635,7 @@ export class ChatwootService {
 
   private async findRosterDestinations(provider: ChatwootModel, inboxId: number, peers: string[]) {
     if (!this.pgClient || !this.isImportHistoryAvailable()) return null;
-    const destinations = new Map<string, { contact: any; conversation: any }>();
+    const destinations = new Map<string, { contact: any; conversation: any; bindingPresent: boolean }>();
     if (!peers.length) return destinations;
     if (peers.length > 10_000) throw new Error('Native group roster exceeds its lookup bound');
     const accountId = Number(provider.accountId);
@@ -673,6 +673,7 @@ export class ChatwootService {
         throw new Error('Group roster destination identity conflicts');
       destinations.set(row.identifier, {
         contact: { id: row.contact_id },
+        bindingPresent: row.binding_provider !== null,
         conversation:
           row.database_id === null
             ? null
@@ -735,18 +736,21 @@ export class ChatwootService {
           conversation.provider !== 'whatsapp')
       )
         throw new Error('Group conversation identity conflicts');
+      const needsBinding = !!conversation && !!destinations && !destination.bindingPresent;
       const id =
-        conversation?.id ||
-        (dryRun
-          ? null
-          : await this.canonicalProviderConversation(
-              instance,
-              context.provider,
-              inbox.id,
-              group.id,
-              { key: { remoteJid: group.id } },
-              group,
-            ));
+        conversation?.id && (dryRun || !needsBinding)
+          ? conversation.id
+          : dryRun
+            ? null
+            : await this.canonicalProviderConversation(
+                instance,
+                context.provider,
+                inbox.id,
+                group.id,
+                { key: { remoteJid: group.id } },
+                group,
+              );
+      if (conversation && id !== conversation.id) throw new Error('Group canonical conversation changed');
       results.push({ peer: group.id, subject: group.subject, conversationId: id, missing: !conversation });
     }
     return { instance: instance.instanceName, inboxId: inbox.id, dryRun, groups: results };
