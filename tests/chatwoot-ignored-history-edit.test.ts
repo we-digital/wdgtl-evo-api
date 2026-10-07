@@ -132,3 +132,66 @@ test('missing/ambiguous/cross-peer/wrong-direction/deleted/private/stale-pointer
     postgresClient.getChatwootConnection = previous;
   }
 });
+
+test('native LID alias survives a merged cross-channel identifier or absent binding only with exact scoped native pointers and CI', async () => {
+  const previous = postgresClient.getChatwootConnection;
+  const { original, envelope, target } = fixture();
+  original.key = { ...original.key, remoteJid: '123456@lid', remoteJidAlt: '628111111111@s.whatsapp.net' };
+  envelope.key = { ...envelope.key, remoteJid: original.key.remoteJid };
+  const bound = {
+    ...target,
+    provider_peer: 'telegram:123456',
+    bound_peer: original.key.remoteJidAlt,
+    binding_snapshot: { provider: 'whatsapp', peer: original.key.remoteJidAlt },
+    contact_inbox_matches: true,
+    contact_inbox_snapshot: { id: 7 },
+  };
+  const unbound = { ...bound, provider_peer: original.key.remoteJidAlt, bound_peer: null, binding_snapshot: null };
+  let rows: any[] = [bound];
+  postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows }) })) as any;
+  const capture = (native = original) =>
+    chatwootImport.captureIgnoredHistoryEdit(
+      envelope,
+      native,
+      99,
+      { accountId: '1' } as any,
+      'conflicting',
+      'retained_edit_order_conflict',
+    );
+  try {
+    const before = JSON.stringify({ original, envelope, bound, unbound });
+    for (const valid of [bound, unbound]) {
+      rows = [valid];
+      const proof = await capture();
+      assert.equal(proof.destinationMessageId, 314);
+      assert.equal(proof.peer, original.key.remoteJid);
+      assert.equal(proof.kind, 'conflicting');
+    }
+    for (const invalid of [
+      { ...bound, bound_peer: 'foreign@s.whatsapp.net' },
+      { ...bound, binding_snapshot: { provider: 'telegram_mtproto' } },
+      { ...bound, binding_snapshot: null, bound_peer: null },
+      { ...unbound, binding_snapshot: { provider: 'whatsapp', peer: 'foreign' }, bound_peer: 'foreign' },
+      { ...unbound, provider_peer: 'telegram:123456' },
+      { ...unbound, contact_inbox_matches: false },
+      { ...bound, contact_inbox_snapshot: null },
+      { ...unbound, id: 315 },
+      { ...bound, display_id: 41 },
+      { ...unbound, message_type: 1 },
+      { ...bound, private: true },
+    ]) {
+      rows = [invalid];
+      await assert.rejects(capture());
+    }
+    for (const valid of [bound, unbound]) {
+      rows = [valid];
+      await assert.rejects(capture({ ...original, chatwootMessageId: null }));
+      await assert.rejects(capture({ ...original, key: { ...original.key, remoteJidAlt: 'foreign@s.whatsapp.net' } }));
+    }
+    rows = [bound, bound];
+    await assert.rejects(capture());
+    assert.equal(JSON.stringify({ original, envelope, bound, unbound }), before);
+  } finally {
+    postgresClient.getChatwootConnection = previous;
+  }
+});

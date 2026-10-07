@@ -555,17 +555,26 @@ class ChatwootImport {
       Number(original.chatwootMessageId) === Number(target?.id) &&
       Number(original.chatwootInboxId) === inboxId &&
       Number(original.chatwootConversationId) === Number(target?.display_id);
+    // A merged person's identifier can belong to another channel. A scoped native
+    // binding proves the WA alias; without a binding require all native pointers
+    // plus the exact PN contact and CI, never a guessed cross-channel identity.
+    const nativeAliasMatches =
+      Boolean(nativeAlias) &&
+      target?.contact_inbox_matches === true &&
+      Boolean(target?.contact_inbox_snapshot) &&
+      ((target?.binding_snapshot?.provider === 'whatsapp' &&
+        target.bound_peer === nativeAlias &&
+        (target.provider_peer === nativeAlias || nativePointersMatch)) ||
+        (target?.binding_snapshot === null &&
+          target.bound_peer === null &&
+          nativePointersMatch &&
+          target.provider_peer === nativeAlias));
+    const providerPeerMatches = target?.provider_peer === key.remoteJid || nativeAliasMatches;
     if (
       result.rows.length !== 1 ||
       target.private !== false ||
       attributes?.deleted === true ||
-      (target.provider_peer !== key.remoteJid &&
-        (!nativeAlias ||
-          target.provider_peer !== nativeAlias ||
-          target.bound_peer !== nativeAlias ||
-          target.contact_inbox_matches !== true ||
-          !target.binding_snapshot ||
-          !target.contact_inbox_snapshot)) ||
+      !providerPeerMatches ||
       Number(target.message_type) !== (key.fromMe ? 1 : 0) ||
       (!nativePointersMatch && !importedOriginalMatches) ||
       !Array.isArray(attachments) ||
