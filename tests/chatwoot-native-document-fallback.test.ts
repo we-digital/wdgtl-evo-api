@@ -147,7 +147,7 @@ test('native 9,177,575-byte PDF retains encrypted/plain SHA and MAC through the 
     /cached_media_bytes_mismatch/,
   );
   const oversized = structuredClone(f.row);
-  oversized.message.documentMessage.fileLength.low = 32 * 1024 * 1024 + 1;
+  oversized.message.documentMessage.fileLength.low = 64 * 1024 * 1024 + 1;
   await assert.rejects(
     () =>
       readRetainedRecoveryMedia(oversized, undefined, (async () =>

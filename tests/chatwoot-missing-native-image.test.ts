@@ -102,7 +102,7 @@ test('missing JPEG refuses unsupported native kinds, MIME, direction, host and d
     (r: any) => (r.message.imageMessage.url = 'http://mmg.whatsapp.net/a'),
     (r: any) => (r.message.imageMessage.mediaKey = 'bad'),
     (r: any) => (r.message.imageMessage.fileSha256 = 'bad'),
-    (r: any) => (r.message.imageMessage.fileLength.low = 32 * 1024 * 1024 + 1),
+    (r: any) => (r.message.imageMessage.fileLength.low = 64 * 1024 * 1024 + 1),
   ]) {
     const record = image();
     change(record);
@@ -119,7 +119,7 @@ test('missing JPEG refuses unsupported native kinds, MIME, direction, host and d
 });
 
 test('missing JPEG keeps the whole-media batch bound and returns no prepared result if a later item fails', async () => {
-  const large = Buffer.alloc(16 * 1024 * 1024, 2);
+  const large = Buffer.alloc(32 * 1024 * 1024, 2);
   const records = [1, 2, 3].map((id) => ({ ...image(large), id: `synthetic-${id}` }));
   let downloads = 0;
   await assert.rejects(

@@ -7,8 +7,8 @@ import { Agent, fetch as fetchMedia } from 'undici';
 
 import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-history-formats';
 
-export const CACHED_MEDIA_BATCH_LIMIT = 32 * 1024 * 1024;
-export const CACHED_MEDIA_FILE_LIMIT = 32 * 1024 * 1024;
+export const CACHED_MEDIA_BATCH_LIMIT = 64 * 1024 * 1024;
+export const CACHED_MEDIA_FILE_LIMIT = 64 * 1024 * 1024;
 const types = new Set(['documentMessage', 'imageMessage', 'audioMessage', 'videoMessage', 'stickerMessage']);
 // A native document's MIME describes the authenticated bytes; it does not select crypto keys.
 const nativeDocumentMIME = (value: unknown): value is string =>
@@ -20,6 +20,21 @@ const nativeDocumentMIME = (value: unknown): value is string =>
 export function cachedHistoryMediaType(message: Message): string {
   const { type } = retainedHistoryMedia(message);
   return type === 'stickerMessage' ? 'image' : type.replace(/Message$/, '');
+}
+
+// Storage sniffing canonicalizes only these exact, observed native MIME aliases.
+export function cachedMediaMIMEsEqual(type: string, native: string, stored: string): boolean {
+  if (native === stored) return true;
+  const aliases =
+    type === 'documentMessage'
+      ? [
+          ['application/zip', 'application/x-zip-compressed'],
+          ['application/rar', 'application/vnd.rar'],
+        ]
+      : type === 'audioMessage'
+        ? [['audio/ogg', 'audio/ogg; codecs=opus']]
+        : [];
+  return aliases.some((pair) => pair.includes(native) && pair.includes(stored));
 }
 
 export function nativeCachedMediaPayload(message: Message) {
@@ -63,7 +78,7 @@ export function cachedMediaDescriptor(message: Message, media: Media) {
     ) ||
     media.fileName.split('/').some((part) => part === '..' || part === '.') ||
     typeof descriptor.mimetype !== 'string' ||
-    descriptor.mimetype !== media.mimetype
+    !cachedMediaMIMEsEqual(type, descriptor.mimetype, media.mimetype)
   ) {
     throw new Error('cached_media_authority_unavailable');
   }
@@ -91,6 +106,10 @@ function retainedDownloadDescriptor(message: Message) {
       (['documentMessage', 'ephemeralMessage'].includes(message.messageType) &&
         type === 'documentMessage' &&
         nativeDocumentMIME(descriptor.mimetype)) ||
+      (message.messageType === 'audioMessage' &&
+        type === 'audioMessage' &&
+        ['audio/ogg', 'audio/ogg; codecs=opus'].includes(descriptor.mimetype)) ||
+      (message.messageType === 'videoMessage' && type === 'videoMessage' && descriptor.mimetype === 'video/mp4') ||
       (['associatedChildMessage', 'templateMessage'].includes(message.messageType) &&
         type === 'videoMessage' &&
         descriptor.mimetype === 'video/mp4')
@@ -104,7 +123,7 @@ function retainedDownloadDescriptor(message: Message) {
     throw new Error('cached_media_authority_unavailable');
   const filename = basename(
     descriptor.fileName ||
-      `${key.id}.${message.messageType === 'lottieStickerMessage' ? 'was' : type === 'stickerMessage' ? 'webp' : type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
+      `${key.id}.${message.messageType === 'lottieStickerMessage' ? 'was' : type === 'stickerMessage' ? 'webp' : type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : type === 'audioMessage' ? 'ogg' : 'mp4'}`,
   );
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
@@ -161,15 +180,18 @@ export async function readRetainedRecoveryMedia(
   const timer = setTimeout(abort, 5000);
   try {
     let dispatcher: any;
-    let decryptType: 'image' | 'video' | 'document' | 'sticker' = ['lottieStickerMessage', 'stickerMessage'].includes(
-      message.messageType,
-    )
+    let decryptType: 'image' | 'video' | 'document' | 'sticker' | 'audio' = [
+      'lottieStickerMessage',
+      'stickerMessage',
+    ].includes(message.messageType)
       ? 'sticker'
       : retainedHistoryMedia(message).type === 'imageMessage'
         ? 'image'
         : retainedHistoryMedia(message).type === 'documentMessage'
           ? 'document'
-          : 'video';
+          : retainedHistoryMedia(message).type === 'audioMessage'
+            ? 'audio'
+            : 'video';
     if (download === downloadContentFromMessage) {
       // Installed Baileys forwards dispatcher, but drops signal and redirect.
       // Read one bounded ciphertext first, then retain its original decryption.
@@ -225,14 +247,17 @@ export async function readRetainedRecoveryMedia(
           decryptType = 'document';
         }
       }
-      if (retainedHistoryMedia(message).type === 'documentMessage' || message.messageType === 'stickerMessage') {
+      if (
+        ['documentMessage', 'audioMessage', 'videoMessage'].includes(retainedHistoryMedia(message).type) ||
+        message.messageType === 'stickerMessage'
+      ) {
         const body = ciphertext.subarray(0, -10);
         const mac = ciphertext.subarray(-10);
         const encryptedDigest =
           typeof descriptor.fileEncSha256 === 'string'
             ? Buffer.from(descriptor.fileEncSha256, 'base64')
             : Buffer.from(descriptor.fileEncSha256?.data || Object.values(descriptor.fileEncSha256 || {}));
-        const keys = await getMediaKeys(key, decryptType === 'sticker' ? 'sticker' : 'document');
+        const keys = await getMediaKeys(key, decryptType);
         const expectedMAC = createHmac('sha256', keys.macKey)
           .update(Buffer.concat([keys.iv, body]))
           .digest()
@@ -242,10 +267,25 @@ export async function readRetainedRecoveryMedia(
           body.length % 16 !== 0 ||
           encryptedDigest.length !== 32 ||
           !createHash('sha256').update(ciphertext).digest().equals(encryptedDigest) ||
-          mac.length !== 10 ||
-          !timingSafeEqual(mac, expectedMAC)
+          mac.length !== 10
         )
           throw new Error('cached_media_crypto_family_unavailable');
+        if (!timingSafeEqual(mac, expectedMAC)) {
+          if (
+            message.messageType !== 'documentMessage' ||
+            descriptor.mimetype !== 'image/jpeg' ||
+            decryptType !== 'document'
+          )
+            throw new Error('cached_media_crypto_family_unavailable');
+          const imageKeys = await getMediaKeys(key, 'image');
+          const imageMAC = createHmac('sha256', imageKeys.macKey)
+            .update(Buffer.concat([imageKeys.iv, body]))
+            .digest()
+            .subarray(0, 10);
+          if (!timingSafeEqual(mac, imageMAC)) throw new Error('cached_media_crypto_family_unavailable');
+          // Authenticate key selection only; the native document envelope and MIME are unchanged.
+          decryptType = 'image';
+        }
       }
       let delivered = false;
       dispatcher = {

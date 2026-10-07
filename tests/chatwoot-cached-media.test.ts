@@ -619,7 +619,7 @@ test('tagged document preserves native UTC epoch across non-UTC pg Dates, replay
   row.attachment_meta.whatsapp_history_sha256 = createHash('sha256').update(large).digest('hex');
   await service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99);
   assert.equal(gets, 3);
-  message.message.documentMessage.fileLength.low = 32 * 1024 * 1024 + 1;
+  message.message.documentMessage.fileLength.low = 64 * 1024 * 1024 + 1;
   row.byte_size = message.message.documentMessage.fileLength.low;
   await assert.rejects(
     service.assertTaggedHistoryMediaStored([message], { instanceName: 'synthetic' }, provider, 99),
