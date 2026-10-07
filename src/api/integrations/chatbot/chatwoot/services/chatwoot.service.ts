@@ -2205,7 +2205,12 @@ export class ChatwootService {
       ) ||
       row.attachment_meta?.whatsapp_history_sha256 !== descriptor.digest.toString('hex') ||
       row.attachment_meta?.whatsapp_history_media_type !== retainedHistoryMedia(message).type.replace(/Message$/, '') ||
-      row.content_type !== descriptor.mimetype ||
+      (row.content_type !== descriptor.mimetype &&
+        !(
+          message.messageType === 'lottieStickerMessage' &&
+          descriptor.mimetype === 'application/was' &&
+          row.content_type === 'application/zip'
+        )) ||
       row.filename !== descriptor.filename ||
       row.checksum !== createHash('md5').update(bytes).digest('base64') ||
       typeof row.created_at_epoch !== 'number' ||
