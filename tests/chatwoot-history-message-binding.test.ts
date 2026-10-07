@@ -71,7 +71,7 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; canonical?
 test('binds exact native ID under canonical peer lock, using display_id and leaving payload/read/status untouched', async () => {
   const f = fixture();
   const before = structuredClone(f.row);
-  assert.deepEqual(await f.run(), { sourceId: 'WAID:SOURCE1', status: 'bound', messageId: 101, conversationId: 37, nativeRows: 1, boundRows: 1 });
+  assert.deepEqual(await f.run(), { sourceId: 'WAID:SOURCE1', status: 'bound', messageId: 101, conversationId: 37, nativeRows: 1, unselectedNativeRows: 0, boundRows: 1 });
   assert.deepEqual(f.writes, [{ where: { id: { in: ['native-1'] }, instanceId: 'instance-1' }, data: {
     chatwootMessageId: 101, chatwootInboxId: 42, chatwootConversationId: 37, chatwootContactInboxSourceId: 'ci-source',
   } }]);
@@ -109,7 +109,6 @@ for (const [label, options] of [
   ['missing alias', { aliases: [] }],
   ['duplicate raw/WAID alias', { aliases: [{ id: 101 }, { id: 102 }] }],
   ['wrong canonical peer', { boundPeer: '120363999999999@g.us' }],
-  ['divergent duplicate native key', { nativeRows: [native(), { ...native(), id: 'native-2', message: { conversation: 'Different source' } }] }],
   ['foreign native instance', { row: { ...native(), instanceId: 'foreign' } }],
   ['source message changed', { row: { ...native(), message: { conversation: 'Edited since admission' } } }],
 ] as const) {
@@ -254,4 +253,33 @@ test('identical copies with different receive timestamps retain their own source
   const changed = fixture({ nativeRows: [{ ...native(), messageTimestamp: 1700000500 }] });
   await assert.rejects(changed.run(), /source version/);
   assert.equal(changed.writes.length, 0);
+});
+
+
+test('admitted source binds while differing locked copies and their conflicting pointers stay untouched', async () => {
+  const admitted = native();
+  const other = { ...native(), id: 'passive-copy', messageTimestamp: 1699999998,
+    key: { ...native().key, addressingMode: 'lid' },
+    message: { conversation: 'Synthetic history', messageContextInfo: { threadId: 'synthetic', messageSecret: 'synthetic' } },
+    chatwootMessageId: 999 };
+  const before = structuredClone(other);
+  const f = fixture({ nativeRows: [other, admitted] });
+  const result = await f.run();
+  assert.equal(result.nativeRows, 1);
+  assert.equal(result.unselectedNativeRows, 1);
+  assert.equal(result.boundRows, 1);
+  assert.deepEqual(f.writes[0].where.id.in, ['native-1']);
+  assert.deepEqual(other, before);
+});
+
+test('an already canonical admitted source remains existing despite an unrelated null copy', async () => {
+  const admitted = { ...native(), chatwootMessageId: 101, chatwootInboxId: 42,
+    chatwootConversationId: 37, chatwootContactInboxSourceId: 'ci-source' };
+  const other = { ...native(), id: 'other', message: { conversation: 'Other content' } };
+  const f = fixture({ nativeRows: [admitted, other] });
+  const result = await f.run();
+  assert.equal(result.status, 'existing');
+  assert.equal(result.nativeRows, 1);
+  assert.equal(result.unselectedNativeRows, 1);
+  assert.equal(f.writes.length, 0);
 });

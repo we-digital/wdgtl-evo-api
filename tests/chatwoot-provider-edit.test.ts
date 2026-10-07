@@ -18,6 +18,7 @@ test('WhatsApp edits update the original in both directions without creating a d
   });
   const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
   const service = Object.create(ChatwootService.prototype) as any;
+  service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.waMonitor = { waInstances: { synthetic: {} } };
   service.clientCw = async () => ({ client: {}, provider: { accountId: '1', ignoreJids: [] } });
   service.logger = {

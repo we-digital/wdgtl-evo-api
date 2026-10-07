@@ -42,6 +42,7 @@ export async function reconcileHistoryMessageBinding(
   messageId: number;
   conversationId: number;
   nativeRows: number;
+  unselectedNativeRows: number;
   boundRows: number;
 }> {
   const peers = historyBindingPeers(source);
@@ -71,11 +72,12 @@ export async function reconcileHistoryMessageBinding(
           if (
             rows.length < 1 ||
             rows.length > 32 ||
-            !rows.some((row) => row.id === source.id && historyBindingSourceMatches(row, source)) ||
-            // Exact admitted row retains its timestamp guard; equivalent receive copies retain their own timestamps.
-            !rows.every((row) => historyBindingSourceMatches(row, source, false))
+            !rows.some((row) => row.id === source.id && historyBindingSourceMatches(row, source))
           )
             throw new Error('History mapping native source version or uniqueness changed');
+          // Lock all same-key copies, but qualify writes only for the admitted critical
+          // source and fully equivalent receives. Other envelopes remain untouched.
+          const matched = rows.filter((row) => historyBindingSourceMatches(row, source, false));
           const pointers = {
             chatwootMessageId: messageId,
             chatwootInboxId: binding.inboxId,
@@ -83,12 +85,12 @@ export async function reconcileHistoryMessageBinding(
             chatwootContactInboxSourceId: binding.contactInboxSourceId,
           };
           if (
-            rows.some((row) =>
+            matched.some((row) =>
               Object.entries(pointers).some(([field, value]) => row[field] !== null && row[field] !== value),
             )
           )
             throw new Error('History mapping refuses conflicting native pointers');
-          const unbound = rows.filter(
+          const unbound = matched.filter(
             (row) => !Object.entries(pointers).every(([field, value]) => row[field] === value),
           );
           const existing = unbound.length === 0;
@@ -105,7 +107,8 @@ export async function reconcileHistoryMessageBinding(
             status: existing ? 'existing' : dryRun ? 'would_bind' : 'bound',
             messageId,
             conversationId: binding.conversationId,
-            nativeRows: rows.length,
+            nativeRows: matched.length,
+            unselectedNativeRows: rows.length - matched.length,
             boundRows: !dryRun ? unbound.length : 0,
           };
         },

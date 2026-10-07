@@ -6,6 +6,14 @@ Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focus
 
 # we:Digital Evolution API fork
 
+## Scoped native event targets and admitted history mapping copies (2026-10-08)
+
+- Resolve known incoming edit/reaction/read/delete/reply targets by instance plus raw provider key and the known target peer/direction. Unscoped ambiguous keys return null; never infer target direction from a reply actor or group title.
+- Edits/reactions may lazily repair historical NULL native pointers using the existing canonical source-alias/peer lock, current native critical source and independently checked configured inbox. Complete and acknowledged multipart mappings remain protected; conflicting non-null pointers refuse. No provider request, Chatwoot message/file write or cache-marker mutation is introduced by reconciliation.
+- The locked admitted database row retains its timestamp/version guard. Only fully critical-equivalent receives share its pointer update. Differing envelopes remain untouched and are reported separately, so an unselected passive copy cannot block an otherwise fully qualified cached source.
+- Source areas: chatwoot service, native message-key/event-binding helpers and history-message-binding. No dependency, database schema, endpoint or configuration changes. Reapply scoped caller wiring and the canonical pointer-only guards together; rollback restores safe refusal for unresolved mappings.
+- Focused regressions: real group event methods with cross-peer/fromMe collisions, native version rotation, NULL pointer recovery, destination ambiguity, preserved multipart/outbound ACKs and admitted-versus-unselected receives. Production deployment and real-result acceptance remain separate.
+
 ## Unavailable native edit originals without a destination (2026-10-07)
 
 - A retained edited image whose authoritative native payload is JSON null and whose native Chatwoot pointers are null can be acknowledged as `ignored_unavailable_provider_edit_original` only after exact source identity, one retained EDITED update and scoped destination absence are proved and rechecked.
