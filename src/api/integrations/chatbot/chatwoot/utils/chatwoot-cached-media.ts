@@ -74,7 +74,12 @@ function retainedDownloadDescriptor(message: Message) {
   const { size, digest } = nativeCachedMediaPayload(message);
   if (
     !(
-      (message.messageType === 'imageMessage' && type === 'imageMessage' && descriptor.mimetype === 'image/jpeg') ||
+      (['imageMessage', 'templateMessage'].includes(message.messageType) &&
+        type === 'imageMessage' &&
+        descriptor.mimetype === 'image/jpeg') ||
+      (message.messageType === 'lottieStickerMessage' &&
+        type === 'documentMessage' &&
+        descriptor.mimetype === 'application/was') ||
       (message.messageType === 'documentMessage' &&
         type === 'documentMessage' &&
         nativeDocumentMIME(descriptor.mimetype)) ||
@@ -90,7 +95,8 @@ function retainedDownloadDescriptor(message: Message) {
   )
     throw new Error('cached_media_authority_unavailable');
   const filename = basename(
-    descriptor.fileName || `${key.id}.${type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
+    descriptor.fileName ||
+      `${key.id}.${message.messageType === 'lottieStickerMessage' ? 'was' : type === 'imageMessage' ? 'jpg' : type === 'documentMessage' ? 'bin' : 'mp4'}`,
   );
   if (!filename || filename.length > 255 || [...filename].some((c) => c.charCodeAt(0) < 32))
     throw new Error('cached_media_filename_unavailable');
@@ -147,12 +153,14 @@ export async function readRetainedRecoveryMedia(
   const timer = setTimeout(abort, 5000);
   try {
     let dispatcher: any;
-    let decryptType: 'image' | 'video' | 'document' =
-      retainedHistoryMedia(message).type === 'imageMessage'
-        ? 'image'
-        : retainedHistoryMedia(message).type === 'documentMessage'
-          ? 'document'
-          : 'video';
+    let decryptType: 'image' | 'video' | 'document' | 'sticker' =
+      message.messageType === 'lottieStickerMessage'
+        ? 'sticker'
+        : retainedHistoryMedia(message).type === 'imageMessage'
+          ? 'image'
+          : retainedHistoryMedia(message).type === 'documentMessage'
+            ? 'document'
+            : 'video';
     if (download === downloadContentFromMessage) {
       // Installed Baileys forwards dispatcher, but drops signal and redirect.
       // Read one bounded ciphertext first, then retain its original decryption.
@@ -215,7 +223,7 @@ export async function readRetainedRecoveryMedia(
           typeof descriptor.fileEncSha256 === 'string'
             ? Buffer.from(descriptor.fileEncSha256, 'base64')
             : Buffer.from(descriptor.fileEncSha256?.data || Object.values(descriptor.fileEncSha256 || {}));
-        const keys = await getMediaKeys(key, 'document');
+        const keys = await getMediaKeys(key, decryptType === 'sticker' ? 'sticker' : 'document');
         const expectedMAC = createHmac('sha256', keys.macKey)
           .update(Buffer.concat([keys.iv, body]))
           .digest()
@@ -292,8 +300,14 @@ export async function prepareCachedRecoveryMedia(
   >();
   let total = 0;
   for (const message of messages) {
-    if (['conversation', 'extendedTextMessage', 'contactMessage'].includes(message.messageType)) continue;
-    if (message.messageType === 'templateMessage' && !retainedTemplate(message.message).video) continue;
+    if (['conversation', 'extendedTextMessage', 'contactMessage', 'buttonsMessage'].includes(message.messageType))
+      continue;
+    if (
+      message.messageType === 'templateMessage' &&
+      !retainedTemplate(message.message).video &&
+      !retainedTemplate(message.message).image
+    )
+      continue;
     const media = await findMedia(message);
     if (!media && !readMissingMedia) throw new Error('cached_media_authority_unavailable');
     const descriptor = media ? cachedMediaDescriptor(message, media) : retainedDownloadDescriptor(message);

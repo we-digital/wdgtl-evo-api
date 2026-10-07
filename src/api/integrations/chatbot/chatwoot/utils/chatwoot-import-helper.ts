@@ -25,7 +25,10 @@ import {
   UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { resolveProviderHistoryConversations } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-conversation';
-import { retainedTemplate } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
+import {
+  retainedButtons,
+  retainedTemplate,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -626,6 +629,14 @@ class ChatwootImport {
             : undefined;
         const documentEdit = message.messageType === 'documentMessage' && payload === null;
         const audioEdit = message.messageType === 'audioMessage';
+        if (
+          ['contactMessage', 'albumMessage'].includes(message.messageType) &&
+          onUnqualifiedNullEdit &&
+          isKnownUnavailableNullEdit(message)
+        ) {
+          await onUnqualifiedNullEdit(message);
+          continue;
+        }
         if (message.messageType !== 'imageMessage' && !textEdit && !documentEdit && !audioEdit)
           throw new Error('Empty provider edit is not a known image, text, audio or NULL document');
         const client = await pool.connect();
@@ -1008,7 +1019,9 @@ class ChatwootImport {
                 JSON.stringify(
                   message.message?.templateMessage
                     ? { provider_history_template: retainedTemplate(message.message).metadata }
-                    : {},
+                    : message.message?.buttonsMessage
+                      ? { provider_history_buttons: retainedButtons(message.message).metadata }
+                      : {},
                 ),
               );
               const bindAttributes = `$${bindInsertMsg.length}`;
@@ -1417,6 +1430,7 @@ class ChatwootImport {
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo, retainedTemplates = false) {
+    if (retainedTemplates && msg.message?.buttonsMessage) return retainedButtons(msg.message).text;
     if (retainedTemplates && msg.message?.templateMessage) return retainedTemplate(msg.message).text;
     const contentMessage = chatwootService.getConversationMessage(msg.message);
     if (contentMessage) {

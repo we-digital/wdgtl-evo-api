@@ -5963,7 +5963,8 @@ export class ChatwootService {
             classification === 'unavailable_image_edit' ||
             classification === 'unavailable_text_edit' ||
             classification === 'unavailable_document_edit' ||
-            classification === 'unavailable_audio_edit')
+            classification === 'unavailable_audio_edit' ||
+            classification === 'unavailable_other_edit')
         );
       });
       const encryptedEdits = authoritativeMessages.filter(
@@ -6147,7 +6148,8 @@ export class ChatwootService {
               ? { ...message, messageType: 'videoMessage', message: retainedHistoryDisplayBody(message) }
               : message;
           const prepared =
-            data.recoveryMode === 'maximize'
+            data.recoveryMode === 'maximize' &&
+            !['lottieStickerMessage', 'buttonsMessage'].includes(message.messageType)
               ? prepareStoredHistoryRecoveryMessage(display)
               : { message: display, recovery: 'native' as const, reason: 'standard_mode' };
           return [sourceId, prepared] as const;
@@ -6409,7 +6411,7 @@ export class ChatwootService {
             size: cached.descriptor.size,
             sha256: cached.descriptor.digest.toString('hex'),
             mediaType: retainedHistoryMedia(original).type.replace(/Message$/, ''),
-            ...(['associatedChildMessage', 'templateMessage'].includes(original.messageType)
+            ...(['associatedChildMessage', 'templateMessage', 'lottieStickerMessage'].includes(original.messageType)
               ? {
                   nativeSource: {
                     message_type: original.messageType,

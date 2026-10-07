@@ -1,5 +1,26 @@
 import { Message } from '@prisma/client';
 
+// Retained protobuf sidecars are preserved, never executed or rendered.
+export const boundedRetainedMetadata = (value: any): boolean => {
+  let nodes = 0;
+  const valid = (v: any, depth: number): boolean => {
+    if (++nodes > 4096 || depth > 12) return false;
+    if (v === null || typeof v === 'boolean') return true;
+    if (typeof v === 'number') return Number.isFinite(v);
+    if (typeof v === 'string') return Buffer.byteLength(v) <= 65536;
+    if (Array.isArray(v)) return v.length <= 512 && v.every((x) => valid(x, depth + 1));
+    return (
+      v &&
+      Object.getPrototypeOf(v) === Object.prototype &&
+      Object.keys(v).length <= 128 &&
+      Object.entries(v).every(
+        ([k, x]) => k.length <= 256 && !['__proto__', 'constructor', 'prototype'].includes(k) && valid(x, depth + 1),
+      )
+    );
+  };
+  return object(value) && valid(value, 0) && Buffer.byteLength(JSON.stringify(value)) <= 65536;
+};
+
 const object = (value: any): value is Record<string, any> =>
   value !== null && typeof value === 'object' && !Array.isArray(value);
 const only = (value: Record<string, any>, fields: string[]) => Object.keys(value).every((key) => fields.includes(key));
@@ -101,6 +122,56 @@ export function knownHistoryMetadataControl(record: { messageType: string; messa
   }
   if (record.messageType !== 'unknown') return false;
   const context = body.messageContextInfo;
+  if (body.messageHistoryNotice !== undefined || body.messageHistoryBundle !== undefined) {
+    const bundle = body.messageHistoryBundle !== undefined;
+    const name = bundle ? 'messageHistoryBundle' : 'messageHistoryNotice';
+    const value = body[name];
+    const metadata = value?.messageHistoryMetadata;
+    return (
+      only(body, [name, 'messageContextInfo', 'senderKeyDistributionMessage']) &&
+      (context === undefined ||
+        (boundedRetainedMetadata(context) &&
+          Array.isArray(context.threadId) &&
+          !context.threadId.length &&
+          (context.messageSecret === undefined || bytes32(context.messageSecret)))) &&
+      object(value) &&
+      only(
+        value,
+        bundle
+          ? [
+              'mimetype',
+              'fileSha256',
+              'mediaKey',
+              'fileEncSha256',
+              'directPath',
+              'mediaKeyTimestamp',
+              'contextInfo',
+              'messageHistoryMetadata',
+            ]
+          : ['contextInfo', 'messageHistoryMetadata'],
+      ) &&
+      (value.contextInfo === undefined || boundedRetainedMetadata(value.contextInfo)) &&
+      (!bundle ||
+        (typeof value.mimetype === 'string' &&
+          value.mimetype === 'application/protobuf' &&
+          bytes32(value.fileSha256) &&
+          bytes32(value.fileEncSha256) &&
+          bytes32(value.mediaKey) &&
+          long(value.mediaKeyTimestamp) &&
+          typeof value.directPath === 'string' &&
+          value.directPath.startsWith('/') &&
+          !value.directPath.startsWith('//') &&
+          !/[\\\s]/.test(value.directPath))) &&
+      object(metadata) &&
+      only(metadata, ['messageCount', 'historyReceivers', 'oldestMessageTimestamp']) &&
+      long(metadata.messageCount) &&
+      long(metadata.oldestMessageTimestamp) &&
+      Array.isArray(metadata.historyReceivers) &&
+      metadata.historyReceivers.length > 0 &&
+      metadata.historyReceivers.length <= 512 &&
+      metadata.historyReceivers.every((jid: any) => typeof jid === 'string' && jid.length > 0 && jid.length <= 256)
+    );
+  }
   if (
     !object(context) ||
     !Array.isArray(context.threadId) ||
@@ -108,23 +179,6 @@ export function knownHistoryMetadataControl(record: { messageType: string; messa
     !bytes32(context.messageSecret)
   )
     return false;
-  if (body.messageHistoryNotice !== undefined) {
-    const notice = body.messageHistoryNotice;
-    const metadata = notice?.messageHistoryMetadata;
-    return (
-      only(body, ['messageHistoryNotice', 'messageContextInfo', 'senderKeyDistributionMessage']) &&
-      only(context, ['threadId', 'messageSecret']) &&
-      object(notice) &&
-      only(notice, ['messageHistoryMetadata']) &&
-      object(metadata) &&
-      only(metadata, ['messageCount', 'historyReceivers', 'oldestMessageTimestamp']) &&
-      long(metadata.messageCount) &&
-      long(metadata.oldestMessageTimestamp) &&
-      Array.isArray(metadata.historyReceivers) &&
-      metadata.historyReceivers.length > 0 &&
-      metadata.historyReceivers.every((jid: any) => typeof jid === 'string' && jid.length > 0)
-    );
-  }
   const limit = context.limitSharingV2;
   return (
     only(body, ['messageContextInfo']) &&
@@ -138,13 +192,16 @@ export function knownHistoryMetadataControl(record: { messageType: string; messa
   );
 }
 
-export function retainedTemplate(body: any): { text: string; metadata: Record<string, any>; video?: any } {
+export function retainedTemplate(body: any): { text: string; metadata: Record<string, any>; video?: any; image?: any } {
   const template = body?.templateMessage;
   if (
+    !object(body) ||
+    !only(body, ['templateMessage', 'messageContextInfo', 'senderKeyDistributionMessage']) ||
     !object(template) ||
-    !only(template, ['templateId', 'hydratedTemplate', 'interactiveMessageTemplate']) ||
+    !only(template, ['templateId', 'hydratedTemplate', 'interactiveMessageTemplate', 'contextInfo']) ||
     typeof template.templateId !== 'string' ||
-    !template.templateId
+    !template.templateId ||
+    (template.contextInfo !== undefined && !boundedRetainedMetadata(template.contextInfo))
   )
     throw new Error('Retained template content is unsupported');
   const hydrated = template.hydratedTemplate;
@@ -158,20 +215,42 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
       'hydratedTitleText',
       'hydratedContentText',
       'hydratedFooterText',
+      'imageMessage',
     ]) &&
     hydrated.templateId === template.templateId &&
     Array.isArray(hydrated.hydratedButtons) &&
-    !hydrated.hydratedButtons.length &&
+    hydrated.hydratedButtons.length <= 10 &&
+    hydrated.hydratedButtons.every(
+      (button: any) =>
+        object(button) &&
+        only(button, ['index', 'urlButton']) &&
+        Number.isInteger(button.index) &&
+        button.index >= 0 &&
+        button.index <= 10 &&
+        object(button.urlButton) &&
+        only(button.urlButton, ['url', 'displayText']) &&
+        typeof button.urlButton.displayText === 'string' &&
+        button.urlButton.displayText.length > 0 &&
+        typeof button.urlButton.url === 'string' &&
+        /^https?:\/\//.test(button.urlButton.url),
+    ) &&
+    (hydrated.imageMessage === undefined || object(hydrated.imageMessage)) &&
     typeof hydrated.hydratedContentText === 'string' &&
     hydrated.hydratedContentText.length > 0 &&
     (hydrated.hydratedTitleText === undefined || typeof hydrated.hydratedTitleText === 'string') &&
     (hydrated.hydratedFooterText === undefined || typeof hydrated.hydratedFooterText === 'string')
   ) {
     return {
-      text: [hydrated.hydratedTitleText, hydrated.hydratedContentText, hydrated.hydratedFooterText]
+      text: [
+        hydrated.hydratedTitleText,
+        hydrated.hydratedContentText,
+        hydrated.hydratedFooterText,
+        ...hydrated.hydratedButtons.map((button: any) => `${button.urlButton.displayText}: ${button.urlButton.url}`),
+      ]
         .filter(Boolean)
         .join('\n'),
       metadata: { template_id: template.templateId, hydrated_template: hydrated },
+      image: hydrated.imageMessage,
     };
   }
   if (
@@ -183,9 +262,9 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
     typeof interactive.body.text !== 'string' ||
     !interactive.body.text ||
     !object(interactive.header) ||
-    !only(interactive.header, ['videoMessage', 'hasMediaAttachment']) ||
+    !only(interactive.header, ['videoMessage', 'imageMessage', 'hasMediaAttachment']) ||
     interactive.header.hasMediaAttachment !== true ||
-    !object(interactive.header.videoMessage) ||
+    Number(object(interactive.header.videoMessage)) + Number(object(interactive.header.imageMessage)) !== 1 ||
     !object(interactive.nativeFlowMessage) ||
     !only(interactive.nativeFlowMessage, ['buttons', 'messageParamsJson'])
   )
@@ -216,12 +295,67 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
     text: `${interactive.body.text}\n${button.display_text}: ${button.url}`,
     metadata: { template_id: template.templateId, body: interactive.body, native_flow: flow },
     video: interactive.header.videoMessage,
+    image: interactive.header.imageMessage,
   };
 }
 
 // Only a validated import copy is unwrapped. The persisted native row remains the authority and is never rewritten.
+export function retainedButtons(body: any): { text: string; metadata: Record<string, any> } {
+  const value = body?.buttonsMessage;
+  if (
+    !object(body) ||
+    !only(body, ['buttonsMessage', 'messageContextInfo', 'senderKeyDistributionMessage']) ||
+    !object(value) ||
+    !only(value, ['buttons', 'headerType', 'contentText', 'footerText']) ||
+    value.headerType !== 1 ||
+    typeof value.contentText !== 'string' ||
+    !value.contentText ||
+    (value.footerText !== undefined && typeof value.footerText !== 'string') ||
+    !Array.isArray(value.buttons) ||
+    !value.buttons.length ||
+    value.buttons.length > 10 ||
+    !value.buttons.every(
+      (b: any) =>
+        object(b) &&
+        only(b, ['type', 'buttonId', 'buttonText']) &&
+        b.type === 1 &&
+        typeof b.buttonId === 'string' &&
+        b.buttonId.length > 0 &&
+        object(b.buttonText) &&
+        only(b.buttonText, ['displayText']) &&
+        typeof b.buttonText.displayText === 'string' &&
+        b.buttonText.displayText.length > 0,
+    )
+  )
+    throw new Error('Retained buttons content is unsupported');
+  return {
+    text: [value.contentText, value.footerText, ...value.buttons.map((b: any) => b.buttonText.displayText)]
+      .filter(Boolean)
+      .join('\n'),
+    metadata: value,
+  };
+}
+
 export function retainedHistoryMedia(message: Message): { type: string; descriptor: any } {
   const body = message.message as any;
+  if (message.messageType === 'lottieStickerMessage') {
+    const wrapper = body?.lottieStickerMessage;
+    const sticker = wrapper?.message?.stickerMessage;
+    if (
+      !object(body) ||
+      !only(body, ['lottieStickerMessage', 'messageContextInfo']) ||
+      !object(wrapper) ||
+      !only(wrapper, ['message']) ||
+      !object(wrapper.message) ||
+      !only(wrapper.message, ['stickerMessage']) ||
+      !object(sticker) ||
+      sticker.isLottie !== true ||
+      sticker.mimetype !== 'application/was'
+    )
+      throw new Error('Retained lottie sticker wrapper is unsupported');
+    // WAS animation bytes are retained as a file; no raster conversion or animation execution.
+    return { type: 'documentMessage', descriptor: sticker };
+  }
   if (message.messageType === 'associatedChildMessage') {
     const child = body?.associatedChildMessage;
     if (
@@ -238,6 +372,7 @@ export function retainedHistoryMedia(message: Message): { type: string; descript
   }
   if (message.messageType === 'templateMessage') {
     const template = retainedTemplate(body);
+    if (template.image) return { type: 'imageMessage', descriptor: template.image };
     if (!template.video) throw new Error('cached_media_native_digest_unavailable');
     return { type: 'videoMessage', descriptor: template.video };
   }
