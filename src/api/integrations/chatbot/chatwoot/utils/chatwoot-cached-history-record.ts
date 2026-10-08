@@ -250,6 +250,21 @@ export function classifyCachedHistoryRecord(
     primary.vote?.encPayload != null
   )
     return 'poll_control';
+  // A decoded sender-key envelope may retain an explicitly empty conversation field.
+  // Require the complete positive envelope; ordinary text or media must never be skipped.
+  if (
+    !edited &&
+    record.messageType === 'conversation' &&
+    (payload as any).conversation === '' &&
+    keys.includes('senderKeyDistributionMessage') &&
+    keys.every((key) => ['conversation', 'senderKeyDistributionMessage', 'messageContextInfo'].includes(key)) &&
+    validSenderKeySidecar(payload) &&
+    typeof (payload as any).senderKeyDistributionMessage?.groupId === 'string' &&
+    (payload as any).senderKeyDistributionMessage.groupId.length > '@g.us'.length &&
+    (payload as any).senderKeyDistributionMessage.groupId.endsWith('@g.us') &&
+    (record.key as any)?.remoteJid === (payload as any).senderKeyDistributionMessage.groupId
+  )
+    return 'encryption_control';
   if (
     record.messageType === 'unknown' &&
     keys.includes('senderKeyDistributionMessage') &&
