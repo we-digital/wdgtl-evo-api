@@ -1,3 +1,17 @@
+## Native plaintext transport-copy reconciliation (2026-10-08)
+
+Durable inbound retries distinguish a verified provider-original plaintext body
+from equivalent sender-key transport copies. The original snapshot must still
+exist in current native rows, including its timestamp, exact peer/key/direction,
+author and context. Protobuf byte representations may normalize only known
+transport fields. A non-edited blank sender-key copy does not erase that text;
+conflicting supported text, edits, unknown controls and source selection overflow
+still refuse. The ledger hash format is unchanged. A unique existing receiver
+message can reconcile through the normal queue without another POST, and the
+raw native roster is checked again before each original-row pointer CAS. No
+native message/cache body, outgoing delivery, schema or runtime configuration is
+changed.
+
 ## Request-local canonical reuse for inbound delivery (2026-10-08)
 
 - Resolve and validate the canonical Chatwoot conversation once during one durable incoming delivery. The nested event handler may reuse that result only for the identical body object, instance, registered receiver binding, account, provider fingerprint, peer, direction and complete native payload hash. Any changed identity or source fails before the message POST.
