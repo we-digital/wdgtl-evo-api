@@ -1,3 +1,9 @@
+## Retained plaintext hydrated quick replies (2026-10-09)
+
+- Render the closed native text-only hydrated-template shape as exact title, body, footer and quick-reply display labels. Keep original template/button IDs, indexes, context and full native payload/version unchanged; no quick-reply action executes and no control accounting substitutes for visible text.
+- Accept only bounded typed plaintext fields and quick-reply buttons with valid indexes/IDs/labels. Header/media/unknown nested fields, mixed template variants and malformed values still refuse. Existing URL/image templates and ordinary/control classification retain their previous behavior; the observed interactive image-header variant remains unsupported.
+- Reapply focused source/compiled decoder and classifier tests, zero-media-IO checks, negative shapes and existing retained-template regressions. No schema/dependency/runtime flags, provider sends, downloads or cache/processed-marker rewrites change. Rollback restores safe refusal for these plaintext quick-reply templates.
+
 ## Native plaintext transport-copy reconciliation (2026-10-08)
 
 Durable inbound retries distinguish a verified provider-original plaintext body

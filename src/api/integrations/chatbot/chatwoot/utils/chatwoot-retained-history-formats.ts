@@ -268,6 +268,55 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
     throw new Error('Retained template content is unsupported');
   const hydrated = template.hydratedTemplate;
   const interactive = template.interactiveMessageTemplate;
+  // Plain quick-reply templates retain visible labels and native IDs; no actions are executed.
+  if (
+    object(hydrated) &&
+    interactive === undefined &&
+    boundedRetainedMetadata(hydrated) &&
+    only(hydrated, [
+      'templateId',
+      'hydratedButtons',
+      'hydratedTitleText',
+      'hydratedContentText',
+      'hydratedFooterText',
+    ]) &&
+    hydrated.templateId === template.templateId &&
+    typeof hydrated.hydratedContentText === 'string' &&
+    hydrated.hydratedContentText.trim().length > 0 &&
+    (hydrated.hydratedTitleText === undefined || typeof hydrated.hydratedTitleText === 'string') &&
+    (hydrated.hydratedFooterText === undefined || typeof hydrated.hydratedFooterText === 'string') &&
+    Array.isArray(hydrated.hydratedButtons) &&
+    hydrated.hydratedButtons.length > 0 &&
+    hydrated.hydratedButtons.length <= 10 &&
+    new Set(hydrated.hydratedButtons.map((button: any) => button?.index)).size === hydrated.hydratedButtons.length &&
+    hydrated.hydratedButtons.every(
+      (button: any) =>
+        object(button) &&
+        only(button, ['index', 'quickReplyButton']) &&
+        Number.isInteger(button.index) &&
+        button.index >= 0 &&
+        button.index <= 10 &&
+        object(button.quickReplyButton) &&
+        only(button.quickReplyButton, ['id', 'displayText']) &&
+        typeof button.quickReplyButton.id === 'string' &&
+        button.quickReplyButton.id.length > 0 &&
+        button.quickReplyButton.id.length <= 256 &&
+        typeof button.quickReplyButton.displayText === 'string' &&
+        button.quickReplyButton.displayText.trim().length > 0,
+    )
+  ) {
+    return {
+      text: [
+        hydrated.hydratedTitleText,
+        hydrated.hydratedContentText,
+        hydrated.hydratedFooterText,
+        ...hydrated.hydratedButtons.map((button: any) => button.quickReplyButton.displayText),
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      metadata: { template_id: template.templateId, hydrated_template: hydrated },
+    };
+  }
   if (
     object(hydrated) &&
     interactive === undefined &&
