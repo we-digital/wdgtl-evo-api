@@ -93,6 +93,13 @@ import {
   UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { ChatwootInboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
+import {
+  ChatwootInboundQueue,
+  InboundDelivery,
+  inboundDeliveryId,
+  inboundPayloadHash,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 import {
   ChatwootIngressDeliveryFence,
   chatwootIngressDeliveryKey,
@@ -193,7 +200,7 @@ import ChatwootClient, {
   inbox,
 } from '@figuro/chatwoot-sdk';
 import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/request';
-import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
+import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel, Prisma } from '@prisma/client';
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
@@ -241,6 +248,9 @@ export class ChatwootService {
   private readonly historySyncCheckpointKey = 'chatwoot:historySyncCheckpoint';
   private readonly outboundStore: ChatwootOutboundPrismaStore;
   private readonly outboundQueue: ChatwootOutboundQueue;
+  private readonly inboundStore: ChatwootInboundPrismaStore;
+  private readonly inboundQueue: ChatwootInboundQueue;
+  private readonly durableInboundBodies = new WeakSet<object>();
   private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
 
   // Lock polling delay
@@ -252,6 +262,12 @@ export class ChatwootService {
     private readonly prismaRepository: PrismaRepository,
     private readonly cache: CacheService,
   ) {
+    this.inboundStore = new ChatwootInboundPrismaStore(prismaRepository);
+    this.inboundQueue = new ChatwootInboundQueue(
+      this.inboundStore,
+      (item) => this.deliverQueuedInbound(item),
+      (event, fields) => this.logger.info(JSON.stringify({ event, ...fields })),
+    );
     const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
     this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository, {
       maxWait: Math.max(500, Math.min(30_000, outboundConfig.OUTBOUND_ADMISSION_MAX_WAIT_MS)),
@@ -282,6 +298,7 @@ export class ChatwootService {
   }
 
   public async startOutboundWorker() {
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) this.inboundQueue.start();
     if (!this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) return;
     await this.bootstrapOutboundWebhookSecrets();
     await this.outboundQueue.start();
@@ -322,7 +339,7 @@ export class ChatwootService {
   }
 
   public async stopOutboundWorker() {
-    await this.outboundQueue.stop();
+    await Promise.all([this.outboundQueue.stop(), this.inboundQueue.stop()]);
   }
 
   public async authenticateOutboundWebhook(
@@ -1916,7 +1933,14 @@ export class ChatwootService {
     const storedBinding = inboxRecord ? this.inboxRouteBinding(inboxRecord) : null;
     const route = chatwootEvoRouteBindingsEqual(storedBinding, expectedBinding) ? expectedBinding : null;
 
-    return buildChatwootIngressAttributes(messageBody, route, clientSent);
+    const attributes = buildChatwootIngressAttributes(messageBody, route, clientSent);
+    return {
+      ...attributes,
+      we_digital_ingress: {
+        ...attributes.we_digital_ingress,
+        source_payload_sha256: messageBody?.key && messageBody?.message ? inboundPayloadHash(messageBody) : null,
+      },
+    };
   }
 
   public async getInbox(instance: InstanceDto, allowRebind = false): Promise<inbox | null> {
@@ -1992,7 +2016,7 @@ export class ChatwootService {
     const sourceReplyId = quotedMsg?.chatwootMessageId || null;
 
     const ingressAttributes = await this.ingressAttributes(instance, provider, messageBody, clientSent);
-    const message = await client.messages.create({
+    const request = {
       accountId: Number(provider.accountId),
       conversationId: conversationId,
       data: {
@@ -2007,14 +2031,28 @@ export class ChatwootService {
         },
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
-    });
+    };
+    const queued = messageBody && this.durableInboundBodies.has(messageBody);
+    const message = queued
+      ? (
+          await axios.post(
+            requireTrustedChatwootUrl(
+              provider.url,
+              this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL,
+              `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+            ),
+            request.data,
+            { headers: { 'api-access-token': provider.token }, timeout: 30_000, maxRedirects: 0 },
+          )
+        ).data
+      : await client.messages.create(request);
 
     if (!message) {
       this.logger.warn('message not found');
       return null;
     }
 
-    await this.bindInboundChatwootMessageId(sourceId, message, instance, conversationId);
+    if (!queued) await this.bindInboundChatwootMessageId(sourceId, message, instance, conversationId);
 
     return message;
   }
@@ -2214,7 +2252,7 @@ export class ChatwootService {
             `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
           )
         : `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
-      ...(recovery ? { timeout: 30_000, maxRedirects: 0 } : {}),
+      ...(recovery || this.durableInboundBodies.has(messageBody) ? { timeout: 30_000, maxRedirects: 0 } : {}),
       headers: {
         'api-access-token': provider.token,
         ...(recovery
@@ -2232,7 +2270,8 @@ export class ChatwootService {
     try {
       const { data } = await axios.request(config);
 
-      if (!recovery) await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId);
+      if (!recovery && !this.durableInboundBodies.has(messageBody))
+        await this.bindInboundChatwootMessageId(sourceId, data, instance, conversationId);
 
       return recovery ? { message: data, expectedContentAttributes } : data;
     } catch (error) {
@@ -4941,29 +4980,266 @@ export class ChatwootService {
     });
     if (!deliveryKey) return this.processWhatsappEvent(event, instance, body);
 
-    return this.inboundDeliveryFence.run(deliveryKey, async () => {
-      const existing = await this.prismaRepository.message.findFirst({
-        where: {
-          instanceId: instance.instanceId,
-          AND: [
-            { key: { path: ['id'], equals: body.key.id } },
-            { key: { path: ['remoteJid'], equals: body.key.remoteJid } },
-            { key: { path: ['fromMe'], equals: body.key.fromMe } },
-          ],
-          chatwootMessageId: { not: null },
-        },
-        orderBy: { messageTimestamp: 'desc' },
-      });
-      if (existing?.chatwootMessageId && existing.chatwootConversationId) {
-        return {
-          id: existing.chatwootMessageId,
-          inbox_id: existing.chatwootInboxId,
-          conversation_id: existing.chatwootConversationId,
-        };
-      }
-
-      return this.processWhatsappEvent(event, instance, body);
+    if (!this.isDurableInboundBody(body))
+      return this.inboundDeliveryFence.run(deliveryKey, () => this.processWhatsappEvent(event, instance, body));
+    const provider = await this.getProvider(instance);
+    if (!provider?.enabled) return null;
+    if (
+      await isChatwootOutboundEcho(body, (id) =>
+        isRetainedChatwootOutboundMessageId(this.prismaRepository, instance.instanceId, id),
+      )
+    )
+      return null;
+    const accountId = Number(provider.accountId);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0 || !instance.instanceId)
+      throw new Error('InboundRouteUnavailable');
+    const raw = JSON.stringify(body);
+    if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new Error('InboundPayloadTooLarge');
+    const now = new Date();
+    return this.inboundQueue.submit({
+      id: inboundDeliveryId(instance.instanceId, body),
+      instanceId: instance.instanceId,
+      instanceName: instance.instanceName,
+      providerId: provider.id,
+      providerFingerprint: this.inboundProviderFingerprint(provider),
+      accountId,
+      inboxId: null,
+      peer: body.key.remoteJid,
+      sourceId: 'WAID:' + body.key.id,
+      fromMe: body.key.fromMe,
+      payload: JSON.parse(raw),
+      payloadHash: inboundPayloadHash(body),
+      state: 'pending',
+      attempts: 0,
+      nextAttemptAt: now,
+      leaseOwner: null,
+      leaseExpiresAt: null,
+      result: null,
     });
+  }
+
+  private isDurableInboundBody(body: any): boolean {
+    try {
+      return (
+        typeof body?.key?.fromMe === 'boolean' &&
+        typeof body.key.remoteJid === 'string' &&
+        !body.key.remoteJid.endsWith('@broadcast') &&
+        classifyCachedHistoryRecord(body, body.status === 'EDITED') === 'ordinary'
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private inboundProviderFingerprint(provider: ChatwootModel): string {
+    return createHash('sha256')
+      .update(
+        JSON.stringify([
+          provider.id,
+          provider.instanceId,
+          provider.accountId,
+          provider.url,
+          provider.nameInbox,
+          provider.number,
+          provider.ignoreJids,
+        ]),
+      )
+      .digest('hex');
+  }
+
+  private async deliverQueuedInbound(item: InboundDelivery) {
+    const instance: InstanceDto = { instanceId: item.instanceId, instanceName: item.instanceName };
+    const nativeInstance = await this.prismaRepository.instance.findUnique({
+      where: { id: item.instanceId },
+      select: { name: true },
+    });
+    const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: item.instanceId } });
+    const wa = this.waMonitor.waInstances[item.instanceName];
+    if (
+      !nativeInstance ||
+      nativeInstance.name !== item.instanceName ||
+      !provider?.enabled ||
+      provider.id !== item.providerId ||
+      this.inboundProviderFingerprint(provider) !== item.providerFingerprint ||
+      wa?.connectionStatus?.state !== 'open'
+    )
+      throw new Error('InboundRouteNotReady');
+    if (
+      inboundDeliveryId(item.instanceId, item.payload) !== item.id ||
+      inboundPayloadHash(item.payload) !== item.payloadHash
+    )
+      throw new Error('InboundStoredSourceChanged');
+    const sources = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: item.instanceId,
+        AND: [
+          { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+          { key: { path: ['remoteJid'], equals: item.peer } },
+          { key: { path: ['fromMe'], equals: item.fromMe } },
+        ],
+      },
+      take: 3,
+    });
+    if (
+      sources.length >= 3 ||
+      (sources.length > 1 && new Set(sources.map((source) => inboundPayloadHash(source))).size !== 1)
+    )
+      throw new Error('InboundNativeSourceAmbiguous');
+    if (sources.length === 0 && item.attempts > 0) throw new Error('InboundNativeSourceUnavailable');
+    const body = JSON.parse(JSON.stringify(sources[0] ?? item.payload));
+    if (!this.isDurableInboundBody(body)) throw new Error('InboundNativePayloadUnavailable');
+    const nativeHash = inboundPayloadHash(body);
+    if (body.message?.ephemeralMessage?.message) body.message = body.message.ephemeralMessage.message;
+    const inbox = await this.getInbox(instance);
+    const expected = inbox ? this.buildEvoRouteBinding(instance, provider, Number(inbox.id)) : null;
+    if (
+      !inbox ||
+      !expected ||
+      !chatwootEvoRouteBindingsEqual(this.inboxRouteBinding(inbox), expected) ||
+      (item.inboxId !== null && item.inboxId !== Number(inbox.id)) ||
+      !(await this.inboundStore.bindInbox(item.id, item.leaseOwner, Number(inbox.id)))
+    )
+      throw new Error('InboundDestinationChanged');
+    const conversationId = Number(await this.createConversation(instance, body));
+    if (!Number.isSafeInteger(conversationId) || conversationId <= 0) throw new Error('InboundCanonicalUnavailable');
+    const peer = toCanonicalHistoryJid(
+      body.key.remoteJidAlt && isLidJid(body.key.remoteJid) ? body.key.remoteJidAlt : body.key.remoteJid,
+    );
+    const sourceHash = inboundPayloadHash(body);
+    const sourceAliases = [item.sourceId, item.sourceId.slice(5)];
+    const owners = async () =>
+      (
+        await this.pgClient.query(
+          `SELECT m.id,m.inbox_id,m.message_type,m.private,m.content,m.content_attributes,m.source_id,
+              c.display_id AS conversation_id,c.account_id,ci.inbox_id AS ci_inbox_id,ci.contact_id AS ci_contact_id,
+              c.contact_id,ct.account_id AS contact_account_id,ct.identifier,pb.provider,pb.peer,ci.source_id AS contact_inbox_source_id,
+              (SELECT count(*)::integer FROM attachments a WHERE a.message_id=m.id) AS attachments
+       FROM messages m LEFT JOIN conversations c ON c.id=m.conversation_id LEFT JOIN contacts ct ON ct.id=c.contact_id
+       LEFT JOIN contact_inboxes ci ON ci.id=c.contact_inbox_id
+       LEFT JOIN provider_conversation_bindings pb ON pb.conversation_id=c.id
+       WHERE m.account_id=$1 AND m.inbox_id=$2 AND m.source_id=ANY($3::text[]) ORDER BY m.id LIMIT 3`,
+          [item.accountId, Number(inbox.id), sourceAliases],
+        )
+      ).rows;
+    let rendered = await this.getConversationMessage(body.message);
+    if (rendered)
+      rendered = rendered
+        .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
+        .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
+        .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~');
+    if (peer.endsWith('@g.us')) {
+      const mentions = extractChatwootIngressMentionJids(body);
+      if (mentions.length && rendered) {
+        const participants = await this.syncWhatsappGroupParticipants(instance, provider, conversationId, peer);
+        rendered = formatIncomingWhatsappMentions(rendered, mentions, participants);
+      }
+      if (!item.fromMe) rendered = formatWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
+    }
+    const confirm = (rows: any[]) => {
+      if (rows.length !== 1) throw new Error('InboundReceiverSourceAmbiguous');
+      const row = rows[0];
+      let attributes = row.content_attributes;
+      if (typeof attributes === 'string') {
+        try {
+          attributes = JSON.parse(attributes);
+        } catch {
+          throw new Error('InboundReceiverMetadataInvalid');
+        }
+      }
+      if (
+        Number(row.account_id) !== item.accountId ||
+        Number(row.inbox_id) !== Number(inbox.id) ||
+        Number(row.conversation_id) !== conversationId ||
+        row.private !== false ||
+        Number(row.message_type) !== (item.fromMe ? 1 : 0) ||
+        Number(row.ci_inbox_id) !== Number(inbox.id) ||
+        Number(row.ci_contact_id) !== Number(row.contact_id) ||
+        row.provider !== 'whatsapp' ||
+        row.peer !== peer ||
+        Number(row.contact_account_id) !== item.accountId ||
+        (peer.endsWith('@g.us') && row.identifier !== peer)
+      )
+        throw new Error('InboundReceiverIdentityMismatch');
+      const isMedia = this.isMediaMessage(body.message);
+      if (attributes?.deleted === true || attributes?.message_deleted === true)
+        throw new Error('InboundReceiverDeleted');
+      if (isMedia && Number(row.attachments) < 1) throw new Error('InboundReceiverMediaUnconfirmed');
+      if ((row.content || '') !== (rendered || '')) throw new Error('InboundReceiverContentChanged');
+      if (
+        attributes?.we_digital_ingress?.source_payload_sha256 !== sourceHash &&
+        (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
+      )
+        throw new Error('InboundReceiverPayloadUnconfirmed');
+      return {
+        id: Number(row.id),
+        inbox_id: Number(row.inbox_id),
+        conversation_id: Number(row.conversation_id),
+        contact_inbox_source_id: row.contact_inbox_source_id,
+      };
+    };
+    return (async () => {
+      const before = await owners();
+      let ack;
+      if (before.length) ack = confirm(before);
+      else {
+        this.durableInboundBodies.add(body);
+        let sent;
+        try {
+          sent = await this.processWhatsappEvent('messages.upsert', instance, body);
+        } finally {
+          this.durableInboundBodies.delete(body);
+        }
+        if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
+        ack = confirm(await owners());
+        if (Number(sent.id) !== ack.id) throw new Error('InboundReceiverAckMismatch');
+      }
+      const after = await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: item.instanceId,
+          AND: [
+            { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+            { key: { path: ['remoteJid'], equals: item.peer } },
+            { key: { path: ['fromMe'], equals: item.fromMe } },
+          ],
+        },
+        take: 3,
+      });
+      if (after.length >= 3 || after.some((source) => inboundPayloadHash(source) !== nativeHash))
+        throw new Error('InboundNativeSourceChangedDuringDelivery');
+      for (const source of after) {
+        if (
+          (source.chatwootMessageId !== null && source.chatwootMessageId !== ack.id) ||
+          (source.chatwootInboxId !== null && source.chatwootInboxId !== ack.inbox_id) ||
+          (source.chatwootConversationId !== null && source.chatwootConversationId !== ack.conversation_id)
+        )
+          throw new Error('InboundNativePointerContradiction');
+        const updated = await this.prismaRepository.message.updateMany({
+          where: {
+            id: source.id,
+            instanceId: item.instanceId,
+            key: { equals: source.key },
+            message: { equals: source.message },
+            contextInfo: { equals: source.contextInfo ?? Prisma.AnyNull },
+            messageType: source.messageType,
+            messageTimestamp: source.messageTimestamp,
+            pushName: source.pushName,
+            participant: source.participant,
+            chatwootMessageId: source.chatwootMessageId,
+            chatwootInboxId: source.chatwootInboxId,
+            chatwootConversationId: source.chatwootConversationId,
+            chatwootContactInboxSourceId: source.chatwootContactInboxSourceId,
+          },
+          data: {
+            chatwootMessageId: ack.id,
+            chatwootInboxId: ack.inbox_id,
+            chatwootConversationId: ack.conversation_id,
+            chatwootContactInboxSourceId: ack.contact_inbox_source_id,
+          },
+        });
+        if (updated.count !== 1) throw new Error('InboundNativeVersionChanged');
+      }
+      return { ...ack, native_source_hash: nativeHash };
+    })();
   }
 
   private async processWhatsappEvent(event: string, instance: InstanceDto, body: any) {
@@ -5141,6 +5417,14 @@ export class ChatwootService {
           }
 
           const fileData = Buffer.from(downloadBase64.base64, 'base64');
+          if (this.durableInboundBodies.has(body)) {
+            const native = nativeCachedMediaPayload(body);
+            if (
+              fileData.length !== native.size ||
+              !createHash('sha256').update(fileData).digest().equals(native.digest)
+            )
+              throw new Error('InboundNativeMediaBytesUnconfirmed');
+          }
 
           const fileStream = new Readable();
           fileStream._read = () => {};
@@ -5547,7 +5831,8 @@ export class ChatwootService {
         }
       }
     } catch (error) {
-      this.logger.error(error);
+      this.logger.error(JSON.stringify({ event: 'chatwoot_ingress_failed', errorClass: error?.name || 'Error' }));
+      if ((event === 'messages.upsert' || event === 'send.message') && this.isDurableInboundBody(body)) throw error;
     }
   }
 

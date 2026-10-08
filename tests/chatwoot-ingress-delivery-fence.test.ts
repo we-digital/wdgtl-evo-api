@@ -74,19 +74,58 @@ test('only builds keys for provider message delivery events with exact identitie
   );
 });
 
-
 test('scoped ingress keys deduplicate only the same instance, provider ID, native peer and direction', async () => {
   const fence = new ChatwootIngressDeliveryFence();
-  const key = (remoteJid: string, fromMe: boolean) => chatwootIngressDeliveryKey({
-    event: 'messages.upsert', instanceId: 'instance-1', whatsappMessageId: 'COLLISION', remoteJid, fromMe,
-  })!;
+  const key = (remoteJid: string, fromMe: boolean) =>
+    chatwootIngressDeliveryKey({
+      event: 'messages.upsert',
+      instanceId: 'instance-1',
+      whatsappMessageId: 'COLLISION',
+      remoteJid,
+      fromMe,
+    })!;
   let calls = 0;
   const deliver = async () => ++calls;
   const same = key('120363000000001@g.us', false);
-  assert.deepEqual(await Promise.all([fence.run(same, deliver), fence.run(same, deliver),
-    fence.run(key('120363000000002@g.us', false), deliver),
-    fence.run(key('120363000000001@g.us', true), deliver)]), [1, 1, 2, 3]);
+  assert.deepEqual(
+    await Promise.all([
+      fence.run(same, deliver),
+      fence.run(same, deliver),
+      fence.run(key('120363000000002@g.us', false), deliver),
+      fence.run(key('120363000000001@g.us', true), deliver),
+    ]),
+    [1, 1, 2, 3],
+  );
   assert.equal(calls, 3);
-  assert.equal(chatwootIngressDeliveryKey({ event: 'messages.upsert', instanceId: 'instance-1',
-    whatsappMessageId: 'COLLISION', remoteJid: '120363000000001@g.us' }), null);
+  assert.equal(
+    chatwootIngressDeliveryKey({
+      event: 'messages.upsert',
+      instanceId: 'instance-1',
+      whatsappMessageId: 'COLLISION',
+      remoteJid: '120363000000001@g.us',
+    }),
+    null,
+  );
+});
+
+test('undefined or null receiver outcome is never retained as a success', async () => {
+  for (const result of [null, undefined]) {
+    const fence = new ChatwootIngressDeliveryFence();
+    let attempts = 0;
+    assert.equal(
+      await fence.run('unconfirmed', async () => {
+        attempts++;
+        return result;
+      }),
+      result,
+    );
+    assert.deepEqual(
+      await fence.run('unconfirmed', async () => {
+        attempts++;
+        return { id: 9 };
+      }),
+      { id: 9 },
+    );
+    assert.equal(attempts, 2);
+  }
 });

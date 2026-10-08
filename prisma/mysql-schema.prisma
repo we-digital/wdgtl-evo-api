@@ -834,3 +834,31 @@ model EvoaiSetting {
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
 }
+
+// Durable WhatsApp -> Chatwoot delivery only. Never authorizes provider sends.
+model ChatwootInboundDelivery {
+  id                     String    @id @db.VarChar(64)
+  instanceId             String
+  instanceName           String
+  providerId             String
+  providerFingerprint    String    @db.VarChar(64)
+  accountId              Int
+  inboxId                Int?
+  peer                   String    @db.VarChar(100)
+  sourceId               String    @db.VarChar(100)
+  fromMe                 Boolean
+  payload                Json
+  payloadHash            String    @db.VarChar(64)
+  state                  String    @default("pending") @db.VarChar(32)
+  attempts               Int       @default(0)
+  nextAttemptAt          DateTime  @default(now()) @db.Timestamp
+  leaseOwner             String?   @db.VarChar(100)
+  leaseExpiresAt         DateTime? @db.Timestamp
+  lastErrorClass         String?   @db.VarChar(100)
+  result                 Json?
+  confirmedAt            DateTime? @db.Timestamp
+  createdAt              DateTime  @default(now()) @db.Timestamp
+  updatedAt              DateTime  @updatedAt @db.Timestamp
+
+  @@index([state, nextAttemptAt, leaseExpiresAt], map: "Cwi_pending_idx")
+}
