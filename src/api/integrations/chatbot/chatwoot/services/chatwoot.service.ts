@@ -736,21 +736,9 @@ export class ChatwootService {
           conversation.provider !== 'whatsapp')
       )
         throw new Error('Group conversation identity conflicts');
-      const needsBinding = !!conversation && !!destinations && !destination.bindingPresent;
-      const id =
-        conversation?.id && (dryRun || !needsBinding)
-          ? conversation.id
-          : dryRun
-            ? null
-            : await this.canonicalProviderConversation(
-                instance,
-                context.provider,
-                inbox.id,
-                group.id,
-                { key: { remoteJid: group.id } },
-                group,
-              );
-      if (conversation && id !== conversation.id) throw new Error('Group canonical conversation changed');
+      // Discovery is read-only even for an unbound existing group: a create-capable
+      // POST could race with empty-card deletion. Message ingress owns resolution.
+      const id = conversation?.id ?? null;
       results.push({ peer: group.id, subject: group.subject, conversationId: id, missing: !conversation });
     }
     return { instance: instance.instanceName, inboxId: inbox.id, dryRun, groups: results };
@@ -5098,7 +5086,16 @@ export class ChatwootService {
           return;
         }
 
-        const getConversation = await this.createConversation(instance, body);
+        // A reaction references an existing original; it cannot create a group card.
+        const getConversation =
+          reactionMessage && isGroupJid(body.key.remoteJid)
+            ? (
+                await this.getNativeEventTarget(instance, reactionMessage.key.id, {
+                  remoteJid: reactionMessage.key.remoteJid ?? body.key.remoteJid,
+                  fromMe: reactionMessage.key.fromMe,
+                })
+              )?.chatwootConversationId
+            : await this.createConversation(instance, body);
 
         if (!getConversation) {
           this.logger.warn('conversation not found');

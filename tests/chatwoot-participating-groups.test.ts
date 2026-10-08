@@ -60,7 +60,7 @@ function fixture(inboxId = 40) {
   return { service, creations: () => creations, instance: { instanceName: 'synthetic' } };
 }
 
-test('dry-run does not create and apply remains scoped to each participating inbox', async () => {
+test('roster discovery never recreates an empty card in dry-run or apply for each inbox', async () => {
   for (const inboxId of [40, 42]) {
     const f = fixture(inboxId);
     const dry = await f.service.syncParticipatingGroups(f.instance);
@@ -68,8 +68,9 @@ test('dry-run does not create and apply remains scoped to each participating inb
     assert.equal(f.creations(), 0);
     const result = await f.service.syncParticipatingGroups(f.instance, false);
     assert.equal(result.inboxId, inboxId);
-    assert.equal(result.groups[0].conversationId, inboxId * 100);
-    assert.equal(f.creations(), 1);
+    assert.equal(result.groups[0].conversationId, null);
+    assert.equal(result.groups[0].missing, true);
+    assert.equal(f.creations(), 0);
   }
 });
 
@@ -99,8 +100,9 @@ test('fresh authenticated joined-group membership works when metadata omits the 
     return { [group]: { id: group, subject: 'Synthetic group', participants: [] } };
   };
   const result = await f.service.syncParticipatingGroups(f.instance, false);
-  assert.equal(result.groups[0].conversationId, 4000);
-  assert.equal(f.creations(), 1);
+  assert.equal(result.groups[0].conversationId, null);
+  assert.equal(result.groups[0].missing, true);
+  assert.equal(f.creations(), 0);
 });
 
 test('primary history request requires current membership and a unique same-instance native anchor', async () => {
@@ -315,7 +317,7 @@ test(
   },
 );
 
-test('existing unbound group keeps its ID in dry-run and repairs only through the protected canonical apply', async () => {
+test('existing unbound group stays read-only until a real message needs canonical resolution', async () => {
   const f = fixture();
   f.service.isImportHistoryAvailable = () => true;
   const row = {
@@ -336,14 +338,14 @@ test('existing unbound group keeps its ID in dry-run and repairs only through th
   assert.equal(f.creations(), 0, 'dry-run never repairs metadata');
   const applied = await f.service.syncParticipatingGroups(f.instance, false);
   assert.equal(applied.groups[0].conversationId, 4000);
-  assert.equal(f.creations(), 1, 'only protected canonical API may install the absent binding');
+  assert.equal(f.creations(), 0, 'roster lookup must not call a create-capable resolver');
   row.binding_provider = 'whatsapp';
   row.binding_peer = group;
   await f.service.syncParticipatingGroups(f.instance, false);
-  assert.equal(f.creations(), 1, 'an exact existing binding needs no metadata write');
+  assert.equal(f.creations(), 0, 'an exact existing binding needs no metadata write');
 });
 
-test('unbound group refuses a changed canonical ID after the protected resolver', async () => {
+test('roster lookup cannot recreate an observed group through a resolver that raced with deletion', async () => {
   const f = fixture();
   f.service.isImportHistoryAvailable = () => true;
   f.service.pgClient = {
@@ -363,6 +365,75 @@ test('unbound group refuses a changed canonical ID after the protected resolver'
       ],
     }),
   };
-  f.service.canonicalProviderConversation = async () => 4001;
-  await assert.rejects(f.service.syncParticipatingGroups(f.instance, false), /canonical conversation changed/);
+  f.service.canonicalProviderConversation = async () => {
+    throw Error('create-capable resolver forbidden');
+  };
+  const result = await f.service.syncParticipatingGroups(f.instance, false);
+  assert.equal(result.groups[0].conversationId, 4000);
+});
+
+test('group reaction requires its existing original and never recreates a deleted empty card', async () => {
+  for (const destination of [null, { chatwootConversationId: 4000, chatwootMessageId: 4001 }]) {
+    const f = fixture();
+    f.service.logger = {
+      info() {},
+      warn() {},
+      error(error) {
+        throw error;
+      },
+    };
+    f.service.getConversationMessage = async () => null;
+    f.service.isMediaMessage = () => false;
+    f.service.getAdsMessage = () => ({});
+    f.service.isInteractiveButtonMessage = () => false;
+    f.service.getNativeEventTarget = async (_instance, id, key) => {
+      assert.equal(id, 'original');
+      assert.deepEqual(key, { remoteJid: group, fromMe: false });
+      return destination;
+    };
+    f.service.createConversation = () => {
+      throw Error('reaction cannot create a conversation');
+    };
+    let reactions = 0;
+    f.service.applyNativeChatwootReaction = async (_instance, conversationId) => {
+      assert.equal(conversationId, 4000);
+      reactions++;
+    };
+    await f.service.processWhatsappEvent('messages.upsert', f.instance, {
+      key: { id: 'reaction', remoteJid: group, fromMe: false },
+      message: { reactionMessage: { key: { id: 'original', remoteJid: group, fromMe: false }, text: 'synthetic' } },
+    });
+    assert.equal(reactions, destination ? 1 : 0);
+    assert.equal(f.creations(), 0);
+  }
+});
+
+test('real group ingress resolves the canonical peer rather than trusting a deleted conversation cache', async () => {
+  const f = fixture();
+  f.service.logger = {
+    warn() {},
+    error(error) {
+      throw error;
+    },
+  };
+  f.service.providerConversationsEnabled = async () => true;
+  let resolutions = 0;
+  f.service.canonicalProviderConversation = async (instance, provider, inboxId, peer, body, roster) => {
+    assert.equal(instance.instanceName, 'synthetic');
+    assert.equal(provider.accountId, '1');
+    assert.equal(inboxId, 40);
+    assert.equal(peer, group);
+    assert.equal(body.key.id, 'ordinary');
+    assert.equal(roster, undefined);
+    resolutions++;
+    return 4000;
+  };
+  f.service.cache = {
+    get() {
+      throw Error('stale legacy cache must not be used');
+    },
+  };
+  const body = { key: { id: 'ordinary', remoteJid: group, fromMe: false }, message: { conversation: 'synthetic' } };
+  assert.equal(await f.service.createConversation(f.instance, body), 4000);
+  assert.equal(resolutions, 1);
 });
