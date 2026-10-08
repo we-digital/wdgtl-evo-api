@@ -815,3 +815,15 @@ Verification: nine focused synthetic tests pass, with the optional isolated-Post
 - Focused synthetic subprocess tests cover scoped migration override, absent override, generate/dev commands, provider selection and error handling.
 
 - Recovery-only retained message-list and signed attachment GETs allow 60 seconds; write requests remain 30 seconds and tagged verification reads retain 15 seconds. Identity, SHA/size, no-redirect and response byte bounds remain unchanged. Existing literal service tests verify both read deadlines and refuse rotated source/CW/route snapshots.
+
+
+### Empty group conversations follow message ingress
+
+Group roster discovery reports missing member groups without creating empty
+conversations, including automatic connect/join/reconnect reconciliation. Existing
+canonical conversations and their bindings remain reusable; roster-only reconciliation
+does not call a create-capable resolver even when a binding is absent. Real supported message
+ingress/history resolves the account/inbox/provider peer through the existing shared
+canonical bridge after content is available. Group reactions/edits require an existing
+original destination and cannot recreate a deleted empty card. Contacts, native source
+rows, media, sessions, read cursors and history checkpoints are retained.
