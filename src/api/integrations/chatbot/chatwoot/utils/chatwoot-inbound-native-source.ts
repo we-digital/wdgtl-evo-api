@@ -35,7 +35,12 @@ function plainTransportBody(body: InboundPayload): boolean {
 
 export function resolveInboundNativeBody(sources: InboundPayload[], stored: InboundPayload): InboundPayload {
   if (sources.length >= 3) throw new Error('InboundNativeSourceAmbiguous');
-  if (plainTransportBody(stored) && stored.message.conversation.length > 0 && sources.length) {
+  if (
+    stored.key?.fromMe === false &&
+    plainTransportBody(stored) &&
+    stored.message.conversation.length > 0 &&
+    sources.length
+  ) {
     const normalizedStored = transportBytes(stored);
     // An exact provider-original snapshot must still exist, including its timestamp and transport bytes.
     const anchor = sources.some(

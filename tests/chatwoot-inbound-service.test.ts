@@ -710,3 +710,19 @@ test('transport-copy source rotation during receiver POST invalidates ACK before
   await assert.rejects(f.service.deliverQueuedInbound(f.item), /ChangedDuringDelivery/);
   assert.equal(f.updates.length, 0);
 });
+
+test('transport-copy reconciliation does not grant outgoing retries', () => {
+  const stored = {
+    key: { id: 'outbound', remoteJid: 'peer@s.whatsapp.net', fromMe: true },
+    messageType: 'conversation',
+    messageTimestamp: 1700000000,
+    status: 'READ',
+    message: {
+      conversation: 'synthetic',
+      senderKeyDistributionMessage: { axolotlSenderKeyDistributionMessage: 'AQID' },
+    },
+  };
+  const transportCopy = structuredClone(stored);
+  transportCopy.messageTimestamp += 4;
+  assert.throws(() => resolveInboundNativeBody([stored, transportCopy], stored), /Ambiguous/);
+});
