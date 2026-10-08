@@ -39,6 +39,7 @@ export function inboundPayloadHash(body: InboundPayload): string {
       body[k] ?? null,
     ]),
   );
+  // Match the ledger/native JSON representation, including installed SDK Buffer/toJSON fields.
   const stable = (v: any): any =>
     Array.isArray(v)
       ? v.map(stable)
@@ -50,7 +51,7 @@ export function inboundPayloadHash(body: InboundPayload): string {
           )
         : v;
   return createHash('sha256')
-    .update(JSON.stringify(stable(source)))
+    .update(JSON.stringify(stable(JSON.parse(JSON.stringify(source)))))
     .digest('hex');
 }
 export function inboundDeliveryId(instanceId: string, body: InboundPayload): string {

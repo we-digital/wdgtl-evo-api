@@ -277,3 +277,17 @@ test('confirmed duplicate notify does not re-create receiver', async () => {
   assert.equal(creates, 1);
   await q.stop();
 });
+
+test('installed SDK Buffer JSON serialization does not rotate frozen native source hash', () => {
+  const original = {
+    ...source(),
+    messageType: 'imageMessage',
+    message: { imageMessage: { fileSha256: Buffer.alloc(32, 7), mediaKey: Buffer.alloc(32, 9) } },
+  };
+  const persisted = JSON.parse(JSON.stringify(original));
+  const before = JSON.stringify(original);
+  assert.equal(inboundPayloadHash(original), inboundPayloadHash(persisted));
+  assert.equal(JSON.stringify(original), before);
+  persisted.message.imageMessage.fileSha256.data[0] = 8;
+  assert.notEqual(inboundPayloadHash(original), inboundPayloadHash(persisted));
+});
