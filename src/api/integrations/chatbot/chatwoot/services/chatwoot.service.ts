@@ -93,6 +93,10 @@ import {
   UnavailableOriginalEditState,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import {
+  inboundNativeSnapshot,
+  resolveInboundNativeBody,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 import { ChatwootInboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
 import {
   ChatwootInboundQueue,
@@ -5094,13 +5098,9 @@ export class ChatwootService {
       },
       take: 3,
     });
-    if (
-      sources.length >= 3 ||
-      (sources.length > 1 && new Set(sources.map((source) => inboundPayloadHash(source))).size !== 1)
-    )
-      throw new Error('InboundNativeSourceAmbiguous');
     if (sources.length === 0 && item.attempts > 0) throw new Error('InboundNativeSourceUnavailable');
-    const body = JSON.parse(JSON.stringify(sources[0] ?? item.payload));
+    const nativeSnapshot = inboundNativeSnapshot(sources);
+    const body = JSON.parse(JSON.stringify(resolveInboundNativeBody(sources, item.payload)));
     if (!this.isDurableInboundBody(body)) throw new Error('InboundNativePayloadUnavailable');
     const nativeHash = inboundPayloadHash(body);
     if (body.message?.ephemeralMessage?.message) body.message = body.message.ephemeralMessage.message;
@@ -5232,7 +5232,7 @@ export class ChatwootService {
         },
         take: 3,
       });
-      if (after.length >= 3 || after.some((source) => inboundPayloadHash(source) !== nativeHash))
+      if (after.length >= 3 || inboundNativeSnapshot(after) !== nativeSnapshot)
         throw new Error('InboundNativeSourceChangedDuringDelivery');
       for (const source of after) {
         if (

@@ -24,6 +24,11 @@ import {
   inboundPayloadHash,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 
+import {
+  inboundNativeSnapshot,
+  resolveInboundNativeBody,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
+
 import { extractWhatsappReplyStanzaId } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 import { requireTrustedChatwootUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
@@ -53,6 +58,8 @@ function literalService() {
     classifyCachedHistoryRecord,
     inboundPayloadHash,
     inboundDeliveryId,
+    inboundNativeSnapshot,
+    resolveInboundNativeBody,
     isLidJid,
     isGroupJid,
     isChatwootLinkedClientSentEvent,
@@ -590,4 +597,116 @@ test('direct/non-queued incoming and outgoing calls continue their original reso
     assert.equal(calls.resolutions, 1);
     assert.equal(f.service.inboundCanonicalContexts.has(body), false);
   }
+});
+
+for (const blank of [false, true])
+  test(`provider-original plaintext survives ${blank ? 'blank' : 'equivalent'} crypto transport copy`, async () => {
+    const f = fixture();
+    f.native.message.senderKeyDistributionMessage = {
+      groupId: f.item.peer,
+      axolotlSenderKeyDistributionMessage: 'AQID',
+    };
+    f.item.payload = structuredClone(f.native);
+    f.item.payload.message.senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = { 0: 1, 1: 2, 2: 3 };
+    f.item.payloadHash = inboundPayloadHash(f.item.payload);
+    const copy = structuredClone(f.native);
+    copy.id = 'native-B';
+    copy.messageTimestamp += 4;
+    copy.message.senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = 'BAUG';
+    if (blank) copy.message.conversation = '';
+    f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), structuredClone(copy)];
+    f.service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
+      assert.equal(body.messageTimestamp, f.item.payload.messageTimestamp);
+      assert.equal(body.message.conversation, 'synthetic');
+      f.rows = [
+        { ...f.owner(), content_attributes: { we_digital_ingress: { source_payload_sha256: f.item.payloadHash } } },
+      ];
+      return { id: 9 };
+    };
+    const ack = await f.service.deliverQueuedInbound(f.item);
+    assert.equal(ack.id, 9);
+    assert.equal(f.updates.length, 2);
+    assert.equal(f.updates[1].where.message.equals.conversation, blank ? '' : 'synthetic');
+  });
+
+test('existing plaintext destination reconciles event/native byte representation without a POST', async () => {
+  const f = fixture();
+  f.native.message.messageContextInfo = { messageSecret: 'AQID' };
+  f.item.payload = structuredClone(f.native);
+  f.item.payload.message.messageContextInfo.messageSecret = { 0: 1, 1: 2, 2: 3 };
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.rows = [
+    { ...f.owner(), content_attributes: { we_digital_ingress: { source_payload_sha256: f.item.payloadHash } } },
+  ];
+  await f.service.deliverQueuedInbound(f.item);
+  assert.equal(f.creates, 0);
+  assert.equal(f.updates.length, 1);
+});
+
+for (const [label, change] of [
+  [
+    'different text',
+    (copy: any) => {
+      copy.message.conversation = 'conflicting';
+    },
+  ],
+  [
+    'blank edit',
+    (copy: any) => {
+      copy.message.conversation = '';
+      copy.status = 'EDITED';
+    },
+  ],
+  [
+    'different author',
+    (copy: any) => {
+      copy.pushName = 'foreign';
+    },
+  ],
+  [
+    'cross peer',
+    (copy: any) => {
+      copy.key.remoteJid = 'foreign@g.us';
+    },
+  ],
+  [
+    'unknown control',
+    (copy: any) => {
+      copy.message.protocolMessage = { type: 0 };
+    },
+  ],
+] as const)
+  test(`transport reconciliation refuses ${label}`, async () => {
+    const f = fixture();
+    f.native.message.senderKeyDistributionMessage = {
+      groupId: f.item.peer,
+      axolotlSenderKeyDistributionMessage: 'AQID',
+    };
+    f.item.payload = structuredClone(f.native);
+    f.item.payloadHash = inboundPayloadHash(f.item.payload);
+    const copy = structuredClone(f.native);
+    copy.id = 'native-B';
+    change(copy);
+    f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), copy];
+    await assert.rejects(f.service.deliverQueuedInbound(f.item), /Ambiguous/);
+    assert.equal(f.creates, 0);
+    assert.equal(f.updates.length, 0);
+  });
+
+test('transport-copy source rotation during receiver POST invalidates ACK before any native pointer CAS', async () => {
+  const f = fixture();
+  f.native.message.senderKeyDistributionMessage = { groupId: f.item.peer, axolotlSenderKeyDistributionMessage: 'AQID' };
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  const copy = structuredClone(f.native);
+  copy.id = 'native-B';
+  copy.messageTimestamp += 4;
+  f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), structuredClone(copy)];
+  f.service.processWhatsappEvent = async () => {
+    f.rows = [f.owner()];
+    copy.messageTimestamp++;
+    return { id: 9 };
+  };
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /ChangedDuringDelivery/);
+  assert.equal(f.updates.length, 0);
 });
