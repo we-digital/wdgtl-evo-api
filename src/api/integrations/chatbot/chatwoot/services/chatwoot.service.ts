@@ -227,6 +227,19 @@ interface ChatwootClientContext {
   provider: ChatwootModel;
 }
 
+interface InboundCanonicalContext {
+  instanceId: string;
+  instanceName: string;
+  providerFingerprint: string;
+  accountId: number;
+  inboxId: number;
+  peer: string;
+  sourceId: string;
+  sourceHash: string;
+  conversationId: number;
+  routeBinding: ChatwootEvoRouteBinding;
+}
+
 interface AuthenticatedChatwootClientContext extends ChatwootClientContext {
   instance: InstanceDto;
 }
@@ -251,6 +264,7 @@ export class ChatwootService {
   private readonly inboundStore: ChatwootInboundPrismaStore;
   private readonly inboundQueue: ChatwootInboundQueue;
   private readonly durableInboundBodies = new WeakSet<object>();
+  private readonly inboundCanonicalContexts = new WeakMap<object, InboundCanonicalContext>();
   private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
 
   // Lock polling delay
@@ -5183,10 +5197,24 @@ export class ChatwootService {
       if (before.length) ack = confirm(before);
       else {
         this.durableInboundBodies.add(body);
+        if (!item.fromMe)
+          this.inboundCanonicalContexts.set(body, {
+            instanceId: item.instanceId,
+            instanceName: item.instanceName,
+            providerFingerprint: item.providerFingerprint,
+            accountId: item.accountId,
+            inboxId: Number(inbox.id),
+            peer,
+            sourceId: item.sourceId,
+            sourceHash,
+            conversationId,
+            routeBinding: expected,
+          });
         let sent;
         try {
           sent = await this.processWhatsappEvent('messages.upsert', instance, body);
         } finally {
+          this.inboundCanonicalContexts.delete(body);
           this.durableInboundBodies.delete(body);
         }
         if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
@@ -5240,6 +5268,31 @@ export class ChatwootService {
       }
       return { ...ack, native_source_hash: nativeHash };
     })();
+  }
+
+  private requestInboundConversation(instance: InstanceDto, provider: ChatwootModel, body: any): number | null {
+    const context = this.inboundCanonicalContexts?.get(body);
+    if (!context) return null;
+    const peer = toCanonicalHistoryJid(
+      body.key.remoteJidAlt && isLidJid(body.key.remoteJid) ? body.key.remoteJidAlt : body.key.remoteJid,
+    );
+    const binding = this.buildEvoRouteBinding(instance, provider, context.inboxId);
+    if (
+      !this.durableInboundBodies.has(body) ||
+      body.key.fromMe !== false ||
+      instance.instanceId !== context.instanceId ||
+      instance.instanceName !== context.instanceName ||
+      !provider.enabled ||
+      Number(provider.accountId) !== context.accountId ||
+      this.inboundProviderFingerprint(provider) !== context.providerFingerprint ||
+      this.waMonitor.waInstances[instance.instanceName]?.connectionStatus?.state !== 'open' ||
+      peer !== context.peer ||
+      'WAID:' + body.key.id !== context.sourceId ||
+      inboundPayloadHash(body) !== context.sourceHash ||
+      !chatwootEvoRouteBindingsEqual(binding, context.routeBinding)
+    )
+      throw new Error('InboundRequestCanonicalChanged');
+    return context.conversationId;
   }
 
   private async processWhatsappEvent(event: string, instance: InstanceDto, body: any) {
@@ -5371,7 +5424,8 @@ export class ChatwootService {
                   fromMe: reactionMessage.key.fromMe,
                 })
               )?.chatwootConversationId
-            : await this.createConversation(instance, body);
+            : (this.requestInboundConversation(instance, provider, body) ??
+              (await this.createConversation(instance, body)));
 
         if (!getConversation) {
           this.logger.warn('conversation not found');

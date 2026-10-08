@@ -8,16 +8,23 @@ import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import { formatWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
-import { isLidJid, toCanonicalHistoryJid } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import {
+  isGroupJid,
+  isLidJid,
+  toCanonicalHistoryJid,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { ChatwootIngressDeliveryFence } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-delivery-fence';
 import {
   chatwootEvoRouteBindingsEqual,
   extractChatwootIngressMentionJids,
+  isChatwootLinkedClientSentEvent,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
   inboundDeliveryId,
   inboundPayloadHash,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
+
+import { extractWhatsappReplyStanzaId } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 import { requireTrustedChatwootUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
 
@@ -28,9 +35,14 @@ function literalService() {
   );
   const file = ts.createSourceFile('service.ts', source, ts.ScriptTarget.Latest, true);
   const klass = file.statements.find(ts.isClassDeclaration)!;
-  const methods = ['isDurableInboundBody', 'inboundProviderFingerprint', 'deliverQueuedInbound', 'createMessage'].map(
-    (name) => klass.members.find((m) => m.name?.getText(file) === name)!.getText(file),
-  );
+  const methods = [
+    'isDurableInboundBody',
+    'inboundProviderFingerprint',
+    'deliverQueuedInbound',
+    'requestInboundConversation',
+    'createMessage',
+    'processWhatsappEvent',
+  ].map((name) => klass.members.find((m) => m.name?.getText(file) === name)!.getText(file));
   const js = ts.transpileModule(`module.exports=class Consumer {${methods.join('\n')}}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
@@ -42,10 +54,15 @@ function literalService() {
     inboundPayloadHash,
     inboundDeliveryId,
     isLidJid,
+    isGroupJid,
+    isChatwootLinkedClientSentEvent,
+    extractWhatsappReplyStanzaId,
+    isChatwootOutboundEcho: async () => false,
     toCanonicalHistoryJid,
     chatwootEvoRouteBindingsEqual,
     formatWhatsappGroupContent,
     extractChatwootIngressMentionJids,
+    isChatwootLinkedClientSentEvent,
     Prisma: { AnyNull: 'synthetic-any-null' },
     requireTrustedChatwootUrl,
     axios: { post: async (..._args: any[]) => ({ data: { id: 9 } }) },
@@ -59,6 +76,11 @@ function literalService() {
 }
 function fixture() {
   const service = literalService();
+  const literalProcess = service.processWhatsappEvent;
+  service.logger = { info() {}, warn() {}, error() {} };
+  service.getAdsMessage = () => ({});
+  service.getReactionMessage = () => null;
+  service.isInteractiveButtonMessage = () => false;
   const peer = '120363000000000000@g.us';
   const native: any = {
     id: 'native-A',
@@ -160,6 +182,7 @@ function fixture() {
   service.isMediaMessage = (msg: any) => Boolean(msg.imageMessage || msg.documentMessage);
   service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
   service.durableInboundBodies = new WeakSet();
+  service.inboundCanonicalContexts = new WeakMap();
   service.pgClient = {
     query: async (sql: string, params: any[]) => {
       queries.push({ sql, params });
@@ -172,12 +195,14 @@ function fixture() {
   };
   service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
     assert.equal(service.durableInboundBodies.has(body), true);
+    assert.equal(service.requestInboundConversation({ instanceId: 'one', instanceName: 'one' }, provider, body), 77);
     creates++;
     rows = [owner()];
     return { id: 9 };
   };
   return {
     service,
+    literalProcess,
     item,
     native,
     provider,
@@ -381,3 +406,188 @@ for (const mode of ['ack', 'timeout', '502'])
     assert.equal(posts, 1);
     assert.equal(binds, 0);
   });
+
+function useLiteralProcess(f: ReturnType<typeof fixture>) {
+  let resolutions = 0;
+  let writes = 0;
+  let deliveredBody: any;
+  f.service.createConversation = async () => {
+    resolutions++;
+    return 77;
+  };
+  f.service.clientCw = async () => ({ client: {}, provider: f.provider });
+  f.service.processWhatsappEvent = f.literalProcess;
+  f.service.createMessage = async (
+    _instance: any,
+    conversation: number,
+    content: string,
+    direction: string,
+    _private: boolean,
+    _tags: any,
+    body: any,
+    sourceId: string,
+  ) => {
+    assert.equal(conversation, 77);
+    assert.equal(content, f.owner().content);
+    assert.equal(direction, 'incoming');
+    assert.equal(sourceId, 'WAID:A');
+    deliveredBody = body;
+    writes++;
+    f.rows = [f.owner()];
+    return { id: 9 };
+  };
+  return {
+    get resolutions() {
+      return resolutions;
+    },
+    get writes() {
+      return writes;
+    },
+    get deliveredBody() {
+      return deliveredBody;
+    },
+  };
+}
+
+test('literal incoming consumer resolves once and preserves owner/native post-ACK checks', async () => {
+  const f = fixture();
+  const calls = useLiteralProcess(f);
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(calls.resolutions, 1);
+  assert.equal(calls.writes, 1);
+  assert.equal(f.queries.length, 2);
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.service.inboundCanonicalContexts.has(calls.deliveredBody), false);
+});
+
+for (const [label, mutate] of [
+  [
+    'provider account',
+    (f: any, _body: any) => {
+      f.provider.accountId = '2';
+    },
+  ],
+  [
+    'provider route',
+    (f: any, _body: any) => {
+      f.provider.nameInbox = 'moved';
+    },
+  ],
+  [
+    'registered receiver',
+    (f: any, _body: any) => {
+      f.service.buildEvoRouteBinding = () => ({
+        version: 1,
+        provider: 'evo_whatsapp',
+        inbox_id: 42,
+        instance_id: 'one',
+        instance_name: 'one',
+        receiver_fingerprint: 'b'.repeat(64),
+      });
+    },
+  ],
+  [
+    'receiver disconnected',
+    (f: any, _body: any) => {
+      f.service.waMonitor.waInstances.one.connectionStatus.state = 'close';
+    },
+  ],
+  [
+    'native peer',
+    (_f: any, body: any) => {
+      body.key.remoteJid = '120363999999999999@g.us';
+    },
+  ],
+  [
+    'native direction',
+    (_f: any, body: any) => {
+      body.key.fromMe = true;
+    },
+  ],
+  [
+    'native source',
+    (_f: any, body: any) => {
+      body.key.id = 'OTHER';
+    },
+  ],
+  [
+    'native version',
+    (_f: any, body: any) => {
+      body.message.conversation = 'changed';
+    },
+  ],
+] as const)
+  test(`request-local ${label} rotation refuses before POST, never reuses a changed context`, async () => {
+    const f = fixture();
+    const calls = useLiteralProcess(f);
+    let received: any;
+    f.service.processWhatsappEvent = async function (event: string, instance: any, body: any) {
+      received = body;
+      mutate(f, body);
+      return f.literalProcess.call(this, event, instance, body);
+    };
+    await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundRequestCanonicalChanged/);
+    assert.equal(calls.resolutions, 1);
+    assert.equal(calls.writes, 0);
+    assert.equal(f.updates.length, 0);
+    assert.equal(f.service.inboundCanonicalContexts.has(received), false);
+  });
+
+test('retry after lost ACK discards the request context and resolves again before alias readback', async () => {
+  const f = fixture();
+  const calls = useLiteralProcess(f);
+  let delivered: any;
+  f.service.createMessage = async (
+    _instance: any,
+    _conversation: number,
+    _content: string,
+    _direction: string,
+    _private: boolean,
+    _tags: any,
+    body: any,
+  ) => {
+    delivered = body;
+    f.rows = [f.owner()];
+    throw new Error('lost ACK');
+  };
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /lost ACK/);
+  assert.equal(f.service.inboundCanonicalContexts.has(delivered), false);
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(calls.resolutions, 2);
+});
+
+test('a cloned body or another receiver cannot inherit request-local canonical authority', async () => {
+  const f = fixture();
+  let received: any;
+  f.service.processWhatsappEvent = async function (_event: string, instance: any, body: any) {
+    received = body;
+    assert.equal(this.requestInboundConversation(instance, f.provider, structuredClone(body)), null);
+    assert.throws(
+      () => this.requestInboundConversation({ ...instance, instanceId: 'other' }, f.provider, body),
+      /InboundRequestCanonicalChanged/,
+    );
+    assert.throws(
+      () => this.requestInboundConversation({ ...instance, instanceName: 'other' }, f.provider, body),
+      /InboundRequestCanonicalChanged/,
+    );
+    f.rows = [f.owner()];
+    return { id: 9 };
+  };
+  await f.service.deliverQueuedInbound(f.item);
+  assert.equal(f.service.inboundCanonicalContexts.has(received), false);
+});
+
+test('direct/non-queued incoming and outgoing calls continue their original resolver path', async () => {
+  for (const fromMe of [false, true]) {
+    const f = fixture();
+    const calls = useLiteralProcess(f);
+    const body = structuredClone(f.native);
+    body.key.fromMe = fromMe;
+    f.service.createMessage = async () => ({ id: 9 });
+    await f.service.processWhatsappEvent('messages.upsert', { instanceId: 'one', instanceName: 'one' }, body);
+    assert.equal(calls.resolutions, 1);
+    assert.equal(f.service.inboundCanonicalContexts.has(body), false);
+  }
+});
