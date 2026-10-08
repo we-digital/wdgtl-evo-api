@@ -813,3 +813,5 @@ Verification: nine focused synthetic tests pass, with the optional isolated-Post
 - `runWithProvider.js` accepts an optional `DATABASE_MIGRATION_CONNECTION_URI` only for `npx prisma migrate deploy`; application and client-generation connection environments stay unchanged.
 - This avoids session advisory locks on transaction poolers without disabling migration locking or rewriting configured connection URLs. The deployment script no longer prints a database URL.
 - Focused synthetic subprocess tests cover scoped migration override, absent override, generate/dev commands, provider selection and error handling.
+
+- Recovery-only retained message-list and signed attachment GETs allow 60 seconds; write requests remain 30 seconds and tagged verification reads retain 15 seconds. Identity, SHA/size, no-redirect and response byte bounds remain unchanged. Existing literal service tests verify both read deadlines and refuse rotated source/CW/route snapshots.

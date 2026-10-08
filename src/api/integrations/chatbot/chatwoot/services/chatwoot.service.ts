@@ -2371,7 +2371,7 @@ export class ChatwootService {
             'api-access-token': provider.token,
             'X-Chatwoot-Native-Bridge-Token': trusted.NATIVE_BRIDGE_TOKEN,
           },
-          timeout: 15_000,
+          timeout: 60_000,
           maxRedirects: 0,
           maxContentLength: 1024 * 1024,
         });
@@ -2380,7 +2380,7 @@ export class ChatwootService {
           method: 'GET',
           url,
           responseType: 'arraybuffer',
-          timeout: 15_000,
+          timeout: 60_000,
           maxRedirects: 0,
           maxContentLength: limit,
         });
