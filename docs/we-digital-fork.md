@@ -807,3 +807,11 @@ Verification: 44 focused synthetic album/format cases, including actual installe
 The scoped bulk roster lookup now retains whether an existing conversation has an exact provider binding. Apply routes an unbound existing group through the protected canonical resolver and requires the same conversation ID; dry-run and already bound groups do not write metadata. Authenticated joined-group membership, account/inbox/contact/peer checks and conflict refusal remain unchanged. No messages, source payloads or provider sends are created, and no schema change is required.
 
 Verification: nine focused synthetic tests pass, with the optional isolated-PostgreSQL case not enabled; the new cases cover dry-run, unbound repair, bound reuse and rotated canonical ID refusal. TypeScript, scoped source ESLint and formatting pass.
+
+### 2026-10-08 — Direct migration connection
+
+- `runWithProvider.js` accepts an optional `DATABASE_MIGRATION_CONNECTION_URI` only for `npx prisma migrate deploy`; application and client-generation connection environments stay unchanged.
+- This avoids session advisory locks on transaction poolers without disabling migration locking or rewriting configured connection URLs. The deployment script no longer prints a database URL.
+- Focused synthetic subprocess tests cover scoped migration override, absent override, generate/dev commands, provider selection and error handling.
+
+- Recovery-only retained message-list and signed attachment GETs allow 60 seconds; write requests remain 30 seconds and tagged verification reads retain 15 seconds. Identity, SHA/size, no-redirect and response byte bounds remain unchanged. Existing literal service tests verify both read deadlines and refuse rotated source/CW/route snapshots.

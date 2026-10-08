@@ -298,6 +298,7 @@ test('literal service reuses proxy bytes and rejects native, CW or route rotatio
   axios.request = (async (request: any) => {
     assert.equal(request.method, 'GET');
     assert.equal(request.maxRedirects, 0);
+    assert.equal(request.timeout, 60_000);
     if (request.responseType === 'arraybuffer') {
       proxyReads++;
       assert.equal(request.maxContentLength, bytes.length);
