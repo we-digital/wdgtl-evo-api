@@ -73,6 +73,10 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       'midQualityFileSha256',
       'interactiveAnnotations',
       'imageSourceType',
+      'jpegThumbnail',
+      'thumbnailSha256',
+      'thumbnailEncSha256',
+      'thumbnailDirectPath',
     ]) &&
     value.mimetype === 'image/jpeg' &&
     (value.imageSourceType === undefined || [0, 1, 2, 3].includes(value.imageSourceType)) &&
@@ -98,7 +102,25 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       (name) => value[name] === undefined || Array.isArray(value[name]),
     ) &&
     (value.scansSidecar === undefined || typeof value.scansSidecar === 'string') &&
-    (value.midQualityFileSha256 === undefined || bytes32(value.midQualityFileSha256))
+    (value.midQualityFileSha256 === undefined || bytes32(value.midQualityFileSha256)) &&
+    (value.jpegThumbnail === undefined ||
+      (typeof value.jpegThumbnail === 'string' &&
+        Buffer.from(value.jpegThumbnail, 'base64').toString('base64') === value.jpegThumbnail &&
+        Buffer.from(value.jpegThumbnail, 'base64').length >= 5 &&
+        Buffer.from(value.jpegThumbnail, 'base64').length <= 16384 &&
+        Buffer.from(value.jpegThumbnail, 'base64')
+          .subarray(0, 3)
+          .equals(Buffer.from([0xff, 0xd8, 0xff])) &&
+        Buffer.from(value.jpegThumbnail, 'base64')
+          .subarray(-2)
+          .equals(Buffer.from([0xff, 0xd9])))) &&
+    ([value.thumbnailSha256, value.thumbnailEncSha256, value.thumbnailDirectPath].every((v) => v === undefined) ||
+      (bytes32(value.thumbnailSha256) &&
+        bytes32(value.thumbnailEncSha256) &&
+        typeof value.thumbnailDirectPath === 'string' &&
+        value.thumbnailDirectPath.startsWith('/') &&
+        !value.thumbnailDirectPath.startsWith('//') &&
+        !/[\\\s]/.test(value.thumbnailDirectPath)))
   );
 }
 
@@ -364,13 +386,22 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
       image: hydrated.imageMessage,
     };
   }
-  // Text-only CTA templates retain their source metadata; no media or actions are executed.
+  // A typed JPEG header uses the same authenticated file path as ordinary images.
+  // Retain the footer and full native flow; actions and thumbnail pointers are never executed.
+  const imageHeader =
+    hydrated === undefined &&
+    object(interactive) &&
+    object(interactive.header) &&
+    interactive.header.hasMediaAttachment === true &&
+    interactive.header.videoMessage === undefined &&
+    retainedNativeJPEGDescriptor(interactive.header.imageMessage);
+  // Text and typed JPEG CTA templates retain their exact visible content and native metadata.
   if (
     hydrated === undefined &&
     object(interactive) &&
     object(interactive.header) &&
-    interactive.header.hasMediaAttachment !== true &&
-    interactive.header.imageMessage === undefined &&
+    (imageHeader ||
+      (interactive.header.hasMediaAttachment !== true && interactive.header.imageMessage === undefined)) &&
     interactive.header.videoMessage === undefined
   ) {
     const header = interactive.header;
@@ -383,9 +414,9 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
       !only(interactive.body, ['text']) ||
       typeof interactive.body.text !== 'string' ||
       !interactive.body.text ||
-      !only(header, ['title', 'hasMediaAttachment']) ||
+      !only(header, imageHeader ? ['title', 'hasMediaAttachment', 'imageMessage'] : ['title', 'hasMediaAttachment']) ||
       (header.title !== undefined && typeof header.title !== 'string') ||
-      (header.hasMediaAttachment !== undefined && header.hasMediaAttachment !== false) ||
+      (!imageHeader && header.hasMediaAttachment !== undefined && header.hasMediaAttachment !== false) ||
       (footer !== undefined && (!object(footer) || !only(footer, ['text']) || typeof footer.text !== 'string')) ||
       !object(flow) ||
       !only(flow, ['buttons', 'messageParamsJson']) ||
@@ -445,10 +476,19 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
     )
       throw new Error('Retained text template actions are unsupported');
     return {
-      text: [header.title, interactive.body.text, footer?.text, `${button.display_text}: ${button.url}`]
+      text: [
+        header.title,
+        interactive.body.text,
+        ...(imageHeader && header.imageMessage.caption && header.imageMessage.caption !== interactive.body.text
+          ? [header.imageMessage.caption]
+          : []),
+        footer?.text,
+        `${button.display_text}: ${button.url}`,
+      ]
         .filter(Boolean)
         .join('\n'),
       metadata: { template_id: template.templateId, header, body: interactive.body, footer, native_flow: flow },
+      ...(imageHeader ? { image: header.imageMessage } : {}),
     };
   }
   if (
