@@ -827,3 +827,29 @@ ingress/history resolves the account/inbox/provider peer through the existing sh
 canonical bridge after content is available. Group reactions/edits require an existing
 original destination and cannot recreate a deleted empty card. Contacts, native source
 rows, media, sessions, read cursors and history checkpoints are retained.
+
+### Durable native inbound delivery (281)
+
+Supported native ordinary live notifications are persisted in a separate
+`ChatwootInboundDelivery` ledger before Chatwoot access. Failed or unknown receiver
+outcomes remain pending and retry after 20 seconds with two background receiver
+writers. An atomic process lease, renewal and database receipt preserve pending
+work across process restart. This is an inbound Chatwoot bridge, not the WhatsApp
+outbound queue; it makes no WhatsApp sends or automatic replies.
+
+Every retry verifies the original instance/provider route and connected native
+session, rereads the latest exact native peer/source/direction payload, resolves
+its canonical account/inbox conversation and queries indexed scoped source aliases
+before any message POST. A unique matching destination can satisfy a lost ACK;
+foreign, private, changed, deleted, ambiguous or missing-media destinations remain
+pending. Native back-pointers use exact source-version CAS after receiver readback;
+source content, cache/history processed markers and native records are retained.
+Successful-only in-memory delivery receipts no longer cache empty results.
+
+Both supported database provider schemas add the same ledger and pending index.
+Production deployment runs the stock migration through the configured direct
+migration connection; application pool/session credentials are unchanged. Focused
+synthetic cases cover timeout/502/restart/lost ACK, multi-inbox groups, source edits,
+route changes and identity conflicts. An isolated PostgreSQL test exercises the
+actual generated Prisma delegate, concurrent claims, expired leases, inbox CAS,
+receipt owner checks and persistent source JSON.

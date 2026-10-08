@@ -31,6 +31,10 @@ export class ChatwootIngressDeliveryFence {
     const delivery = Promise.resolve()
       .then(deliver)
       .then((result) => {
+        if (result === null || result === undefined) {
+          if (this.deliveries.get(key) === delivery) this.deliveries.delete(key);
+          return result;
+        }
         const timer = setTimeout(() => {
           if (this.deliveries.get(key) === delivery) this.deliveries.delete(key);
         }, this.successTtlMs);
