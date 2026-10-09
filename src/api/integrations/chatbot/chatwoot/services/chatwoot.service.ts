@@ -5750,7 +5750,7 @@ export class ChatwootService {
           sourceId: toChatwootSourceId(body.key.id),
           direction: (message.key as WAMessageKey).fromMe ? 'outgoing' : 'incoming',
         });
-        return;
+        return { providerEditApplied: true };
       }
 
       if (event === 'messages.read') {
@@ -5886,6 +5886,7 @@ export class ChatwootService {
       }
     } catch (error) {
       this.logger.error(JSON.stringify({ event: 'chatwoot_ingress_failed', errorClass: error?.name || 'Error' }));
+      if (event === 'messages.edit' || event === 'send.message.update') throw error;
       if ((event === 'messages.upsert' || event === 'send.message') && this.isDurableInboundBody(body)) throw error;
     }
   }

@@ -1,3 +1,5 @@
+import { isDeepStrictEqual } from 'node:util';
+
 import { getCollectionsDto } from '@api/dto/business.dto';
 import { OfferCallDto } from '@api/dto/call.dto';
 import {
@@ -100,7 +102,7 @@ import { BadRequestException, InternalServerErrorException, NotFoundException } 
 import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
-import { Instance, Message } from '@prisma/client';
+import { Instance, Message, Prisma } from '@prisma/client';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { formatCaughtError } from '@utils/formatCaughtError';
@@ -178,6 +180,15 @@ import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
 import { expiredNativeMediaStatus, refreshExpiredNativeMedia } from './native-media-refresh';
+import {
+  LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP,
+  nativeWhatsappEditIdentity,
+  NativeWhatsappEditQueue,
+  nativeWhatsappEditVersion,
+  normalizedWhatsappEdit,
+  projectNativeWhatsappEdit,
+  qualifyNativeWhatsappEditKey,
+} from './normalized-whatsapp-edit';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 import {
@@ -256,6 +267,7 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 }
 
 export class BaileysStartupService extends ChannelStartupService {
+  private readonly nativeEditQueue = new NativeWhatsappEditQueue();
   private messageProcessor = new BaileysMessageProcessor();
   private readonly groupSenderKeyRepairs = new WeakMap<
     WASocket,
@@ -572,6 +584,121 @@ export class BaileysStartupService extends ChannelStartupService {
     if (connection === 'connecting') {
       this.sendDataWebhook(Events.CONNECTION_UPDATE, { instance: this.instance.name, ...this.stateConnection });
     }
+  }
+
+  private async applyNativeWhatsappEdit(key: unknown, body: unknown, timestamp: number): Promise<void> {
+    const edit = normalizedWhatsappEdit(key, body, timestamp);
+    const rows = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: this.instanceId,
+        AND: [
+          { key: { path: ['id'], equals: edit.key.id } },
+          { key: { path: ['fromMe'], equals: edit.key.fromMe } },
+          {
+            OR: [
+              { key: { path: ['remoteJid'], equals: edit.key.remoteJid } },
+              { key: { path: ['remoteJidAlt'], equals: edit.key.remoteJid } },
+            ],
+          },
+        ],
+      },
+      take: 2,
+    });
+    if (rows.length !== 1) throw new Error('Native normalized edit source is missing or ambiguous');
+    qualifyNativeWhatsappEditKey(rows[0].key as Record<string, any>, edit.key);
+    const identity = nativeWhatsappEditIdentity(this.instanceId, { ...edit, key: rows[0].key as any });
+    await this.nativeEditQueue.run(identity, async () => {
+      const fresh = await this.prismaRepository.message.findMany({
+        where: { id: rows[0].id, instanceId: this.instanceId },
+        take: 2,
+      });
+      if (fresh.length !== 1 || !isDeepStrictEqual(fresh[0].key, rows[0].key))
+        throw new Error('Native normalized edit source identity changed before persistence');
+      const source = fresh[0];
+      const sourceKey = source.key as Record<string, any>;
+      qualifyNativeWhatsappEditKey(sourceKey, edit.key);
+      if (source.contextInfo && (typeof source.contextInfo !== 'object' || Array.isArray(source.contextInfo)))
+        throw new Error('Native normalized edit original context is unavailable');
+      const context = (source.contextInfo || {}) as Record<string, any>;
+      const lastEdit = context[LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP];
+      if (lastEdit !== undefined && (!Number.isSafeInteger(lastEdit) || lastEdit <= 0))
+        throw new Error('Native normalized edit previous epoch is unavailable');
+      if (Number.isSafeInteger(lastEdit) && edit.timestamp < lastEdit) return;
+      const message = projectNativeWhatsappEdit(source.message as Record<string, any>, edit);
+      const version = nativeWhatsappEditVersion(edit);
+      const cacheKey = `native_edit_${createHash('sha256').update(identity).digest('hex')}`;
+      if (
+        (await this.baileysCache.get(cacheKey)) === version &&
+        lastEdit === edit.timestamp &&
+        isDeepStrictEqual(source.message, message)
+      )
+        return;
+      const previous = await this.prismaRepository.messageUpdate.findFirst({
+        where: { messageId: source.id, instanceId: this.instanceId, status: 'EDITED' },
+      });
+      const originalTimestamp = originalWhatsappTimestamp(source, !!previous || source.status === 'EDITED');
+      if (!originalTimestamp) throw new Error('Native normalized edit original timestamp is unavailable');
+      if (!isDeepStrictEqual(source.message, message) || !previous || lastEdit !== edit.timestamp) {
+        await this.prismaRepository.$transaction(async (transaction) => {
+          const saved = await transaction.message.updateMany({
+            where: {
+              id: source.id,
+              instanceId: this.instanceId,
+              key: { equals: source.key },
+              message: { equals: source.message },
+              contextInfo: { equals: source.contextInfo ?? Prisma.DbNull },
+              messageTimestamp: source.messageTimestamp,
+              status: source.status,
+            },
+            data: {
+              message,
+              contextInfo: {
+                ...context,
+                [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp,
+                [LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP]: edit.timestamp,
+              },
+              status: 'EDITED',
+            },
+          });
+          if (saved.count !== 1) throw new Error('Native normalized edit source changed before persistence');
+          await transaction.messageUpdate.create({
+            data: {
+              fromMe: edit.key.fromMe,
+              keyId: edit.key.id,
+              remoteJid: sourceKey.remoteJid,
+              status: 'EDITED',
+              instanceId: this.instanceId,
+              messageId: source.id,
+            },
+          });
+        });
+      }
+      let destinationAcknowledged = false;
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+        const result = await this.chatwootService.eventWhatsapp(
+          'messages.edit',
+          { instanceName: this.instance.name, instanceId: this.instanceId },
+          { key: sourceKey, editedMessage: edit.message },
+        );
+        if (!(result as any)?.providerEditApplied)
+          throw new Error('Native normalized edit Chatwoot ACK is unavailable');
+        destinationAcknowledged = true;
+      }
+      const current = await this.prismaRepository.message.findMany({
+        where: { id: source.id, instanceId: this.instanceId },
+        take: 2,
+      });
+      if (
+        current.length !== 1 ||
+        !isDeepStrictEqual(current[0].key, source.key) ||
+        current[0].messageTimestamp !== source.messageTimestamp ||
+        !isDeepStrictEqual(current[0].message, message) ||
+        (current[0].contextInfo as any)?.[LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP] !== edit.timestamp
+      )
+        throw new Error('Native normalized edit source changed before ACK');
+      await this.sendDataWebhook(Events.MESSAGES_EDITED, { key: sourceKey, editedMessage: edit.message });
+      if (destinationAcknowledged) await this.baileysCache.set(cacheKey, version, this.UPDATE_CACHE_TTL_SECONDS);
+    });
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
@@ -1278,50 +1405,17 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
 
           if (editedMessage) {
-            await this.sendDataWebhook(Events.MESSAGES_EDITED, editedMessage);
-
             if (received.key?.id && editedMessage.key?.id) {
               await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
             }
 
-            const oldMessage = await this.getMessage(editedMessage.key, true);
-            if ((oldMessage as any)?.id) {
-              const previousEdit = await this.prismaRepository.messageUpdate.findFirst({
-                where: { messageId: (oldMessage as any).id, instanceId: this.instanceId, status: 'EDITED' },
-              });
-              const originalTimestamp = originalWhatsappTimestamp(
-                oldMessage,
-                !!previousEdit || (oldMessage as any).status === 'EDITED',
-              );
-
-              await this.prismaRepository.message.update({
-                where: { id: (oldMessage as any).id },
-                data: {
-                  message: editedMessage.editedMessage as any,
-                  contextInfo: {
-                    ...((oldMessage as any).contextInfo || {}),
-                    ...(originalTimestamp ? { [ORIGINAL_WHATSAPP_TIMESTAMP]: originalTimestamp } : {}),
-                  },
-                  status: 'EDITED',
-                },
-              });
-              await this.prismaRepository.messageUpdate.create({
-                data: {
-                  fromMe: editedMessage.key.fromMe,
-                  keyId: editedMessage.key.id,
-                  remoteJid: editedMessage.key.remoteJid,
-                  status: 'EDITED',
-                  instanceId: this.instanceId,
-                  messageId: (oldMessage as any).id,
-                },
-              });
-            }
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled)
-              await this.chatwootService.eventWhatsapp(
-                'messages.edit',
-                { instanceName: this.instance.name, instanceId: this.instance.id },
-                editedMessage,
-              );
+            await this.applyNativeWhatsappEdit(
+              editedMessage.key,
+              editedMessage.editedMessage,
+              editedMessage.timestampMs
+                ? Math.floor(Number(editedMessage.timestampMs) / 1000)
+                : Number(received.messageTimestamp),
+            );
           }
 
           if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
@@ -1750,6 +1844,17 @@ export class BaileysStartupService extends ChannelStartupService {
 
       for await (const { key, update } of args) {
         if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
+          continue;
+        }
+
+        // Baileys normalizes protocol edits into this event, with no delivery status.
+        // They must not share the status/timestamp dedup key below.
+        if (update.message?.editedMessage) {
+          await this.applyNativeWhatsappEdit(
+            key,
+            update.message.editedMessage.message,
+            Number(update.messageTimestamp),
+          );
           continue;
         }
 
