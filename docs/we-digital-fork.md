@@ -879,3 +879,30 @@ synthetic cases cover timeout/502/restart/lost ACK, multi-inbox groups, source e
 route changes and identity conflicts. An isolated PostgreSQL test exercises the
 actual generated Prisma delegate, concurrent claims, expired leases, inbox CAS,
 receipt owner checks and persistent source JSON.
+
+
+### 2026-10-09 — Native client edits normalized by Baileys
+
+The pinned SDK emits client edits as `messages.update` with `message.editedMessage`.
+Handle this shape before delivery-status dedup and share the guarded native edit
+adapter with protocol-edit upserts. Resolve one original by instance, source key,
+direction and exact peer, allowing only the original's explicit typed PN/LID aliases.
+Serialize edits by the original native identity; same-second different bodies remain
+ordered, stale edit epochs cannot replace newer content, and success dedup requires
+both native persistence and a real Chatwoot edit ACK. Edit-specific receiver failures
+propagate rather than being swallowed; no client or ACK leaves the event retryable.
+
+Replace only native visible text/caption, preserving original timestamp, native key,
+secret/context, media descriptors, reply metadata, read state and destination mappings.
+Empty media captions are valid; unavailable text or changed file authority refuses.
+The existing privileged Chatwoot edit endpoint retains `skip_native: true`, updates
+Edited attributes/realtime, and performs no WhatsApp send. No dependency, schema,
+history marker or scheduler change is required.
+
+Reapply the helper, update/upsert dispatch and edit-specific ACK handling together.
+Run `tests/whatsapp-normalized-edit.test.ts`, `tests/chatwoot-provider-edit.test.ts`
+and `tests/whatsapp-edit-restrictions.test.ts`, plus the pinned build/lint. Tests use
+the literal SDK registration and callbacks with synthetic persistence/receiver
+failures, exact aliases, 64-bit file sizes and original metadata preservation.
+Rollback restores the previous handler implementation without changing retained
+native rows or files; already persisted edit timestamps remain contextual metadata.
