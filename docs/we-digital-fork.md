@@ -1,3 +1,9 @@
+## History bindings for acknowledged multipart sends (2026-10-11)
+
+History recovery resolves a secondary outgoing WhatsApp ID through the exact retained multipart delivery acknowledgements of its existing Chatwoot owner. It requires a public outgoing message, complete canonical acknowledgement set, exact source membership, account/inbox scope, canonical peer locks and unchanged native source/version. Ordinary aliases retain their uniqueness checks; any new conflicting alias, private/foreign target or unproved acknowledgement refuses.
+
+Only native binding pointers can change. Message bodies, files, delivery acknowledgements, timestamps and cache processing markers remain unchanged. Provider sends do not run. See `docs/operations/history-multipart-binding337.md` for validation and production acceptance requirements.
+
 ## Retained plaintext hydrated quick replies (2026-10-09)
 
 - Render the closed native text-only hydrated-template shape as exact title, body, footer and quick-reply display labels. Keep original template/button IDs, indexes, context and full native payload/version unchanged; no quick-reply action executes and no control accounting substitutes for visible text.

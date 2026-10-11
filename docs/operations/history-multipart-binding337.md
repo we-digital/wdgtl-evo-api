@@ -1,0 +1,9 @@
+# Recovery of acknowledged multipart message bindings
+
+A Chatwoot operator message with two files owns two provider acknowledgements but one Chatwoot message/source_id. The successful history outcome for its second native ID previously failed at pointer reconciliation with `History mapping destination source is missing or ambiguous`. Production read-only evidence identified this exact case in inboxes 99 and 108; both native IDs belong to complete two-part confirmations.
+
+The fallback reads the source's existing message pointer in the exact account/inbox, validates complete canonical delivery acknowledgements, then repeats scoped ownership/part-set/alias/direction/peer checks under the existing Chatwoot transaction and peer lock. The normal exact native row/copy locks and pointer conflict checks remain. No new Chatwoot message, source_id rewrite, provider send, cache marker change, schema or dependency change occurs.
+
+Validation: TypeScript, focused ESLint, and 66 synthetic cases in an offline Docker lab; ordinary/multipart history, native event binding, delivery acknowledgements and retained controls. New tests cover raw and prefixed IDs, dry-run, private/incoming/foreign targets, duplicate ordinary owners and a new alias appearing under lock. Two additional pre-existing regression tests fail identically with baseline main source and this candidate: native-event ingress fence fixture and encrypted LID preservation fixture. They are outside the changed mapping path and recorded in private lab evidence.
+
+Release: short-lived PR -> exact synthetic lab -> main -> immutable production readback. After release, resume only the two paused jobs through fresh source/direction/destination guards. If another source/media/identity error appears, retain the unfinished records; do not replay unknown writes or fabricate attachment placeholders.

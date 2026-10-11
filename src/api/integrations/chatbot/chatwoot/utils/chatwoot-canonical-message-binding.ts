@@ -43,7 +43,9 @@ export async function withCanonicalChatwootMessageBinding<T>(
     const message = original.rows[0];
     const acknowledgedPart =
       message?.message_type === 1 &&
-      scope.acknowledgedParts?.some((part) => part.sourceId === scope.whatsappMessageId) &&
+      scope.acknowledgedParts?.some((part) =>
+        [scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(part.sourceId),
+      ) &&
       acknowledgedMultipartPartsMatch(message.additional_attributes, message.source_id, scope.acknowledgedParts);
     if (
       original.rows.length !== 1 ||
@@ -66,11 +68,11 @@ export async function withCanonicalChatwootMessageBinding<T>(
         [scope.accountId, scope.inboxId, [scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`]],
       );
       if (
-        aliases.rows.length !== 1 ||
-        Number(aliases.rows[0].id) !== scope.messageId ||
+        (!(aliases.rows.length === 1 && Number(aliases.rows[0].id) === scope.messageId) &&
+          !(acknowledgedPart && aliases.rows.length === 0)) ||
         message.private !== false ||
         message.message_type !== (scope.history.direction === 'outgoing' ? 1 : 0) ||
-        ![scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(message.source_id)
+        (![scope.whatsappMessageId, `WAID:${scope.whatsappMessageId}`].includes(message.source_id) && !acknowledgedPart)
       )
         throw new Error('History mapping requires one public scoped source and direction');
     }
