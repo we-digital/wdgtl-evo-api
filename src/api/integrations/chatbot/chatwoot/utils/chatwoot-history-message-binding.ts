@@ -1,4 +1,8 @@
 import { withCanonicalChatwootMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-canonical-message-binding';
+import {
+  acknowledgedMultipartSourceIds,
+  ChatwootProviderDeliveryPart,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { toCanonicalHistoryJid } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { Message, Prisma, PrismaClient } from '@prisma/client';
 import type { Pool } from 'pg';
@@ -51,8 +55,46 @@ export async function reconcileHistoryMessageBinding(
     'SELECT id FROM messages WHERE account_id=$1 AND inbox_id=$2 AND source_id=ANY($3::text[])',
     [accountId, inboxId, [key.id, `WAID:${key.id}`]],
   );
-  if (aliases.rows.length !== 1) throw new Error('History mapping destination source is missing or ambiguous');
-  const messageId = Number(aliases.rows[0].id);
+  let messageId = Number(aliases.rows[0]?.id);
+  let acknowledgedParts: ChatwootProviderDeliveryPart[] | undefined;
+  // A multipart operator send owns one Chatwoot message. Its second provider
+  // ID is an acknowledgement alias, not a second Chatwoot source_id.
+  if (
+    aliases.rows.length === 0 &&
+    key.fromMe &&
+    Number.isSafeInteger(source.chatwootMessageId) &&
+    source.chatwootMessageId > 0
+  ) {
+    const result = await pool.query(
+      'SELECT source_id,additional_attributes,private,message_type FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3',
+      [source.chatwootMessageId, accountId, inboxId],
+    );
+    const target = result.rows[0];
+    const sources = acknowledgedMultipartSourceIds(target?.additional_attributes, target?.source_id);
+    if (
+      result.rows.length === 1 &&
+      target.private === false &&
+      target.message_type === 1 &&
+      sources?.has(`WAID:${key.id}`)
+    ) {
+      const attributes =
+        typeof target.additional_attributes === 'string'
+          ? JSON.parse(target.additional_attributes)
+          : target.additional_attributes;
+      const delivery = attributes.we_digital_api_inbox_status.provider_delivery;
+      acknowledgedParts = Object.entries(delivery.acknowledgements)
+        .map(([partKey, part]: [string, any]) => ({
+          partKey,
+          partIndex: part.part_index,
+          partCount: delivery.part_count,
+          sourceId: part.source_id,
+        }))
+        .sort((a, b) => a.partIndex - b.partIndex);
+      messageId = source.chatwootMessageId;
+    }
+  }
+  if (aliases.rows.length !== 1 && !acknowledgedParts)
+    throw new Error('History mapping destination source is missing or ambiguous');
   return withCanonicalChatwootMessageBinding(
     pool,
     {
@@ -60,6 +102,7 @@ export async function reconcileHistoryMessageBinding(
       inboxId,
       messageId,
       whatsappMessageId: key.id,
+      acknowledgedParts,
       history: { peers, direction: key.fromMe ? 'outgoing' : 'incoming' },
     },
     async (binding) =>

@@ -13,7 +13,7 @@ const native = () => ({
 const destination = () => ({
   conversation_id: 900, source_id: 'WAID:SOURCE1', message_type: 0, private: false,
 });
-function fixture(options: { row?: any; target?: any; aliases?: any[]; canonical?: any; nativeRows?: any[]; boundPeer?: string } = {}) {
+function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAliases?: any[]; canonical?: any; nativeRows?: any[]; boundPeer?: string } = {}) {
   const expected = native();
   const row = options.row || structuredClone(expected);
   const events: string[] = [];
@@ -32,7 +32,7 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; canonical?
         assert.deepEqual(values, [1, 42, 900]);
         return { rows: [{ id: 900 }] };
       }
-      if (sql.startsWith('SELECT id FROM messages')) return { rows: aliases };
+      if (sql.startsWith('SELECT id FROM messages')) return { rows: options.lockedAliases || aliases };
       if (sql.startsWith('SELECT c.id')) return { rows: [canonical] };
       if (sql.includes('SELECT b.peer')) return { rows: [{ peer: options.boundPeer || peer }] };
       return { rows: [] };
@@ -40,7 +40,11 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; canonical?
     release: () => events.push('release'),
   };
   const pool = {
-    query: async (_sql: string, values: any[]) => {
+    query: async (sql: string, values: any[]) => {
+      if (sql.startsWith('SELECT source_id')) {
+        assert.deepEqual(values, [101, 1, 42]);
+        return { rows: [target] };
+      }
       assert.deepEqual(values, [1, 42, ['SOURCE1', 'WAID:SOURCE1']]);
       return { rows: aliases };
     },
@@ -79,6 +83,54 @@ test('binds exact native ID under canonical peer lock, using display_id and leav
   assert.ok(f.events.findIndex((sql) => sql.includes('provider_message_conversation_route')) < f.events.indexOf('native-write'));
   assert.ok(f.events.indexOf('native-write') < f.events.indexOf('COMMIT'));
 });
+
+function multipartFixture(prefixed = true, options: any = {}) {
+  const id = (value: string) => prefixed ? `WAID:${value}` : value;
+  const row = { ...native(), key: { ...native().key, fromMe: true }, chatwootMessageId: 101 };
+  const target = { ...destination(), message_type: 1, source_id: id('PRIMARY'), additional_attributes: {
+    we_digital_api_inbox_status: { confirmed_status: 'sent', provider_delivery: {
+      contract_version: 1, part_count: 2, acknowledgements: {
+        first: { part_index: 0, source_id: id('PRIMARY') }, second: { part_index: 1, source_id: id('SOURCE1') },
+      },
+    } },
+  } };
+  const f = fixture({ ...options, row, aliases: options.aliases || [], target: { ...target, ...options.target } });
+  return { ...f, run: (dryRun = false) => f.run(dryRun, row) };
+}
+
+for (const prefixed of [false, true]) {
+  test(`history qualifies the second acknowledged outgoing part under peer and native locks (WAID=${prefixed})`, async () => {
+    const f = multipartFixture(prefixed);
+    const result = await f.run();
+    assert.equal(result.messageId, 101);
+    assert.equal(result.nativeRows, 1);
+    assert.equal(f.writes.length, 1);
+    assert.ok(f.events.some(sql => sql.includes('SELECT b.peer')));
+    assert.ok(f.events.some(sql => sql.includes('FOR SHARE')));
+    assert.ok(f.events.every(sql => !/^(INSERT|UPDATE|DELETE)/i.test(sql)));
+  });
+}
+
+test('multipart history dry run locks and qualifies the owner without native writes', async () => {
+  const f = multipartFixture();
+  assert.equal((await f.run(true)).status, 'would_bind');
+  assert.equal(f.writes.length, 0);
+});
+
+for (const [label, options] of [
+  ['foreign peer', { boundPeer: '120363999999999@g.us' }],
+  ['private target', { target: { private: true } }],
+  ['incoming target', { target: { message_type: 0 } }],
+  ['missing provider acknowledgements', { target: { additional_attributes: {} } }],
+  ['two ordinary owners', { aliases: [{ id: 101 }, { id: 102 }] }],
+  ['new ordinary owner under lock', { lockedAliases: [{ id: 102 }] }],
+] as const) {
+  test(`multipart history refuses ${label} without writes`, async () => {
+    const f = multipartFixture(true, options);
+    await assert.rejects(f.run());
+    assert.equal(f.writes.length, 0);
+  });
+}
 
 test('dry run qualifies real scoped destination and locks source without writing', async () => {
   const f = fixture();
