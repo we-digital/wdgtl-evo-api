@@ -179,6 +179,11 @@ import {
   retainedTemplate,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import {
+  qualifySupersededHistoryEdit,
+  SUPERSEDED_HISTORY_EDIT_REASON,
+  SupersededHistoryEdit,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-superseded-history-edit';
+import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
@@ -6911,6 +6916,7 @@ export class ChatwootService {
       >();
 
       const recoveredEdits: Array<{ envelope: MessageModel; target: MessageModel; recovered: MessageModel }> = [];
+      const supersededEdits = new Map<string, SupersededHistoryEdit>();
       const ignoredEdits = new Map<
         string,
         { envelope: MessageModel; target: MessageModel; kind: IgnoredHistoryEditKind; rejection: string }
@@ -7003,6 +7009,20 @@ export class ChatwootService {
         const state = encryptedStates.get(envelope.id)!;
         if (unavailableOriginalTargets.has(target.id)) continue;
         const sameTarget = qualifiedEncryptedEdits.filter((edit) => encryptedTargets.get(edit.id)?.id === target.id);
+        if (state.competitors.length) {
+          if (sameTarget.length !== 1 || state.targetUpdates.length || target.status === 'EDITED')
+            throw new Error('Superseded provider edit current original ordering is ambiguous');
+          const newerState = await readEncryptedEditState(state.competitors[0], target);
+          const qualified = qualifySupersededHistoryEdit(envelope, target, state, newerState);
+          supersededEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), qualified);
+          ignoredEdits.set(toChatwootSourceId((envelope.key as { id: string }).id), {
+            envelope,
+            target,
+            kind: 'conflicting',
+            rejection: 'retained_edit_superseded_by_authenticated_newer_source',
+          });
+          continue;
+        }
         if (
           sameTarget.length > 1 ||
           state.targetUpdates.length ||
@@ -7415,23 +7435,42 @@ export class ChatwootService {
       );
 
       const ignoredEditProofs = new Map();
+      const captureIgnored = async (ignored: {
+        envelope: MessageModel;
+        target: MessageModel;
+        kind: IgnoredHistoryEditKind;
+        rejection: string;
+      }) => {
+        const sourceId = toChatwootSourceId((ignored.envelope.key as { id: string }).id);
+        const superseded = supersededEdits.get(sourceId);
+        if (superseded) {
+          await assertEncryptedEditCurrent(ignored.envelope, ignored.target);
+          if (!isDeepStrictEqual(await readEncryptedEditState(superseded.newer, ignored.target), superseded.newerState))
+            throw new Error('Superseded provider edit newer source or native ordering rotated');
+          return chatwootImport.captureSupersededHistoryEdit(
+            ignored.envelope,
+            ignored.target,
+            inbox.id,
+            provider,
+            superseded,
+          );
+        }
+        return chatwootImport.captureIgnoredHistoryEdit(
+          ignored.envelope,
+          ignored.target,
+          inbox.id,
+          provider,
+          ignored.kind,
+          ignored.rejection,
+          importedEditOriginals.get(ignored.target.id),
+        );
+      };
       for (const envelope of qualifiedEncryptedEdits) {
         const target = encryptedTargets.get(envelope.id)!;
         await assertEncryptedEditCurrent(envelope, target);
         const ignored = ignoredEdits.get(toChatwootSourceId((envelope.key as { id: string }).id));
         if (ignored)
-          ignoredEditProofs.set(
-            toChatwootSourceId((envelope.key as { id: string }).id),
-            await chatwootImport.captureIgnoredHistoryEdit(
-              envelope,
-              target,
-              inbox.id,
-              provider,
-              ignored.kind,
-              ignored.rejection,
-              importedEditOriginals.get(target.id),
-            ),
-          );
+          ignoredEditProofs.set(toChatwootSourceId((envelope.key as { id: string }).id), await captureIgnored(ignored));
       }
       for (const [sourceId, ignored] of ignoredEdits) {
         if (classifications.get(sourceId) === 'conflicting_text_edit') {
@@ -7460,15 +7499,7 @@ export class ChatwootService {
           if (!isDeepStrictEqual(source, ignored.envelope))
             throw new Error('Ignored provider edit native source rotated');
         }
-        const current = await chatwootImport.captureIgnoredHistoryEdit(
-          ignored.envelope,
-          ignored.target,
-          inbox.id,
-          provider,
-          ignored.kind,
-          ignored.rejection,
-          importedEditOriginals.get(ignored.target.id),
-        );
+        const current = await captureIgnored(ignored);
         if (!isDeepStrictEqual(current, ignoredEditProofs.get(sourceId)))
           throw new Error('Ignored provider edit destination or media rotated before acknowledgement');
       }
@@ -7585,8 +7616,8 @@ export class ChatwootService {
             return {
               sourceId,
               status: 'skipped',
-              reason: IGNORED_HISTORY_EDIT_REASON,
-              recovery: 'unsupported',
+              reason: supersededEdits.has(sourceId) ? SUPERSEDED_HISTORY_EDIT_REASON : IGNORED_HISTORY_EDIT_REASON,
+              recovery: supersededEdits.has(sourceId) ? 'native' : 'unsupported',
               ignoredEditPreservation,
             };
           return { sourceId, status: 'existing', reason: 'authenticated_provider_edit_reconciled', recovery: 'native' };

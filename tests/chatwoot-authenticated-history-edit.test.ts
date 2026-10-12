@@ -387,9 +387,10 @@ test('whole cached-v2 encrypted edit updates only the unique existing original a
   assert.equal(content, 'before');
   drift = false;
   competingEdit = true;
-  const ignoredOrder = await service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request);
-  assert.equal(ignoredOrder.outcomes[0].reason, 'preserved_existing_ignored_provider_edit');
-  assert.equal(ignoredOrder.outcomes[0].ignoredEditPreservation.kind, 'conflicting');
+  await assert.rejects(
+    service.syncStoredHistoryRecoveryBatch({ instanceName: 'synthetic' }, request),
+    /Superseded provider edit lacks exact unambiguous newer native ordering/,
+  );
   assert.equal(calls, 0);
   assert.equal(content, 'before');
   competingEdit = false;

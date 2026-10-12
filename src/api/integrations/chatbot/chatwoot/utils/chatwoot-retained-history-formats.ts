@@ -276,6 +276,22 @@ export function knownHistoryMetadataControl(record: { messageType: string; messa
   );
 }
 
+const retainedTemplateURL = (value: any): boolean => {
+  if (
+    typeof value !== 'string' ||
+    !value ||
+    /\s/.test(value) ||
+    [...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
+  )
+    return false;
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !!url.hostname && !url.username && !url.password;
+  } catch {
+    return false;
+  }
+};
+
 export function retainedTemplate(body: any): { text: string; metadata: Record<string, any>; video?: any; image?: any } {
   const template = body?.templateMessage;
   if (
@@ -342,6 +358,7 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
   if (
     object(hydrated) &&
     interactive === undefined &&
+    boundedRetainedMetadata(hydrated) &&
     only(hydrated, [
       'templateId',
       'hydratedButtons',
@@ -353,21 +370,30 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
     hydrated.templateId === template.templateId &&
     Array.isArray(hydrated.hydratedButtons) &&
     hydrated.hydratedButtons.length <= 10 &&
-    hydrated.hydratedButtons.every(
-      (button: any) =>
-        object(button) &&
+    new Set(hydrated.hydratedButtons.map((button: any) => button?.index)).size === hydrated.hydratedButtons.length &&
+    hydrated.hydratedButtons.every((button: any) => {
+      if (!object(button) || !Number.isInteger(button.index) || button.index < 0 || button.index > 10) return false;
+      if (only(button, ['index', 'quickReplyButton']) && object(button.quickReplyButton)) {
+        const reply = button.quickReplyButton;
+        return (
+          only(reply, ['id', 'displayText']) &&
+          typeof reply.id === 'string' &&
+          reply.id.length > 0 &&
+          reply.id.length <= 256 &&
+          typeof reply.displayText === 'string' &&
+          reply.displayText.trim().length > 0
+        );
+      }
+      return (
         only(button, ['index', 'urlButton']) &&
-        Number.isInteger(button.index) &&
-        button.index >= 0 &&
-        button.index <= 10 &&
         object(button.urlButton) &&
         only(button.urlButton, ['url', 'displayText']) &&
         typeof button.urlButton.displayText === 'string' &&
-        button.urlButton.displayText.length > 0 &&
-        typeof button.urlButton.url === 'string' &&
-        /^https?:\/\//.test(button.urlButton.url),
-    ) &&
-    (hydrated.imageMessage === undefined || object(hydrated.imageMessage)) &&
+        button.urlButton.displayText.trim().length > 0 &&
+        retainedTemplateURL(button.urlButton.url)
+      );
+    }) &&
+    (hydrated.imageMessage === undefined || retainedNativeJPEGDescriptor(hydrated.imageMessage)) &&
     typeof hydrated.hydratedContentText === 'string' &&
     hydrated.hydratedContentText.length > 0 &&
     (hydrated.hydratedTitleText === undefined || typeof hydrated.hydratedTitleText === 'string') &&
@@ -378,7 +404,14 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
         hydrated.hydratedTitleText,
         hydrated.hydratedContentText,
         hydrated.hydratedFooterText,
-        ...hydrated.hydratedButtons.map((button: any) => `${button.urlButton.displayText}: ${button.urlButton.url}`),
+        ...(hydrated.imageMessage?.caption && hydrated.imageMessage.caption !== hydrated.hydratedContentText
+          ? [hydrated.imageMessage.caption]
+          : []),
+        ...hydrated.hydratedButtons.map((button: any) =>
+          button.quickReplyButton
+            ? button.quickReplyButton.displayText
+            : `${button.urlButton.displayText}: ${button.urlButton.url}`,
+        ),
       ]
         .filter(Boolean)
         .join('\n'),
@@ -421,50 +454,44 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
       !object(flow) ||
       !only(flow, ['buttons', 'messageParamsJson']) ||
       !Array.isArray(flow.buttons) ||
-      flow.buttons.length !== 1 ||
-      !object(flow.buttons[0]) ||
-      !only(flow.buttons[0], ['name', 'buttonParamsJson']) ||
-      flow.buttons[0].name !== 'cta_url' ||
-      typeof flow.buttons[0].buttonParamsJson !== 'string' ||
+      flow.buttons.length < 1 ||
+      flow.buttons.length > 3 ||
+      !flow.buttons.every(
+        (button: any) =>
+          object(button) &&
+          only(button, ['name', 'buttonParamsJson']) &&
+          button.name === 'cta_url' &&
+          typeof button.buttonParamsJson === 'string',
+      ) ||
       typeof flow.messageParamsJson !== 'string'
     )
       throw new Error('Retained text template content is unsupported');
-    const button = JSON.parse(flow.buttons[0].buttonParamsJson);
+    const buttons = flow.buttons.map((button: any) => JSON.parse(button.buttonParamsJson));
     const params = JSON.parse(flow.messageParamsJson);
-    const safeURL = (value: any): boolean => {
-      if (
-        typeof value !== 'string' ||
-        !value ||
-        /\s/.test(value) ||
-        [...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
-      )
-        return false;
-      try {
-        const url = new URL(value);
-        return ['http:', 'https:'].includes(url.protocol) && !!url.hostname && !url.username && !url.password;
-      } catch {
-        return false;
-      }
-    };
     if (
-      !boundedRetainedMetadata(button) ||
-      !only(button, [
-        'display_text',
-        'url',
-        'consented_users_url',
-        'webview_presentation',
-        'payment_link_preview',
-        'merchant_payment_link_preview',
-        'landing_page_url',
-        'webview_interaction',
-      ]) ||
-      typeof button.display_text !== 'string' ||
-      !button.display_text ||
-      !safeURL(button.url) ||
-      ['consented_users_url', 'landing_page_url'].some((key) => button[key] !== undefined && !safeURL(button[key])) ||
-      (button.webview_presentation !== undefined && button.webview_presentation !== null) ||
-      ['payment_link_preview', 'merchant_payment_link_preview', 'webview_interaction'].some(
-        (key) => button[key] !== undefined && typeof button[key] !== 'boolean',
+      buttons.some(
+        (button: any) =>
+          !boundedRetainedMetadata(button) ||
+          !only(button, [
+            'display_text',
+            'url',
+            'consented_users_url',
+            'webview_presentation',
+            'payment_link_preview',
+            'merchant_payment_link_preview',
+            'landing_page_url',
+            'webview_interaction',
+          ]) ||
+          typeof button.display_text !== 'string' ||
+          !button.display_text ||
+          !retainedTemplateURL(button.url) ||
+          ['consented_users_url', 'landing_page_url'].some(
+            (key) => button[key] !== undefined && !retainedTemplateURL(button[key]),
+          ) ||
+          (button.webview_presentation !== undefined && button.webview_presentation !== null) ||
+          ['payment_link_preview', 'merchant_payment_link_preview', 'webview_interaction'].some(
+            (key) => button[key] !== undefined && typeof button[key] !== 'boolean',
+          ),
       ) ||
       !boundedRetainedMetadata(params) ||
       !only(params, [
@@ -483,7 +510,7 @@ export function retainedTemplate(body: any): { text: string; metadata: Record<st
           ? [header.imageMessage.caption]
           : []),
         footer?.text,
-        `${button.display_text}: ${button.url}`,
+        ...buttons.map((button: any) => `${button.display_text}: ${button.url}`),
       ]
         .filter(Boolean)
         .join('\n'),

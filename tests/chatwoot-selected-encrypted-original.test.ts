@@ -55,6 +55,7 @@ function nativePair(image: boolean) {
     chatwootMessageId: null,
     chatwootInboxId: null,
     chatwootConversationId: null,
+    chatwootContactInboxSourceId: null,
   };
   const envelope: any = {
     id: 'native-edit',
@@ -142,6 +143,11 @@ test('same-selected available original imports and verifies before recovered edi
       fileName: 'synthetic/123456@g.us/imageMessage/1700000000000_synthetic.jpeg',
     };
     service.prismaRepository = {
+      $transaction: async (work: any) =>
+        work({
+          $queryRaw: async () => [original],
+          message: { updateMany: async (query: any) => ({ count: query.where.id.in.length }) },
+        }),
       message: {
         findMany: async ({ where }: any) =>
           where.OR
@@ -205,6 +211,21 @@ test('same-selected available original imports and verifies before recovered edi
     chatwootImport.selectOrCreateFksFromChatwoot = async () =>
       new Map([[original.key.remoteJid, { conversation_id: '123' }]]);
     postgresClient.getChatwootConnection = (() => ({
+      connect: async () => ({
+        query: async (sql: string) => {
+          if (sql.startsWith('SELECT conversation_id'))
+            return {
+              rows: [{ conversation_id: 123, source_id: 'WAID:original', message_type: 0, private: false }],
+            };
+          if (sql.startsWith('SELECT public.provider_message_conversation_route')) return { rows: [{ id: 123 }] };
+          if (sql.startsWith('SELECT c.id'))
+            return { rows: [{ id: 123, display_id: 40, inbox_id: 99, source_id: 'synthetic-ci' }] };
+          if (sql.startsWith('SELECT id FROM messages')) return { rows: [{ id: 314 }] };
+          if (sql.includes('SELECT b.peer')) return { rows: [{ peer: original.key.remoteJid }] };
+          return { rows: [] };
+        },
+        release: () => {},
+      }),
       query: async (sql: string) => {
         if (sql.includes('a.meta ?')) return { rows: [] };
         if (sql.includes('message_snapshot')) {
@@ -272,7 +293,7 @@ test('same-selected available original imports and verifies before recovered edi
       assert.equal(edits, 0);
       assert.equal(stored, false);
       assert.equal(events.includes('import'), false);
-    } else if (['text', 'image', 'competing', 'already-imported-image'].includes(mode)) {
+    } else if (['text', 'image', 'already-imported-image'].includes(mode)) {
       const done = await result;
       assert.equal(
         done.outcomes.find((x: any) => x.sourceId === 'WAID:original').status,
@@ -292,7 +313,7 @@ test('same-selected available original imports and verifies before recovered edi
     } else {
       await assert.rejects(result);
       assert.equal(edits, 0);
-      if (['out-of-batch', 'ambiguous'].includes(mode)) assert.equal(stored, false);
+      if (['out-of-batch', 'ambiguous', 'competing'].includes(mode)) assert.equal(stored, false);
       if (['media-failure', 'rotated'].includes(mode)) assert.equal(captures, 0);
     }
     assert.equal(JSON.stringify({ original, envelope }), before);
