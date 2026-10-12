@@ -127,6 +127,14 @@ const negatives: [string, (f: ReturnType<typeof mixedFixture>) => void][] = [
     },
   ],
   [
+    'split canonical conversations',
+    (f) => {
+      f.targets[0].conversation.id = 51;
+      f.targets[0].message.conversation_id = 51;
+      f.targets[0].binding.conversation_id = 51;
+    },
+  ],
+  [
     'caption changed',
     (f) => {
       f.targets[0].message.content = 'changed';

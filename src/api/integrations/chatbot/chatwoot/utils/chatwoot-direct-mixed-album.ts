@@ -136,7 +136,7 @@ export async function preserveDirectMixedChildren(
   } finally {
     client.release();
   }
-  if (targets.length !== 4) fail();
+  if (targets.length !== 4 || new Set(targets.map((r) => r.conversation?.id)).size !== 1) fail();
   for (const child of children) {
     const rows = targets.filter((r: any) => ['WAID:' + child.key.id, child.key.id].includes(r.message.source_id));
     if (rows.length !== 1) fail();
