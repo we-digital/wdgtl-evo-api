@@ -38,28 +38,82 @@ test('authenticated ordinary files accept 43MB and exact 64MiB, but reject over-
   assert.throws(() => nativeCachedMediaPayload(video('invalid', 43204359, Buffer.alloc(31).toString('base64'))));
 });
 
-test('batch bytes remain bounded and refuse before reading the file that would exceed the total', async () => {
+test('cached aggregate budget uses complete authenticated physical sizes, not native declared sizes', async () => {
+  const bytes = Buffer.alloc(32 * 1024 * 1024, 7);
+  const overflow = Buffer.from([9]);
+  const digest = createHash('sha256').update(bytes).digest('base64');
+  const overflowDigest = createHash('sha256').update(overflow).digest('base64');
+  // PR148 permits a contradictory reported length only after full physical SHA proof.
+  const rows = [video('one', 2 * 1024 * 1024, digest), video('two', 2 * 1024 * 1024, digest)];
+  const before = JSON.stringify(rows);
+  let reads = 0;
+  const read = async (name: string) => {
+    reads++;
+    return name.endsWith('_overflow.mp4') ? overflow : bytes;
+  };
+  const prepared = await prepareCachedRecoveryMedia(rows, async (row) => media(row), read);
+  assert.equal(prepared.size, 2);
+  assert.equal(reads, 2);
+  for (const result of prepared.values()) {
+    assert.equal(result.descriptor.size, bytes.length);
+    assert.equal(result.descriptor.nativeReportedSize, 2 * 1024 * 1024);
+  }
+  assert.equal(
+    [...prepared.values()].reduce((total, result) => total + result.bytes.length, 0),
+    CACHED_MEDIA_BATCH_LIMIT,
+  );
+  reads = 0;
+  await assert.rejects(
+    prepareCachedRecoveryMedia([...rows, video('overflow', 1, overflowDigest)], async (row) => media(row), read),
+    /cached_media_batch_limit/,
+  );
+  assert.equal(reads, 3, 'Cached size must be authenticated before enforcing the measured aggregate budget');
+  assert.equal(JSON.stringify(rows), before);
+});
+
+test('provider aggregate budget refuses before the download that exceeds native exact lengths', async () => {
   const bytes = Buffer.alloc(32 * 1024 * 1024, 7);
   const digest = createHash('sha256').update(bytes).digest('base64');
+  const overflow = Buffer.from([9]);
   const rows = [video('one', bytes.length, digest), video('two', bytes.length, digest)];
   let reads = 0;
   const read = async () => {
     reads++;
     return bytes;
   };
-  const prepared = await prepareCachedRecoveryMedia(rows, async (row) => media(row), read);
-  assert.equal(prepared.size, 2);
-  assert.equal(reads, 2);
-  reads = 0;
   await assert.rejects(
-    prepareCachedRecoveryMedia([...rows, video('overflow', 1)], async (row) => media(row), read),
+    prepareCachedRecoveryMedia(
+      [...rows, video('overflow', 1, createHash('sha256').update(overflow).digest('base64'))],
+      async () => null,
+      async () => assert.fail('Provider path must not read stored objects'),
+      read,
+    ),
     /cached_media_batch_limit/,
   );
   assert.equal(reads, 2);
   reads = 0;
   await assert.rejects(
-    prepareCachedRecoveryMedia([video('too-large', CACHED_MEDIA_FILE_LIMIT + 1)], async (row) => media(row), read),
+    prepareCachedRecoveryMedia([video('too-large', CACHED_MEDIA_FILE_LIMIT + 1)], async () => null, read, read),
     /cached_media_size_or_digest_unavailable/,
   );
   assert.equal(reads, 0);
+});
+
+test('corrupt cached physical bytes still fail their native digest before aggregate accounting', async () => {
+  const expected = Buffer.from('expected-owned-bytes');
+  const corrupted = Buffer.from('different-owned-bytes');
+  let reads = 0;
+  const source = video('corrupt', expected.length, createHash('sha256').update(expected).digest('base64'));
+  await assert.rejects(
+    prepareCachedRecoveryMedia(
+      [source],
+      async (row) => media(row),
+      async () => {
+        reads++;
+        return corrupted;
+      },
+    ),
+    /cached_media_bytes_mismatch/,
+  );
+  assert.equal(reads, 1);
 });
