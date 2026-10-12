@@ -381,7 +381,11 @@ export async function prepareCachedRecoveryMedia(
 ) {
   const result = new Map<
     string,
-    { media: Media | null; descriptor: ReturnType<typeof cachedMediaDescriptor>; bytes: Buffer }
+    {
+      media: Media | null;
+      descriptor: ReturnType<typeof cachedMediaDescriptor> & { nativeReportedSize?: number };
+      bytes: Buffer;
+    }
   >();
   let total = 0;
   for (const message of messages) {
@@ -395,15 +399,28 @@ export async function prepareCachedRecoveryMedia(
       continue;
     const media = await findMedia(message);
     if (!media && !readMissingMedia) throw new Error('cached_media_authority_unavailable');
-    const descriptor = media ? cachedMediaDescriptor(message, media) : retainedDownloadDescriptor(message);
-    total += descriptor.size;
+    let descriptor: ReturnType<typeof cachedMediaDescriptor> & { nativeReportedSize?: number } = media
+      ? cachedMediaDescriptor(message, media)
+      : retainedDownloadDescriptor(message);
+    // Provider reads keep the original native length and pre-read batch bound.
+    if (!media && total + descriptor.size > CACHED_MEDIA_BATCH_LIMIT) throw new Error('cached_media_batch_limit');
+    const bytes = media
+      ? await readObject(descriptor.objectName, descriptor.size, descriptor.mimetype)
+      : await readMissingMedia!(message);
+    if (media) {
+      if (
+        bytes.length < 1 ||
+        bytes.length > CACHED_MEDIA_FILE_LIMIT ||
+        !createHash('sha256').update(bytes).digest().equals(descriptor.digest)
+      )
+        throw new Error('cached_media_bytes_mismatch');
+      // A complete native digest authenticates these exact stored bytes. Keep
+      // the original envelope intact and import the measured physical size.
+      descriptor = { ...descriptor, nativeReportedSize: descriptor.size, size: bytes.length };
+    }
+    verifyCachedMediaBytes(bytes, descriptor);
+    total += bytes.length;
     if (total > CACHED_MEDIA_BATCH_LIMIT) throw new Error('cached_media_batch_limit');
-    const bytes = verifyCachedMediaBytes(
-      media
-        ? await readObject(descriptor.objectName, descriptor.size, descriptor.mimetype)
-        : await readMissingMedia!(message),
-      descriptor,
-    );
     result.set(message.id, { media, descriptor, bytes });
   }
   return result;

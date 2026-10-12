@@ -1,3 +1,9 @@
+## Stored native media with contradictory reported lengths (2026-10-12)
+
+Cached history may reuse a source-bound stored Media object whose complete physical SHA256 matches the native digest even when its reported native length differs. Storage still verifies MIME, bounded authenticated stat size, exact stream length and deadline; preparation verifies the complete native digest before importing the measured physical size. The original source envelope and reported length remain unchanged. Missing-object/provider-download paths retain exact native length checks.
+
+Tagged destination replay requires the native digest, scope, peer, direction and timestamp plus an authenticated physical storage proof for the actual blob size. Corrupt, truncated, oversized, uncertain or foreign bytes refuse before history imports; replay does not duplicate imports. No source/cache body rewrite, manual processed markers, provider sends, dependencies or schema changes are introduced. Validate the synthetic candidate in the shared lab before immutable deployment; revert this change to restore refusal for contradictory native lengths.
+
 ## History bindings for acknowledged multipart sends (2026-10-11)
 
 History recovery resolves a secondary outgoing WhatsApp ID through the exact retained multipart delivery acknowledgements of its existing Chatwoot owner. It requires a public outgoing message, complete canonical acknowledgement set, exact source membership, account/inbox scope, canonical peer locks and unchanged native source/version. Ordinary aliases retain their uniqueness checks; any new conflicting alias, private/foreign target or unproved acknowledgement refuses.

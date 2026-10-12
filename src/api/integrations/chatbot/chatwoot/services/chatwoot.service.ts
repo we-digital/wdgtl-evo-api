@@ -2503,7 +2503,6 @@ export class ChatwootService {
         row.attachment_meta?.whatsapp_history_media_type !== mediaType ||
         !nativeMedia ||
         nativeMedia.digest.toString('hex') !== sha256 ||
-        nativeMedia.size !== Number(row.byte_size) ||
         nativePeers.length !== 1 ||
         nativePeers[0] !== row.peer ||
         !Number.isSafeInteger(Number(row.byte_size)) ||
@@ -2521,8 +2520,11 @@ export class ChatwootService {
         !row.peer
       )
         throw new Error('cached_media_tagged_destination_unconfirmed');
-      seen.add(sourceId);
+      // Reported native length may be inconsistent. The native SHA must match
+      // above, and the authenticated receiver must prove the physical bytes
+      // and measured blob size below before this source is accepted.
       await this.verifyTaggedMediaStorageProof(instance, provider, inboxId, message, row, mediaType, sha256);
+      seen.add(sourceId);
     }
     if ([...requiredSources].some((source) => !seen.has(source)))
       throw new Error('cached_media_tagged_destination_rotated');
