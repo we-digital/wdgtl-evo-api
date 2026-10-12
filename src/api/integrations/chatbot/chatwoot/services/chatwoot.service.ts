@@ -7060,6 +7060,31 @@ export class ChatwootService {
         Number(provider.accountId),
         inbox.id,
         'container_only',
+        async (parent) => {
+          const wa = this.waMonitor.waInstances[instance.instanceName] as any;
+          const registered = await this.prismaRepository.instance.findUnique({
+            where: { id: parent.instanceId },
+            select: { id: true, name: true, ownerJid: true },
+          });
+          if (
+            !registered ||
+            registered.name !== instance.instanceName ||
+            (instance.instanceId && registered.id !== instance.instanceId) ||
+            wa?.instanceId !== registered.id ||
+            wa?.connectionStatus?.state !== 'open'
+          )
+            throw new Error('Direct album receiving owner is unproved');
+          // Local authenticated state getter only: no native RPC, reupload or provider action.
+          const { me } = await wa.baileysGetAuthState();
+          return {
+            instanceId: registered.id,
+            accountID: Number(provider.accountId),
+            inboxID: inbox.id,
+            registeredPN: registered.ownerJid,
+            livePN: me?.id,
+            liveLID: me?.lid,
+          };
+        },
       );
       const ordinaryMessages = authoritativeMessages.filter(
         (message) => classifications.get(toChatwootSourceId((message.key as { id: string }).id)) === 'ordinary',
