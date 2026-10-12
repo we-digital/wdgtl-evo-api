@@ -918,3 +918,29 @@ the literal SDK registration and callbacks with synthetic persistence/receiver
 failures, exact aliases, 64-bit file sizes and original metadata preservation.
 Rollback restores the previous handler implementation without changing retained
 native rows or files; already persisted edit timestamps remain contextual metadata.
+
+
+### 2026-10-13 — Confirm a cached document through the original live receipt
+
+An older live document may remain pending after silent cached recovery because
+cached ingress hashes the native-derived PN/LID history projection. Existing-owner
+confirmation may accept that exact stock projection, without another message POST,
+only after proving the queued and current document differ solely in valid typed
+protobuf byte encoding and an added native HTTPS media locator. All other source
+fields, including unknown nodes, remain in the comparison and hash. Unsupported
+content, edited/changed sources and malformed bytes retain pending status.
+
+The fallback additionally proves the current receiver binding, native source ID,
+author, direction, epoch, visible content and reply references; requires the existing
+stock authenticated full-storage SHA and measured-length proof; then independently
+rereads the unchanged owner. Reported native length is retained, and never substitutes
+for actual physical bytes. Native source CAS, retry/lease loss and atomic queue
+`finish` remain the existing delivery path. There is no manual ledger/processed
+update, dependency/schema change, provider send or history-recovery replay.
+
+Reapply the document projection helper and asynchronous existing-owner confirmation
+together. Focused inbound service/queue/cached-media tests cover exact aliases and
+byte encodings, semantic/receiver/source/time/reply conflicts, physical failure,
+owner rotation and lost finish lease. Rollback removes this fallback; retained
+native content, files and original live payloads remain available, and unresolved
+receipts resume the prior fail-closed behavior.
