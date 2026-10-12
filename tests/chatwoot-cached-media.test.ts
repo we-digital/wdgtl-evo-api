@@ -157,6 +157,8 @@ test('literal whole250 service preflights before writes and uses silent original
     })),
     doc(),
   ];
+  rows[249].message.documentMessage.fileLength = bytes.length + 7;
+  const originalReportedSource = JSON.stringify(rows[249]);
   let guards = 0,
     editCalls = 0,
     posts = 0,
@@ -164,16 +166,26 @@ test('literal whole250 service preflights before writes and uses silent original
   let bindingRow: any;
   let nativeBindings = 0;
   service.prismaRepository = {
-    $transaction: async (work: any) => work({
-      $queryRaw: async () => [{ ...bindingRow, chatwootMessageId: null, chatwootInboxId: null,
-        chatwootConversationId: null, chatwootContactInboxSourceId: null }],
-      message: { updateMany: async (data: any) => {
-        assert.equal(data.where.id.in[0], bindingRow.id);
-        assert.ok(proofs >= 2, 'Native bindings occur after stored media postimage proof');
-        nativeBindings++;
-        return { count: data.where.id.in.length };
-      } },
-    }),
+    $transaction: async (work: any) =>
+      work({
+        $queryRaw: async () => [
+          {
+            ...bindingRow,
+            chatwootMessageId: null,
+            chatwootInboxId: null,
+            chatwootConversationId: null,
+            chatwootContactInboxSourceId: null,
+          },
+        ],
+        message: {
+          updateMany: async (data: any) => {
+            assert.equal(data.where.id.in[0], bindingRow.id);
+            assert.ok(proofs >= 2, 'Native bindings occur after stored media postimage proof');
+            nativeBindings++;
+            return { count: data.where.id.in.length };
+          },
+        },
+      }),
     message: {
       findMany: async () => rows,
       findUnique: async ({ where }: any) => rows.find((row) => row.id === where.id),
@@ -219,13 +231,26 @@ test('literal whole250 service preflights before writes and uses silent original
   // Original sendData duplicate check and literal postimage query remain exercised.
   postgresClient.getChatwootConnection = (() => ({
     connect: async () => ({
-      query: async (sql: string) => ({ rows:
-        sql.startsWith('SELECT id FROM messages') ? [{ id: 7 }]
-        : sql.startsWith('SELECT conversation_id') ? [{ conversation_id: 123, source_id: `WAID:${bindingRow.key.id}`,
-          message_type: bindingRow.key.fromMe ? 1 : 0, private: false }]
-        : sql.startsWith('SELECT public.provider_message_conversation_route') ? [{ id: 123 }]
-        : sql.startsWith('SELECT c.id') ? [{ id: 123, display_id: 345, inbox_id: 99, source_id: 'synthetic-ci' }]
-        : sql.includes('SELECT b.peer') ? [{ peer: bindingRow.key.remoteJid }] : [] }),
+      query: async (sql: string) => ({
+        rows: sql.startsWith('SELECT id FROM messages')
+          ? [{ id: 7 }]
+          : sql.startsWith('SELECT conversation_id')
+            ? [
+                {
+                  conversation_id: 123,
+                  source_id: `WAID:${bindingRow.key.id}`,
+                  message_type: bindingRow.key.fromMe ? 1 : 0,
+                  private: false,
+                },
+              ]
+            : sql.startsWith('SELECT public.provider_message_conversation_route')
+              ? [{ id: 123 }]
+              : sql.startsWith('SELECT c.id')
+                ? [{ id: 123, display_id: 345, inbox_id: 99, source_id: 'synthetic-ci' }]
+                : sql.includes('SELECT b.peer')
+                  ? [{ peer: bindingRow.key.remoteJid }]
+                  : [],
+      }),
       release: () => {},
     }),
     query: async (sql: string, values?: any[]) => {
@@ -234,65 +259,66 @@ test('literal whole250 service preflights before writes and uses silent original
         assert.ok(bindingRow);
         return { rows: [{ id: 7 }] };
       }
-      return { rows:
-        sql.includes('a.meta ?') && !stored
-          ? []
-          : sql.includes('active_storage_blobs')
-            ? [
-                {
-                  id: 7,
-                  attachment_id: 8,
-                  source_id: 'WAID:doc',
-                  peer: doc().key.remoteJid,
-                  file_type: wireType === 'video' ? 2 : wireType === 'image' ? 0 : 3,
-                  message_type: rows[249].key.fromMe ? 1 : 0,
-                  private: false,
-                  account_id: 1,
-                  conversation_account: 1,
-                  conversation_inbox: 99,
-                  byte_size: bytes.length,
-                  content_type: currentMedia.mimetype,
-                  filename: 'synthetic.pdf',
-                  attachment_meta: {
-                    whatsapp_history_media_type: wireType,
-                    whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
-                  },
-                  checksum: createHash('md5').update(bytes).digest('base64'),
-                  created_at: pg.types.getTypeParser(1114)('2023-11-14 22:13:20'),
-                  created_at_epoch: persistedEpoch,
-                  conversation_id: 123,
-                  display_id: 345,
-                  content: expectedContent,
-                  content_attributes: {
-                    in_reply_to_external_id: 'quoted',
-                    synthetic_author: 'preserved',
-                    provider_history_native: {
-                      message_id: 'native-doc',
-                      from_me: rows[249].key.fromMe,
-                      remote_jid: doc().key.remoteJid,
-                      participant: null,
-                      participant_alt: null,
-                      push_name: null,
-                      ...(['associatedChildMessage', 'templateMessage', 'stickerMessage'].includes(
-                        rows[249].messageType,
-                      )
-                        ? {
-                            source: {
-                              message_type: rows[249].messageType,
-                              sha256: createHash('sha256').update(JSON.stringify(rows[249])).digest('hex'),
-                            },
-                          }
-                        : {}),
-                      ...(rows[249].message.templateMessage
-                        ? { template: retainedTemplate(rows[249].message).metadata }
-                        : {}),
+      return {
+        rows:
+          sql.includes('a.meta ?') && !stored
+            ? []
+            : sql.includes('active_storage_blobs')
+              ? [
+                  {
+                    id: 7,
+                    attachment_id: 8,
+                    source_id: 'WAID:doc',
+                    peer: doc().key.remoteJid,
+                    file_type: wireType === 'video' ? 2 : wireType === 'image' ? 0 : 3,
+                    message_type: rows[249].key.fromMe ? 1 : 0,
+                    private: false,
+                    account_id: 1,
+                    conversation_account: 1,
+                    conversation_inbox: 99,
+                    byte_size: bytes.length,
+                    content_type: currentMedia.mimetype,
+                    filename: 'synthetic.pdf',
+                    attachment_meta: {
+                      whatsapp_history_media_type: wireType,
+                      whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
+                    },
+                    checksum: createHash('md5').update(bytes).digest('base64'),
+                    created_at: pg.types.getTypeParser(1114)('2023-11-14 22:13:20'),
+                    created_at_epoch: persistedEpoch,
+                    conversation_id: 123,
+                    display_id: 345,
+                    content: expectedContent,
+                    content_attributes: {
+                      in_reply_to_external_id: 'quoted',
+                      synthetic_author: 'preserved',
+                      provider_history_native: {
+                        message_id: 'native-doc',
+                        from_me: rows[249].key.fromMe,
+                        remote_jid: doc().key.remoteJid,
+                        participant: null,
+                        participant_alt: null,
+                        push_name: null,
+                        ...(['associatedChildMessage', 'templateMessage', 'stickerMessage'].includes(
+                          rows[249].messageType,
+                        )
+                          ? {
+                              source: {
+                                message_type: rows[249].messageType,
+                                sha256: createHash('sha256').update(JSON.stringify(rows[249])).digest('hex'),
+                              },
+                            }
+                          : {}),
+                        ...(rows[249].message.templateMessage
+                          ? { template: retainedTemplate(rows[249].message).metadata }
+                          : {}),
+                      },
                     },
                   },
-                },
-              ]
-            : sql.includes('provider_conversation_bindings')
-              ? [{ id: 123, display_id: 345 }]
-              : [],
+                ]
+              : sql.includes('provider_conversation_bindings')
+                ? [{ id: 123, display_id: 345 }]
+                : [],
       };
     },
   })) as any;
@@ -302,6 +328,7 @@ test('literal whole250 service preflights before writes and uses silent original
       assert.equal(config.url.endsWith('/inboxes/99/conversations/345/messages/7'), true);
       assert.equal(config.params.provider_receiver_fingerprint.length, 64);
       assert.equal(config.params.history_media_proof, '1');
+      assert.equal(config.params.provider_file_bytes, String(bytes.length));
       if (corruptStored) throw new Error('synthetic stored object absent/corrupt');
       return {
         data: {
@@ -330,6 +357,7 @@ test('literal whole250 service preflights before writes and uses silent original
       config.data.resume();
     });
     assert.equal(body.includes(bytes.toString()), true);
+    assert.equal(body.match(/name="provider_file_bytes"\r\n\r\n([0-9]+)\r\n/)?.[1], String(bytes.length));
     for (const value of [
       'external_created_at',
       '1700000000',
@@ -373,6 +401,7 @@ test('literal whole250 service preflights before writes and uses silent original
   assert.equal(result.outcomes.find((outcome: any) => outcome.sourceId === 'WAID:doc').status, 'imported');
   assert.equal(proofs, 2);
   assert.equal(nativeBindings, 250);
+  assert.equal(JSON.stringify(rows[249]), originalReportedSource);
   for (const invalidEpoch of [1700000001.321, Number.NaN]) {
     persistedEpoch = invalidEpoch;
     await assert.rejects(
@@ -399,6 +428,7 @@ test('literal whole250 service preflights before writes and uses silent original
   );
   assert.equal(retained.importedMessages, 0);
   assert.equal(posts, 1);
+  assert.equal(JSON.stringify(rows[249]), originalReportedSource);
   corruptStored = true;
   guards = 0;
   editCalls = 0;
