@@ -23,6 +23,60 @@ test('observed direct mixed header preserves existing complete children with rec
   assert.ok(f.queries.every((sql) => /^(SELECT|BEGIN READ ONLY|SET LOCAL|COMMIT)/.test(sql)));
 });
 
+for (const caption of [undefined, ''] as const)
+  test(`PostgreSQL NULL content preserves exact empty native caption (${String(caption)}) and serialized attributes`, async () => {
+    const f = mixedFixture();
+    for (const c of f.children) {
+      if (caption === undefined) delete c.message[c.messageType].caption;
+      else c.message[c.messageType].caption = caption;
+    }
+    for (const r of f.targets) {
+      r.message.content = null as any;
+      r.message.content_attributes = JSON.stringify(r.message.content_attributes) as any;
+    }
+    const before = structuredClone(f.targets);
+    const result = await f.run();
+    await result.assertCurrent();
+    const raw = JSON.parse(result.proofs.get('WAID:album').directChildren.destinationSnapshotJSON);
+    assert.ok(raw.every((r: any) => r.message.content === null));
+    assert.ok(raw.every((r: any) => typeof r.message.content_attributes === 'string'));
+    assert.deepEqual(f.targets, before);
+  });
+for (const [name, change] of [
+  [
+    'missing content field',
+    (f: any) => {
+      delete f.children[0].message.videoMessage.caption;
+      delete f.targets[0].message.content;
+    },
+  ],
+  [
+    'nonempty native caption with NULL content',
+    (f: any) => {
+      f.targets[0].message.content = null;
+    },
+  ],
+  [
+    'malformed native null caption',
+    (f: any) => {
+      f.children[0].message.videoMessage.caption = null;
+      f.targets[0].message.content = null;
+    },
+  ],
+  [
+    'nonempty destination with absent caption',
+    (f: any) => {
+      delete f.children[0].message.videoMessage.caption;
+      f.targets[0].message.content = 'wrong';
+    },
+  ],
+] as const)
+  test(`${name} refuses before acknowledgment`, async () => {
+    const f = mixedFixture();
+    change(f);
+    await assert.rejects(f.run());
+  });
+
 const negatives: [string, (f: ReturnType<typeof mixedFixture>) => void][] = [
   [
     'wrong authenticated LID',
