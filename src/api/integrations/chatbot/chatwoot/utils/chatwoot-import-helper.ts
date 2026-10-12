@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { isDeepStrictEqual } from 'node:util';
 
 import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
@@ -29,6 +30,10 @@ import {
   retainedButtons,
   retainedTemplate,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
+import {
+  SupersededHistoryEdit,
+  supersededHistoryEditContent,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-superseded-history-edit';
 import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
@@ -600,6 +605,47 @@ class ChatwootImport {
       nativeVersionSHA256: createHash('sha256').update(JSON.stringify(original)).digest('hex'),
       destinationVersionSHA256: createHash('sha256').update(JSON.stringify(target)).digest('hex'),
     };
+  }
+
+  public async captureSupersededHistoryEdit(
+    envelope: Message,
+    original: Message,
+    inboxId: number,
+    provider: ChatwootModel,
+    qualified: SupersededHistoryEdit,
+  ): Promise<IgnoredHistoryEditProof & { newerSourceEdit: SupersededHistoryEdit['audit'] }> {
+    const capture = () =>
+      this.captureIgnoredHistoryEdit(
+        envelope,
+        original,
+        inboxId,
+        provider,
+        'conflicting',
+        'retained_edit_superseded_by_authenticated_newer_source',
+      );
+    const before = await capture();
+    const current = await postgresClient
+      .getChatwootConnection()
+      .query('SELECT content,content_attributes FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3', [
+        before.destinationMessageId,
+        Number(provider.accountId),
+        inboxId,
+      ]);
+    const row = current.rows[0];
+    const attributes =
+      typeof row?.content_attributes === 'string' ? JSON.parse(row.content_attributes) : row?.content_attributes;
+    if (
+      current.rows.length !== 1 ||
+      row?.content !== supersededHistoryEditContent(qualified.recovered) ||
+      attributes?.edited !== true ||
+      !attributes?.edited_at ||
+      attributes?.deleted === true
+    )
+      throw new Error('Superseded provider edit latest authenticated destination payload is unproved');
+    const after = await capture();
+    if (!isDeepStrictEqual(before, after))
+      throw new Error('Superseded provider edit destination or media rotated during qualification');
+    return { ...after, newerSourceEdit: qualified.audit };
   }
 
   public async reconcileProviderHistoryEdits(
