@@ -94,6 +94,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
   resolveInboundNativeBody,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
@@ -5127,6 +5128,7 @@ export class ChatwootService {
       (
         await this.pgClient.query(
           `SELECT m.id,m.inbox_id,m.message_type,m.private,m.content,m.content_attributes,m.source_id,
+              extract(epoch from m.created_at)::double precision AS created_at_epoch,
               c.display_id AS conversation_id,c.account_id,ci.inbox_id AS ci_inbox_id,ci.contact_id AS ci_contact_id,
               c.contact_id,ct.account_id AS contact_account_id,ct.identifier,pb.provider,pb.peer,ci.source_id AS contact_inbox_source_id,
               (SELECT count(*)::integer FROM attachments a WHERE a.message_id=m.id) AS attachments
@@ -5151,7 +5153,7 @@ export class ChatwootService {
       }
       if (!item.fromMe) rendered = formatWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
     }
-    const confirm = (rows: any[]) => {
+    const confirm = async (rows: any[]) => {
       if (rows.length !== 1) throw new Error('InboundReceiverSourceAmbiguous');
       const row = rows[0];
       let attributes = row.content_attributes;
@@ -5184,8 +5186,45 @@ export class ChatwootService {
       if (
         attributes?.we_digital_ingress?.source_payload_sha256 !== sourceHash &&
         (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
-      )
-        throw new Error('InboundReceiverPayloadUnconfirmed');
+      ) {
+        if (!isMedia) throw new Error('InboundReceiverPayloadUnconfirmed');
+        const projected = await inboundHistoryDocumentProjection(body, item.payload);
+        const history = attributes?.provider_history_native;
+        const replies = await this.getReplyToIds(body, instance);
+        if (
+          inboundPayloadHash(projected) !== attributes?.we_digital_ingress?.source_payload_sha256 ||
+          !chatwootEvoRouteBindingsEqual(attributes?.we_digital_ingress?.route, expected) ||
+          attributes?.we_digital_ingress?.provider !== 'evo_whatsapp' ||
+          attributes?.we_digital_ingress?.scope !== (peer.endsWith('@g.us') ? 'group' : 'direct') ||
+          attributes?.we_digital_ingress?.from_me !== item.fromMe ||
+          attributes?.we_digital_ingress?.direction !== (item.fromMe ? 'outbound' : 'inbound') ||
+          history?.message_id !== body.id ||
+          history?.from_me !== item.fromMe ||
+          history?.remote_jid !== peer ||
+          history?.participant !== (projected.key.participant ?? projected.participant ?? null) ||
+          history?.participant_alt !== (projected.key.participantAlt ?? null) ||
+          history?.push_name !== (projected.pushName ?? null) ||
+          Number(row.created_at_epoch) !== body.messageTimestamp ||
+          attributes?.external_created_at !== body.messageTimestamp ||
+          ['in_reply_to', 'in_reply_to_external_id', 'quote_text'].some(
+            (field) => (attributes?.[field] ?? null) !== (replies[field] ?? null),
+          )
+        )
+          throw new Error('InboundReceiverPayloadUnconfirmed');
+        // Performs the existing authenticated full-storage SHA/length verification;
+        // attachment count or native-reported fileLength alone cannot satisfy it.
+        const verified = await this.assertTaggedHistoryMediaStored(
+          [projected as MessageModel],
+          instance,
+          provider,
+          Number(inbox.id),
+          new Set([item.sourceId]),
+        );
+        if (!verified.has(item.sourceId)) throw new Error('InboundReceiverMediaUnconfirmed');
+        const currentOwners = await owners();
+        if (currentOwners.length !== 1 || !isDeepStrictEqual(currentOwners[0], row))
+          throw new Error('InboundReceiverChangedDuringConfirmation');
+      }
       return {
         id: Number(row.id),
         inbox_id: Number(row.inbox_id),
@@ -5196,7 +5235,7 @@ export class ChatwootService {
     return (async () => {
       const before = await owners();
       let ack;
-      if (before.length) ack = confirm(before);
+      if (before.length) ack = await confirm(before);
       else {
         this.durableInboundBodies.add(body);
         if (!item.fromMe)
@@ -5220,7 +5259,7 @@ export class ChatwootService {
           this.durableInboundBodies.delete(body);
         }
         if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
-        ack = confirm(await owners());
+        ack = await confirm(await owners());
         if (Number(sent.id) !== ack.id) throw new Error('InboundReceiverAckMismatch');
       }
       const after = await this.prismaRepository.message.findMany({

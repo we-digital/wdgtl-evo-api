@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import test from 'node:test';
 import vm from 'node:vm';
+import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
@@ -20,11 +21,13 @@ import {
   isChatwootLinkedClientSentEvent,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
+  ChatwootInboundQueue,
   inboundDeliveryId,
   inboundPayloadHash,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 
 import {
+  inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
   resolveInboundNativeBody,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
@@ -55,9 +58,11 @@ function literalService() {
     module: { exports: undefined as any },
     Buffer,
     createHash,
+    isDeepStrictEqual,
     classifyCachedHistoryRecord,
     inboundPayloadHash,
     inboundDeliveryId,
+    inboundHistoryDocumentProjection,
     inboundNativeSnapshot,
     resolveInboundNativeBody,
     isLidJid,
@@ -725,4 +730,228 @@ test('transport-copy reconciliation does not grant outgoing retries', () => {
   const transportCopy = structuredClone(stored);
   transportCopy.messageTimestamp += 4;
   assert.throws(() => resolveInboundNativeBody([stored, transportCopy], stored), /Ambiguous/);
+});
+
+async function recoveredDocumentFixture() {
+  const f = fixture();
+  const bytes = Buffer.alloc(32, 7).toString('base64');
+  f.native.key = {
+    id: 'A',
+    fromMe: false,
+    remoteJid: '100000000000000@lid',
+    remoteJidAlt: '628123456789@s.whatsapp.net',
+    participant: '',
+  };
+  f.native.messageType = 'documentMessage';
+  f.native.message = {
+    documentMessage: {
+      caption: '',
+      fileSha256: bytes,
+      fileEncSha256: bytes,
+      mediaKey: bytes,
+      jpegThumbnail: 'AQID',
+      fileLength: { low: 110906, high: 0, unsigned: true },
+      mimetype: 'application/pdf',
+      fileName: 'synthetic.pdf',
+    },
+    messageContextInfo: { messageSecret: bytes, deviceListMetadata: { recipientKeyHash: 'AQID' } },
+    mediaUrl: 'https://storage.synthetic/native.pdf',
+  };
+  f.native.participant = null;
+  f.native.pushName = 'synthetic author';
+  f.item.payload = structuredClone(f.native);
+  delete f.item.payload.message.mediaUrl;
+  for (const field of ['fileSha256', 'fileEncSha256', 'mediaKey', 'jpegThumbnail'])
+    f.item.payload.message.documentMessage[field] = Object.fromEntries(
+      [...Buffer.from(f.native.message.documentMessage[field], 'base64')].map((value, index) => [String(index), value]),
+    );
+  f.item.payload.message.messageContextInfo.messageSecret = { type: 'Buffer', data: [...Buffer.alloc(32, 7)] };
+  f.item.payload.message.messageContextInfo.deviceListMetadata.recipientKeyHash = { 0: 1, 1: 2, 2: 3 };
+  f.item.peer = f.native.key.remoteJid;
+  f.item.id = inboundDeliveryId('one', f.item.payload);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  const projected = await inboundHistoryDocumentProjection(f.native, f.item.payload);
+  f.service.getConversationMessage = async (msg: any) => msg.documentMessage.caption;
+  f.service.getReplyToIds = async () => ({});
+  const binding = f.service.buildEvoRouteBinding();
+  f.rows = [
+    {
+      ...f.owner(),
+      peer: projected.key.remoteJid,
+      identifier: projected.key.remoteJid,
+      content: '',
+      attachments: 1,
+      created_at_epoch: f.native.messageTimestamp,
+      content_attributes: {
+        we_digital_ingress: {
+          source_payload_sha256: inboundPayloadHash(projected),
+          provider: 'evo_whatsapp',
+          scope: 'direct',
+          from_me: false,
+          direction: 'inbound',
+          route: structuredClone(binding),
+        },
+        provider_history_native: {
+          message_id: f.native.id,
+          from_me: false,
+          remote_jid: projected.key.remoteJid,
+          participant: '',
+          participant_alt: null,
+          push_name: f.native.pushName,
+        },
+        external_created_at: f.native.messageTimestamp,
+      },
+    },
+  ];
+  let physical = 0;
+  f.service.assertTaggedHistoryMediaStored = async (
+    messages: any[],
+    instance: any,
+    provider: any,
+    inbox: number,
+    required: Set<string>,
+  ) => {
+    physical++;
+    assert.equal(inbox, 42);
+    assert.deepEqual([...required], ['WAID:A']);
+    assert.deepEqual(JSON.parse(JSON.stringify(messages[0])), JSON.parse(JSON.stringify(projected)));
+    return new Set(['WAID:A']);
+  };
+  return {
+    ...f,
+    get rows() {
+      return f.rows;
+    },
+    set rows(value: any[]) {
+      f.rows = value;
+    },
+    get creates() {
+      return f.creates;
+    },
+    get physical() {
+      return physical;
+    },
+  };
+}
+
+test('exact cached document history projection confirms existing owner through full physical proof without POST', async () => {
+  const f = await recoveredDocumentFixture();
+  const original = JSON.stringify(f.item.payload);
+  const native = JSON.stringify(f.native);
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(f.creates, 0);
+  assert.equal(f.physical, 1);
+  assert.equal(f.queries.length, 2);
+  assert.equal(JSON.stringify(f.item.payload), original);
+  assert.equal(JSON.stringify(f.native), native);
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.updates[0].data.chatwootMessageId, 9);
+});
+
+test('cached document fallback rejects semantic changes, malformed bytes, foreign owner and missing full proof', async () => {
+  const changes = [
+    (f: any) => (f.native.message.documentMessage.caption = 'changed'),
+    (f: any) => (f.native.message.documentMessage.fileName = 'changed.pdf'),
+    (f: any) => f.native.message.documentMessage.fileLength.low++,
+    (f: any) => (f.native.message.unknownNode = { opaque: true }),
+    (f: any) => (f.item.payload.message.documentMessage.fileSha256 = { 0: 999 }),
+    (f: any) => (f.native.contextInfo = { stanzaId: 'foreign' }),
+    (f: any) => (f.native.instanceId = 'foreign'),
+    (f: any) => (f.native.status = 'EDITED'),
+    (f: any) => f.native.messageTimestamp++,
+    (f: any) => (f.native.messageType = 'imageMessage'),
+  ];
+  for (const mutate of changes) {
+    const f = await recoveredDocumentFixture();
+    mutate(f);
+    f.item.payloadHash = inboundPayloadHash(f.item.payload);
+    await assert.rejects(f.service.deliverQueuedInbound(f.item));
+    assert.equal(f.creates, 0);
+    assert.equal(f.updates.length, 0);
+  }
+  for (const mutate of [
+    (r: any) => (r.inbox_id = 43),
+    (r: any) => (r.message_type = 1),
+    (r: any) => (r.private = true),
+    (r: any) => (r.peer = 'foreign@g.us'),
+    (r: any) => r.created_at_epoch++,
+    (r: any) => r.content_attributes.external_created_at++,
+    (r: any) => (r.content_attributes.provider_history_native.message_id = 'foreign'),
+    (r: any) => (r.content_attributes.we_digital_ingress.route.receiver_fingerprint = 'f'.repeat(64)),
+    (r: any) => (r.content_attributes.in_reply_to_external_id = 'WAID:foreign'),
+    (r: any) => (r.content_attributes.we_digital_ingress.source_payload_sha256 = 'f'.repeat(64)),
+  ]) {
+    const f = await recoveredDocumentFixture();
+    const rows = f.rows;
+    mutate(rows[0]);
+    f.rows = rows;
+    await assert.rejects(f.service.deliverQueuedInbound(f.item));
+    assert.equal(f.creates, 0);
+    assert.equal(f.updates.length, 0);
+  }
+  const f = await recoveredDocumentFixture();
+  f.service.assertTaggedHistoryMediaStored = async () => {
+    throw Error('actual object missing or SHA changed');
+  };
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /object missing/);
+  assert.equal(f.updates.length, 0);
+});
+
+test('destination rotation or lease loss cannot finish a cached document reconciliation', async () => {
+  const f = await recoveredDocumentFixture();
+  f.service.assertTaggedHistoryMediaStored = async () => {
+    const rows = f.rows;
+    rows[0].content = 'changed';
+    f.rows = rows;
+    return new Set(['WAID:A']);
+  };
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /ChangedDuringConfirmation/);
+  assert.equal(f.updates.length, 0);
+  assert.equal(f.creates, 0);
+  const next = await recoveredDocumentFixture();
+  next.service.inboundStore.bindInbox = async () => false;
+  await assert.rejects(next.service.deliverQueuedInbound(next.item), /DestinationChanged/);
+  assert.equal(next.physical, 0);
+  assert.equal(next.updates.length, 0);
+});
+
+test('existing document reaches only the official leased queue finish; lost finish lease remains pending', async () => {
+  for (const finishAllowed of [true, false]) {
+    const f = await recoveredDocumentFixture();
+    let owner = '',
+      finishCalls = 0,
+      state = 'pending';
+    const payloadHash = f.item.payloadHash;
+    const store: any = {
+      enqueue: async () => f.item,
+      claim: async (_id: string, lease: string) => {
+        owner = lease;
+        return true;
+      },
+      renew: async () => true,
+      finish: async (_id: string, lease: string, ack: any) => {
+        assert.equal(lease, owner);
+        assert.equal(f.physical, 1);
+        assert.equal(ack.id, 9);
+        finishCalls++;
+        if (finishAllowed) state = 'confirmed';
+        return finishAllowed;
+      },
+      defer: async (_id: string, lease: string) => {
+        assert.equal(lease, owner);
+        state = 'pending';
+      },
+      due: async () => [],
+    };
+    f.service.inboundStore.bindInbox = async (_id: string, lease: string) => lease === owner;
+    const queue = new ChatwootInboundQueue(store, (item) => f.service.deliverQueuedInbound(item));
+    const result = await queue.submit(f.item);
+    await queue.stop();
+    assert.equal(finishCalls, 1);
+    assert.equal(state, finishAllowed ? 'confirmed' : 'pending');
+    assert.equal(result?.id, finishAllowed ? 9 : undefined);
+    assert.equal(f.item.payloadHash, payloadHash);
+    assert.equal(f.creates, 0);
+  }
 });
