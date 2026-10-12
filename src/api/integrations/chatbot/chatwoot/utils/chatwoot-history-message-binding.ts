@@ -3,7 +3,10 @@ import {
   acknowledgedMultipartSourceIds,
   ChatwootProviderDeliveryPart,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
-import { toCanonicalHistoryJid } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
+import {
+  buildStoredLidMap,
+  toCanonicalHistoryJid,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { Message, Prisma, PrismaClient } from '@prisma/client';
 import type { Pool } from 'pg';
 import { isDeepStrictEqual } from 'util';
@@ -51,6 +54,37 @@ export async function reconcileHistoryMessageBinding(
 }> {
   const peers = historyBindingPeers(source);
   const key = source.key as { id: string; fromMe: boolean; remoteJid: string };
+  // An absent alternative may be recovered only from exact same-instance native
+  // key pairs. Keep the source key untouched and fence the evidence under lock.
+  const readAliasEvidence = (reader: PrismaClient | Prisma.TransactionClient, locked: boolean) =>
+    reader.$queryRaw<Array<Pick<Message, 'id' | 'instanceId' | 'key' | 'messageTimestamp'>>>(Prisma.sql`
+      SELECT id,"instanceId",key,"messageTimestamp" FROM "Message"
+      WHERE "instanceId"=${source.instanceId} AND key->>'remoteJid'=${key.remoteJid}
+        AND key->>'remoteJidAlt' ~ '^[0-9]+(:[0-9]+)?@s[.]whatsapp[.]net$'
+      ORDER BY id LIMIT 65 ${locked ? Prisma.sql`FOR SHARE` : Prisma.empty}`);
+  let aliasEvidence: Array<Pick<Message, 'id' | 'instanceId' | 'key' | 'messageTimestamp'>> | undefined;
+  if (key.remoteJid.endsWith('@lid') && peers.length === 1 && typeof prisma.$queryRaw === 'function') {
+    const evidence = await readAliasEvidence(prisma, false);
+    if (
+      evidence.some(
+        (row) =>
+          row.instanceId !== source.instanceId ||
+          (row.key as any).remoteJid !== key.remoteJid ||
+          !(row.key as any).id ||
+          typeof (row.key as any).fromMe !== 'boolean',
+      )
+    )
+      throw new Error('History mapping native peer evidence is invalid');
+    const phones = new Set(evidence.map((row) => toCanonicalHistoryJid((row.key as any).remoteJidAlt)));
+    if (evidence.length > 64 || phones.size > 1) throw new Error('History mapping native peer evidence is ambiguous');
+    if (evidence.length) {
+      const phone = buildStoredLidMap(evidence).get(key.remoteJid);
+      if (!phone || !phones.has(toCanonicalHistoryJid(phone)))
+        throw new Error('History mapping native peer evidence is missing');
+      peers.push(toCanonicalHistoryJid(phone));
+      aliasEvidence = evidence;
+    }
+  }
   const aliases = await pool.query(
     'SELECT id FROM messages WHERE account_id=$1 AND inbox_id=$2 AND source_id=ANY($3::text[])',
     [accountId, inboxId, [key.id, `WAID:${key.id}`]],
@@ -103,7 +137,13 @@ export async function reconcileHistoryMessageBinding(
       messageId,
       whatsappMessageId: key.id,
       acknowledgedParts,
-      history: { peers, direction: key.fromMe ? 'outgoing' : 'incoming' },
+      history: {
+        peers,
+        direction: key.fromMe ? 'outgoing' : 'incoming',
+        ...(aliasEvidence && source.chatwootContactInboxSourceId
+          ? { danglingContactInboxSourceId: source.chatwootContactInboxSourceId }
+          : {}),
+      },
     },
     async (binding) =>
       prisma.$transaction(
@@ -127,9 +167,27 @@ export async function reconcileHistoryMessageBinding(
             chatwootConversationId: binding.conversationId,
             chatwootContactInboxSourceId: binding.contactInboxSourceId,
           };
+          if (aliasEvidence) {
+            const currentEvidence = await readAliasEvidence(tx, true);
+            if (!isDeepStrictEqual(currentEvidence, aliasEvidence))
+              throw new Error('History mapping native peer evidence changed');
+            const critical = matched.find((row) => row.id === source.id);
+            if (!critical || Object.keys(pointers).some((field) => critical[field] !== source[field]))
+              throw new Error('History mapping native pointer preimage changed');
+          }
+          const canRepairDangling = (row: Message, field: string) =>
+            field === 'chatwootContactInboxSourceId' &&
+            aliasEvidence &&
+            binding.danglingContactInboxSourceId === row.chatwootContactInboxSourceId &&
+            row.chatwootContactInboxSourceId === source.chatwootContactInboxSourceId &&
+            row.chatwootMessageId === pointers.chatwootMessageId &&
+            row.chatwootInboxId === pointers.chatwootInboxId &&
+            row.chatwootConversationId === pointers.chatwootConversationId;
           if (
             matched.some((row) =>
-              Object.entries(pointers).some(([field, value]) => row[field] !== null && row[field] !== value),
+              Object.entries(pointers).some(
+                ([field, value]) => row[field] !== null && row[field] !== value && !canRepairDangling(row, field),
+              ),
             )
           )
             throw new Error('History mapping refuses conflicting native pointers');
@@ -139,7 +197,21 @@ export async function reconcileHistoryMessageBinding(
           const existing = unbound.length === 0;
           if (!existing && !dryRun) {
             const updated = await tx.message.updateMany({
-              where: { id: { in: unbound.map((row) => row.id) }, instanceId: source.instanceId },
+              where: {
+                id: { in: unbound.map((row) => row.id) },
+                instanceId: source.instanceId,
+                ...(binding.danglingContactInboxSourceId
+                  ? {
+                      OR: unbound.map((row) => ({
+                        id: row.id,
+                        chatwootMessageId: row.chatwootMessageId,
+                        chatwootInboxId: row.chatwootInboxId,
+                        chatwootConversationId: row.chatwootConversationId,
+                        chatwootContactInboxSourceId: row.chatwootContactInboxSourceId,
+                      })),
+                    }
+                  : {}),
+              },
               data: pointers,
             });
             if (updated.count !== unbound.length)

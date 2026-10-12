@@ -7,6 +7,7 @@ import {
   retainedNativeJPEGDescriptor,
   retainedTemplate,
 } from './chatwoot-retained-history-formats';
+import { isRetainedListOrLiveLocation } from './chatwoot-retained-list-location';
 
 const ordinaryTypes = new Set([
   'conversation',
@@ -161,6 +162,10 @@ export function classifyCachedHistoryRecord(
     return 'album_container';
   }
   const keys = Object.keys(payload);
+  if (['liveLocationMessage', 'listMessage', 'listResponseMessage'].includes(record.messageType)) {
+    if (!isRetainedListOrLiveLocation(record)) throw new Error('Retained list or live location is unsupported');
+    return 'ordinary';
+  }
   if (isKnownPlaintextHistoryEdit(record)) return 'plaintext_edit';
   if (knownHistoryMetadataControl(record)) return 'metadata_control';
   if (

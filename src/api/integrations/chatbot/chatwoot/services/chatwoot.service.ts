@@ -4938,11 +4938,12 @@ export class ChatwootService {
         listDescription +
         '\n' +
         '_Footer_: ' +
-        listFooter;
+        listFooter +
+        (result.buttonText ? '\n_Button_: ' + result.buttonText : '');
 
       if (result.sections && result.sections.length > 0) {
         result.sections.forEach((section, sectionIndex) => {
-          formattedList += '\n\n*Section ' + (sectionIndex + 1) + ':* ' + section.title || 'Unknown\n';
+          formattedList += '\n\n*Section ' + (sectionIndex + 1) + ':* ' + (section.title || 'Unknown');
 
           if (section.rows && section.rows.length > 0) {
             section.rows.forEach((row, rowIndex) => {

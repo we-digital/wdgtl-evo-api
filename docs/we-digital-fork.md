@@ -1,3 +1,11 @@
+## Retained native lists and live locations (2026-10-13)
+
+Destination-aware cached history accepts the closed native liveLocation, single-select list and list-response shapes already handled by the stock renderer. It validates finite coordinates, bounded protobuf metadata, native sequence numbers, unique typed menu rows and an exact selected-row identifier; unknown actions/product lists, mixed payloads and malformed fields still refuse. Lists retain their native menu-button label and section labels. No list action executes.
+
+Only these validated ordinary shapes bypass file preparation. The normal authoritative source/direction/version guards, account/inbox checks, stock history SQL projection and verified destination acknowledgements remain in place. Original native keys, payloads, timestamps, quotes and metadata are unchanged. Templates and mixed album containers retain their existing refusal/dependency requirements; no placeholder, control reclassification, source rewrite, manual cache marker, media download or provider send is introduced.
+
+Reapply the literal read → classify → render → history SQL projection regression, retry/foreign-inbox/direction/stale-source refusals and typed malformed negatives after upstream changes. Rollback restores safe refusal for these retained ordinary subtypes. Synthetic candidate proof is separate from immutable production and external-result acceptance.
+
 ## Stored native media with contradictory reported lengths (2026-10-12)
 
 Cached history may reuse a source-bound stored Media object whose complete physical SHA256 matches the native digest even when its reported native length differs. Storage still verifies MIME, bounded authenticated stat size, exact stream length and deadline; preparation verifies the complete native digest before importing the measured physical size. The original source envelope and reported length remain unchanged. Missing-object/provider-download paths retain exact native length checks.
@@ -56,7 +64,6 @@ Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focus
 - Absent values remain supported; null, strings, unknown enum values and malformed native digests/keys/lengths still refuse. The complete native envelope remains the source version used for recovery acknowledgement.
 - Reapply the narrow descriptor validator with its installed-protobuf roundtrip and negative cache-authority regression. No dependencies, schema, history acknowledgement contract, provider requests or customer sends change. Rollback restores safe refusal for sources carrying this optional field.
 
-
 ## Scoped native event targets and admitted history mapping copies (2026-10-08)
 
 - Resolve known incoming edit/reaction/read/delete/reply targets by instance plus raw provider key and the known target peer/direction. Unscoped ambiguous keys return null; never infer target direction from a reply actor or group title.
@@ -87,7 +94,6 @@ Reapply this narrow `chatwoot-cached-media.ts` default-path check with its focus
 - Reapply the cross-store lock lifetime and import lock order together. A native commit followed by a Chatwoot connection failure requires reconciliation; it is never evidence of rollback or authority to replay a send.
 - Rollback: old shells remain through qualification. After deletion, retain compatible mapping/import consumers and durable Chatwoot routes; unbridged writers are unsafe. This change introduces no provider sends or business operations.
 - Focused validation: literal mapping/import helper recordings, actual PostgreSQL delayed writer/import interleavings and duplicate import, existing direction/source guards, targeted TypeScript checks and lint. Runtime bridge and final cleanup acceptance are separate.
-
 
 ## Source and deployment contract
 
@@ -233,8 +239,8 @@ tags are never deployment inputs.
   the legacy deletion behavior; local message mappings remain recoverable
   because they are removed only after acknowledged soft deletion.
 - **Focused regression:** run `npm run test:unit --
-  tests/chatwoot-ingress-scope.test.ts tests/chatwoot-auto-reply-binding.test.ts
-  tests/chatwoot-provider-deletion.test.ts tests/outbound-provenance.test.ts`,
+tests/chatwoot-ingress-scope.test.ts tests/chatwoot-auto-reply-binding.test.ts
+tests/chatwoot-provider-deletion.test.ts tests/outbound-provenance.test.ts`,
   `npm run lint:check`, and `npm run build`;
   staging canary must prove direct/text, direct/media, group, broadcast,
   unknown, wrong-instance auto-reply rejection, stored provenance, a failed
@@ -411,11 +417,11 @@ tags are never deployment inputs.
   redelivery can cross the cutoff; otherwise roll forward. Keep the additive
   table and rows.
 - **Focused regression:** run `npm run test:unit --
-  tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
-  tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
-  tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
-  tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts
-  tests/persist-native-forward-message.test.ts`,
+tests/chatwoot-outbound-queue.test.ts tests/chatwoot-outbound-prisma-store.test.ts
+tests/chatwoot-provider-dto.test.ts tests/chatwoot-delivery-failure.test.ts
+tests/chatwoot-auto-reply-binding.test.ts tests/whatsapp-media-metadata.test.ts
+tests/outbound-provenance.test.ts tests/chatwoot-history-sync.test.ts
+tests/persist-native-forward-message.test.ts`,
   generate Prisma for PostgreSQL and
   MySQL, then run `npm run build` and `npm run lint:check`. Staging must prove
   text, media, multipart, duplicate webhook, callback retry, pre-send failure,
@@ -466,7 +472,7 @@ No production deployment is part of this local change.
 
 ## Bounded release and drain of uncertain outbound sends (2026-09-28)
 
-- **Behavior:** Production EVO restart began transport for Chatwoot message 2463608 before shutdown; its exact provider WAID was not durably observed, so it correctly remained `ambiguous` and was never retried. Seven subsequent distinct messages in the same destination lane were then indefinitely pending. After a full 10-minute transport-lease window, an ambiguous or transport-unresolved quarantined predecessor with a known `sendStartedAt` no longer blocks *different* Chatwoot message IDs. The ambiguous operation remains unchanged and exact-ID maintenance continues; sibling parts of that same multipart message, recent ambiguities, and missing-start timestamps remain fenced. Pending siblings of an aged ambiguous multipart message no longer starve distinct later messages or their webhook admission; they can send only after their own preceding part reconciles. Pending/preparing/sending/deletion blockers retain their existing behavior. Unresolved outcomes are excluded from delivery-backlog depth/age, preventing an aged reconciliation row from rejecting new webhook admissions. This trades only indefinite cross-message ordering for live delivery, not exactly-once send safety.
+- **Behavior:** Production EVO restart began transport for Chatwoot message 2463608 before shutdown; its exact provider WAID was not durably observed, so it correctly remained `ambiguous` and was never retried. Seven subsequent distinct messages in the same destination lane were then indefinitely pending. After a full 10-minute transport-lease window, an ambiguous or transport-unresolved quarantined predecessor with a known `sendStartedAt` no longer blocks _different_ Chatwoot message IDs. The ambiguous operation remains unchanged and exact-ID maintenance continues; sibling parts of that same multipart message, recent ambiguities, and missing-start timestamps remain fenced. Pending siblings of an aged ambiguous multipart message no longer starve distinct later messages or their webhook admission; they can send only after their own preceding part reconciles. Pending/preparing/sending/deletion blockers retain their existing behavior. Unresolved outcomes are excluded from delivery-backlog depth/age, preventing an aged reconciliation row from rejecting new webhook admissions. This trades only indefinite cross-message ordering for live delivery, not exactly-once send safety.
 - **Source areas:** `chatwoot-outbound-prisma-store.ts`, `main.ts`, `Dockerfile`, focused tests, and `docs/operations/chatwoot-outbound-delivery.md`; no schema or flag change. Docker execs Node as PID 1 after database bootstrap, and SIGTERM/SIGINT close HTTP ingress then await accepted requests and the outbound worker drain before exit. The paired bbc-devops compose files give this bounded drain three minutes in both contours.
 - **Upstream reapply/conflicts:** Keep the no-resend rule for `ambiguous`, deterministic planned WAID, claim-generation fencing, and same-message multipart ordering. Never mark an ambiguous send failed merely because no local mapping exists.
 - **Rollback:** Do not roll back to an image that permanently fences a lane while distinct successor operations remain pending. An ambiguous predecessor still needs exact provider/device reconciliation independently of later deliveries.
@@ -542,7 +548,6 @@ SQL resolver; check upstream new ingestion/creation paths. Focused checks: TypeS
 changed-file ESLint, LID/cache/identity/history tests, actual PostgreSQL cross-runtime
 worker through Chatwoot concurrency RSpec, exact-source synthetic lab and runtime readback.
 
-
 The opt-in live contact resolver uses exact identifier/phone filters instead of
 legacy Brazilian-number rewriting or contact merging. Duplicate, truncated or
 contradictory PN/LID/group identities fail closed. Group participant creation must
@@ -590,7 +595,6 @@ Focused verification: 44 EVO tests, TypeScript and changed-file lint, plus real
 PostgreSQL preservation of all image fields for a JSON null source. Independent
 source review, exact candidate lab and immutable production readback remain gates.
 
-
 ### Exact provider contact precedence for history import
 
 History now uses the exact account-scoped WhatsApp identifier before the unique PN phone fallback, matching live provider ingress. A same-phone Telegram contact remains intact, including its documents and message authors; contact merge, deletion and identifier rewrites are excluded. Duplicate exact identifiers, foreign provider identifiers, inconsistent PN phones and existing binding/contact-inbox conflicts still refuse. This does not itself authorize cross-contact consolidation or reparent conversations.
@@ -636,7 +640,6 @@ single-body refusal and leaves retained source/gap data intact. Focused checks:
 `npx tsc --noEmit --incremental false`, normal ESLint on the helper, and an exact
 candidate network-isolated synthetic lab before immutable production readback.
 
-
 ### Missing retained PDF document edit payload
 
 Cached recovery explicitly preserves a NULL edited document only when the existing public destination is unique for its source/account/inbox/direction, authenticated peer and bound message/display IDs, with exactly one file attachment backed by nonempty PDF blob metadata. It emits the existing unresolved payload-unavailable outcome, keeps original content/context/media and never claims the edit or blob content was recovered. Unknown types, non-NULL malformed documents and ambiguous targets still stop the whole batch. No provider sends, routing change, dependency upgrade or migration.
@@ -644,7 +647,6 @@ Cached recovery explicitly preserves a NULL edited document only when the existi
 Source: `chatwoot-cached-history-record.ts`, `chatwoot-import-helper.ts`, and `chatwoot.service.ts` under `src/api/integrations/chatbot/chatwoot/`. Reapply these focused branches after upstream changes to recovery classification/edit reconciliation; reverting restores safe refusal. Deploy the matching official cache document gap validator before acknowledging this new outcome. Focused regression: `node node_modules/tsx/dist/cli.mjs --test --test-name-pattern="NULL edited PDF" tests/chatwoot-authenticated-history-edit.test.ts`.
 
 Native source-bound pointer IDs remain mandatory: absent or stale pointers refuse. A saved storage existence check alone never establishes native-pointer eligibility or recovered edit content.
-
 
 ### Typed album-container preservation (259)
 
@@ -654,13 +656,11 @@ The official history schema5 adds only `recovery_album_gaps`; prior schema4 tabl
 
 Source areas: EFO `chatwoot-history-album.ts`, `chatwoot-cached-history-record.ts`, `chatwoot.service.ts`; history `cache/album-preservation.ts`, `cache/sqlite-cache-store.ts`, `evolution/evolution-client.ts`. Focused checks: EFO `node --import tsx --test tests/chatwoot-album-preservation.test.ts` and `node node_modules/typescript/bin/tsc --noEmit`; history `node node_modules/vitest/vitest.mjs run test/album-preservation.test.ts` and `node node_modules/typescript/bin/tsc --noEmit`. Runtime lint: EFO normal ESLint on the three named runtime files. No dependency/provider upgrade.
 
-
 ### Explicit ignored provider edit preservation (260)
 
 Owner-authorized recovery skips unavailable encrypted edits and preserves the latest known original when edit content/order conflicts. This never applies rejected identity metadata: the original native instance/key/peer/business direction and unique public current account/inbox destination with exact native pointers remain mandatory. Source/ordering snapshots and destination versions are recorded; missing/ambiguous targets, source drift, unknown failures and uncertain writes still stop. No message/media/provider send or reaction changes occur for an ignored edit.
 
 The official cache schema6 adds only `recovery_ignored_edit_gaps`, atomically recording the raw source version and typed dependency proof with ordinary version-CAS bookkeeping. New source versions remain eligible for recheck. An ignored edit is not reported as applied or fully recovered. Deploy schema6 before the matching EFO outcome; rollback preserves gap tables and existing jobs/cache/state. Source areas: EFO `chatwoot-ignored-history-edit.ts`, import helper and recovery service; history `cache/ignored-edit-preservation.ts`, SQLite store and Evolution outcome validator. Checks include scoped preservation/identity/unknown-error tests, whole batch conflict/source drift regressions, durable gap/repeated batch/stale ACK/migration tests, TypeScript and exact synthetic candidate lab.
-
 
 ### Confirmed multipart callback source binding (260)
 
@@ -675,20 +675,17 @@ Reapply the optional acknowledged-parts argument in `chatwoot.service.ts` and `c
 - Reapply the operator-only serial/autocommit, key-size/continuity and no-retry contract; never add this index to automatic startup migration. Invalid or unknown index outcomes require inspection, not automatic replacement.
 - Validate on synthetic PostgreSQL 16.15: full-row conservation, OR/UNION equivalence, exact catalogue/conditioned plans and duplicate versions. Runtime identity and recovery eligibility remain independent.
 
-
 ### Cached-media recovery UTC timestamp verification (263)
 
 The cached-media tagged preflight and import postimage queries compare PostgreSQL's persisted UTC epoch with the native message timestamp at whole-second precision. A `timestamp without time zone` returned by node-pg otherwise inherits the process timezone and can reject correct stored media in a non-UTC deployment. Both checks require a finite numeric epoch before flooring; a different native second still refuses. This changes read verification only: no global date parser, timezone configuration, stored timestamp, permissions, source identity, provider send or recovery acknowledgement is changed.
 
 Reapply the two query projections and comparisons in `chatwoot.service.ts` when upstream changes cached-media verification. Keep native descriptor/digest/size, peer/inbox/direction/cardinality and authenticated physical storage proof guards. Rollback restores strict safe refusal without changing historical messages or cache data. Focused regression: `TZ=America/Sao_Paulo node node_modules/tsx/dist/cli.mjs --test --test-name-pattern="literal whole250|tagged document" tests/chatwoot-cached-media.test.ts`; the real pg timestamp parser, fractional seconds, wrong seconds/nonfinite epochs, tagged replay and import postimage are covered. Run normal runtime ESLint, the test-only parser override, TypeScript checks and an exact synthetic candidate lab before immutable readback.
 
-
 ### Retained reaction-removal control typing (263)
 
 History recovery recognizes the native protobuf reaction-removal representations with absent or NULL reaction text as the existing `reaction_control` category. The native target key/id/peer shape and allowed wrapper keys still apply; numeric/object/boolean text, missing targets and contradictory message bodies refuse. This aligns retained controls with Baileys' nullable optional field and the existing live removal interpretation. It does not apply a reaction, import a message or prove recovery identity: the original whole-batch source/direction/version checks and durable known-control outcome remain required.
 
 Reapply the bounded reaction text condition in `chatwoot-cached-history-record.ts`; rollback restores strict safe refusal and retains all source/cache outcomes. No provider sends, routing, schema, migrations or manual markers change. Focused regression: `node node_modules/tsx/dist/cli.mjs --test tests/chatwoot-retained-control-formats.test.ts`, runtime ESLint and the test-only parser override, TypeScript and exact synthetic candidate lab before immutable readback.
-
 
 ## Retained native history formats (2026-10-06)
 
@@ -700,13 +697,11 @@ Reapply the bounded reaction text condition in `chatwoot-cached-history-record.t
 
 The retained encrypted-edit preservation path accepts a native LID phone alias only when the native `remoteJidAlt` agrees with the current scoped WhatsApp conversation binding and its contact/inbox relation. The original native key, peer, and full native/destination version hashes remain intact; foreign or absent bindings refuse preservation.
 
-
 ### Missing native JPEG cache authority (264)
 
 A current native plain `imageMessage` with JPEG MIME may use the existing necessary, bounded descriptor download when its unique same-instance `Media` relation is absent. Owned cached media remains the first choice; a corrupt or unavailable owned object does not trigger a provider fallback. The native key/direction and full plaintext SHA-256/length are mandatory, with the existing fixed HTTPS WhatsApp host, no redirects/reupload/retry, five-second abort, 8 MiB file and 16 MiB batch limits. All missing media is verified before any edit, source guard, import or processed outcome. Unknown kinds/MIME, malformed descriptors, incorrect bytes and uncertain results stop. No socket operation, provider send, read acknowledgement, cache mutation, dependency or schema change is added.
 
 Reapply only `chatwoot-cached-media.ts` and its service callback; rollback restores missing-image refusal. Focused synthetic JPEG tests cover the missing-row path, native envelope retention, cache-first/no-fallback, corrupt SHA/length, host/kind/MIME refusal and the existing deadline. Exact candidate lab and immutable runtime readback remain required before recovery.
-
 
 ### Native media pointer and installed SDK transport (264)
 
@@ -714,18 +709,15 @@ Necessary retained-media reads select a validated canonical `https://mmg.whatsap
 
 The installed Baileys downloader drops its supplied signal and redirect options. Its default recovery path therefore reads one bounded ciphertext through a scoped Undici agent with certificate validation, no redirects, a five-second abort and an encrypted-byte bound, then supplies those bytes through an isolated in-memory dispatcher to the original Baileys decryptor. No global fetch mutation, dependency update, socket reupload, send, read acknowledgement or cache write is added. Wrong bytes, unavailable pointers and uncertain reads stop before history writes. Reapply only this helper and its focused tests; rollback restores safe refusal. Verify actual installed-SDK decryption, HTTP/redirect/overflow/hash negatives, native envelope retention, real abort delivery, and existing JPEG/video/cache-first preflight tests in the exact synthetic candidate lab before immutable readback.
 
-
 ### Album container-only preservation with retained protocol companions (266)
 
 A selected, authenticated image-only album may share its native key with an earlier context-only protocol row. Recovery retains the complete selected album and every same-key native row in a distinct version2 `container_only` proof, when all companions have the exact known empty-thread/canonical32-byte-secret context shape and matching instance, key, peer and direction. Supplied participant fields must match; absent fields remain absent in the raw proof. Another visible payload, later companion, missing selected version, excess cardinality or any native rotation refuses.
 
 This disposition preserves the raw container as an unsupported versioned gap. Declared image counts do not assert that children were queried, present, imported or complete, and the proof carries no fabricated destination IDs. Ordinary children keep their existing independent import/source/version/media guards. The original version1 complete-child proof remains unchanged for a unique native parent, including all destination requirements. Reapply `chatwoot-history-album.ts` together with the matching History schema7 album-proof validator; existing gap rows and reasons remain intact without a migration. Focused tests cover exact protocol companions, visible/identity/ordering/malformed negatives, final native rotation and the existing version1 proof. Exact synthetic lab and immutable source/runtime readback precede recovery.
 
-
 ### Preserve unavailable retained Word document edits (266)
 
 A NULL retained document edit may preserve its uniquely bound existing PDF or Word (`application/msword`) attachment. The existing single document attachment/file relation, positive durable blob/key, public direction, peer, complete native pointers and undeleted destination checks remain mandatory. Unknown MIME, ambiguous or absent destinations and malformed pointers refuse. This keeps the complete existing content and attachment intact, applies no edit, and uses the existing version-bound unavailable-payload disposition; ordinary missing media is never skipped. No History contract, schema, provider request or destination write is added. Reapply only the document preservation predicate together with its focused regression; exact synthetic lab and immutable source/runtime readback precede recovery.
-
 
 ### Missing native PDF cache authority (267)
 
@@ -839,7 +831,6 @@ The installed protobuf represents omitted optional album counts as absent JSON p
 
 Verification: 44 focused synthetic album/format cases, including actual installed protobuf omission, preserved JSON, changing presence/source, explicit malformed counters and unchanged legacy refusal.
 
-
 ### Silent roster binding repair (276)
 
 The scoped bulk roster lookup now retains whether an existing conversation has an exact provider binding. Apply routes an unbound existing group through the protected canonical resolver and requires the same conversation ID; dry-run and already bound groups do not write metadata. Authenticated joined-group membership, account/inbox/contact/peer checks and conflict refusal remain unchanged. No messages, source payloads or provider sends are created, and no schema change is required.
@@ -853,7 +844,6 @@ Verification: nine focused synthetic tests pass, with the optional isolated-Post
 - Focused synthetic subprocess tests cover scoped migration override, absent override, generate/dev commands, provider selection and error handling.
 
 - Recovery-only retained message-list and signed attachment GETs allow 60 seconds; write requests remain 30 seconds and tagged verification reads retain 15 seconds. Identity, SHA/size, no-redirect and response byte bounds remain unchanged. Existing literal service tests verify both read deadlines and refuse rotated source/CW/route snapshots.
-
 
 ### Empty group conversations follow message ingress
 
@@ -892,7 +882,6 @@ route changes and identity conflicts. An isolated PostgreSQL test exercises the
 actual generated Prisma delegate, concurrent claims, expired leases, inbox CAS,
 receipt owner checks and persistent source JSON.
 
-
 ### 2026-10-09 — Native client edits normalized by Baileys
 
 The pinned SDK emits client edits as `messages.update` with `message.editedMessage`.
@@ -919,7 +908,6 @@ failures, exact aliases, 64-bit file sizes and original metadata preservation.
 Rollback restores the previous handler implementation without changing retained
 native rows or files; already persisted edit timestamps remain contextual metadata.
 
-
 ### 2026-10-13 — Confirm a cached document through the original live receipt
 
 An older live document may remain pending after silent cached recovery because
@@ -944,3 +932,18 @@ byte encodings, semantic/receiver/source/time/reply conflicts, physical failure,
 owner rotation and lost finish lease. Rollback removes this fallback; retained
 native content, files and original live payloads remain available, and unresolved
 receipts resume the prior fail-closed behavior.
+
+### 2026-10-13 — Repair proven dangling history contact-inbox mappings
+
+History reconciliation can recover a missing LID/PN alternative only from bounded,
+same-instance stored native key pairs. It rejects contradictory alternatives and
+rereads the exact evidence under the canonical owner lock. A retained native
+contact-inbox source pointer may be replaced only when its former scoped Chatwoot
+ContactInbox is absent and its message, inbox and conversation pointers already
+match the unique current canonical owner. Existing conflicting owners remain
+errors. Native pointer preimages are fenced and updated through the existing
+transactional repair path; native keys, source bodies and processed ledgers remain
+unchanged. The native peer lookup requires its verified expression index before
+production acceptance. Focused tests include missing/ambiguous evidence, existing
+wrong owners, pointer/source races and dry-run behavior. Rollback removes the
+helper fallback while retaining the repaired correct mapping and original history.
