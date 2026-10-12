@@ -6,6 +6,7 @@ import { downloadContentFromMessage, getMediaKeys } from 'baileys';
 import { Agent, fetch as fetchMedia } from 'undici';
 
 import { retainedHistoryMedia, retainedTemplate } from './chatwoot-retained-history-formats';
+import { isRetainedListOrLiveLocation } from './chatwoot-retained-list-location';
 
 export const CACHED_MEDIA_BATCH_LIMIT = 64 * 1024 * 1024;
 export const CACHED_MEDIA_FILE_LIMIT = 64 * 1024 * 1024;
@@ -389,6 +390,11 @@ export async function prepareCachedRecoveryMedia(
   >();
   let total = 0;
   for (const message of messages) {
+    if (
+      ['liveLocationMessage', 'listMessage', 'listResponseMessage'].includes(message.messageType) &&
+      isRetainedListOrLiveLocation(message)
+    )
+      continue;
     if (['conversation', 'extendedTextMessage', 'contactMessage', 'buttonsMessage'].includes(message.messageType))
       continue;
     if (

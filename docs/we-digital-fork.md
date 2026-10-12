@@ -1,3 +1,11 @@
+## Retained native lists and live locations (2026-10-13)
+
+Destination-aware cached history accepts the closed native liveLocation, single-select list and list-response shapes already handled by the stock renderer. It validates finite coordinates, bounded protobuf metadata, native sequence numbers, unique typed menu rows and an exact selected-row identifier; unknown actions/product lists, mixed payloads and malformed fields still refuse. Lists retain their native menu-button label and section labels. No list action executes.
+
+Only these validated ordinary shapes bypass file preparation. The normal authoritative source/direction/version guards, account/inbox checks, stock history SQL projection and verified destination acknowledgements remain in place. Original native keys, payloads, timestamps, quotes and metadata are unchanged. Templates and mixed album containers retain their existing refusal/dependency requirements; no placeholder, control reclassification, source rewrite, manual cache marker, media download or provider send is introduced.
+
+Reapply the literal read → classify → render → history SQL projection regression, retry/foreign-inbox/direction/stale-source refusals and typed malformed negatives after upstream changes. Rollback restores safe refusal for these retained ordinary subtypes. Synthetic candidate proof is separate from immutable production and external-result acceptance.
+
 ## Stored native media with contradictory reported lengths (2026-10-12)
 
 Cached history may reuse a source-bound stored Media object whose complete physical SHA256 matches the native digest even when its reported native length differs. Storage still verifies MIME, bounded authenticated stat size, exact stream length and deadline; preparation verifies the complete native digest before importing the measured physical size. The original source envelope and reported length remain unchanged. Missing-object/provider-download paths retain exact native length checks.
