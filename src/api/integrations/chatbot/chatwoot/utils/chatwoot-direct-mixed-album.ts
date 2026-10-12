@@ -150,7 +150,8 @@ export async function preserveDirectMixedChildren(
       m.inbox_id !== inboxID ||
       m.message_type !== 0 ||
       m.private !== false ||
-      m.content !== (native.caption || '') ||
+      (m.content !== (native.caption || '') &&
+        !(m.content === null && (native.caption === undefined || native.caption === ''))) ||
       c.id !== m.conversation_id ||
       c.account_id !== accountID ||
       c.inbox_id !== inboxID ||

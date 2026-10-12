@@ -983,3 +983,10 @@ refuse. No native key normalization, content write, file upload or provider acti
 occurs. Version4 binds complete native and protected destination snapshots, while
 explicitly making no new physical-byte completion claim; independent byte receipts
 remain separate. H40 requires the paired version4 validator before acknowledging it.
+
+### Exact empty-caption NULL presentation in mixed bookkeeping
+
+Existing PostgreSQL NULL message content is accepted only for an absent or exact
+empty native caption, without changing the raw row or file. Missing content
+fields, malformed native captions and nonempty mismatches still refuse. Literal
+PostgreSQL-shaped fixtures retain JSON-string attributes and raw NULL content.
