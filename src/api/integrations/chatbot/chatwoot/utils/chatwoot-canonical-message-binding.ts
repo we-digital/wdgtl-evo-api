@@ -4,7 +4,12 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import type { Pool } from 'pg';
 
-type Binding = { conversationId: number; inboxId: number; contactInboxSourceId: string };
+type Binding = {
+  conversationId: number;
+  inboxId: number;
+  contactInboxSourceId: string;
+  danglingContactInboxSourceId?: string;
+};
 
 // The CW peer lock covers the local mapping write as well as the CW lookup.
 // Online native-map reconciliation must acquire this same lock before its
@@ -18,7 +23,7 @@ export async function withCanonicalChatwootMessageBinding<T>(
     whatsappMessageId: string;
     claimedConversationId?: number;
     acknowledgedParts?: ChatwootProviderDeliveryPart[];
-    history?: { peers: string[]; direction: 'incoming' | 'outgoing' };
+    history?: { peers: string[]; direction: 'incoming' | 'outgoing'; danglingContactInboxSourceId?: string };
   },
   write: (binding: Binding) => Promise<T>,
 ): Promise<T> {
@@ -87,6 +92,7 @@ export async function withCanonicalChatwootMessageBinding<T>(
     );
     if (actual.rows.length !== 1) throw new Error('Canonical mapping current scope mismatch');
     const row = actual.rows[0];
+    let danglingContactInboxSourceId: string | undefined;
     if (scope.history) {
       const binding = await client.query(
         `SELECT b.peer FROM provider_conversation_bindings b
@@ -100,6 +106,16 @@ export async function withCanonicalChatwootMessageBinding<T>(
         !row.source_id.length
       )
         throw new Error('History mapping canonical peer or contact inbox mismatch');
+      const oldSource = scope.history.danglingContactInboxSourceId;
+      if (oldSource && oldSource !== row.source_id) {
+        const old = await client.query(
+          `SELECT ci.id FROM contact_inboxes ci JOIN inboxes i ON i.id=ci.inbox_id
+           WHERE i.account_id=$1 AND ci.inbox_id=$2 AND ci.source_id=$3 FOR SHARE OF ci, i`,
+          [scope.accountId, scope.inboxId, oldSource],
+        );
+        if (old.rows.length) throw new Error('History mapping refuses an existing conflicting contact inbox');
+        danglingContactInboxSourceId = oldSource;
+      }
     }
 
     if (scope.claimedConversationId !== undefined && scope.claimedConversationId !== Number(row.display_id)) {
@@ -115,6 +131,7 @@ export async function withCanonicalChatwootMessageBinding<T>(
       conversationId: Number(row.display_id),
       inboxId: Number(row.inbox_id),
       contactInboxSourceId: row.source_id,
+      ...(danglingContactInboxSourceId ? { danglingContactInboxSourceId } : {}),
     });
     await client.query('COMMIT');
     return result;

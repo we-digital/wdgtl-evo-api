@@ -13,7 +13,7 @@ const native = () => ({
 const destination = () => ({
   conversation_id: 900, source_id: 'WAID:SOURCE1', message_type: 0, private: false,
 });
-function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAliases?: any[]; canonical?: any; nativeRows?: any[]; boundPeer?: string } = {}) {
+function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAliases?: any[]; canonical?: any; nativeRows?: any[]; boundPeer?: string; aliasEvidence?: any[]; lockedAliasEvidence?: any[]; oldContactInboxes?: any[] } = {}) {
   const expected = native();
   const row = options.row || structuredClone(expected);
   const events: string[] = [];
@@ -33,6 +33,7 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAlia
         return { rows: [{ id: 900 }] };
       }
       if (sql.startsWith('SELECT id FROM messages')) return { rows: options.lockedAliases || aliases };
+      if (sql.startsWith('SELECT ci.id')) return { rows: options.oldContactInboxes || [] };
       if (sql.startsWith('SELECT c.id')) return { rows: [canonical] };
       if (sql.includes('SELECT b.peer')) return { rows: [{ peer: options.boundPeer || peer }] };
       return { rows: [] };
@@ -51,8 +52,10 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAlia
     connect: async () => client,
   };
   const prisma = {
+    $queryRaw: async () => options.aliasEvidence || [],
     $transaction: async (work: any) => work({
       $queryRaw: async (sql: any) => {
+        if (sql.text.includes('FOR SHARE')) { events.push('alias-lock'); return options.lockedAliasEvidence || options.aliasEvidence || []; }
         events.push('native-lock');
         assert.match(sql.text, /FOR UPDATE/);
         assert.deepEqual(sql.values.slice(0, 2), ['instance-1', 'SOURCE1']);
@@ -335,3 +338,81 @@ test('an already canonical admitted source remains existing despite an unrelated
   assert.equal(result.unselectedNativeRows, 1);
   assert.equal(f.writes.length, 0);
 });
+
+
+function danglingLidFixture(options: any = {}) {
+  const lid = '999999999@lid';
+  const phone = '14155552671@s.whatsapp.net';
+  const source = { ...native(), key: { ...native().key, remoteJid: lid },
+    chatwootMessageId: 101, chatwootInboxId: 42, chatwootConversationId: 37,
+    chatwootContactInboxSourceId: 'removed-ci-source' };
+  const evidence = { id: 'paired-native', instanceId: source.instanceId,
+    key: { id: 'PAIR1', remoteJid: lid, remoteJidAlt: phone, fromMe: true }, messageTimestamp: 1700000001 };
+  const f = fixture({ row: source, boundPeer: phone, aliasEvidence: [evidence], ...options });
+  return { ...f, source, evidence, run: (dryRun = false) => f.run(dryRun, source) };
+}
+
+test('official history repair replaces only a dangling contact-inbox pointer using fresh native pair evidence', async () => {
+  const f = danglingLidFixture();
+  const before = structuredClone(f.source);
+  const result = await f.run();
+  assert.equal(result.status, 'bound');
+  assert.equal(f.writes.length, 1);
+  assert.deepEqual(f.writes[0].data, { chatwootMessageId: 101, chatwootInboxId: 42,
+    chatwootConversationId: 37, chatwootContactInboxSourceId: 'ci-source' });
+  assert.deepEqual(f.writes[0].where.OR, [{ id: 'native-1', chatwootMessageId: 101,
+    chatwootInboxId: 42, chatwootConversationId: 37, chatwootContactInboxSourceId: 'removed-ci-source' }]);
+  assert.deepEqual(f.source, before);
+  assert.ok(f.events.indexOf('alias-lock') < f.events.indexOf('native-write'));
+});
+
+test('dangling repair dry run performs all guards without modifying pointers', async () => {
+  const f = danglingLidFixture();
+  assert.equal((await f.run(true)).status, 'would_bind');
+  assert.equal(f.writes.length, 0);
+});
+
+for (const [label, options] of [
+  ['existing wrong contact owner', { oldContactInboxes: [{ id: 999 }] }],
+  ['ambiguous canonical source', { aliases: [{ id: 101 }, { id: 102 }] }],
+  ['missing native alias evidence', { aliasEvidence: [] }],
+  ['wrong current canonical owner', { boundPeer: '14155559999@s.whatsapp.net' }],
+] as const) {
+  test(`dangling repair refuses ${label} without writes`, async () => {
+    const f = danglingLidFixture(options);
+    await assert.rejects(f.run());
+    assert.equal(f.writes.length, 0);
+  });
+}
+
+test('native alias ambiguity is rejected rather than allowing normalizer last-write wins', async () => {
+  const first = danglingLidFixture().evidence;
+  const second = { ...first, id: 'pair-two', key: { ...first.key, remoteJidAlt: '14155559999@s.whatsapp.net' } };
+  const f = danglingLidFixture({ aliasEvidence: [first, second] });
+  await assert.rejects(f.run(), /ambiguous/);
+  assert.equal(f.writes.length, 0);
+});
+
+test('alias evidence freshness is fenced before replacing the dangling pointer', async () => {
+  const evidence = danglingLidFixture().evidence;
+  const f = danglingLidFixture({ lockedAliasEvidence: [{ ...evidence, messageTimestamp: 1700000002 }] });
+  await assert.rejects(f.run(), /peer evidence changed/);
+  assert.equal(f.writes.length, 0);
+});
+
+test('critical native pointer changed since request fails its compare-and-set preimage', async () => {
+  const source = danglingLidFixture().source;
+  const f = danglingLidFixture({ row: { ...source, chatwootContactInboxSourceId: 'racing-pointer' } });
+  await assert.rejects(f.run(), /pointer preimage changed/);
+  assert.equal(f.writes.length, 0);
+});
+
+for (const field of ['chatwootMessageId', 'chatwootInboxId', 'chatwootConversationId']) {
+  test(`dangling repair still refuses an existing wrong non-null ${field}`, async () => {
+    const source = { ...danglingLidFixture().source, [field]: 999 };
+    const f = fixture({ row: source, boundPeer: '14155552671@s.whatsapp.net',
+      aliasEvidence: [danglingLidFixture().evidence] });
+    await assert.rejects(f.run(false, source), /conflicting native pointers/);
+    assert.equal(f.writes.length, 0);
+  });
+}
