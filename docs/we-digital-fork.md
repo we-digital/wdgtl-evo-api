@@ -947,3 +947,27 @@ unchanged. The native peer lookup requires its verified expression index before
 production acceptance. Focused tests include missing/ambiguous evidence, existing
 wrong owners, pointer/source races and dry-run behavior. Rollback removes the
 helper fallback while retaining the repaired correct mapping and original history.
+
+### 2026-10-13 — Preserve retained templates with mixed visible buttons
+
+Retained hydrated JPEG templates may contain zero-based quick-reply buttons, and
+plaintext hydrated templates may mix quick-reply and URL buttons. Accept only
+closed typed button unions, unique bounded indexes, nonempty native IDs/labels,
+HTTP(S) URLs without credentials and the existing complete JPEG descriptor.
+Retain title, body, footer, a distinct image caption and all visible button labels
+and URLs. Preserve the complete native template metadata; never execute buttons.
+Native-flow text/JPEG templates may have one to three individually validated URL
+CTAs. Unknown actions/fields, malformed later buttons and foreign media refuse.
+
+The existing stock history renderer, original quiet multipart and cached-media
+proof paths perform delivery. No native key, author, epoch, secret/context, file
+payload or processed marker is rewritten by the decoder. Focused tests exercise
+literal source selection, SQL projection and silent media service persistence,
+full byte SHA, scoped ownership, immutable original metadata, repeat dedup and
+stale/foreign/malformed refusals. Rollback restores the previous decoder; retained
+native payloads and already imported messages/files remain available.
+
+Mixed album headers remain unsupported in this change. Declared counts and
+matching association IDs alone do not establish nested parent peer authority or
+normalize sender-relative direction. Container accounting must remain separate
+from independently proven child bytes and from any complete-album claim.

@@ -9,6 +9,7 @@ import { postgresClient } from '../src/api/integrations/chatbot/chatwoot/libs/po
 import { prepareCachedRecoveryMedia } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
 import { chatwootImport } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { retainedTemplate } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
+import { retainedTemplateFixtures } from './fixtures/retained-template-buttons';
 
 const bytes = Buffer.from('synthetic-owned-pdf');
 function doc(type = 'documentMessage') {
@@ -144,6 +145,7 @@ test('literal whole250 service preflights before writes and uses silent original
   let wireType = 'document';
   let currentMedia = media;
   let expectedContent = 'synthetic-caption';
+  let persistedFilename = 'synthetic.pdf';
   let corruptStored = false;
   let persistedEpoch = 1700000000.321;
   let proofs = 0;
@@ -278,7 +280,7 @@ test('literal whole250 service preflights before writes and uses silent original
                     conversation_inbox: 99,
                     byte_size: bytes.length,
                     content_type: currentMedia.mimetype,
-                    filename: 'synthetic.pdf',
+                    filename: persistedFilename,
                     attachment_meta: {
                       whatsapp_history_media_type: wireType,
                       whatsapp_history_sha256: createHash('sha256').update(bytes).digest('hex'),
@@ -310,7 +312,7 @@ test('literal whole250 service preflights before writes and uses silent original
                             }
                           : {}),
                         ...(rows[249].message.templateMessage
-                          ? { template: retainedTemplate(rows[249].message).metadata }
+                          ? { template: JSON.parse(JSON.stringify(retainedTemplate(rows[249].message).metadata)) }
                           : {}),
                       },
                     },
@@ -499,6 +501,36 @@ test('literal whole250 service preflights before writes and uses silent original
     assert.equal(posts, postCount);
     assert.equal(JSON.stringify(rows), before);
   }
+  for (const templateBody of retainedTemplateFixtures(bytes)) {
+    const template = retainedTemplate(templateBody);
+    if (!template.image) continue;
+    stored = false;
+    wireType = 'image';
+    currentMedia = {
+      ...media,
+      type: 'imageMessage',
+      mimetype: 'image/jpeg',
+      fileName: media.fileName.replace('/documentMessage/', '/imageMessage/'),
+    };
+    rows[249] = { ...doc(), messageType: 'templateMessage', message: templateBody };
+    expectedContent = template.text;
+    persistedFilename = currentMedia.fileName.split('/').at(-1)!;
+    const before = structuredClone(rows[249]);
+    const imported = await service.syncStoredHistoryRecoveryBatch(
+      { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+      request(),
+    );
+    assert.equal(imported.importedMessages, 1);
+    const postCount = posts;
+    const repeated = await service.syncStoredHistoryRecoveryBatch(
+      { instanceName: 'synthetic', instanceId: 'synthetic-instance' },
+      request(),
+    );
+    assert.equal(repeated.importedMessages, 0);
+    assert.equal(posts, postCount);
+    assert.deepEqual(rows[249], before);
+  }
+  persistedFilename = 'synthetic.pdf';
   stored = false;
   wireType = 'image';
   currentMedia = {
