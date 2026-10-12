@@ -971,3 +971,15 @@ Mixed album headers remain unsupported in this change. Declared counts and
 matching association IDs alone do not establish nested parent peer authority or
 normalize sender-relative direction. Container accounting must remain separate
 from independently proven child bytes and from any complete-album claim.
+### Direct incoming mixed-album container preservation
+
+The observed native 3-image/1-video direct album may preserve its container through
+stock selected-history bookkeeping only after the current authenticated receiving
+instance proves the nested sender-relative parent peer is its own LID. The local
+parent and all four children retain their original incoming peer/direction, exact
+parent ID, native versions and unique scoped Chatwoot destinations. Group parents,
+foreign owners, incomplete sets, caption/file-link changes and final-read rotation
+refuse. No native key normalization, content write, file upload or provider action
+occurs. Version4 binds complete native and protected destination snapshots, while
+explicitly making no new physical-byte completion claim; independent byte receipts
+remain separate. H40 requires the paired version4 validator before acknowledging it.

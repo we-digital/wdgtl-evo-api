@@ -1,6 +1,8 @@
 import { createHash } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
+import { DirectAlbumOwner, preserveDirectMixedChildren } from './chatwoot-direct-mixed-album';
+
 const validSenderKeySidecar = (body: any) => {
   const value = body?.senderKeyDistributionMessage;
   return (
@@ -159,7 +161,7 @@ export function albumImageCount(record: any, disposition: 'legacy' | 'container_
     !Number.isInteger(count) ||
     count < (disposition === 'container_only' ? 0 : 1) ||
     count > 13 ||
-    videos !== 0 ||
+    (videos !== 0 && !(disposition === 'container_only' && count === 3 && videos === 1)) ||
     (disposition === 'legacy' &&
       album.contextInfo !== undefined &&
       (!object(album.contextInfo) ||
@@ -253,6 +255,7 @@ export async function preserveAlbumContainers(
   accountID: number,
   inboxID: number,
   disposition: 'legacy' | 'container_only' = 'legacy',
+  directOwner?: (parent: any) => Promise<DirectAlbumOwner>,
 ) {
   const snapshots = new Map<string, any>();
   const proofs = new Map<string, any>();
@@ -301,7 +304,11 @@ export async function preserveAlbumContainers(
         originals.some((row: any) => row.id !== parent.id && !albumMetadataCompanion(row, parent))
       )
         fail();
-      return { parent, sameKeyNativeRows: originals, count, containerOnly: true as const };
+      const mixed = parent.message.albumMessage.expectedVideoCount === 1;
+      const directChildren = mixed
+        ? await preserveDirectMixedChildren(parent, repository, pool, accountID, inboxID, directOwner)
+        : undefined;
+      return { parent, sameKeyNativeRows: originals, count, containerOnly: true as const, directChildren };
     }
     if (originals.length !== 1 || !isDeepStrictEqual(originals[0], parent)) fail();
     // Do not filter peer/direction/type: contradictory associations must remain visible and refuse.
@@ -444,7 +451,7 @@ export async function preserveAlbumContainers(
       );
       const omittedCounts = !nativeImageCountPresent || !nativeVideoCountPresent;
       proofs.set('WAID:' + parent.key.id, {
-        version: omittedCounts ? 3 : 2,
+        version: snapshot.directChildren ? 4 : omittedCounts ? 3 : 2,
         ...(omittedCounts ? { nativeImageCountPresent, nativeVideoCountPresent } : {}),
         disposition: 'container_only',
         accountID,
@@ -459,9 +466,10 @@ export async function preserveAlbumContainers(
           status: parent.status,
         }),
         expectedImages: snapshot.count,
-        expectedVideos: 0,
-        childrenComplete: false,
-        childrenQueried: false,
+        expectedVideos: snapshot.directChildren ? 1 : 0,
+        childrenComplete: !!snapshot.directChildren,
+        childrenQueried: !!snapshot.directChildren,
+        ...(snapshot.directChildren ? { directChildren: snapshot.directChildren } : {}),
         sourceNativeJSON,
         sourceNativeSHA256: rawHash(sourceNativeJSON),
         sameKeyNativeJSON,
