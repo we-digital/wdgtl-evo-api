@@ -862,3 +862,25 @@ model ChatwootInboundDelivery {
 
   @@index([state, nextAttemptAt, leaseExpiresAt], map: "Cwi_pending_idx")
 }
+
+// Durable opt-in API delivery identity. Payloads remain in the owning source queue.
+model ApiOutboundOperation {
+  id                       String    @id @db.VarChar(36)
+  instanceId               String    @db.VarChar(100)
+  fingerprint              String    @db.VarChar(64)
+  state                    String    @default("pending") @db.VarChar(16)
+  plannedWhatsappMessageId String    @db.VarChar(32)
+  destinationJid           String?   @db.VarChar(100)
+  result                   Json?     @db.Json
+  claimToken               String?   @db.VarChar(36)
+  leaseExpiresAt           DateTime? @db.DateTime(3)
+  transportStartedAt       DateTime? @db.DateTime(3)
+  nextAttemptAt            DateTime  @default(now()) @db.DateTime(3)
+  attempts                 Int       @default(0)
+  lastErrorCode            String?   @db.VarChar(80)
+  createdAt                DateTime  @default(now()) @db.DateTime(3)
+  updatedAt                DateTime  @updatedAt @db.DateTime(3)
+
+  @@unique([instanceId, plannedWhatsappMessageId], map: "ApiOutbound_instance_native_key")
+  @@index([instanceId, state], map: "ApiOutbound_instance_state_idx")
+}

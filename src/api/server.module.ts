@@ -39,6 +39,8 @@ import { S3Controller } from './integrations/storage/s3/controllers/s3.controlle
 import { S3Service } from './integrations/storage/s3/services/s3.service';
 import { ProviderFiles } from './provider/sessions';
 import { PrismaRepository } from './repository/repository.service';
+import { ApiOutboundOperations } from './services/api-outbound-operation';
+import { ApiOutboundPrismaStore } from './services/api-outbound-prisma-store';
 import { CacheService } from './services/cache.service';
 import { WAMonitoringService } from './services/monitor.service';
 import { ProxyService } from './services/proxy.service';
@@ -61,6 +63,9 @@ if (configService.get<ProviderSession>('PROVIDER').ENABLED) {
 }
 
 export const prismaRepository = new PrismaRepository(configService);
+export const apiOutboundOperations = new ApiOutboundOperations(
+  new ApiOutboundPrismaStore(prismaRepository, process.env.DATABASE_PROVIDER || 'postgresql'),
+);
 
 export const waMonitor = new WAMonitoringService(
   eventEmitter,

@@ -1,0 +1,20 @@
+CREATE TABLE `ApiOutboundOperation` (
+  `id` VARCHAR(36) NOT NULL,
+  `instanceId` VARCHAR(100) NOT NULL,
+  `fingerprint` VARCHAR(64) NOT NULL,
+  `state` VARCHAR(16) NOT NULL DEFAULT 'pending',
+  `plannedWhatsappMessageId` VARCHAR(32) NOT NULL,
+  `destinationJid` VARCHAR(100) NULL,
+  `result` JSON NULL,
+  `claimToken` VARCHAR(36) NULL,
+  `leaseExpiresAt` DATETIME(3) NULL,
+  `transportStartedAt` DATETIME(3) NULL,
+  `nextAttemptAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  `attempts` INTEGER NOT NULL DEFAULT 0,
+  `lastErrorCode` VARCHAR(80) NULL,
+  `createdAt` DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+  `updatedAt` DATETIME(3) NOT NULL,
+  INDEX `ApiOutbound_instance_state_idx` (`instanceId`, `state`),
+  UNIQUE INDEX `ApiOutbound_instance_native_key` (`instanceId`, `plannedWhatsappMessageId`),
+  PRIMARY KEY (`id`)
+) DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;

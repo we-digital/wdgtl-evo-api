@@ -1,3 +1,21 @@
+## Durable API send receipts for Zoho notifications (2026-10-13)
+
+Opt-in Baileys text/JSON-media API operations bind a UUID to instance and exact
+payload, claim attempts through database CAS/leases, and retain the planned
+WhatsApp key before optional history/webhook work. Authenticated status lookup
+recovers interrupted receipts from exact native instance/key/direction/peer
+evidence, including unavailable message bodies. Existing ordinary API and
+Chatwoot send semantics remain unchanged. Unknown outcomes retry only under an
+explicit caller policy that accepts duplicates. Both database schemas have an
+additive migration; PostgreSQL has synthetic migration/real CAS coverage.
+
+Reapply native hook-order, HTTP/auth/binding, concurrency, timeout, restart and
+existing Chatwoot outbound regressions after upstream updates. See
+`docs/operations/api-outbound-operations.md`. Rollback keeps the table and all
+delivery evidence; enable the coordinated sender only after immutable Evolution
+deployment/migration and Zoho process-metadata readback. Real phone delivery and
+production alert receipts remain release acceptance checks.
+
 ## Retained native lists and live locations (2026-10-13)
 
 Destination-aware cached history accepts the closed native liveLocation, single-select list and list-response shapes already handled by the stock renderer. It validates finite coordinates, bounded protobuf metadata, native sequence numbers, unique typed menu rows and an exact selected-row identifier; unknown actions/product lists, mixed payloads and malformed fields still refuse. Lists retain their native menu-button label and section labels. No list action executes.

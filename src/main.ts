@@ -5,7 +5,7 @@ import '@utils/instrumentSentry';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { chatwootService, eventManager, waMonitor } from '@api/server.module';
+import { apiOutboundOperations, chatwootService, eventManager, waMonitor } from '@api/server.module';
 import {
   Auth,
   Chatwoot,
@@ -177,7 +177,11 @@ async function bootstrap() {
       const httpClosed = new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
-      const drains = await Promise.allSettled([httpClosed, chatwootService.stopOutboundWorker()]);
+      const drains = await Promise.allSettled([
+        httpClosed,
+        chatwootService.stopOutboundWorker(),
+        apiOutboundOperations.stop(),
+      ]);
       const failed = drains.find((result): result is PromiseRejectedResult => result.status === 'rejected');
       if (failed) throw failed.reason;
       logger.info(JSON.stringify({ event: 'evo_shutdown_drained' }));
