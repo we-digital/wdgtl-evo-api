@@ -2530,7 +2530,7 @@ export class BaileysStartupService extends ChannelStartupService {
       error.name = 'OutboundOperationAborted';
       throw error;
     }
-    await beforeTransport?.();
+    await beforeTransport?.(sender);
     if (signal?.aborted) {
       const error = new Error('Outbound operation aborted after transport fencing');
       error.name = 'OutboundOperationAborted';
@@ -2807,6 +2807,9 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
 
+      // Commit API delivery proof before optional history, media and webhook work.
+      await options?.afterTransport?.(messageSent);
+
       if (Long.isLong(messageSent?.messageTimestamp)) {
         messageSent.messageTimestamp = messageSent.messageTimestamp?.toNumber();
       }
@@ -3040,6 +3043,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mentioned: data?.mentioned,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        afterTransport: data?.afterTransport,
         signal: data?.signal,
       },
       isIntegration,
@@ -3392,6 +3396,7 @@ export class BaileysStartupService extends ChannelStartupService {
         mentioned: data?.mentioned,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        afterTransport: data?.afterTransport,
         signal: data?.signal,
       },
       isIntegration,
@@ -3676,6 +3681,7 @@ export class BaileysStartupService extends ChannelStartupService {
         delay: data?.delay,
         messageId: data?.messageId,
         beforeTransport: data?.beforeTransport,
+        afterTransport: data?.afterTransport,
         signal: data?.signal,
       },
       isIntegration,

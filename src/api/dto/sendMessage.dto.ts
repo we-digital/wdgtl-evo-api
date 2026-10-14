@@ -15,7 +15,8 @@ export class Options {
   mentioned?: string[];
   webhookUrl?: string;
   messageId?: string;
-  beforeTransport?: () => Promise<void>;
+  beforeTransport?: (destinationJid?: string) => Promise<void>;
+  afterTransport?: (receipt: any) => Promise<void>;
   signal?: AbortSignal;
 }
 
@@ -50,7 +51,8 @@ export class Metadata {
   encoding?: boolean;
   notConvertSticker?: boolean;
   messageId?: string;
-  beforeTransport?: () => Promise<void>;
+  beforeTransport?: (destinationJid?: string) => Promise<void>;
+  afterTransport?: (receipt: any) => Promise<void>;
   signal?: AbortSignal;
 }
 

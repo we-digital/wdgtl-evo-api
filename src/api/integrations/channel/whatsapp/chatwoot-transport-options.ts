@@ -5,7 +5,7 @@ export interface BaileysTransportOptions {
   messageId?: string;
   ephemeralExpiration?: number;
   contextInfo?: any;
-  beforeTransport?: () => Promise<void>;
+  beforeTransport?: (destinationJid?: string) => Promise<void>;
   signal?: AbortSignal;
 }
 

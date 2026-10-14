@@ -14,7 +14,8 @@ import {
   SendTemplateDto,
   SendTextDto,
 } from '@api/dto/sendMessage.dto';
-import { sendMessageController } from '@api/server.module';
+import { apiOutboundOperations, prismaRepository, sendMessageController } from '@api/server.module';
+import { isApiOperationId } from '@api/services/api-outbound-operation';
 import { resolveOutboundRequestId } from '@api/types/outbound-provenance';
 import {
   audioMessageSchema,
@@ -42,6 +43,13 @@ export class MessageRouter extends RouterBroker {
   constructor(...guards: RequestHandler[]) {
     super();
     this.router
+      .get('/operations/:instanceName/:operationId', ...guards, async (req, res) => {
+        if (!isApiOperationId(req.params.operationId))
+          return res.status(400).json({ error: 'INVALID_API_OPERATION_ID' });
+        const instance = await prismaRepository.instance.findUnique({ where: { name: req.params.instanceName } });
+        const result = await apiOutboundOperations.status(req.params.operationId, instance.id);
+        return res.status(result ? 200 : 404).json(result || { error: 'API_OPERATION_NOT_FOUND' });
+      })
       .post(this.routerPath('sendTemplate'), ...guards, async (req, res) => {
         const response = await this.dataValidate<SendTemplateDto>({
           request: req,
@@ -58,15 +66,32 @@ export class MessageRouter extends RouterBroker {
           request: req,
           schema: textMessageSchema,
           ClassRef: SendTextDto,
-          execute: (instance, data) =>
-            sendMessageController.sendText(instance, data, {
-              version: 1,
-              origin: 'api',
-              requestId,
-            }),
+          execute: async (instance, data) => {
+            const key = req.get('idempotency-key');
+            if (!key) return sendMessageController.sendText(instance, data, { version: 1, origin: 'api', requestId });
+            if (!isApiOperationId(key)) throw { status: 400, message: ['INVALID_API_OPERATION_ID'] };
+            const stored = await prismaRepository.instance.findUnique({ where: { name: instance.instanceName } });
+            if (stored?.integration !== 'WHATSAPP-BAILEYS')
+              throw { status: 400, message: ['API_OPERATION_REQUIRES_BAILEYS'] };
+            return apiOutboundOperations.send(
+              key,
+              stored.id,
+              'sendText',
+              req.body,
+              req.get('x-evo-retry-ambiguous') === 'true',
+              (hooks) =>
+                sendMessageController.sendText(instance, Object.assign(data, hooks), {
+                  version: 1,
+                  origin: 'api',
+                  requestId: key,
+                }),
+            );
+          },
         });
 
-        return res.status(HttpStatus.CREATED).json(response);
+        return res
+          .status(response?.operation && response.operation.state !== 'sent' ? HttpStatus.ACCEPTED : HttpStatus.CREATED)
+          .json(response);
       })
       .post(this.routerPath('sendMedia'), ...guards, upload.single('file'), async (req, res) => {
         const bodyData = req.body;
@@ -75,10 +100,29 @@ export class MessageRouter extends RouterBroker {
           request: req,
           schema: mediaMessageSchema,
           ClassRef: SendMediaDto,
-          execute: (instance) => sendMessageController.sendMedia(instance, bodyData, req.file as any),
+          execute: async (instance) => {
+            const key = req.get('idempotency-key');
+            if (!key) return sendMessageController.sendMedia(instance, bodyData, req.file as any);
+            if (!isApiOperationId(key) || req.file)
+              throw { status: 400, message: ['API_OPERATION_REQUIRES_JSON_MEDIA'] };
+            const stored = await prismaRepository.instance.findUnique({ where: { name: instance.instanceName } });
+            if (stored?.integration !== 'WHATSAPP-BAILEYS')
+              throw { status: 400, message: ['API_OPERATION_REQUIRES_BAILEYS'] };
+            const payload = { ...bodyData };
+            return apiOutboundOperations.send(
+              key,
+              stored.id,
+              'sendMedia',
+              payload,
+              req.get('x-evo-retry-ambiguous') === 'true',
+              (hooks) => sendMessageController.sendMedia(instance, Object.assign({ ...bodyData }, hooks)),
+            );
+          },
         });
 
-        return res.status(HttpStatus.CREATED).json(response);
+        return res
+          .status(response?.operation && response.operation.state !== 'sent' ? HttpStatus.ACCEPTED : HttpStatus.CREATED)
+          .json(response);
       })
       .post(this.routerPath('sendPtv'), ...guards, upload.single('file'), async (req, res) => {
         const bodyData = req.body;
