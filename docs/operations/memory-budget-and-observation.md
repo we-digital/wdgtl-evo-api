@@ -23,7 +23,9 @@ PostgreSQL session, not an expiring Prisma interactive transaction. Its30-second
 soft deadline stops new destination statements/COMMIT but never releases source
 locks under a continuing writer. Dedicated destination leases retain5-second
 statement deadlines, permit rollback after cancellation, restore exact prior
-session settings and settle all cleanup before source rollback/unlock. Ancillary
+session settings through transaction-local settings and settle all cleanup before
+source rollback/unlock. Every scoped statement has an owned transaction, including
+through the production transaction pooler; no session-level SET is issued. Ancillary
 group/user lookups happen before lock acquisition. No global DB setting changes.
 A real31.5-second test crosses the unchanged30-second deadline and proves source
 updates stay blocked until destination rollback, with zero stale metadata. A stale/deleted later-page donor cannot supply metadata

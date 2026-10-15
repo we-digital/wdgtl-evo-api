@@ -1,20 +1,21 @@
 import type { Pool, PoolClient } from 'pg';
 
-// No shared-pool mutation: each operation owns its leases, restores exact
-// session settings and awaits every cleanup before the source guard unlocks.
+// Operation-owned transactions use LOCAL settings only, including through a
+// transaction pooler. Cleanup settles before the native source guard unlocks.
 export const createHistoryDatabaseScope = (pool: Pool, signal: AbortSignal) => {
   const leases = new Map<any, () => Promise<void>>();
   const cleanup = new Set<Promise<void>>();
   let closed = false;
-  const admit = (sql?: any) => {
-    if (typeof sql === 'string' && /^\s*ROLLBACK\s*;?\s*$/i.test(sql)) return;
+  const sqlText = (value: any) => (typeof value === 'string' ? value : value?.text || '');
+  const rollback = (sql: string) => /^\s*ROLLBACK\s*;?\s*$/i.test(sql);
+  const admit = () => {
     if (closed) throw new Error('History database scope is closed');
     signal.throwIfAborted();
   };
   const lease = async () => {
     admit();
     const client = await pool.connect();
-    let settings: any;
+    let transaction = false;
     let connectionError: Error | undefined;
     const failed = (error: Error) => {
       connectionError = error;
@@ -25,13 +26,7 @@ export const createHistoryDatabaseScope = (pool: Pool, signal: AbortSignal) => {
       if (!released) {
         released = (async () => {
           try {
-            // Even after cancellation, rollback/restore remain admitted.
-            await client.query('ROLLBACK');
-            if (settings)
-              await client.query(
-                "SELECT set_config('statement_timeout',$1,false),set_config('idle_in_transaction_session_timeout',$2,false)",
-                [settings.statement, settings.idle],
-              );
+            if (transaction) await client.query('ROLLBACK');
             client.release();
           } catch (error) {
             client.release(true);
@@ -42,20 +37,12 @@ export const createHistoryDatabaseScope = (pool: Pool, signal: AbortSignal) => {
           }
         })();
         cleanup.add(released);
-        // Attach immediately so ignored synchronous release() cannot create an
-        // unhandled rejection; close() still awaits and propagates its outcome.
         void released.catch(() => undefined);
       }
       return released;
     };
     leases.set(client, release);
     try {
-      settings = (
-        await client.query(
-          "SELECT current_setting('statement_timeout') AS statement,current_setting('idle_in_transaction_session_timeout') AS idle",
-        )
-      ).rows[0];
-      await client.query("SET statement_timeout='5s'; SET idle_in_transaction_session_timeout='10s'");
       admit();
     } catch (error) {
       await release();
@@ -63,9 +50,27 @@ export const createHistoryDatabaseScope = (pool: Pool, signal: AbortSignal) => {
     }
     return {
       query: async (...args: any[]) => {
+        const sql = sqlText(args[0]);
         if (connectionError) throw connectionError;
-        admit(args[0]);
-        return (client.query as any)(...args);
+        // Rollback remains admitted after cancellation/close; commit never does.
+        if (rollback(sql)) {
+          const result = await (client.query as any)(...args);
+          transaction = false;
+          return result;
+        }
+        admit();
+        if (/^\s*BEGIN\b/i.test(sql)) {
+          if (transaction) throw new Error('History transaction already started');
+          const result = await (client.query as any)(...args);
+          transaction = true;
+          await client.query("SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='10s'");
+          admit();
+          return result;
+        }
+        if (!transaction) throw new Error('History query requires an owned transaction');
+        const result = await (client.query as any)(...args);
+        if (/^\s*COMMIT\s*;?\s*$/i.test(sql)) transaction = false;
+        return result;
       },
       release: () => {
         void release();
@@ -77,7 +82,13 @@ export const createHistoryDatabaseScope = (pool: Pool, signal: AbortSignal) => {
     query: async (...args: any[]) => {
       const client = await lease();
       try {
-        return await client.query(...args);
+        await client.query('BEGIN');
+        const result = await client.query(...args);
+        await client.query('COMMIT');
+        return result;
+      } catch (error) {
+        await client.query('ROLLBACK');
+        throw error;
       } finally {
         await client._release();
       }
