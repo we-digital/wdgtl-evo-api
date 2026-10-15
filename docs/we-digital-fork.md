@@ -1,3 +1,14 @@
+## Bounded history memory and process observation (2026-10-15)
+
+Use dependency-native device/retry TTLs, batch-scoped bootstrap deduplication,
+250-row stored-history payload pages and a compact version-bound two-pass plan.
+Global selection/deduplication, timestamps, names, native source identities and
+existing provider/destination guards are retained. No dependency/schema/send
+change. Main-process memory/cache/event-loop metrics remain loopback-only in
+production. See `docs/operations/memory-budget-and-observation.md` for exact
+checks, limits, sizing observation and rollback. No production leak cure or
+Droplet-downsize acceptance is inferred from a synthetic benchmark.
+
 ## Group participant names (2026-10-15)
 
 Live inbound group ingress carries a validated native PN/LID participant JID,

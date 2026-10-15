@@ -8,44 +8,93 @@ const servicePath = '../src/api/integrations/chatbot/chatwoot/services/chatwoot.
 test('actual group edit/reaction/reply methods scope colliding provider IDs to target peer/direction', async (t) => {
   const modulePath = require.resolve('../src/api/server.module.ts');
   const previous = require.cache[modulePath];
-  require.cache[modulePath] = { id: modulePath, filename: modulePath, loaded: true,
-    exports: new Proxy({}, { get: () => ({}) }), children: [], paths: [] } as NodeModule;
-  t.after(() => { if (previous) require.cache[modulePath] = previous; else delete require.cache[modulePath]; });
+  require.cache[modulePath] = {
+    id: modulePath,
+    filename: modulePath,
+    loaded: true,
+    exports: new Proxy({}, { get: () => ({}) }),
+    children: [],
+    paths: [],
+  } as NodeModule;
+  t.after(() => {
+    if (previous) require.cache[modulePath] = previous;
+    else delete require.cache[modulePath];
+  });
   const { ChatwootService } = require(servicePath);
   const service = Object.create(ChatwootService.prototype) as any;
   const instance = { instanceName: 'synthetic', instanceId: 'instance-1' };
   const peer = '120363000000001@g.us';
   const otherPeer = '120363000000002@g.us';
-  const rows = [peer, otherPeer].flatMap((remoteJid, i) => [false, true].map((fromMe, j) => ({
-    id: `${i}-${j}`, instanceId: 'instance-1', key: { id: 'SAME', remoteJid, fromMe }, messageType: 'conversation',
-    message: { conversation: 'Synthetic' }, chatwootMessageId: 100 + i * 10 + j,
-    chatwootConversationId: 40 + i, chatwootInboxId: 42, chatwootContactInboxSourceId: 'ci',
-  })));
+  const rows = [peer, otherPeer].flatMap((remoteJid, i) =>
+    [false, true].map((fromMe, j) => ({
+      id: `${i}-${j}`,
+      instanceId: 'instance-1',
+      key: { id: 'SAME', remoteJid, fromMe },
+      messageType: 'conversation',
+      message: { conversation: 'Synthetic' },
+      chatwootMessageId: 100 + i * 10 + j,
+      chatwootConversationId: 40 + i,
+      chatwootInboxId: 42,
+      chatwootContactInboxSourceId: 'ci',
+    })),
+  );
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: false }) };
   service.waMonitor = { waInstances: { synthetic: {} } };
   service.clientCw = async () => ({ client: {}, provider: { accountId: '1', ignoreJids: [] } });
-  service.logger = { info() {}, warn() {}, error(error: Error) { throw error; } };
-  service.prismaRepository = { $queryRaw: async (sql: any) => rows.filter((row) =>
-    row.key.id === sql.values[1] && (!sql.text.includes("key->>'remoteJid'") || row.key.remoteJid === sql.values[2]) &&
-    (!sql.text.includes("key->>'fromMe'") || String(row.key.fromMe) === sql.values[3])) };
+  service.logger = {
+    info() {},
+    warn() {},
+    error(error: Error) {
+      throw error;
+    },
+  };
+  service.prismaRepository = {
+    $queryRaw: async (sql: any) =>
+      rows.filter(
+        (row) =>
+          row.key.id === sql.values[1] &&
+          (!sql.text.includes("key->>'remoteJid'") || row.key.remoteJid === sql.values[2]) &&
+          (!sql.text.includes("key->>'fromMe'") || String(row.key.fromMe) === sql.values[3]),
+      ),
+  };
   const requests: any[] = [];
   service.privilegedChatwootRequest = async (_provider: any, request: any) => requests.push(request);
   for (const fromMe of [false, true]) {
-    await service.eventWhatsapp('messages.edit', instance, { key: { id: 'SAME', remoteJid: peer, fromMe },
-      editedMessage: { conversation: 'Updated synthetic' } });
+    await service.eventWhatsapp('messages.edit', instance, {
+      key: { id: 'SAME', remoteJid: peer, fromMe },
+      editedMessage: { conversation: 'Updated synthetic' },
+    });
     assert.match(requests.at(-1).path, new RegExp(`/conversations/40/messages/${fromMe ? 101 : 100}/edit$`));
   }
-  await service.applyNativeChatwootReaction(instance, 999, { key: { remoteJid: otherPeer, fromMe: true }, pushName: 'Synthetic' },
-    { key: { id: 'SAME', remoteJid: peer, fromMe: false }, text: '👍' });
+  await service.applyNativeChatwootReaction(
+    instance,
+    999,
+    { key: { remoteJid: otherPeer, fromMe: true }, pushName: 'Synthetic' },
+    { key: { id: 'SAME', remoteJid: peer, fromMe: false }, text: '👍' },
+  );
   assert.match(requests.at(-1).path, /\/conversations\/40\/messages\/100\/react$/);
   const before = requests.length;
-  await assert.rejects(service.eventWhatsapp('messages.edit', instance, { key: { id: 'SAME' },
-    editedMessage: { conversation: 'Ambiguous' } }));
+  await assert.rejects(
+    service.eventWhatsapp('messages.edit', instance, {
+      key: { id: 'SAME' },
+      editedMessage: { conversation: 'Ambiguous' },
+    }),
+  );
   assert.equal(requests.length, before);
   let replyScope: any;
-  service.getMessageByKeyId = async (_instance: any, _id: string, scope: any) => { replyScope = scope; return null; };
-  await service.getReplyToIds({ key: { remoteJid: peer, fromMe: true },
-    message: { extendedTextMessage: { contextInfo: { stanzaId: 'SAME', quotedMessage: { conversation: 'Synthetic' } } } } }, instance);
+  service.getMessageByKeyId = async (_instance: any, _id: string, scope: any) => {
+    replyScope = scope;
+    return null;
+  };
+  await service.getReplyToIds(
+    {
+      key: { remoteJid: peer, fromMe: true },
+      message: {
+        extendedTextMessage: { contextInfo: { stanzaId: 'SAME', quotedMessage: { conversation: 'Synthetic' } } },
+      },
+    },
+    instance,
+  );
   assert.deepEqual(replyScope, { remoteJid: peer });
   assert.equal(await findNativeMessageByKey(service.prismaRepository, 'instance-1', 'SAME'), null);
 });
@@ -64,37 +113,73 @@ test('read/delete wiring passes full event key; deletion only drops exact native
   assert.match(deleteBranch, /path: \['fromMe'\], equals: \(message\.key as WAMessageKey\)\.fromMe/);
 });
 
-
-test('actual ingress existing-row lookup and fence do not suppress another group or direction', async (t) => {
+test('actual durable ingress gives colliding native IDs distinct peer/direction identities and never trusts a local mapping as delivery', async (t) => {
   const modulePath = require.resolve('../src/api/server.module.ts');
   const previous = require.cache[modulePath];
-  require.cache[modulePath] = { id: modulePath, filename: modulePath, loaded: true,
-    exports: new Proxy({}, { get: () => ({}) }), children: [], paths: [] } as NodeModule;
-  t.after(() => { if (previous) require.cache[modulePath] = previous; else delete require.cache[modulePath]; });
+  require.cache[modulePath] = {
+    id: modulePath,
+    filename: modulePath,
+    loaded: true,
+    exports: new Proxy({}, { get: () => ({}) }),
+    children: [],
+    paths: [],
+  } as NodeModule;
+  t.after(() => {
+    if (previous) require.cache[modulePath] = previous;
+    else delete require.cache[modulePath];
+  });
   const { ChatwootService } = require(servicePath);
-  const { ChatwootIngressDeliveryFence } = require('../src/api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-delivery-fence');
   const service = Object.create(ChatwootService.prototype) as any;
-  service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
-  const peer = '120363000000001@g.us'; const otherPeer = '120363000000002@g.us';
-  const queries: any[] = []; const deliveries: any[] = [];
-  service.prismaRepository = { message: { findFirst: async (query: any) => {
-    queries.push(query);
-    assert.equal(query.where.instanceId, 'instance-1');
-    assert.deepEqual(query.where.AND[0], { key: { path: ['id'], equals: 'SAME' } });
-    assert.equal(query.where.AND[1].key.path[0], 'remoteJid');
-    assert.equal(query.where.AND[2].key.path[0], 'fromMe');
-    return query.where.AND[1].key.equals === peer && query.where.AND[2].key.equals === false
-      ? { chatwootMessageId: 101, chatwootConversationId: 37, chatwootInboxId: 42 } : null;
-  } } };
-  service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
-    deliveries.push(body.key); return { id: 102 };
+  const peer = '120363000000001@g.us';
+  const otherPeer = '120363000000002@g.us';
+  const submissions: any[] = [];
+  service.prismaRepository = {
+    message: { findFirst: async () => assert.fail('A native pointer is not an authoritative delivery receipt') },
+    chatwootOutboundOperation: { findMany: async () => [] },
   };
-  const instance = { instanceId: 'instance-1' };
-  const body = (remoteJid: string, fromMe: boolean) => ({ key: { id: 'SAME', remoteJid, fromMe } });
-  await Promise.all([service.eventWhatsapp('messages.upsert', instance, body(peer, false)),
+  service.getProvider = async () => ({
+    id: 'provider',
+    instanceId: 'instance-1',
+    accountId: '1',
+    enabled: true,
+    url: 'https://cw.synthetic',
+    nameInbox: 'synthetic',
+    ignoreJids: [],
+  });
+  service.inboundQueue = {
+    submit: async (item: any) => {
+      submissions.push(item);
+      return { queued: true };
+    },
+  };
+  service.processWhatsappEvent = async () => assert.fail('Ordinary ingress must enter the durable queue');
+  const instance = { instanceId: 'instance-1', instanceName: 'synthetic' };
+  const body = (remoteJid: string, fromMe: boolean) => ({
+    key: { id: 'SAME', remoteJid, fromMe },
+    messageType: 'conversation',
+    messageTimestamp: 1700000000,
+    message: { conversation: 'Synthetic' },
+  });
+  await Promise.all([
+    service.eventWhatsapp('messages.upsert', instance, body(peer, false)),
     service.eventWhatsapp('messages.upsert', instance, body(peer, false)),
     service.eventWhatsapp('messages.upsert', instance, body(otherPeer, false)),
-    service.eventWhatsapp('messages.upsert', instance, body(peer, true))]);
-  assert.equal(queries.length, 3);
-  assert.deepEqual(deliveries, [body(otherPeer, false).key, body(peer, true).key]);
+    service.eventWhatsapp('messages.upsert', instance, body(peer, true)),
+  ]);
+  assert.equal(submissions.length, 4);
+  assert.equal(submissions[0].id, submissions[1].id);
+  assert.equal(new Set(submissions.map((item) => item.id)).size, 3);
+  assert.deepEqual(
+    submissions.map((item) => [item.peer, item.fromMe]),
+    [
+      [peer, false],
+      [peer, false],
+      [otherPeer, false],
+      [peer, true],
+    ],
+  );
+  assert.ok(
+    submissions.every((item) => item.state === 'pending' && item.sourceId === 'WAID:SAME' && item.accountId === 1),
+  );
+  assert.deepEqual(submissions[0].payload, body(peer, false));
 });

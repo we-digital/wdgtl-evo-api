@@ -8,6 +8,7 @@ import { StorageRouter } from '@api/integrations/storage/storage.router';
 import { waMonitor } from '@api/server.module';
 import { configService, Database, Facebook } from '@config/env.config';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
+import { createRuntimeMetrics, metricsPeerAllowed } from '@utils/runtime-metrics';
 import { NextFunction, Request, Response, Router } from 'express';
 import fs from 'fs';
 import mimeTypes from 'mime-types';
@@ -48,15 +49,8 @@ const packageJson = JSON.parse(fs.readFileSync('./package.json', 'utf8'));
 // Middleware for metrics IP whitelist
 const metricsIPWhitelist = (req: Request, res: Response, next: NextFunction) => {
   const metricsConfig = configService.get('METRICS');
-  const allowedIPs = metricsConfig.ALLOWED_IPS?.split(',').map((ip) => ip.trim()) || ['127.0.0.1'];
-  const clientIPs = [
-    req.ip,
-    req.connection.remoteAddress,
-    req.socket.remoteAddress,
-    req.headers['x-forwarded-for'],
-  ].filter((ip) => ip !== undefined);
-
-  if (allowedIPs.filter((ip) => clientIPs.includes(ip)) === 0) {
+  // Only the TCP peer is authoritative; X-Forwarded-For is caller-controlled.
+  if (!metricsPeerAllowed(req.socket.remoteAddress, metricsConfig.ALLOWED_IPS || '127.0.0.1,::1')) {
     return res.status(403).send('Forbidden: IP not allowed');
   }
 
@@ -93,6 +87,7 @@ const metricsBasicAuth = (req: Request, res: Response, next: NextFunction) => {
 const metricsConfig = configService.get('METRICS');
 if (metricsConfig.ENABLED) {
   const metricsMiddleware = [];
+  const runtimeMetrics = createRuntimeMetrics();
 
   // Add IP whitelist if configured
   if (metricsConfig.ALLOWED_IPS) {
@@ -114,7 +109,7 @@ if (metricsConfig.ENABLED) {
         .replace(/\n/g, '\\n')
         .replace(/"/g, '\\"');
 
-    const lines: string[] = [];
+    const lines: string[] = runtimeMetrics();
 
     const clientName = databaseConfig.CONNECTION.CLIENT_NAME || 'unknown';
     const serverUrl = serverConfig.URL || '';
@@ -157,6 +152,17 @@ if (metricsConfig.ENABLED) {
       );
     }
 
+    const cacheTotals = instanceEntries.reduce(
+      (total, [, instance]) => {
+        const stats = (instance as any)?.resourceCacheStats?.();
+        total.devices += Number(stats?.devices || 0);
+        total.retries += Number(stats?.retries || 0);
+        return total;
+      },
+      { devices: 0, retries: 0 },
+    );
+    lines.push('# TYPE evolution_cache_device_keys gauge', `evolution_cache_device_keys ${cacheTotals.devices}`);
+    lines.push('# TYPE evolution_cache_retry_keys gauge', `evolution_cache_retry_keys ${cacheTotals.retries}`);
     res.send(lines.join('\n') + '\n');
   });
 }

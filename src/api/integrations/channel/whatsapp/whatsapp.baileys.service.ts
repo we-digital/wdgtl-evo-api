@@ -73,6 +73,7 @@ import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
+import { findStoredHistoryIds } from '@api/integrations/chatbot/chatwoot/utils/history-memory-budget';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -118,12 +119,12 @@ import makeWASocket, {
   AnyMessageContent,
   BufferedEventData,
   BufferJSON,
-  CacheStore,
   CatalogCollection,
   Chat,
   ConnectionState,
   Contact,
   decryptPollVote,
+  DEFAULT_CACHE_TTLS,
   delay,
   DisconnectReason,
   downloadContentFromMessage,
@@ -293,8 +294,20 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private authStateProvider: AuthStateProvider;
-  private readonly msgRetryCounterCache: CacheStore = new NodeCache();
-  private readonly userDevicesCache: CacheStore = new NodeCache({ stdTTL: 300000, useClones: false });
+  private readonly msgRetryCounterCache = new NodeCache({
+    stdTTL: DEFAULT_CACHE_TTLS.MSG_RETRY,
+    checkperiod: 300,
+    useClones: false,
+  });
+  private readonly userDevicesCache = new NodeCache({
+    stdTTL: DEFAULT_CACHE_TTLS.USER_DEVICES,
+    checkperiod: 60,
+    useClones: false,
+  });
+
+  public resourceCacheStats() {
+    return { devices: this.userDevicesCache.getStats().keys, retries: this.msgRetryCounterCache.getStats().keys };
+  }
   private endSession = false;
   private historySyncFullRequestedForSocket = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
@@ -1217,7 +1230,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          this.logger.info(`Received on-demand history sync: ${messages.length} messages`);
         }
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
@@ -1233,7 +1246,10 @@ export class BaileysStartupService extends ChannelStartupService {
           const date = new Date();
           timestampLimitToImport = new Date(date.setDate(date.getDate() - daysLimitToImport)).getTime() / 1000;
 
-          const maxBatchTimestamp = Math.max(...messages.map((message) => message.messageTimestamp as number));
+          const maxBatchTimestamp = messages.reduce(
+            (max, message) => Math.max(max, Number(message.messageTimestamp)),
+            -Infinity,
+          );
 
           const processBatch = maxBatchTimestamp >= timestampLimitToImport;
 
@@ -1253,9 +1269,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const chatsRaw: { remoteJid: string; instanceId: string; name?: string }[] = [];
         const chatsRepository = new Set(
-          (await this.prismaRepository.chat.findMany({ where: { instanceId: this.instanceId } })).map(
-            (chat) => chat.remoteJid,
-          ),
+          (
+            await this.prismaRepository.chat.findMany({
+              where: { instanceId: this.instanceId, remoteJid: { in: chats.map((chat) => chat.id) } },
+              select: { remoteJid: true },
+            })
+          ).map((chat) => chat.remoteJid),
         );
 
         for (const chat of chats) {
@@ -1274,23 +1293,11 @@ export class BaileysStartupService extends ChannelStartupService {
 
         const messagesRaw: any[] = [];
 
-        const messagesRepository: Set<string> = new Set(
-          chatwootImport.getRepositoryMessagesCache(instance) ??
-            (
-              await this.prismaRepository.message.findMany({
-                select: { key: true },
-                where: { instanceId: this.instanceId },
-              })
-            ).map((message) => {
-              const key = message.key as { id: string };
-
-              return key.id;
-            }),
+        const messagesRepository = await findStoredHistoryIds(
+          this.prismaRepository.message,
+          this.instanceId,
+          messages.map((message) => message.key?.id),
         );
-
-        if (chatwootImport.getRepositoryMessagesCache(instance) === null) {
-          chatwootImport.setRepositoryMessagesCache(instance, messagesRepository);
-        }
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {

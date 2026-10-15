@@ -21,6 +21,7 @@ function fixture(targetType = 'imageMessage') {
     chatwootMessageId: null,
     chatwootInboxId: null,
     chatwootConversationId: null,
+    chatwootContactInboxSourceId: null,
   };
   const source: any = {
     ...target,
@@ -205,12 +206,67 @@ async function assertMixedBatch(t: TestContext, targetType = 'imageMessage') {
     assert.equal(requested.length, 0);
     return new Map();
   };
+  // Existing ordinary rows now undergo native-pointer reconciliation as well.
+  // Exercise that real guard with a faithful scoped destination instead of a
+  // blanket empty SELECT response (which correctly means "missing source").
+  const ordinary = rows.filter((row) => row.message !== null && row.messageType === 'conversation');
+  const destinationId = (row: any) => 1000 + ordinary.indexOf(row);
+  const aliasRows = (values: any[]) => {
+    const aliases = values.find((value) => Array.isArray(value));
+    assert.ok(aliases, 'The native source lookup must carry explicit aliases');
+    const row = ordinary.find((entry) => aliases.includes(`WAID:${entry.key.id}`));
+    return row ? [{ id: destinationId(row) }] : [];
+  };
+  let pointerWrites = 0;
+  service.prismaRepository.$transaction = async (work: any) =>
+    work({
+      $queryRaw: async (sql: any) => {
+        assert.match(sql.text, /FOR UPDATE/);
+        return ordinary.filter(
+          (row) =>
+            row.instanceId === sql.values[0] &&
+            row.key.id === sql.values[1] &&
+            row.key.remoteJid === sql.values[2] &&
+            String(row.key.fromMe) === sql.values[3],
+        );
+      },
+      message: {
+        updateMany: async (args: any) => {
+          assert.equal(args.where.instanceId, 'synthetic-instance');
+          assert.deepEqual(Object.keys(args.data).sort(), [
+            'chatwootContactInboxSourceId',
+            'chatwootConversationId',
+            'chatwootInboxId',
+            'chatwootMessageId',
+          ]);
+          pointerWrites++;
+          return { count: 1 };
+        },
+      },
+    });
   postgresClient.getChatwootConnection = (() => ({
-    query: async (sql: string) => {
+    query: async (sql: string, values: any[]) => {
       assert.equal(sql.trim().startsWith('SELECT'), true);
       captures++;
-      return { rows: [] };
+      return { rows: sql.startsWith('SELECT id FROM messages') ? aliasRows(values) : [] };
     },
+    connect: async () => ({
+      release() {},
+      query: async (sql: string, values: any[]) => {
+        if (/^(BEGIN|SET|COMMIT|ROLLBACK)/.test(sql)) return { rows: [] };
+        assert.ok(sql.startsWith('SELECT'), 'No Chatwoot mutation');
+        if (sql.startsWith('SELECT id FROM messages')) return { rows: aliasRows(values) };
+        if (sql.startsWith('SELECT conversation_id')) {
+          const row = ordinary.find((entry) => destinationId(entry) === values[0]);
+          return { rows: [{ conversation_id: 900, source_id: `WAID:${row.key.id}`, private: false, message_type: 0 }] };
+        }
+        if (sql.startsWith('SELECT public.provider_message_conversation_route')) return { rows: [{ id: 900 }] };
+        if (sql.startsWith('SELECT c.id'))
+          return { rows: [{ id: 900, display_id: 37, inbox_id: 99, source_id: 'synthetic-ci' }] };
+        if (sql.includes('SELECT b.peer')) return { rows: [{ peer: '123@g.us' }] };
+        assert.fail('Unexpected canonical binding query');
+      },
+    }),
   })) as any;
   const input = {
     contractVersion: '2026-08-28',
@@ -228,6 +284,7 @@ async function assertMixedBatch(t: TestContext, targetType = 'imageMessage') {
     input,
   );
   assert.equal(guards, 1);
+  assert.equal(pointerWrites, 248);
   assert.ok(captures >= 4);
   assert.equal(result.importedMessages, 0);
   assert.equal(result.outcomes.length, 250);
@@ -405,8 +462,14 @@ test('existing NULL text preserves authenticated native LID alias with valid CI 
   const result = await read();
   assert.equal(result.get('WAID:known-text'), 'preserved_existing_source_payload_unavailable');
   assert.equal(queries.at(-1), 'COMMIT');
-  assert.ok(queries.some((sql) => sql.includes('LEFT JOIN provider_conversation_bindings pc') && sql.includes('FOR UPDATE OF m')));
-  assert.ok(queries.filter((sql) => sql.includes('SELECT m.id')).every((sql) => !sql.includes("pc.provider = 'whatsapp'")));
+  assert.ok(
+    queries.some(
+      (sql) => sql.includes('LEFT JOIN provider_conversation_bindings pc') && sql.includes('FOR UPDATE OF m'),
+    ),
+  );
+  assert.ok(
+    queries.filter((sql) => sql.includes('SELECT m.id')).every((sql) => !sql.includes("pc.provider = 'whatsapp'")),
+  );
   rows = [{ ...valid, bound_peer: null, binding_snapshot: null }];
   const absent = await read();
   assert.equal(absent.get('WAID:known-text'), 'preserved_existing_source_payload_unavailable');

@@ -151,7 +151,7 @@ test('ignored encrypted LID edit requires authenticated native phone alias plus 
     provider_peer: original.key.remoteJidAlt,
     bound_peer: original.key.remoteJidAlt,
     contact_inbox_matches: true,
-    binding_snapshot: { peer: original.key.remoteJidAlt },
+    binding_snapshot: { provider: 'whatsapp', peer: original.key.remoteJidAlt },
     contact_inbox_snapshot: { id: 8 },
   };
   const before = JSON.stringify({ original, envelope, row });
@@ -159,7 +159,6 @@ test('ignored encrypted LID edit requires authenticated native phone alias plus 
     for (const changed of [
       null,
       { bound_peer: 'foreign@s.whatsapp.net' },
-      { provider_peer: 'foreign@s.whatsapp.net' },
       { contact_inbox_matches: false },
       { binding_snapshot: null },
       { contact_inbox_snapshot: null },
@@ -188,6 +187,22 @@ test('ignored encrypted LID edit requires authenticated native phone alias plus 
         assert.equal(JSON.stringify({ original, envelope, row }), before);
       } else await assert.rejects(run, /unique current scoped/);
     }
+    postgresClient.getChatwootConnection = (() => ({
+      query: async () => ({ rows: [{ ...row, provider_peer: 'merged-contact@s.whatsapp.net' }] }),
+    })) as any;
+    assert.equal(
+      (
+        await chatwootImport.captureIgnoredHistoryEdit(
+          envelope,
+          original,
+          9,
+          { accountId: '1' } as any,
+          'conflicting',
+          'Retained encrypted edit target identity differs',
+        )
+      ).peer,
+      original.key.remoteJid,
+    );
     for (const alias of [undefined, 'foreign@s.whatsapp.net', '12345@lid']) {
       postgresClient.getChatwootConnection = (() => ({ query: async () => ({ rows: [row] }) })) as any;
       await assert.rejects(

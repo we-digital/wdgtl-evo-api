@@ -111,7 +111,18 @@ test('NULL edited contacts and albums use only exact ignored-native proof, never
 });
 
 test('hydrated and interactive image templates plus plain buttons retain visible text and native media', () => {
-  const image = { mimetype: 'image/jpeg', fileLength: 12, fileSha256: b64 };
+  const image = {
+    mimetype: 'image/jpeg',
+    fileLength: 12,
+    fileSha256: b64,
+    fileEncSha256: b64,
+    mediaKey: b64,
+    mediaKeyTimestamp: long,
+    width: 8,
+    height: 8,
+    url: 'https://example.invalid/synthetic.jpeg',
+    directPath: '/synthetic.jpeg',
+  };
   const hydrated = {
     templateMessage: {
       templateId: 'template',
@@ -150,6 +161,17 @@ test('hydrated and interactive image templates plus plain buttons retain visible
     assert.equal(retainedHistoryMedia({ messageType: 'templateMessage', message: body } as any).type, 'imageMessage');
     assert.equal(JSON.stringify(body), before);
   }
+  assert.throws(() =>
+    retainedTemplate({
+      templateMessage: {
+        ...hydrated.templateMessage,
+        hydratedTemplate: {
+          ...hydrated.templateMessage.hydratedTemplate,
+          imageMessage: { ...image, mediaKey: undefined },
+        },
+      },
+    }),
+  );
   const buttons = {
     buttonsMessage: {
       buttons: [{ type: 1, buttonId: 'button', buttonText: { displayText: 'Retained label' } }],
