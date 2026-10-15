@@ -9,7 +9,9 @@ import ts from 'typescript';
 import {
   findStoredHistoryIds,
   HISTORY_PAGE_SIZE,
+  historySourceFingerprint,
   storedHistoryPages,
+  withLockedHistoryDependencies,
 } from '../src/api/integrations/chatbot/chatwoot/utils/history-memory-budget';
 import * as normalization from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import * as coordinator from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync-coordinator';
@@ -92,12 +94,15 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
   const imported: string[][] = [];
   const plans: any[] = [];
   let fail = false;
+  let beforeLock: (() => void) | undefined;
   const context = {
     module: { exports: undefined as any },
     ...normalization,
     ...coordinator,
     storedHistoryPages,
+    withLockedHistoryDependencies,
     HISTORY_PAGE_SIZE,
+    historySourceFingerprint,
     createHash,
     dayjs,
     BadRequestException: Error,
@@ -122,12 +127,32 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
   );
   const svc = new context.module.exports();
   const repo = repository(rows);
+  const read = repo.findMany;
+  repo.findMany = async (args: any) => {
+    if (args.where?.id?.in) beforeLock?.(); // also exercise the previous read-before-write path
+    return read(args);
+  };
   Object.assign(svc, {
     isImportHistoryAvailable: () => true,
     getProvider: async () => ({ importMessages: true, enabled: true }),
     clientCw: async () => ({}),
     getInbox: async () => ({ id: 42 }),
-    prismaRepository: { message: repo },
+    prismaRepository: {
+      message: repo,
+      $transaction: async (work: any) => {
+        beforeLock?.();
+        return work({
+          $queryRaw: async (sql: any) => {
+            assert.match(sql.text, /FOR SHARE OF m/);
+            const ids = sql.values.slice(1);
+            assert.ok(ids.length <= 250);
+            return rows
+              .filter((row) => row.instanceId === 'a' && ids.includes(row.id))
+              .map((row) => structuredClone(row));
+          },
+        });
+      },
+    },
     configService: { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) },
     refreshKnownLidMappings: async () => ({ attemptedPhoneJids: 0, refreshedMappings: 0 }),
     resolvePhoneJidForLid: async () => null,
@@ -140,6 +165,9 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
     repo,
     imported,
     plans,
+    setBeforeLock: (hook: () => void) => {
+      beforeLock = hook;
+    },
     setFail: (value: boolean) => {
       fail = value;
     },
@@ -239,14 +267,12 @@ test('planning retains whole-conversation last timestamp and first human name be
   assert.equal(plan.identityPushNames.get('628100000001@s.whatsapp.net'), 'Late synthetic human');
 });
 
-test('a source replacement between plan and import is refused before any destination write', async () => {
-  const next = service(current, fixture());
-  const read = next.repo.findMany;
-  next.repo.findMany = async (args: any) => {
-    const rows = await read(args);
-    if (args.where?.id?.in) rows[0] = { ...rows[0], message: { conversation: 'changed after planning' } };
-    return rows;
-  };
+test('a source replacement at lock admission is refused before any destination write', async () => {
+  const rows = fixture();
+  const next = service(current, rows);
+  next.setBeforeLock(() => {
+    rows[1].message = { conversation: 'changed after planning' };
+  });
   await assert.rejects(
     next.svc.syncStoredHistory({ instanceName: 'synthetic' }, { scope: 'all', dryRun: false }),
     /source changed/,
@@ -264,4 +290,85 @@ test('adversarial out-of-order database IDs preserve chronological LID mapping e
   const old = await service(baseline, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
   const next = await service(current, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
   assert.equal(next.routeMessages, old.routeMessages);
+});
+
+for (const change of ['name', 'timestamp', 'delete'])
+  test(`later metadata donor ${change} refuses before the first dependent import`, async () => {
+    const rows = fixture(501).map((row, index) => ({
+      ...row,
+      key: { id: 'NATIVE-' + index, remoteJid: '628100000001@s.whatsapp.net', fromMe: false },
+      messageTimestamp: 1700000000 + index,
+      pushName: index === 500 ? 'Later donor' : '',
+    }));
+    const next = service(current, rows);
+    next.setBeforeLock(() => {
+      if (change === 'name') rows[500].pushName = 'Rotated donor';
+      if (change === 'timestamp') rows[500].messageTimestamp++;
+      if (change === 'delete') rows.splice(500, 1);
+    });
+    await assert.rejects(
+      next.svc.syncStoredHistory({ instanceName: 'synthetic' }, { dryRun: false }),
+      /dependency|source changed/,
+    );
+    assert.equal(next.imported.length, 0);
+    assert.equal(next.plans.length, 0);
+  });
+
+test('changed key-only routing donor outside selected payload refuses before metadata writes', async () => {
+  const rows = fixture(501).map((row, index) => ({
+    ...row,
+    key: {
+      id: 'NATIVE-' + index,
+      remoteJid: '9000@lid',
+      fromMe: false,
+      ...(index === 500 ? { remoteJidAlt: '628100000001@s.whatsapp.net' } : {}),
+    },
+    messageTimestamp: 1700000000 + index,
+  }));
+  const next = service(current, rows);
+  next.setBeforeLock(() => {
+    rows[500].key.remoteJidAlt = '628100000002@s.whatsapp.net';
+  });
+  await assert.rejects(
+    next.svc.syncStoredHistory({ instanceName: 'synthetic' }, { dryRun: false, limit: 10 }),
+    /routing dependency/,
+  );
+  assert.equal(next.imported.length, 0);
+});
+
+test('chronological LID precedence survives conflicting evidence on different pages and a fixed horizon', async () => {
+  const rows = fixture(501).map((row, index) => ({
+    ...row,
+    key: { id: 'NATIVE-' + index, remoteJid: '9000@lid', fromMe: false },
+    messageTimestamp: 1700000000 + index,
+  }));
+  rows[0].id = 'z';
+  rows[0].key.remoteJidAlt = '628100000001@s.whatsapp.net';
+  rows[500].id = 'a';
+  rows[500].key.remoteJidAlt = '628100000002@s.whatsapp.net';
+  const args = { remoteJid: '628100000002@s.whatsapp.net' };
+  const before = await service(baseline, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
+  const after = await service(current, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
+  assert.equal(after.routeMessages, before.routeMessages);
+  const repositoryRows = fixture(501);
+  const repo = repository(repositoryRows);
+  const visited: string[] = [];
+  let inserted = false;
+  for await (const page of storedHistoryPages(repo as any, { instanceId: 'a' }, { key: true })) {
+    visited.push(...page.map((row) => row.id));
+    if (!inserted) {
+      repositoryRows.push({ ...fixture(1)[0], id: 'zz', messageTimestamp: 1800000000 });
+      inserted = true;
+    }
+  }
+  assert.equal(visited.length, 501);
+  assert.equal(visited.includes('zz'), false);
+});
+
+test('raw SQL and Prisma property order do not rotate the immutable native source fingerprint', () => {
+  const original = fixture(1)[0];
+  const reordered = Object.fromEntries(Object.entries(original).reverse());
+  reordered.key = Object.fromEntries(Object.entries(original.key).reverse());
+  assert.equal(historySourceFingerprint(reordered), historySourceFingerprint(original));
+  assert.notEqual(historySourceFingerprint({ ...reordered, pushName: 'changed' }), historySourceFingerprint(original));
 });

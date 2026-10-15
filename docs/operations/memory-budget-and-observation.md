@@ -15,7 +15,12 @@ Key-only LID evidence pages retain timestamp/ID chronology, not UUID ordering;
 late/out-of-order database IDs cannot override newer native mapping evidence. A
 compact first-pass plan preserves global deduplication/limit, first/last identity
 timestamps and first push name; a second pass reads only selected source rows.
-SHA-256 binds the complete normalized source version across passes. Changed or
+SHA-256 binds the complete normalized source version across passes. Before each
+dependent import, first/last/name donors and routing-map donors from every page
+are checked under instance-scoped PostgreSQL SHARE locks held until the bounded
+Chatwoot write commits. A stale/deleted later-page donor cannot supply metadata
+to an earlier write. Each dependency query is capped at250 rows; locks, not
+payload arrays, span the mutation. Changed or
 missing versions refuse, preserving already applied rows for idempotent retry.
 The existing import writer guards, instance/destination isolation and SQL source
 checks remain authoritative. At most two legacy scans hold global capacity.

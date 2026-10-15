@@ -186,7 +186,12 @@ import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
-import { HISTORY_PAGE_SIZE, storedHistoryPages } from '@api/integrations/chatbot/chatwoot/utils/history-memory-budget';
+import {
+  HISTORY_PAGE_SIZE,
+  historySourceFingerprint,
+  storedHistoryPages,
+  withLockedHistoryDependencies,
+} from '@api/integrations/chatbot/chatwoot/utils/history-memory-budget';
 import { readStoredFile } from '@api/integrations/storage/s3/libs/minio.server';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { CacheService } from '@api/services/cache.service';
@@ -6310,6 +6315,7 @@ export class ChatwootService {
 
       // Retain compact identity evidence, not every historic payload/key object.
       const lidMap = new Map<string, string>();
+      const mappingSources = new Map<string, { id: string; fingerprint: string }>();
       const phoneKeys = new Map<string, { key: any }>();
       // Preserve chronological evidence precedence even when database IDs arrive
       // out of order; key-only pages never retain complete message bodies.
@@ -6320,7 +6326,13 @@ export class ChatwootService {
       )) {
         for (const row of keys) {
           const key = row.key as { remoteJid?: string; remoteJidAlt?: string };
-          if (isLidJid(key?.remoteJid) && isPhoneJid(key?.remoteJidAlt)) lidMap.set(key.remoteJid, key.remoteJidAlt);
+          if (isLidJid(key?.remoteJid) && isPhoneJid(key?.remoteJidAlt)) {
+            lidMap.set(key.remoteJid, key.remoteJidAlt);
+            mappingSources.set(key.remoteJid, {
+              id: row.id,
+              fingerprint: historySourceFingerprint({ key: row.key, timestamp: row.messageTimestamp }),
+            });
+          }
           if (data.refreshLidMappings) {
             for (const jid of [key?.remoteJid, key?.remoteJidAlt]) {
               if (isPhoneJid(jid)) phoneKeys.set(jid, { key: { remoteJid: jid } });
@@ -6378,7 +6390,9 @@ export class ChatwootService {
       };
       const unresolvedChats = new Set<string>();
       const seenImportable = new Set<string>();
-      const selection: Array<{ id: string; source: string; fingerprint: string }> = [];
+      const selection: Array<{ id: string; source: string; fingerprint: string; peer: string; nativeLid?: string }> =
+        [];
+      const identityDonors = new Map<string, { first: string; last: string; name?: string }>();
       const identityTimestamps = new Map<string, { first: number; last: number }>();
       const identityPushNames = new Map<string, string>();
       for await (const page of storedHistoryPages(this.prismaRepository.message, {
@@ -6406,6 +6420,7 @@ export class ChatwootService {
         result.unresolvedLidMessages += stats.unresolvedLidMessages;
         result.provisionalLidMessages += stats.provisionalLidMessages;
         result.normalizedMessages += stats.normalizedMessages;
+        const rawKeys = new Map(page.map((row) => [row.id, row.key]));
         const route = normalized.messages.filter((message: any) => {
           const jid = message.key?.remoteJid;
           return (
@@ -6442,51 +6457,100 @@ export class ChatwootService {
           if (isGroupJid(key.remoteJid)) result.selectedGroupMessages++;
           if (isLidJid(key.remoteJid)) result.selectedProvisionalLidMessages++;
           if (!dryRun) {
+            const peer = toCanonicalHistoryJid(key.remoteJid);
+            const nativePeer = (rawKeys.get(message.id) as { remoteJid?: string })?.remoteJid;
             selection.push({
               id: message.id,
               source,
-              fingerprint: createHash('sha256').update(JSON.stringify(message)).digest('hex'),
+              peer,
+              fingerprint: historySourceFingerprint(message),
+              ...(isLidJid(nativePeer) ? { nativeLid: nativePeer } : {}),
             });
-            const peer = toCanonicalHistoryJid(key.remoteJid);
             const timestamps = identityTimestamps.get(peer);
             identityTimestamps.set(peer, {
               first: timestamps?.first ?? message.messageTimestamp,
               last: message.messageTimestamp,
             });
-            if (!identityPushNames.has(peer) && message.pushName?.trim())
+            const donors = identityDonors.get(peer) || { first: message.id, last: message.id };
+            donors.last = message.id;
+            if (!identityPushNames.has(peer) && message.pushName?.trim()) {
               identityPushNames.set(peer, message.pushName.trim());
+              donors.name = message.id;
+            }
+            identityDonors.set(peer, donors);
           }
         }
       }
-      // Two passes retain full-conversation timestamps/names without retaining bodies.
-      // Bind each selected source version; replacements between passes refuse safely.
+      // Every metadata donor (including a later page) is version-checked and
+      // locked before the dependent write, not only when its own turn arrives.
+      const selectedById = new Map(selection.map((entry) => [entry.id, entry]));
       if (!dryRun)
         for (let offset = 0; offset < selection.length; offset += HISTORY_PAGE_SIZE) {
           const planned = selection.slice(offset, offset + HISTORY_PAGE_SIZE);
-          const rows = await this.prismaRepository.message.findMany({
-            where: { Instance: { name: instance.instanceName }, id: { in: planned.map((entry) => entry.id) } },
-            take: HISTORY_PAGE_SIZE,
-          });
-          const normalized = await normalizeStoredHistoryMessages(rows, [], undefined, {
-            lidMap,
-            retainProviderAliases: this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS,
-            includeGroups: scope === 'groups' || scope === 'all',
-            includeUnresolvedLids: unresolvedLidMode === 'provisional' && (scope === 'direct' || scope === 'all'),
-          });
-          const byId = new Map(normalized.messages.map((message) => [message.id, message]));
-          const selected = planned.map((entry) => {
-            const message = byId.get(entry.id);
-            if (!message || createHash('sha256').update(JSON.stringify(message)).digest('hex') !== entry.fingerprint)
-              throw new Error('Stored history source changed between planning and import; refresh before retry');
-            return message;
-          });
-          const identityNames = await this.getGroupIdentityNames(instance, selected);
-          const imported = await chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
-            messages: selected,
-            identityNames,
-            identityTimestamps,
-            identityPushNames,
-          });
+          const needed = new Map(planned.map((entry) => [entry.id, entry]));
+          for (const entry of planned) {
+            const donors = identityDonors.get(entry.peer);
+            for (const id of [donors.first, donors.last, donors.name].filter(Boolean))
+              needed.set(id, selectedById.get(id));
+          }
+          const routing = new Map<string, { id: string; fingerprint: string }>();
+          const externalLids = new Set<string>();
+          for (const entry of needed.values())
+            if (entry.nativeLid) {
+              const donor = mappingSources.get(entry.nativeLid);
+              if (donor) routing.set(donor.id, donor);
+              else externalLids.add(entry.nativeLid);
+            }
+          const selectedRows = new Map<string, MessageModel>();
+          const imported = await withLockedHistoryDependencies(
+            this.prismaRepository,
+            instance.instanceName,
+            [...needed.keys(), ...routing.keys()],
+            async (rows) => {
+              for (const row of rows) {
+                const donor = routing.get(row.id);
+                if (
+                  donor &&
+                  historySourceFingerprint({ key: row.key, timestamp: row.messageTimestamp }) !== donor.fingerprint
+                )
+                  throw new Error('Stored history routing dependency changed; refresh before retry');
+              }
+              const normalized = await normalizeStoredHistoryMessages(
+                rows.filter((row) => needed.has(row.id)),
+                [],
+                undefined,
+                {
+                  lidMap,
+                  retainProviderAliases: this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS,
+                  includeGroups: scope === 'groups' || scope === 'all',
+                  includeUnresolvedLids: unresolvedLidMode === 'provisional' && (scope === 'direct' || scope === 'all'),
+                },
+              );
+              const byId = new Map(normalized.messages.map((message) => [message.id, message]));
+              for (const row of rows)
+                if (needed.has(row.id)) {
+                  const message = byId.get(row.id);
+                  if (!message || historySourceFingerprint(message) !== needed.get(row.id).fingerprint)
+                    throw new Error('Stored history source changed between planning and import; refresh before retry');
+                  if (planned.some((entry) => entry.id === row.id)) selectedRows.set(row.id, message);
+                }
+            },
+            async () => {
+              for (const lid of externalLids) {
+                const current = await this.resolvePhoneJidForLid(instance, lid);
+                if ((isPhoneJid(current) ? current : null) !== (lidMap.get(lid) || null))
+                  throw new Error('Stored history live routing dependency changed; refresh before retry');
+              }
+              const selected = planned.map((entry) => selectedRows.get(entry.id));
+              const identityNames = await this.getGroupIdentityNames(instance, selected);
+              return chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
+                messages: selected,
+                identityNames,
+                identityTimestamps,
+                identityPushNames,
+              });
+            },
+          );
           if (!Number.isInteger(imported))
             throw new Error(`Chatwoot history import failed for ${instance.instanceName}`);
           const applied = await chatwootImport.getExistingSourceIds(
@@ -6494,8 +6558,8 @@ export class ChatwootService {
             undefined,
             inbox.id,
           );
-          if (applied.size !== selected.length)
-            throw new Error(`Chatwoot history batch only applied ${applied.size}/${selected.length}`);
+          if (applied.size !== planned.length)
+            throw new Error(`Chatwoot history batch only applied ${applied.size}/${planned.length}`);
           result.importedMessages += Number(imported);
           result.appliedMessages += applied.size;
         }
