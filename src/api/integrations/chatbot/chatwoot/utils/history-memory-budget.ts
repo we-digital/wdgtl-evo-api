@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 
 import { Message, Prisma } from '@prisma/client';
+import { Client } from 'pg';
 
 export const HISTORY_PAGE_SIZE = 250;
 
@@ -102,32 +103,68 @@ export async function* storedHistoryPages(
   }
 }
 
-// Keep native donor rows stable until the dependent Chatwoot mutation commits.
-// Read/verify one page at a time; only database row locks span the write.
+// A soft deadline stops further destination work; it never releases source
+// locks underneath an outstanding independent database writer.
 export async function withLockedHistoryDependencies<T>(
-  repository: {
-    $transaction: (work: (transaction: Prisma.TransactionClient) => Promise<T>, options: any) => Promise<T>;
-  },
+  connectionUri: string,
   instanceName: string,
   ids: string[],
   verify: (rows: Message[]) => Promise<void>,
-  write: () => Promise<T>,
+  write: (signal: AbortSignal) => Promise<T>,
+  options: { deadlineMs?: number; clientFactory?: (uri: string) => any } = {},
 ): Promise<T> {
-  const unique = [...new Set(ids)].sort();
-  return repository.$transaction(
-    async (transaction) => {
-      for (let offset = 0; offset < unique.length; offset += HISTORY_PAGE_SIZE) {
-        const pageIds = unique.slice(offset, offset + HISTORY_PAGE_SIZE);
-        const rows = await transaction.$queryRaw<Message[]>(Prisma.sql`
-        SELECT m.* FROM "Message" m JOIN "Instance" i ON i.id=m."instanceId"
-        WHERE i.name=${instanceName} AND m.id IN (${Prisma.join(pageIds)})
-        ORDER BY m.id FOR SHARE OF m`);
-        if (rows.length !== pageIds.length || rows.some((row) => !pageIds.includes(row.id)))
-          throw new Error('Stored history dependency is missing or changed; refresh before retry');
-        await verify(rows);
-      }
-      return write();
-    },
-    { maxWait: 5000, timeout: 30000 },
-  );
+  const client =
+    options.clientFactory?.(connectionUri) ||
+    new Client({
+      connectionString: connectionUri,
+      connectionTimeoutMillis: 5000,
+      application_name: 'evo_history_source_guard',
+      keepAlive: true,
+    });
+  const controller = new AbortController();
+  const abort = () => controller.abort(new Error('Stored history source guard deadline or connection failure'));
+  client.on?.('error', abort);
+  let closing = false;
+  client.on?.('end', () => {
+    if (!closing) abort();
+  });
+  let timer: ReturnType<typeof setTimeout>;
+  try {
+    await client.connect();
+    await client.query('BEGIN');
+    // Only this owned read-guard session is non-expiring while its destination
+    // callback settles. Statement/lock waits stay bounded; no global setting changes.
+    await client.query(
+      "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout=0",
+    );
+    timer = setTimeout(abort, options.deadlineMs ?? 30000);
+    timer.unref?.();
+    const unique = [...new Set(ids)].sort();
+    for (let offset = 0; offset < unique.length; offset += HISTORY_PAGE_SIZE) {
+      controller.signal.throwIfAborted();
+      const pageIds = unique.slice(offset, offset + HISTORY_PAGE_SIZE);
+      const result = await client.query(
+        `SELECT m.* FROM "Message" m JOIN "Instance" i ON i.id=m."instanceId"
+        WHERE i.name=$1 AND m.id=ANY($2::text[]) ORDER BY m.id FOR SHARE OF m`,
+        [instanceName, pageIds],
+      );
+      if (result.rows.length !== pageIds.length || result.rows.some((row: Message) => !pageIds.includes(row.id)))
+        throw new Error('Stored history dependency is missing or changed; refresh before retry');
+      await verify(result.rows);
+    }
+    controller.signal.throwIfAborted();
+    const result = await write(controller.signal);
+    controller.signal.throwIfAborted();
+    return result;
+  } finally {
+    if (timer) clearTimeout(timer);
+    // write() must settle/clean all owned destination sessions first. A deadline
+    // is cancellation admission, never an automatic source transaction expiry.
+    closing = true;
+    try {
+      await client.query('ROLLBACK');
+    } finally {
+      await client.end();
+    }
+  }
 }

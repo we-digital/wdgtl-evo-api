@@ -39,6 +39,7 @@ import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
 import { Chatwoot as ChatwootModel, Contact, Message } from '@prisma/client';
 import { proto } from 'baileys';
+import type { Pool } from 'pg';
 
 type ChatwootUser = {
   user_type: string;
@@ -79,6 +80,8 @@ export type HistoryMessageImportOptions = {
   identityNames?: Map<string, string>;
   identityTimestamps?: Map<string, firstLastTimestamp>;
   identityPushNames?: Map<string, string>;
+  database?: Pool;
+  chatwootUser?: ChatwootUser;
 };
 
 class ChatwootImport {
@@ -233,6 +236,7 @@ class ChatwootImport {
     sourceIds: string[],
     conversationId?: number,
     inboxId?: number,
+    database?: Pool,
   ): Promise<Set<string>> {
     try {
       const existingSourceIdsSet = new Set<string>();
@@ -245,7 +249,7 @@ class ChatwootImport {
       const sourceIdAliases = [
         ...new Set(canonicalSourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)])),
       ];
-      const pgClient = postgresClient.getChatwootConnection();
+      const pgClient = database || postgresClient.getChatwootConnection();
 
       const params: Array<string[] | number> = [sourceIdAliases];
       const filters = ['source_id = ANY($1)'];
@@ -871,8 +875,9 @@ class ChatwootImport {
   private async insertHistoryMessagesSerialized(
     statements: Array<{ sql: string; params: unknown[] }>,
     scope: { accountId: number; inboxId: number; peers: string[]; conversationIds: number[] },
+    database?: Pool,
   ): Promise<number> {
-    const pool = postgresClient.getChatwootConnection();
+    const pool = database || postgresClient.getChatwootConnection();
     const client = await pool.connect();
     try {
       await client.query('BEGIN ISOLATION LEVEL READ COMMITTED');
@@ -944,7 +949,7 @@ class ChatwootImport {
     const usesBufferedHistory = options.messages === undefined;
     let recoveryPhase = 'user_lookup';
     try {
-      const chatwootUser = await this.getChatwootUser(provider);
+      const chatwootUser = options.chatwootUser || (await this.getChatwootUser(provider, options.database));
       if (!chatwootUser) {
         throw new Error('User not found to import messages.');
       }
@@ -978,6 +983,7 @@ class ChatwootImport {
         messagesOrdered.map((message: any) => message.key.id),
         undefined,
         inbox.id,
+        options.database,
       );
       recoveryPhase = 'content_projection';
       const contentByMessage = this.getImportableHistoryMessages(
@@ -1026,6 +1032,7 @@ class ChatwootImport {
             messagesByIdentity,
             options.identityNames || this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
             options.identityPushNames,
+            options.database,
           );
           // inserting messages in chatwoot db
           const insertChunks: Array<{ values: string; params: unknown[]; rows: number }> = [];
@@ -1131,14 +1138,18 @@ class ChatwootImport {
             }));
 
             recoveryPhase = 'message_insert';
-            totalMessagesImported += await this.insertHistoryMessagesSerialized(statements, {
-              accountId: Number(provider.accountId),
-              inboxId: Number(inbox.id),
-              peers: [...fksByIdentity.keys()],
-              conversationIds: [...fksByIdentity.values()]
-                .map((row) => Number(row.conversation_id))
-                .filter((id) => Number.isSafeInteger(id) && id > 0),
-            });
+            totalMessagesImported += await this.insertHistoryMessagesSerialized(
+              statements,
+              {
+                accountId: Number(provider.accountId),
+                inboxId: Number(inbox.id),
+                peers: [...fksByIdentity.keys()],
+                conversationIds: [...fksByIdentity.values()]
+                  .map((row) => Number(row.conversation_id))
+                  .filter((id) => Number.isSafeInteger(id) && id > 0),
+              },
+              options.database,
+            );
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -1178,8 +1189,9 @@ class ChatwootImport {
     messagesByIdentity: Map<string, Message[]>,
     identityNames: Map<string, string>,
     identityPushNames?: Map<string, string>,
+    database?: Pool,
   ): Promise<Map<string, FksChatwoot>> {
-    const pgClient = postgresClient.getChatwootConnection();
+    const pgClient = database || postgresClient.getChatwootConnection();
 
     const identities = Array.from(messagesByIdentity.entries()).flatMap(([identityKey, messages]) => {
       const timestamps = identitiesWithTimestamp.get(identityKey);
@@ -1445,9 +1457,9 @@ class ChatwootImport {
     };
   }
 
-  public async getChatwootUser(provider: ChatwootModel): Promise<ChatwootUser> {
+  public async getChatwootUser(provider: ChatwootModel, database?: Pool): Promise<ChatwootUser> {
     try {
-      const pgClient = postgresClient.getChatwootConnection();
+      const pgClient = database || postgresClient.getChatwootConnection();
 
       const sqlUser = `SELECT owner_type AS user_type, owner_id AS user_id
                          FROM access_tokens

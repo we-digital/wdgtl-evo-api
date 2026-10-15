@@ -186,6 +186,7 @@ import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
+import { createHistoryDatabaseScope } from '@api/integrations/chatbot/chatwoot/utils/history-database-scope';
 import {
   HISTORY_PAGE_SIZE,
   historySourceFingerprint,
@@ -6502,8 +6503,13 @@ export class ChatwootService {
               else externalLids.add(entry.nativeLid);
             }
           const selectedRows = new Map<string, MessageModel>();
+          const identityNames = await this.getGroupIdentityNames(
+            instance,
+            planned.map((entry) => ({ key: { remoteJid: entry.peer } }) as unknown as MessageModel),
+          );
+          const chatwootUser = await chatwootImport.getChatwootUser(provider);
           const imported = await withLockedHistoryDependencies(
-            this.prismaRepository,
+            this.configService.get<Database>('DATABASE').CONNECTION.URI,
             instance.instanceName,
             [...needed.keys(), ...routing.keys()],
             async (rows) => {
@@ -6535,20 +6541,28 @@ export class ChatwootService {
                   if (planned.some((entry) => entry.id === row.id)) selectedRows.set(row.id, message);
                 }
             },
-            async () => {
+            async (signal) => {
               for (const lid of externalLids) {
                 const current = await this.resolvePhoneJidForLid(instance, lid);
                 if ((isPhoneJid(current) ? current : null) !== (lidMap.get(lid) || null))
                   throw new Error('Stored history live routing dependency changed; refresh before retry');
               }
-              const selected = planned.map((entry) => selectedRows.get(entry.id));
-              const identityNames = await this.getGroupIdentityNames(instance, selected);
-              return chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
-                messages: selected,
-                identityNames,
-                identityTimestamps,
-                identityPushNames,
-              });
+              signal.throwIfAborted();
+
+              const scope = createHistoryDatabaseScope(postgresClient.getChatwootConnection(), signal);
+              try {
+                const selected = planned.map((entry) => selectedRows.get(entry.id));
+                return await chatwootImport.importHistoryMessages(instance, this, inbox, provider, {
+                  messages: selected,
+                  identityNames,
+                  identityTimestamps,
+                  identityPushNames,
+                  database: scope.database,
+                  chatwootUser,
+                });
+              } finally {
+                await scope.close();
+              }
             },
           );
           if (!Number.isInteger(imported))

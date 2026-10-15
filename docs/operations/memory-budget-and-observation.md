@@ -18,7 +18,15 @@ timestamps and first push name; a second pass reads only selected source rows.
 SHA-256 binds the complete normalized source version across passes. Before each
 dependent import, first/last/name donors and routing-map donors from every page
 are checked under instance-scoped PostgreSQL SHARE locks held until the bounded
-Chatwoot write commits. A stale/deleted later-page donor cannot supply metadata
+Chatwoot write has conclusively committed or rolled back. This is an owned native
+PostgreSQL session, not an expiring Prisma interactive transaction. Its30-second
+soft deadline stops new destination statements/COMMIT but never releases source
+locks under a continuing writer. Dedicated destination leases retain5-second
+statement deadlines, permit rollback after cancellation, restore exact prior
+session settings and settle all cleanup before source rollback/unlock. Ancillary
+group/user lookups happen before lock acquisition. No global DB setting changes.
+A real31.5-second test crosses the unchanged30-second deadline and proves source
+updates stay blocked until destination rollback, with zero stale metadata. A stale/deleted later-page donor cannot supply metadata
 to an earlier write. Each dependency query is capped at250 rows; locks, not
 payload arrays, span the mutation. Changed or
 missing versions refuse, preserving already applied rows for idempotent retry.

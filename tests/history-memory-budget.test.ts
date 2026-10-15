@@ -100,7 +100,28 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
     ...normalization,
     ...coordinator,
     storedHistoryPages,
-    withLockedHistoryDependencies,
+    withLockedHistoryDependencies: (uri: string, name: string, ids: string[], verify: any, write: any) =>
+      withLockedHistoryDependencies(uri, name, ids, verify, write, {
+        clientFactory: () => ({
+          on() {},
+          end: async () => {},
+          connect: async () => {
+            beforeLock?.();
+          },
+          query: async (sql: string, values: any[]) => {
+            if (!sql.startsWith('SELECT m.*')) return { rows: [] };
+            assert.match(sql, /FOR SHARE OF m/);
+            assert.ok(values[1].length <= 250);
+            return {
+              rows: rows
+                .filter((row) => row.instanceId === 'a' && values[1].includes(row.id))
+                .map((row) => structuredClone(row)),
+            };
+          },
+        }),
+      }),
+    createHistoryDatabaseScope: () => ({ database: {}, close: async () => {} }),
+    postgresClient: { getChatwootConnection: () => ({}) },
     HISTORY_PAGE_SIZE,
     historySourceFingerprint,
     createHash,
@@ -109,6 +130,7 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
     chatwootImport: {
       getExistingSourceIds: async (ids: string[]) =>
         new Set(ids.map(normalization.toChatwootSourceId).filter((id) => existing.has(id))),
+      getChatwootUser: async () => ({ user_type: 'User', user_id: 1 }),
       getContentMessage: (_service: any, message: any) => message.message?.conversation,
       importHistoryMessages: async (_instance: any, _svc: any, _inbox: any, _provider: any, options: any) => {
         if (fail) throw new Error('synthetic destination failure');
@@ -153,7 +175,12 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
         });
       },
     },
-    configService: { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) },
+    configService: {
+      get: (category: string) =>
+        category === 'DATABASE'
+          ? { CONNECTION: { URI: 'postgresql://synthetic' } }
+          : { PROVIDER_CONVERSATION_BINDINGS: true },
+    },
     refreshKnownLidMappings: async () => ({ attemptedPhoneJids: 0, refreshedMappings: 0 }),
     resolvePhoneJidForLid: async () => null,
     getGroupIdentityNames: async () => new Map(),

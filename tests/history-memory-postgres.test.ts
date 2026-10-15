@@ -90,7 +90,7 @@ test(
       });
       let wrote = false;
       await withLockedHistoryDependencies(
-        prisma,
+        process.env.DATABASE_CONNECTION_URI!,
         marker,
         [message.id],
         async (rows) => {
