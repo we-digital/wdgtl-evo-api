@@ -87,6 +87,7 @@ for (const media of [false, true]) {
       const before = JSON.stringify(source);
       const service = Object.create(ChatwootService.prototype) as any;
       service.logger = { info() {}, warn() {}, error() {} };
+      service.durableInboundBodies = new WeakSet();
       service.waMonitor = {
         waInstances: {
           synthetic: { getBase64FromMediaMessage: async () => ({ base64: 'c3ludGhldGlj', mimetype: 'image/png' }) },

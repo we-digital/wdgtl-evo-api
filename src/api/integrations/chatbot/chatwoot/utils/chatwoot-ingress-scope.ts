@@ -7,6 +7,8 @@ export type ChatwootIngressScope = 'direct' | 'group' | 'broadcast' | 'unknown';
 type MessageKey = {
   remoteJid?: unknown;
   remoteJidAlt?: unknown;
+  participant?: unknown;
+  participantAlt?: unknown;
   fromMe?: unknown;
 };
 
@@ -214,6 +216,17 @@ export const buildChatwootIngressAttributes = (
 ) => {
   const fromMe = messageBody?.key?.fromMe;
   const mentionedJids = extractChatwootIngressMentionJids(messageBody);
+  // Native group identity is immutable. Display names remain owned by Chatwoot contacts.
+  const key = messageBody?.key;
+  const primary = readJid(key?.participant).replace(/:\d+@/, '@');
+  const alternate = readJid(key?.participantAlt).replace(/:\d+@/, '@');
+  const participant = /^\d+@lid$/.test(primary) && /^\d+@s\.whatsapp\.net$/.test(alternate) ? alternate : primary;
+  const groupParticipant =
+    classifyChatwootIngressScope(messageBody) === 'group' &&
+    fromMe === false &&
+    /^\d+@(s\.whatsapp\.net|lid)$/.test(participant)
+      ? participant
+      : null;
   const direction =
     fromMe === false ? ('inbound' as const) : fromMe === true ? ('outbound' as const) : ('unknown' as const);
 
@@ -226,6 +239,7 @@ export const buildChatwootIngressAttributes = (
       from_me: typeof fromMe === 'boolean' ? fromMe : null,
       ...(clientSent === true ? { client_sent: true as const } : {}),
       ...(mentionedJids.length > 0 ? { mentioned_jids: mentionedJids } : {}),
+      ...(groupParticipant ? { participant_jid: groupParticipant } : {}),
       route,
     },
   };
