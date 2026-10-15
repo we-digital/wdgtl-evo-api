@@ -77,41 +77,30 @@ type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.I
 export type HistoryMessageImportOptions = {
   messages?: Message[];
   identityNames?: Map<string, string>;
+  identityTimestamps?: Map<string, firstLastTimestamp>;
+  identityPushNames?: Map<string, string>;
 };
 
 class ChatwootImport {
   private logger = new Logger('ChatwootImport');
-  private repositoryMessagesCache = new Map<string, Set<string>>();
   private historyMessages = new Map<string, Message[]>();
   private historyContacts = new Map<string, Contact[]>();
   private historyIdentityNames = new Map<string, Map<string, string>>();
-
-  public getRepositoryMessagesCache(instance: InstanceDto) {
-    return this.repositoryMessagesCache.has(instance.instanceName)
-      ? this.repositoryMessagesCache.get(instance.instanceName)
-      : null;
-  }
-
-  public setRepositoryMessagesCache(instance: InstanceDto, repositoryMessagesCache: Set<string>) {
-    this.repositoryMessagesCache.set(instance.instanceName, repositoryMessagesCache);
-  }
-
-  public deleteRepositoryMessagesCache(instance: InstanceDto) {
-    this.repositoryMessagesCache.delete(instance.instanceName);
-  }
 
   public addHistoryMessages(instance: InstanceDto, messagesRaw: Message[]) {
     const actualValue = this.historyMessages.has(instance.instanceName)
       ? this.historyMessages.get(instance.instanceName)
       : [];
-    this.historyMessages.set(instance.instanceName, [...actualValue, ...messagesRaw]);
+    for (const message of messagesRaw) actualValue.push(message);
+    this.historyMessages.set(instance.instanceName, actualValue);
   }
 
   public addHistoryContacts(instance: InstanceDto, contactsRaw: Contact[]) {
     const actualValue = this.historyContacts.has(instance.instanceName)
       ? this.historyContacts.get(instance.instanceName)
       : [];
-    this.historyContacts.set(instance.instanceName, actualValue.concat(contactsRaw));
+    for (const contact of contactsRaw) actualValue.push(contact);
+    this.historyContacts.set(instance.instanceName, actualValue);
   }
 
   public addHistoryIdentityNames(instance: InstanceDto, identityNames: Map<string, string>) {
@@ -133,7 +122,6 @@ class ChatwootImport {
   }
 
   public clearAll(instance: InstanceDto) {
-    this.deleteRepositoryMessagesCache(instance);
     this.deleteHistoryMessages(instance);
     this.deleteHistoryContacts(instance);
     this.deleteHistoryIdentityNames(instance);
@@ -1006,8 +994,9 @@ class ChatwootImport {
       }
 
       const allMessagesMappedByIdentity = this.createMessagesMapByIdentity(messagesOrdered);
-      const identitiesWithTimestamp = new Map<string, firstLastTimestamp>();
+      const identitiesWithTimestamp = new Map<string, firstLastTimestamp>(options.identityTimestamps);
       allMessagesMappedByIdentity.forEach((messages: Message[], identityKey: string) => {
+        if (identitiesWithTimestamp.has(identityKey)) return;
         identitiesWithTimestamp.set(identityKey, {
           first: messages[0]?.messageTimestamp as any as number,
           last: messages[messages.length - 1]?.messageTimestamp as any as number,
@@ -1036,6 +1025,7 @@ class ChatwootImport {
             identitiesWithTimestamp,
             messagesByIdentity,
             options.identityNames || this.historyIdentityNames.get(instance.instanceName) || new Map<string, string>(),
+            options.identityPushNames,
           );
           // inserting messages in chatwoot db
           const insertChunks: Array<{ values: string; params: unknown[]; rows: number }> = [];
@@ -1187,13 +1177,20 @@ class ChatwootImport {
     identitiesWithTimestamp: Map<string, firstLastTimestamp>,
     messagesByIdentity: Map<string, Message[]>,
     identityNames: Map<string, string>,
+    identityPushNames?: Map<string, string>,
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
 
     const identities = Array.from(messagesByIdentity.entries()).flatMap(([identityKey, messages]) => {
       const timestamps = identitiesWithTimestamp.get(identityKey);
       if (!timestamps) return [];
-      const identity = this.getHistoryIdentity(identityKey, messages, timestamps, identityNames);
+      const identity = this.getHistoryIdentity(
+        identityKey,
+        messages,
+        timestamps,
+        identityNames,
+        identityPushNames?.get(identityKey),
+      );
       const aliases = [
         ...new Set(
           messages.flatMap((message) => {
@@ -1225,7 +1222,13 @@ class ChatwootImport {
           return null;
         }
 
-        const identity = this.getHistoryIdentity(identityKey, messages, timestamps, identityNames);
+        const identity = this.getHistoryIdentity(
+          identityKey,
+          messages,
+          timestamps,
+          identityNames,
+          identityPushNames?.get(identityKey),
+        );
         const values = [
           identity.identityKey,
           identity.identifier,
@@ -1405,10 +1408,12 @@ class ChatwootImport {
     messages: Message[],
     timestamps: firstLastTimestamp,
     identityNames: Map<string, string>,
+    plannedPushName?: string,
   ): HistoryIdentity {
     const canonicalJid = toCanonicalHistoryJid(identityKey);
     const jidUser = canonicalJid.split('@')[0].split(':')[0];
-    const firstPushName = messages.find((message) => Boolean(message.pushName?.trim()))?.pushName?.trim();
+    const firstPushName =
+      plannedPushName || messages.find((message) => Boolean(message.pushName?.trim()))?.pushName?.trim();
 
     if (isPhoneJid(canonicalJid)) {
       return {

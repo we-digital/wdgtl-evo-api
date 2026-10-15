@@ -30,6 +30,8 @@ export type HistoryNormalizationOptions = {
   includeGroups?: boolean;
   includeUnresolvedLids?: boolean;
   retainProviderAliases?: boolean;
+  lidMap?: Map<string, string>;
+  onUnresolvedLid?: (lid: string) => void;
 };
 
 export type HistoryRecoveryPreparation = {
@@ -240,7 +242,7 @@ export const normalizeStoredHistoryMessages = async (
   resolvePhoneJid?: ResolvePhoneJid,
   options: HistoryNormalizationOptions = {},
 ): Promise<NormalizedHistoryMessages> => {
-  const lidMap = buildStoredLidMap(mappingMessages);
+  const lidMap = options.lidMap || buildStoredLidMap(mappingMessages);
   const unresolvedLids = new Set<string>();
 
   for (const message of messages) {
@@ -251,18 +253,21 @@ export const normalizeStoredHistoryMessages = async (
   }
 
   if (resolvePhoneJid) {
-    await Promise.all(
-      Array.from(unresolvedLids).map(async (lid) => {
-        try {
-          const phoneJid = await resolvePhoneJid(lid);
-          if (isPhoneJid(phoneJid)) {
-            lidMap.set(lid, phoneJid);
+    const unresolved = Array.from(unresolvedLids);
+    for (let offset = 0; offset < unresolved.length; offset += 16) {
+      await Promise.all(
+        unresolved.slice(offset, offset + 16).map(async (lid) => {
+          try {
+            const phoneJid = await resolvePhoneJid(lid);
+            if (isPhoneJid(phoneJid)) {
+              lidMap.set(lid, phoneJid);
+            }
+          } catch {
+            // Keep the LID unresolved and report it instead of creating a false phone contact.
           }
-        } catch {
-          // Keep the LID unresolved and report it instead of creating a false phone contact.
-        }
-      }),
-    );
+        }),
+      );
+    }
   }
 
   const normalizedMessages: Message[] = [];
@@ -304,6 +309,7 @@ export const normalizeStoredHistoryMessages = async (
       normalizedJid = lidMap.get(key.remoteJid);
       if (!normalizedJid) {
         unresolvedMessages.add(key.remoteJid);
+        options.onUnresolvedLid?.(key.remoteJid);
         if (options.includeUnresolvedLids) {
           provisionalLidMessages++;
           normalizedMessages.push({
