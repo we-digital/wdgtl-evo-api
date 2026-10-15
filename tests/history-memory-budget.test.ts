@@ -253,3 +253,15 @@ test('a source replacement between plan and import is refused before any destina
   );
   assert.equal(next.imported.length, 0);
 });
+
+test('adversarial out-of-order database IDs preserve chronological LID mapping evidence', async () => {
+  const rows = fixture(2);
+  rows[0].messageTimestamp = 1700000002;
+  rows[1].messageTimestamp = 1700000001;
+  rows[0].key = { id: 'first', remoteJid: '9000@lid', remoteJidAlt: '628100000002@s.whatsapp.net', fromMe: false };
+  rows[1].key = { id: 'second', remoteJid: '9000@lid', remoteJidAlt: '628100000001@s.whatsapp.net', fromMe: false };
+  const args = { remoteJid: '628100000002@s.whatsapp.net' };
+  const old = await service(baseline, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
+  const next = await service(current, rows).svc.syncStoredHistory({ instanceName: 'synthetic' }, args);
+  assert.equal(next.routeMessages, old.routeMessages);
+});

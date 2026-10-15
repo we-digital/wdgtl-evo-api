@@ -6311,20 +6311,13 @@ export class ChatwootService {
       // Retain compact identity evidence, not every historic payload/key object.
       const lidMap = new Map<string, string>();
       const phoneKeys = new Map<string, { key: any }>();
-      const [mappingUpper] = await this.prismaRepository.message.findMany({
-        where: { Instance: { name: instance.instanceName } },
-        select: { id: true, key: true },
-        orderBy: { id: 'desc' },
-        take: 1,
-      });
-      let mappingAfter: string | undefined;
-      while (mappingUpper) {
-        const keys = await this.prismaRepository.message.findMany({
-          where: { Instance: { name: instance.instanceName }, ...(mappingAfter ? { id: { gt: mappingAfter } } : {}) },
-          select: { id: true, key: true },
-          orderBy: { id: 'asc' },
-          take: HISTORY_PAGE_SIZE,
-        });
+      // Preserve chronological evidence precedence even when database IDs arrive
+      // out of order; key-only pages never retain complete message bodies.
+      for await (const keys of storedHistoryPages(
+        this.prismaRepository.message,
+        { Instance: { name: instance.instanceName } },
+        { id: true, key: true, messageTimestamp: true },
+      )) {
         for (const row of keys) {
           const key = row.key as { remoteJid?: string; remoteJidAlt?: string };
           if (isLidJid(key?.remoteJid) && isPhoneJid(key?.remoteJidAlt)) lidMap.set(key.remoteJid, key.remoteJidAlt);
@@ -6334,8 +6327,6 @@ export class ChatwootService {
             }
           }
         }
-        if (keys.length < HISTORY_PAGE_SIZE) break;
-        mappingAfter = keys[keys.length - 1].id;
       }
       const scope = data.scope || 'direct';
       const unresolvedLidMode = data.unresolvedLidMode || 'skip';

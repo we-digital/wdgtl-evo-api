@@ -10,7 +10,9 @@ Chat/contact buffer append no longer copies all previously buffered references.
 Incoming provider packets themselves remain owned by Baileys; this change does not
 claim a hard cap on provider packet size or on compact identity/source evidence.
 
-Legacy stored-history scans read at most 250 full message rows per query. A
+Legacy stored-history scans read at most 250 full message rows per query.
+Key-only LID evidence pages retain timestamp/ID chronology, not UUID ordering;
+late/out-of-order database IDs cannot override newer native mapping evidence. A
 compact first-pass plan preserves global deduplication/limit, first/last identity
 timestamps and first push name; a second pass reads only selected source rows.
 SHA-256 binds the complete normalized source version across passes. Changed or

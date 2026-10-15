@@ -39,16 +39,19 @@ export const findStoredHistoryIds = async (
 export async function* storedHistoryPages(
   repository: { findMany(args: Prisma.MessageFindManyArgs): Promise<Message[]> },
   where: Prisma.MessageWhereInput,
+  select?: Prisma.MessageSelect,
 ): AsyncGenerator<Message[]> {
   const [upper] = await repository.findMany({
     where,
     orderBy: [{ messageTimestamp: 'desc' }, { id: 'desc' }],
     take: 1,
+    select: { id: true, messageTimestamp: true },
   });
   if (!upper) return;
   let after: Pick<Message, 'id' | 'messageTimestamp'> | undefined;
   while (true) {
     const page = await repository.findMany({
+      ...(select ? { select: { ...select, id: true, messageTimestamp: true } } : {}),
       where: {
         AND: [
           where,

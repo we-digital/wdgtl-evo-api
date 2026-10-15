@@ -43,6 +43,13 @@ test(
             }
             assert.equal(ids.length, 750);
             assert.equal(new Set(ids).size, 750);
+            const keyIds: string[] = [];
+            for await (const page of storedHistoryPages(tx.message, { instanceId: one.id }, { key: true })) {
+              assert.ok(page.length <= 250);
+              assert.ok(page.every((row) => !('message' in row)));
+              keyIds.push(...page.map((row) => row.id));
+            }
+            assert.deepEqual(keyIds, ids);
             throw new Error('rollback-synthetic-task050');
           },
           { timeout: 30000 },
