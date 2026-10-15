@@ -229,3 +229,26 @@ test('uses the live phone owner as the physical receiver and never falls back fr
   );
   assert.equal(selectChatwootPhysicalReceiverNumber({ ownerJid: null, number: '6281111111111' }), '6281111111111');
 });
+
+test('carries native group participant identity, not mutable push names or unproved alternate numbers', () => {
+  const attrs = (key: Record<string, unknown>) => buildChatwootIngressAttributes({ key }, route).we_digital_ingress;
+  assert.equal(
+    attrs({ remoteJid: '123@g.us', fromMe: false, participant: '155:2@s.whatsapp.net' }).participant_jid,
+    '155@s.whatsapp.net',
+  );
+  assert.equal(
+    attrs({ remoteJid: '123@g.us', fromMe: false, participant: '991@lid', participantAlt: '155@s.whatsapp.net' })
+      .participant_jid,
+    '155@s.whatsapp.net',
+  );
+  assert.equal(
+    attrs({ remoteJid: '123@g.us', fromMe: false, participant: '991@lid', participantAlt: 'invalid' }).participant_jid,
+    '991@lid',
+  );
+  for (const key of [
+    { remoteJid: '123@g.us', fromMe: true, participant: '155@s.whatsapp.net' },
+    { remoteJid: '155@s.whatsapp.net', fromMe: false, participant: '155@s.whatsapp.net' },
+    { remoteJid: '123@g.us', fromMe: false, participant: 'bad@example.com', participantAlt: '155@s.whatsapp.net' },
+  ])
+    assert.equal(attrs(key).participant_jid, undefined);
+});

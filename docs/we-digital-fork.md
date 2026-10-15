@@ -1,3 +1,13 @@
+## Group participant names (2026-10-15)
+
+Live inbound group ingress carries a validated native PN/LID participant JID,
+using only its native paired alternate when present. No push name, saved display
+name or customer text is added to the immutable recovery body. Chatwoot resolves
+this identity under its existing account/inbox route contract. Old messages and
+provider payloads remain unchanged. No schema, dependency or send change.
+Reapply `tests/chatwoot-ingress-scope.test.ts` and existing group/recovery tests.
+Rollback omits the additive attribute; legacy text/identity fallback remains.
+
 ## Durable API send receipts for Zoho notifications (2026-10-13)
 
 Opt-in Baileys text/JSON-media API operations bind a UUID to instance and exact
