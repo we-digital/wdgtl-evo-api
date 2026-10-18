@@ -63,6 +63,7 @@ async function runOriginalConsumer(
   partCount = 2,
   interrupt = false,
   httpCallbacks = false,
+  retainCanonical = false,
 ) {
   const parts = Array.from({ length: partCount }, (_, i) => ({
     partKey: i === 0 ? 'first' : i === 1 ? 'second' : `part-${i}`,
@@ -160,8 +161,9 @@ async function runOriginalConsumer(
     }
     if (!acknowledged.some((existing) => existing.partKey === p.partKey)) acknowledged.push(p);
     if (acknowledged.length === partCount) {
-      source = 'A';
+      if (!retainCanonical) source = 'A';
       attrs = fullReceipt();
+      if (retainCanonical) attrs.we_digital_api_inbox_status.provider_delivery.canonical_part_index = partCount - 2;
       if (rotateReceipt)
         attrs.we_digital_api_inbox_status.provider_delivery.acknowledgements.second.source_id = 'rotated';
     }
@@ -177,6 +179,7 @@ async function runOriginalConsumer(
         part_index: p.partIndex,
         part_count: partCount,
         acknowledged_part_count: acknowledged.length,
+        ...(retainCanonical && acknowledged.length === partCount ? { canonical_part_index: partCount - 2 } : {}),
         source_ids: acknowledged.map((part) => ({
           part_key: part.partKey,
           part_index: part.partIndex,
@@ -257,13 +260,16 @@ async function runOriginalConsumer(
       nativeWrites,
       parts.map((p) => p.sourceId),
     );
-    assert.equal(source, 'A');
+    assert.equal(source, retainCanonical ? parts[partCount - 2].sourceId : 'A');
     assert.equal(events.filter((event) => event === 'COMMIT').length, partCount);
   } finally {
     if (server)
       await new Promise<void>((resolve, reject) => server.close((error) => (error ? reject(error) : resolve())));
   }
 }
+
+test('eight-part HTTP recovery preserves a receipt-bound later canonical identity', () =>
+  runOriginalConsumer(false, true, 8, false, true, true));
 
 test('eight-part retained 7/8 receipt and non-primary source recovers without transport', () =>
   runOriginalConsumer(false, true, 8, false, true));
@@ -342,4 +348,16 @@ test('complete receipts also require canonical part zero and exact frozen part k
   assert.equal(acknowledgedMultipartPartsMatch(receipt(), 'A', parts), true);
   assert.equal(acknowledgedMultipartPartsMatch(receipt(), 'B', parts), false);
   assert.equal(acknowledgedMultipartPartsMatch('{bad', 'A', parts), false);
+});
+
+test('native binding accepts only the explicitly recorded canonical member of the full exact set', () => {
+  const attributes = receipt();
+  (attributes.we_digital_api_inbox_status.provider_delivery as any).canonical_part_index = 1;
+  assert.equal(acknowledgedMultipartPartsMatch(attributes, 'B', parts), true);
+  assert.equal(acknowledgedMultipartPartsMatch(attributes, 'A', parts), false);
+  assert.equal(acknowledgedMultipartPartsMatch(attributes, 'FOREIGN', parts), false);
+  for (const bad of [-1, 2, '1', null, false, 0.5]) {
+    (attributes.we_digital_api_inbox_status.provider_delivery as any).canonical_part_index = bad;
+    assert.equal(acknowledgedMultipartPartsMatch(attributes, 'B', parts), false);
+  }
 });

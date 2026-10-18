@@ -226,6 +226,43 @@ test('keeps the exact Chatwoot deletion event separate from outbound delivery', 
   };
   assert.equal(isChatwootMessageDeletion(deletion), true);
   assert.equal(isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: true } }), false);
-  assert.equal(isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: false, native_delete_probe: true } }), false);
+  assert.equal(
+    isChatwootMessageDeletion({ ...deletion, content_attributes: { deleted: false, native_delete_probe: true } }),
+    false,
+  );
   assert.equal(isDeliverableChatwootOutgoing({ ...deletion, id: 314, message_type: 'outgoing' }, '628123'), false);
+});
+
+test('accepts a retained canonical member only through an explicit complete exact receipt', () => {
+  const response: any = {
+    id: 314,
+    status: 'sent',
+    source_id: providerParts[1].sourceId,
+    provider_delivery: {
+      contract_version: 1,
+      acknowledged: true,
+      message_confirmed: true,
+      part_key: providerParts[0].partKey,
+      part_index: 0,
+      part_count: 2,
+      acknowledged_part_count: 2,
+      canonical_part_index: 1,
+      source_ids: providerParts.map((p) => ({ part_key: p.partKey, part_index: p.partIndex, source_id: p.sourceId })),
+    },
+  };
+  assert.equal(isChatwootProviderDeliveryAcknowledged(response, 314, providerParts[0], providerParts), true);
+  const legacy = structuredClone(response);
+  delete legacy.provider_delivery.canonical_part_index;
+  assert.equal(isChatwootProviderDeliveryAcknowledged(legacy, 314, providerParts[0], providerParts), false);
+  for (const bad of [-1, 2, '1', null, 0.5, false]) {
+    const malformed = structuredClone(response);
+    malformed.provider_delivery.canonical_part_index = bad;
+    assert.equal(isChatwootProviderDeliveryAcknowledged(malformed, 314, providerParts[0], providerParts), false);
+  }
+  const foreign = structuredClone(response);
+  foreign.source_id = 'FOREIGN';
+  assert.equal(isChatwootProviderDeliveryAcknowledged(foreign, 314, providerParts[0], providerParts), false);
+  const incomplete = structuredClone(response);
+  incomplete.provider_delivery.source_ids.pop();
+  assert.equal(isChatwootProviderDeliveryAcknowledged(incomplete, 314, providerParts[0], providerParts), false);
 });
