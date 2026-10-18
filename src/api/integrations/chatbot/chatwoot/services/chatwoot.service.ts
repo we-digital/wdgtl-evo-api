@@ -3182,6 +3182,11 @@ export class ChatwootService {
         error.name = 'ChatwootProviderDeliveryCallbackNotAcknowledged';
         throw error;
       }
+    }
+    // Canonical local mapping requires the complete acknowledged multipart set.
+    // Finish the idempotent callback sequence before taking any mapping lock;
+    // a retry may start with a non-primary legacy source and a partial receipt.
+    for (const callbackPart of callbackParts) {
       const persisted = await this.persistLocalChatwootMessageBinding(
         callbackPart.sourceId,
         {

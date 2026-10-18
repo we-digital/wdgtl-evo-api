@@ -444,6 +444,54 @@ test('recovers a lost 202 idempotently and durably reserves every accepted deliv
   assert.ok(memory.rows.every((row) => row.state === 'pending'));
 });
 
+for (const state of ['callback_pending', 'failure_callback_pending'] as const) {
+  test(`old ${state} maintenance cannot exhaust transport admission or reject its age`, async () => {
+    const now = admission('later-callback').receivedAt;
+    const old = {
+      ...stored(0, state, state === 'callback_pending' ? 'WAID:old' : undefined),
+      chatwootMessageId: 313,
+      laneKey: parts[0].laneKey,
+      createdAt: new Date(now.getTime() - 24 * 60 * 60_000),
+    };
+    const memory = admissionRepository([old]);
+    const store = new ChatwootOutboundPrismaStore(memory.repository);
+    const result = await store.enqueue('instance-1', 314, 58, 42, parts, {
+      ...admission(`later-${state}`),
+      maxBacklog: parts.length,
+    });
+    assert.equal(result.recovered, false);
+    assert.deepEqual(result.backlog, { depth: parts.length, oldestAt: now });
+    assert.equal(old.state, state);
+    const visible = await store.backlog();
+    assert.equal(visible.depth, parts.length + 1);
+    assert.equal(visible.oldestAt?.getTime(), old.createdAt.getTime());
+  });
+}
+
+for (const state of ['pending', 'preparing', 'sending', 'delete_pending'] as const) {
+  test(`old ${state} transport work retains age and capacity backpressure`, async () => {
+    const now = admission('blocked').receivedAt;
+    const old = {
+      ...stored(0, state),
+      chatwootMessageId: 313,
+      laneKey: parts[0].laneKey,
+      createdAt: new Date(now.getTime() - 24 * 60 * 60_000),
+    };
+    const memory = admissionRepository([old]);
+    const store = new ChatwootOutboundPrismaStore(memory.repository);
+    await assert.rejects(
+      store.enqueue('instance-1', 314, 58, 42, parts, admission('too-old')),
+      (e: any) => e.name === 'ChatwootOutboundBacklogTooOld',
+    );
+    await assert.rejects(
+      store.enqueue('instance-1', 314, 58, 42, parts, { ...admission('full'), maxBacklog: parts.length }),
+      (e: any) => e.name === 'ChatwootOutboundBacklogExceeded',
+    );
+    assert.equal(memory.rows.length, 1);
+    assert.equal(memory.receipts.size, 0);
+  });
+}
+
 test('aged unresolved transport does not reject a distinct webhook as stale delivery backlog', async () => {
   const now = admission('later').receivedAt;
   const old = {
@@ -1000,14 +1048,20 @@ test('releases only a distinct successor after a full ambiguous-send lease windo
 
   assert.equal(await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'), null);
   rows[0].sendStartedAt = new Date(now.getTime() - 11 * 60_000);
-  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  assert.equal(
+    (await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id,
+    'distinct-successor',
+  );
   assert.equal(rows[0].state, 'ambiguous');
   assert.equal(rows[0].sendAttempts, 1);
 
   rows[1].state = 'pending';
   rows[1].leaseOwner = null;
   rows[0].state = 'quarantined';
-  assert.equal((await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id, 'distinct-successor');
+  assert.equal(
+    (await store.claim('worker', now, new Date(now.getTime() + 1_000), 'transport'))?.id,
+    'distinct-successor',
+  );
   rows[0].state = 'ambiguous';
 
   rows[1].state = 'callback_pending';
@@ -1034,18 +1088,32 @@ test('aged ambiguous multipart siblings stay fenced while a distinct later messa
   const laneKey = 'a'.repeat(64);
   const rows: any[] = [
     {
-      ...stored(0, 'ambiguous'), id: 'uncertain-first', laneKey, laneSequence: 1n,
+      ...stored(0, 'ambiguous'),
+      id: 'uncertain-first',
+      laneKey,
+      laneSequence: 1n,
       sendStartedAt: new Date(now.getTime() - 11 * 60_000),
       createdAt: new Date(now.getTime() - 12 * 60_000),
     },
     {
-      ...stored(1, 'pending'), id: 'fenced-sibling', laneKey, laneSequence: 1n,
-      leaseOwner: null, nextAttemptAt: now, createdAt: new Date(now.getTime() - 12 * 60_000),
+      ...stored(1, 'pending'),
+      id: 'fenced-sibling',
+      laneKey,
+      laneSequence: 1n,
+      leaseOwner: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 12 * 60_000),
     },
     {
-      ...stored(0, 'pending'), id: 'later-distinct', chatwootMessageId: 315,
-      laneKey, laneSequence: 2n, partCount: 1, leaseOwner: null,
-      nextAttemptAt: now, createdAt: new Date(now.getTime() - 8 * 60_000),
+      ...stored(0, 'pending'),
+      id: 'later-distinct',
+      chatwootMessageId: 315,
+      laneKey,
+      laneSequence: 2n,
+      partCount: 1,
+      leaseOwner: null,
+      nextAttemptAt: now,
+      createdAt: new Date(now.getTime() - 8 * 60_000),
     },
   ];
   const operations = {
