@@ -36,8 +36,9 @@ const LANE_BLOCKING_STATES: ChatwootOutboundState[] = [
   'delete_pending',
 ];
 const TRANSPORT_LANE_BLOCKING_STATES = LANE_BLOCKING_STATES.filter((state) => state !== 'ambiguous');
-// Unresolved transport outcomes need reconciliation, not queue capacity.
-const DELIVERY_BACKLOG_STATES = ACTIVE_STATES.filter((state) => state !== 'ambiguous');
+// Only unsent transport work consumes delivery admission capacity. Callback
+// recovery remains active/observable, but cannot reject a new provider send.
+const DELIVERY_BACKLOG_STATES: ChatwootOutboundState[] = ['pending', 'preparing', 'sending', 'delete_pending'];
 const LANE_BLOCKING_STATE_WHERE = {
   OR: [{ state: { in: LANE_BLOCKING_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };

@@ -64,8 +64,11 @@ duplicate WhatsApp messages.
   closed. HTTP 202 is returned only after the
   whole frozen set commits in one transaction.
 - Admission is local and bounded. It performs no reverse Chatwoot reads.
-  Backlog depth/age is checked for the exact `instance + WhatsApp destination`
-  lane before the write transaction. A stale or exhausted disconnected lane
+  Backlog depth/age counts only unsent transport work (`pending`, `preparing`,
+  `sending`) and pending deletion, for the exact `instance + WhatsApp destination`
+  lane before the write transaction. Success/failure callback-only maintenance
+  stays visible in aggregate health and retries with reserved maintenance capacity,
+  but does not consume send admission capacity or age. A stale or exhausted disconnected lane
   therefore cannot reject traffic for any other destination. The transaction locks only the exact
   destination lane, repeats duplicate receipt/frozen-message checks under that
   keyed lock, and commits the receipt plus operation set before returning 202.
@@ -154,7 +157,9 @@ duplicate WhatsApp messages.
   callback sequence; Chatwoot treats identical mappings idempotently and the
   sequence converges after restart or outage. Callback retry never invokes
   WhatsApp. The whole message becomes `completed` only after every response is
-  acknowledged. A terminal failure callback is accepted only for the exact
+  acknowledged. All conditional part PATCHes finish before local canonical mapping
+  writes, so interrupted partial receipts converge to the complete exact set and
+  canonical part-zero source before mapping validation takes its existing locks. A terminal failure callback is accepted only for the exact
   message ID and `failed` status.
 - If one multipart sibling ends in a confirmed pre-send failure while another
   has an exact WAID, the worker atomically completes the message as

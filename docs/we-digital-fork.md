@@ -1,3 +1,22 @@
+## Multipart callback recovery and transport-only backlog (2026-10-18)
+
+The queued Chatwoot callback acknowledges every frozen part before writing any
+local canonical native binding. This recovers a retained partial receipt whose
+legacy canonical source points at a later attachment: the final conditional
+PATCH restores part zero and the complete exact receipt before canonical mapping
+locks run. Every response and the complete persisted part set remain validated;
+route, snapshot, lease, identity and no-blind-resend fences are unchanged.
+
+Admission depth/age counts pending/preparing/sending/deletion transport work,
+not success/failure callback-only maintenance. Old callbacks remain observable,
+retryable with reserved maintenance capacity, and never invoke WhatsApp transport.
+True transport backpressure and unresolved multipart protections remain intact.
+
+No schema, dependency, flag, provider-send, or infrastructure change. Rollback
+retains all ledger receipts; restoring old source can restore the stale-callback
+admission defect. Reapply the queue-store and literal multipart-consumer tests
+plus the opt-in shared-lab PostgreSQL recovery test after upstream merges.
+
 ## Bounded history memory and process observation (2026-10-15)
 
 Use dependency-native device/retry TTLs, batch-scoped bootstrap deduplication,
