@@ -112,6 +112,7 @@ export const isChatwootProviderDeliveryAcknowledged = (
       part_count?: unknown;
       acknowledged_part_count?: unknown;
       source_ids?: unknown;
+      canonical_part_index?: unknown;
     };
   } | null;
   const delivery = acknowledgement?.provider_delivery;
@@ -167,9 +168,21 @@ export const isChatwootProviderDeliveryAcknowledged = (
     return false;
   }
   if (complete) {
+    const explicitCanonical = delivery.canonical_part_index !== undefined;
+    const canonicalIndex = explicitCanonical ? delivery.canonical_part_index : 0;
+    if (
+      !Number.isSafeInteger(canonicalIndex) ||
+      Number(canonicalIndex) < 0 ||
+      Number(canonicalIndex) >= expectedParts.length
+    )
+      return false;
+    const expectedCanonical = expectedParts[Number(canonicalIndex)].sourceId;
     return (
       ['sent', 'delivered', 'read'].includes(String(acknowledgement?.status)) &&
-      acknowledgement?.source_id === expectedParts[0].sourceId
+      (explicitCanonical
+        ? typeof acknowledgement?.source_id === 'string' &&
+          acknowledgement.source_id.replace(/^WAID:/, '') === expectedCanonical.replace(/^WAID:/, '')
+        : acknowledgement?.source_id === expectedCanonical)
     );
   }
   return true;
@@ -249,7 +262,10 @@ export const acknowledgedMultipartSourceIds = (
   if (parts.length !== delivery.part_count || !isCanonicalProviderPartSet(parts as ChatwootProviderDeliveryPart[]))
     return null;
   const normalize = (id: string) => 'WAID:' + id.replace(/^WAID:/, '');
-  if (!canonicalSource || normalize(canonicalSource) !== normalize(parts[0].sourceId as string)) return null;
+  const canonicalIndex = delivery.canonical_part_index === undefined ? 0 : delivery.canonical_part_index;
+  if (!Number.isSafeInteger(canonicalIndex) || canonicalIndex < 0 || canonicalIndex >= parts.length) return null;
+  if (!canonicalSource || normalize(canonicalSource) !== normalize(parts[canonicalIndex].sourceId as string))
+    return null;
   const sources = new Set(parts.map((part) => normalize(part.sourceId as string)));
   return sources.size === parts.length ? sources : null;
 };

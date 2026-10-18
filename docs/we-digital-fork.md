@@ -1,3 +1,20 @@
+## Explicit canonical member in retained multipart receipts (2026-10-18)
+
+The complete exact Chatwoot receipt may identify its already-bound canonical
+member with additive `canonical_part_index`. EVO validates an integer in range,
+all frozen keys/indices/source IDs and the exact corresponding canonical source
+before acknowledgement or native mapping. Without that field, the original
+part-zero rule remains. Foreign, incomplete, malformed or rotated receipts
+still fail closed; legacy WAID-prefix equivalence applies only to the explicit
+member and existing canonical-binding checks.
+
+This preserves provider identities and uniqueness guards when a retained
+multipart message's current source is a later part. No alias takeover, message
+removal, transport replay, schema, dependency or flag change. Deploy this
+backward-compatible reader before the Chatwoot server preservation rule. Keep
+reader compatibility during rollback while explicit receipts remain. Reapply
+callback, canonical binding, history/native-event and malformed-index checks.
+
 ## Multipart callback recovery and transport-only backlog (2026-10-18)
 
 The queued Chatwoot callback acknowledges every frozen part before writing any

@@ -113,8 +113,12 @@ duplicate WhatsApp messages.
   leader then PATCHes every part in canonical index order with `status=sent`,
   its raw WAID as `source_id`, and `provider_delivery` containing the stable
   operation key as `part_key` plus the zero-based `part_index` and immutable
-  `part_count` (maximum 100). Chatwoot retains every mapping and chooses part
-  zero as the message's canonical `source_id` only after all parts confirm.
+  `part_count` (maximum 100). Chatwoot retains every mapping and uses part zero for an unbound message
+  only after all parts confirm. A retained already-bound source is preserved
+  only when it is a unique member of the full exact set; the server records
+  and returns its additive integer `canonical_part_index`. EVO validates that
+  exact member and canonical source, never a foreign alias. Absent the field,
+  the legacy part-zero rule is unchanged.
   The PATCH is actual `application/json`; `provider_delivery` is a nested
   object with exactly `part_key`, `part_index`, and `part_count`, never a
   multipart/FormData string.
@@ -149,8 +153,9 @@ duplicate WhatsApp messages.
 - EVO validates each PATCH response: exact message ID, valid message status,
   contract version 1, exact requested part fields, exact known source-ID
   mappings, acknowledgement count, and aggregate `message_confirmed` value.
-  A complete response must use the primary WAID and `sent`, `delivered`, or
-  `read`. Mapping order in the response is irrelevant; conflicting or foreign
+  A complete response must use the receipt-selected canonical WAID (part zero
+  unless `canonical_part_index` explicitly selects an exact known member) and
+  `sent`, `delivered`, or `read`. Mapping order in the response is irrelevant; conflicting or foreign
   mappings fail closed.
 - If callback part N fails after earlier acknowledgements succeeded, EVO leaves
   the whole operation `callback_pending`. Retry replays the same canonical
@@ -159,7 +164,7 @@ duplicate WhatsApp messages.
   WhatsApp. The whole message becomes `completed` only after every response is
   acknowledged. All conditional part PATCHes finish before local canonical mapping
   writes, so interrupted partial receipts converge to the complete exact set and
-  canonical part-zero source before mapping validation takes its existing locks. A terminal failure callback is accepted only for the exact
+  receipt-proven canonical source before mapping validation takes its existing locks. A terminal failure callback is accepted only for the exact
   message ID and `failed` status.
 - If one multipart sibling ends in a confirmed pre-send failure while another
   has an exact WAID, the worker atomically completes the message as
