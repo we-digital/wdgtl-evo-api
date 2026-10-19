@@ -1,3 +1,31 @@
+## Native group forwarding and delivery error diagnostics (2026-10-19)
+
+Native WhatsApp forwards now use the same group device/session/sender-key
+preparation as ordinary sends. First send after socket creation forces fresh
+metadata/devices/sessions; later sends clear the cache-aware group delivery
+memory. Preparation precedes the existing durable send fence and rechecks abort
+before transport. Direct sends and flag-off behavior remain unchanged. Preserve
+source media, force-forward semantics, planned WhatsApp IDs and post-transport
+acknowledgement retention; never fall back or replay an ambiguous send.
+
+MessageUpdate has an additive nullable `providerErrorCode` (VARCHAR(6)) in both
+provider schemas. Only numeric Baileys negative-ACK codes are retained and added
+to existing message-update webhooks. Error dedup separates distinct codes. Raw
+stub text is not stored/logged by this diagnostic; no recipient text or Signal
+key material is logged. A group ERROR is device/display evidence, not proof of
+global failure and does not cause automatic resend or a global failed status.
+
+Production PostgreSQL migration is metadata-only and bounds lock acquisition to
+five seconds. Apply migration before new generated Prisma runtime. Old images
+remain compatible with the nullable field; rollback the immutable image and keep
+the diagnostic column/receipts. No dependency, flags, sessions or permission
+changes. Reapply shared transport preparation and literal messages.update tests
+on upstream merges. Run focused native-forward/persistence/queue/Signal and
+PostgreSQL migration tests plus build/lint and exact shared-lab checks. See
+`docs/operations/baileys-group-sender-key-refresh.md` for handset acceptance.
+Synthetic Signal/SDK receipts are not WhatsApp UI-display acceptance; never
+resend a business image merely to verify the release.
+
 ## Explicit canonical member in retained multipart receipts (2026-10-18)
 
 The complete exact Chatwoot receipt may identify its already-bound canonical

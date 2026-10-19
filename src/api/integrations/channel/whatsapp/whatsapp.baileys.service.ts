@@ -1845,7 +1845,7 @@ export class BaileysStartupService extends ChannelStartupService {
     },
 
     'messages.update': async (args: { update: Partial<WAMessage>; key: WAMessageKey }[], settings: any) => {
-      this.logger.verbose(`Update messages ${JSON.stringify(args, undefined, 2)}`);
+      this.logger.verbose(`Update messages (${args.length})`);
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
 
@@ -1865,7 +1865,14 @@ export class BaileysStartupService extends ChannelStartupService {
           continue;
         }
 
-        const updateKey = `${this.instance.id}_${key.id}_${update.status}`;
+        // Baileys exposes negative-ACK codes via stub parameters. Persist only a
+        // bounded numeric code, never arbitrary provider text or key material.
+        const errorParameter = update.messageStubParameters?.[0];
+        const providerErrorCode =
+          status[update.status] === 'ERROR' && typeof errorParameter === 'string' && /^\d{1,6}$/.test(errorParameter)
+            ? errorParameter
+            : undefined;
+        const updateKey = `${this.instance.id}_${key.id}_${update.status}${providerErrorCode ? `_${providerErrorCode}` : ''}`;
 
         const cached = await this.baileysCache.get(updateKey);
 
@@ -1916,12 +1923,25 @@ export class BaileysStartupService extends ChannelStartupService {
             fromMe: key.fromMe,
             participant: key?.participant,
             status: status[update.status] ?? 'SERVER_ACK',
+            ...(providerErrorCode ? { providerErrorCode } : {}),
             pollUpdates,
             instanceId: this.instanceId,
           };
 
           if (update.message) {
             message.message = update.message;
+          }
+
+          if (message.status === 'ERROR') {
+            this.logger.warn(
+              JSON.stringify({
+                event: 'whatsapp_delivery_error',
+                instanceId: this.instanceId,
+                providerMessageId: key.id,
+                group: isJidGroup(key.remoteJid || ''),
+                providerErrorCode: providerErrorCode || null,
+              }),
+            );
           }
 
           let findMessage: any;
@@ -2505,6 +2525,12 @@ export class BaileysStartupService extends ChannelStartupService {
     return false;
   }
 
+  private async groupTransportOptions(jid: string): Promise<MiscMessageGenerationOptions> {
+    if (!isJidGroup(jid)) return {};
+    const usedFreshGroupMetadata = await this.refreshGroupSenderKey(jid);
+    return { useCachedGroupMetadata: !usedFreshGroupMetadata };
+  }
+
   private async sendMessage(
     sender: string,
     message: any,
@@ -2516,16 +2542,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const { mentions, linkPreview, quoted, messageId, ephemeralExpiration, contextInfo, beforeTransport, signal } =
       transport;
 
-    const option: any = { quoted };
-
-    if (isJidGroup(sender)) {
-      const usedFreshGroupMetadata = await this.refreshGroupSenderKey(sender);
-      option.useCachedGroupMetadata = !usedFreshGroupMetadata;
-      // if (participants)
-      //   option.cachedGroupMetadata = async () => {
-      //     return { participants: participants as GroupParticipant[] };
-      //   };
-    }
+    const option: any = { quoted, ...(await this.groupTransportOptions(sender)) };
 
     if (ephemeralExpiration) option.ephemeralExpiration = ephemeralExpiration;
 
@@ -3964,6 +3981,14 @@ export class BaileysStartupService extends ChannelStartupService {
       error.name = 'OutboundOperationAborted';
       throw error;
     }
+    // Native forwarding needs the same device/session/key freshness as ordinary
+    // group sends. Complete preparation before crossing the durable send fence.
+    const transportOptions = await this.groupTransportOptions(jid);
+    if (options?.signal?.aborted) {
+      const error = new Error('Outbound operation aborted during native forward preparation');
+      error.name = 'OutboundOperationAborted';
+      throw error;
+    }
     await options?.beforeTransport?.();
     if (options?.signal?.aborted) {
       const error = new Error('Outbound operation aborted after native forward transport fencing');
@@ -3976,7 +4001,7 @@ export class BaileysStartupService extends ChannelStartupService {
         forward: source,
         force: true,
       },
-      options?.messageId ? ({ messageId: options.messageId } as MiscMessageGenerationOptions) : undefined,
+      { ...transportOptions, ...(options?.messageId ? { messageId: options.messageId } : {}) },
     );
     if (!messageSent?.key?.id) {
       throw new BadRequestException('Native forward returned empty message key');

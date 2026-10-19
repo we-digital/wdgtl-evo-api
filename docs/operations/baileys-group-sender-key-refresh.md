@@ -125,3 +125,34 @@ Do not force-push or retag a released package. For a new patch:
 3. Merge through a reviewed PR and create a new immutable release/tag/package version.
 4. Update both lockfiles through npm; do not use a floating branch, Git SSH dependency, or mutable asset.
 5. Update this runbook with the new fork commit and removal analysis.
+
+
+## Native forwarding coverage and diagnostic codes (2026-10-19)
+
+Both ordinary group sends and `nativeForwardMessage` use `groupTransportOptions`.
+The latter previously bypassed proactive repair entirely, despite the production
+flag being enabled. Preparation must finish before the durable transport fence;
+failure or cancellation sends nothing, and ambiguous sends are never replayed.
+First/repeated/reconnected-socket cases and direct/flag-off paths are covered by
+`tests/native-forward-group-delivery.test.ts`, including actual installed Signal
+primary-versus-linked-device decryption and native-image protobuf round trips.
+
+Numeric Baileys `messageStubParameters[0]` from negative ACKs is stored in nullable
+`MessageUpdate.providerErrorCode`, alongside the unchanged `ERROR` status. Raw
+provider text is excluded. Different numeric codes do not share a dedup key.
+Migration `20261019060000_message_update_provider_error_code` is additive; keep its
+column during an image rollback. PostgreSQL DDL lock acquisition is bounded to
+five seconds. MySQL has a matching nullable column; PostgreSQL is the deployed
+provider. No automatic resend or global failed transition follows from these
+codes: group delivery can be partial.
+
+The 2026-10-19 Invoice image had fourteen SDK receptions but empty clients were
+reported. The exact old negative-ACK reasons were not retained, so the bypass is
+a confirmed defect, not conclusive proof of this incident's sole cause. Release
+readback must distinguish installed source/migration/session health from actual
+new-message visibility on the affected primary and linked WhatsApp clients.
+Manual check: in a separately authorized test group, forward a harmless image
+once, confirm its image/caption on both primary and linked clients, inspect exact
+key errors/recovery counters and verify a direct send. Name the test destination
+and obtain an explicit send request; do not use or replay the original business
+image. Existing messages/placeholders are not retroactively repaired.
