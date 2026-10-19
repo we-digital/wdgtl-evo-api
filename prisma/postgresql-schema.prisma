@@ -196,6 +196,7 @@ model MessageUpdate {
 
   @@index([instanceId])
   @@index([messageId])
+  providerErrorCode String? @db.VarChar(6)
 }
 
 model Webhook {
