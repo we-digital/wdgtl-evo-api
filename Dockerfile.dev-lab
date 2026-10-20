@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends git ffmpeg open
 WORKDIR /evolution
 ENV NODE_ENV=development DATABASE_PROVIDER=postgresql
 COPY package.json package-lock.json ./
+COPY Docker/scripts/bound-signal-caches.cjs ./Docker/scripts/bound-signal-caches.cjs
 RUN npm ci
 COPY prisma ./prisma
 COPY runWithProvider.js ./

@@ -1093,3 +1093,16 @@ Existing PostgreSQL NULL message content is accepted only for an absent or exact
 empty native caption, without changing the raw row or file. Missing content
 fields, malformed native captions and nonempty mismatches still refuse. Literal
 PostgreSQL-shaped fixtures retain JSON-string attributes and raw NULL content.
+
+### 2026-10-20 — Bound derived Signal caches without transaction timers
+
+The pinned controlled Baileys release is unchanged. An integrity-bound npm
+postinstall repairs only the LID mapping and migrated-session LRU declarations:
+10,000 entries each, existing three-day sliding TTL, lazy expiration without
+per-entry timers. Those timers retained AsyncLocalStorage Signal transactions.
+Eviction falls back to persistent Signal keys; no identity/group recovery,
+session storage, transport, or message semantics change. The script verifies
+both original SHA-256 values before writing, accepts its exact prior result,
+and refuses dependency drift. Production Docker copies it before npm ci; its
+Docker/scripts location is covered by the immutable runtime input hash.
+Rollback is the preceding immutable EVO image; no data rollback is needed.
