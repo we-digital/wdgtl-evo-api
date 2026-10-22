@@ -7,7 +7,9 @@ type GroupDisplayBody = {
   pushName?: string;
 };
 
-export function formatWhatsappGroupContent(body: GroupDisplayBody, content: string, fallbackName: string): string {
+// Read-only compatibility for an already stored message during an interrupted pre-upgrade delivery.
+// Never use this legacy decoration for a new Chatwoot write.
+export function legacyWhatsappGroupContent(body: GroupDisplayBody, content: string, fallbackName: string): string {
   if (body.key?.fromMe) return content || '';
 
   const participant = body.key?.participant;

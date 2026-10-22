@@ -1,3 +1,4 @@
+import { legacyWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
@@ -8,7 +9,6 @@ import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
-import { formatWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import {
   isGroupJid,
   isLidJid,
@@ -59,6 +59,7 @@ function literalService() {
     Buffer,
     createHash,
     isDeepStrictEqual,
+    legacyWhatsappGroupContent,
     classifyCachedHistoryRecord,
     inboundPayloadHash,
     inboundDeliveryId,
@@ -72,7 +73,6 @@ function literalService() {
     isChatwootOutboundEcho: async () => false,
     toCanonicalHistoryJid,
     chatwootEvoRouteBindingsEqual,
-    formatWhatsappGroupContent,
     extractChatwootIngressMentionJids,
     isChatwootLinkedClientSentEvent,
     Prisma: { AnyNull: 'synthetic-any-null' },
@@ -151,7 +151,7 @@ function fixture() {
     inbox_id: 42,
     message_type: 0,
     private: false,
-    content: formatWhatsappGroupContent(native, native.message.conversation, 'Contact'),
+    content: native.message.conversation,
     content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(native) } },
     source_id: 'WAID:A',
     conversation_id: 77,
@@ -954,4 +954,13 @@ test('existing document reaches only the official leased queue finish; lost fini
     assert.equal(f.item.payloadHash, payloadHash);
     assert.equal(f.creates, 0);
   }
+});
+
+ test('pre-upgrade stored group prefix is confirmed read-only without a duplicate POST or body rewrite', async () => {
+  const f = fixture();
+  f.rows = [{ ...f.owner(), content: '**sender:**\n\nsynthetic' }];
+  await f.service.deliverQueuedInbound(f.item);
+  assert.equal(f.creates, 0);
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.rows[0].content, '**sender:**\n\nsynthetic');
 });

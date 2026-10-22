@@ -1106,3 +1106,7 @@ both original SHA-256 values before writing, accepts its exact prior result,
 and refuses dependency drift. Production Docker copies it before npm ci; its
 Docker/scripts location is covered by the immutable runtime input hash.
 Rollback is the preceding immutable EVO image; no data rollback is needed.
+
+## 2026-10-22 — Clean future WhatsApp group message bodies
+
+Remove obsolete phone/name text prefixes from new inbound group text and media captions; the native v2 participant sender is already displayed by Chatwoot. Source IDs, native identity, ingress attributes, mentions, replies, attachment bytes, queues and outgoing delivery are unchanged. Native retry reconciliation compares the same undecorated projection. No history update/backfill/job is run; previously stored messages are untouched. Legacy formatter retained ONLY for read-only reconciliation of a pre-upgrade interrupted delivery; never used for a new write. Upstream conflicts: keep clean content in live text/media and durable reconciliation paths. Rollback requires reverting all three projections together. Focused checks: chatwoot-group-display, chatwoot-inbound-service, native ingress/reply/mentions contracts and ESLint; shared Linux lab and immutable release readback.
