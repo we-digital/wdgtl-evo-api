@@ -197,6 +197,7 @@ jobs:
           client-payload: |
             {
               "image_ref": "${{ steps.deployref.outputs.image_ref }}",
+              "receiver_revision": "2bfeb71cc529a4b21ded6dd85ec13dfb05997dac",
               "source_repository": "${{ github.repository }}",
               "source_ref": "${{ github.ref_name }}",
               "source_sha": "${{ github.sha }}",

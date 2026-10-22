@@ -49,7 +49,7 @@ import {
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
-import { formatWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
+import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import { reconcileHistoryMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-message-binding';
 import {
@@ -5168,7 +5168,6 @@ export class ChatwootService {
         const participants = await this.syncWhatsappGroupParticipants(instance, provider, conversationId, peer);
         rendered = formatIncomingWhatsappMentions(rendered, mentions, participants);
       }
-      if (!item.fromMe) rendered = formatWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
     }
     const confirm = async (rows: any[]) => {
       if (rows.length !== 1) throw new Error('InboundReceiverSourceAmbiguous');
@@ -5199,7 +5198,13 @@ export class ChatwootService {
       if (attributes?.deleted === true || attributes?.message_deleted === true)
         throw new Error('InboundReceiverDeleted');
       if (isMedia && Number(row.attachments) < 1) throw new Error('InboundReceiverMediaUnconfirmed');
-      if ((row.content || '') !== (rendered || '')) throw new Error('InboundReceiverContentChanged');
+      const sameContent = (row.content || '') === (rendered || '');
+      const sameLegacyContent =
+        !sameContent &&
+        peer.endsWith('@g.us') &&
+        !item.fromMe &&
+        (row.content || '') === legacyWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
+      if (!sameContent && !sameLegacyContent) throw new Error('InboundReceiverContentChanged');
       if (
         attributes?.we_digital_ingress?.source_payload_sha256 !== sourceHash &&
         (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
@@ -5544,9 +5549,7 @@ export class ChatwootService {
           fileStream.push(null);
 
           if (body.key.remoteJid.includes('@g.us')) {
-            const content = body.key.fromMe
-              ? chatwootBodyMessage || ''
-              : formatWhatsappGroupContent(body, chatwootBodyMessage, i18next.t('cw.contactMessage.contact'));
+            const content = chatwootBodyMessage || '';
 
             const send = await this.sendData(
               getConversation,
@@ -5702,9 +5705,7 @@ export class ChatwootService {
         }
 
         if (body.key.remoteJid.includes('@g.us')) {
-          const content = body.key.fromMe
-            ? `${chatwootBodyMessage}`
-            : formatWhatsappGroupContent(body, chatwootBodyMessage, i18next.t('cw.contactMessage.contact'));
+          const content = chatwootBodyMessage || '';
 
           const send = await this.createMessage(
             instance,
