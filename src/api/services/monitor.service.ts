@@ -83,7 +83,7 @@ export class WAMonitoringService {
     }
   }
 
-  public async instanceInfo(instanceNames?: string[]): Promise<any> {
+  public async instanceInfo(instanceNames?: string[], includeCounts = true): Promise<any> {
     if (instanceNames && instanceNames.length > 0) {
       const inexistentInstances = instanceNames ? instanceNames.filter((instance) => !this.waInstances[instance]) : [];
 
@@ -116,20 +116,14 @@ export class WAMonitoringService {
         Sqs: true,
         Websocket: true,
         Setting: true,
-        _count: {
-          select: {
-            Message: true,
-            Contact: true,
-            Chat: true,
-          },
-        },
+        _count: includeCounts ? { select: { Message: true, Contact: true, Chat: true } } : false,
       },
     });
 
     return instances;
   }
 
-  public async instanceInfoById(instanceId?: string, number?: string) {
+  public async instanceInfoById(instanceId?: string, number?: string, includeCounts = true) {
     let instanceName: string;
     if (instanceId) {
       instanceName = await this.prismaRepository.instance.findFirst({ where: { id: instanceId } }).then((r) => r?.name);
@@ -153,7 +147,7 @@ export class WAMonitoringService {
 
     const instanceNames = instanceName ? [instanceName] : null;
 
-    return this.instanceInfo(instanceNames);
+    return this.instanceInfo(instanceNames, includeCounts);
   }
 
   public async cleaningUp(instanceName: string) {

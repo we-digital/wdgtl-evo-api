@@ -1112,3 +1112,66 @@ Rollback is the preceding immutable EVO image; no data rollback is needed.
 Remove obsolete phone/name text prefixes from new inbound group text and media captions; the native v2 participant sender is already displayed by Chatwoot. Source IDs, native identity, ingress attributes, mentions, replies, attachment bytes, queues and outgoing delivery are unchanged. Native retry reconciliation compares the same undecorated projection. No history update/backfill/job is run; previously stored messages are untouched. Legacy formatter retained ONLY for read-only reconciliation of a pre-upgrade interrupted delivery; never used for a new write. Upstream conflicts: keep clean content in live text/media and durable reconciliation paths. Rollback requires reverting all three projections together. Focused checks: chatwoot-group-display, chatwoot-inbound-service, native ingress/reply/mentions contracts and ESLint; shared Linux lab and immutable release readback.
 
 Release dispatch binds receiver_revision=2bfeb71cc529a4b21ded6dd85ec13dfb05997dac; native receiver validation rejects changed/missing/non-main revision before the Environment-bound deployment. Closed packaging manifest updated; no host or provider configuration changes.
+
+
+## 2026-10-26: lightweight instance inventory
+
+`GET /instance/fetchInstances?includeCounts=false` skips the Message/Contact/Chat
+relation aggregates. Omitted or `true` preserves the existing full response and
+exact counters. All other instance fields and integration settings remain unchanged;
+connection state is read fresh on each request, never cached. Only `_count` is
+absent in the opt-in response. The same global/instance-key authorization and
+name/ID/number paths apply. Invalid values, including repeated/structured query
+parameters, are rejected with the existing BadRequestException contract.
+
+Owner: infrastructure optimization request, 2026-10-26. No schema, provider,
+Baileys, message delivery, history, or queue retention change. Existing Manager
+UI callers require counters and are deliberately unchanged. Health-only callers
+may opt in after this server release; deploy server before consumers. Rollback
+consumers first if their acceptance requires the no-count guarantee (older servers
+ignore this parameter and return the larger full response). Reapply the small
+router/controller/monitor delta during upstream merges.
+
+Focused regression: `npx tsx --test tests/instance-inventory.test.ts`; local real
+Prisma synthetic comparison must demonstrate equal fields and zero count SQL in
+lightweight mode before release.
+
+### Single production bundle (same optimization release)
+
+`tsup.config.ts` now builds only `src/main.ts` as CommonJS. `package.json` and
+Docker have always executed `dist/main.js`; no internal `dist/api/...` or ESM
+entrypoint is consumed by the application. Keep minification, source maps,
+translation copying, typechecking and all runtime dependencies unchanged.
+The old 1,007-file / 564,558,034-byte `dist` becomes five files / 3,605,241
+bytes. The complete old and new `main.js`, `main.js.map` and all three runtime
+translation JSON files have identical SHA-256 hashes on the same source.
+This is a build-output reduction, not a claimed runtime memory improvement or
+compressed image-size measurement. Upstream reapply must preserve the single
+entrypoint and repeat artifact comparison plus an isolated built-API boot test
+if build settings or dynamic imports change. Rollback restores the old config;
+there is no data/schema migration or Baileys change.
+
+### 2026-10-26 security-release qualification
+
+Owner explicitly added the latest Node CVE check to this optimization PR.
+[Node 24.22.1, released 2026-10-21](https://nodejs.org/en/blog/release/v24.22.1)
+fixes CVE-2026-106069, CVE-2026-106072, CVE-2026-105482, CVE-2026-105483,
+CVE-2026-111497, CVE-2026-105481, CVE-2026-106074 and CVE-2026-106073.
+It includes OpenSSL 3.5.9 and built-in Undici 7.30.1. Read-only production
+preflight already observed those three patched versions; this is not a claim
+that production still runs vulnerable Node. Its separate npm Undici was 7.16.0.
+
+Production builder/final images now pin the official Node 24.22.1 Alpine
+multi-architecture digest; lab pins its official Bookworm-slim counterpart,
+and `.nvmrc` documents the same version. `verify-node-runtime.cjs` rejects any
+other Node/OpenSSL/built-in Undici/npm Undici combination at image build time.
+The direct npm Undici dependency is pinned to 7.30.1 with registry integrity;
+only the root dependency entry and that package's lock entry change. Controlled
+Baileys/libsignal source and integrity are unchanged. Existing native HTTP/media
+boundary tests, full local EVO regression, a production-platform image build,
+isolated built-API smoke and actual image/process version readback are required.
+
+This qualification covers the named Node release and direct HTTP client; it
+is not an assertion that the whole dependency graph or Alpine image has zero
+other CVEs. Full npm audit is retained separately, including remaining inherited
+findings; no audit suppression or major-version blanket upgrade is introduced.

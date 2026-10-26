@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.7
 
-FROM node:24-alpine AS builder
+FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
 
 RUN apk add --no-cache git ffmpeg wget curl bash openssl
 
@@ -15,8 +15,10 @@ COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
 COPY ./Docker/scripts/bound-signal-caches.cjs ./Docker/scripts/bound-signal-caches.cjs
+COPY ./Docker/scripts/verify-node-runtime.cjs ./Docker/scripts/verify-node-runtime.cjs
 
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci --silent
+RUN node ./Docker/scripts/verify-node-runtime.cjs
 
 COPY ./src ./src
 COPY ./public ./public
@@ -33,7 +35,7 @@ RUN ./Docker/scripts/generate_database.sh
 
 RUN npm run build
 
-FROM node:24-alpine AS final
+FROM node:24.22.1-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS final
 
 RUN apk add --no-cache tzdata ffmpeg bash openssl
 
@@ -62,6 +64,8 @@ ARG BUILD_INPUT_SHA
 LABEL org.opencontainers.image.revision=$SOURCE_SHA \
   io.we-digital.build-input-sha=$BUILD_INPUT_SHA \
   io.we-digital.build-policy=evo-runtime-v1
+
+RUN node ./Docker/scripts/verify-node-runtime.cjs
 
 EXPOSE 8080
 
