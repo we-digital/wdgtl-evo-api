@@ -1150,3 +1150,28 @@ compressed image-size measurement. Upstream reapply must preserve the single
 entrypoint and repeat artifact comparison plus an isolated built-API boot test
 if build settings or dynamic imports change. Rollback restores the old config;
 there is no data/schema migration or Baileys change.
+
+### 2026-10-26 security-release qualification
+
+Owner explicitly added the latest Node CVE check to this optimization PR.
+[Node 24.22.1, released 2026-10-21](https://nodejs.org/en/blog/release/v24.22.1)
+fixes CVE-2026-106069, CVE-2026-106072, CVE-2026-105482, CVE-2026-105483,
+CVE-2026-111497, CVE-2026-105481, CVE-2026-106074 and CVE-2026-106073.
+It includes OpenSSL 3.5.9 and built-in Undici 7.30.1. Read-only production
+preflight already observed those three patched versions; this is not a claim
+that production still runs vulnerable Node. Its separate npm Undici was 7.16.0.
+
+Production builder/final images now pin the official Node 24.22.1 Alpine
+multi-architecture digest; lab pins its official Bookworm-slim counterpart,
+and `.nvmrc` documents the same version. `verify-node-runtime.cjs` rejects any
+other Node/OpenSSL/built-in Undici/npm Undici combination at image build time.
+The direct npm Undici dependency is pinned to 7.30.1 with registry integrity;
+only the root dependency entry and that package's lock entry change. Controlled
+Baileys/libsignal source and integrity are unchanged. Existing native HTTP/media
+boundary tests, full local EVO regression, a production-platform image build,
+isolated built-API smoke and actual image/process version readback are required.
+
+This qualification covers the named Node release and direct HTTP client; it
+is not an assertion that the whole dependency graph or Alpine image has zero
+other CVEs. Full npm audit is retained separately, including remaining inherited
+findings; no audit suppression or major-version blanket upgrade is introduced.
