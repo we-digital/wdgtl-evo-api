@@ -315,7 +315,7 @@ export class ChatwootService {
         confirm: (operation, callbackParts, signal) => this.confirmQueuedOutbound(operation, callbackParts, signal),
         fail: (operation, signal) => this.failQueuedOutbound(operation, signal),
         delete: (operation, signal) => this.deleteQueuedOutbound(operation, signal),
-        observe: (event, metrics) => this.logger.verbose(JSON.stringify({ event, ...metrics })),
+        observe: (event, metrics) => this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
       },
       1_000,
       600_000,
@@ -1609,7 +1609,7 @@ export class ChatwootService {
         }
       }
       this.logger.verbose(`--- Start createConversation ---`);
-      this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
+      this.logger.verbose(() => `Instance: ${JSON.stringify(instance)}`);
 
       // If it already exists in the cache, return conversationId
       if (await this.cache.has(cacheKey)) {
@@ -1685,7 +1685,7 @@ export class ChatwootService {
           nameContact = `${group.subject} (GROUP)`;
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
-          this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
+          this.logger.verbose(() => `Participant profile picture URL: ${JSON.stringify(picture_url)}`);
 
           const findParticipant = isProvisionalParticipantLid
             ? await this.findContactByIdentifier(instance, participantJid)
@@ -1716,7 +1716,7 @@ export class ChatwootService {
 
         const pictureLookupId = isProvisionalLid ? phoneNumber : chatId;
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(pictureLookupId);
-        this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
+        this.logger.verbose(() => `Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
         this.logger.verbose(`Searching contact for: ${chatId}`);
         let contact = isProvisionalLid
@@ -1793,7 +1793,7 @@ export class ChatwootService {
               (conversation) =>
                 conversation && conversation.status !== 'resolved' && conversation.inbox_id == filterInbox.id,
             );
-            this.logger.verbose(`Found conversation: ${JSON.stringify(inboxConversation)}`);
+            this.logger.verbose(() => `Found conversation: ${JSON.stringify(inboxConversation)}`);
           }
 
           if (inboxConversation) {
@@ -5424,7 +5424,16 @@ export class ChatwootService {
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
-        this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
+        this.logger.info(
+          JSON.stringify({
+            event: 'chatwoot_message_received',
+            sourceEvent: event,
+            instanceId: instance.instanceId,
+            messageId: typeof body?.key?.id === 'string' ? body.key.id.slice(0, 100) : null,
+            messageType: typeof body?.messageType === 'string' ? body.messageType.slice(0, 64) : null,
+            fromMe: body?.key?.fromMe === true,
+          }),
+        );
         const clientSent = isChatwootLinkedClientSentEvent(event, body);
         if (body.key.remoteJid === 'status@broadcast') {
           return;

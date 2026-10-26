@@ -79,8 +79,10 @@ export class Logger {
 
     this.configService.get<Log>('LOG').LEVEL.forEach((level) => types.push(Type[level]));
 
-    const typeValue = typeof value;
     if (types.includes(type)) {
+      // Diagnostic callers can defer expensive formatting until their level is enabled.
+      if (typeof value === 'function') value = value();
+      const typeValue = typeof value;
       if (configService.get<Log>('LOG').COLOR) {
         console.log(
           /*Command.UNDERSCORE +*/ Command.BRIGHT + Level[type],

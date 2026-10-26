@@ -15,10 +15,9 @@ export const setChatwootSearchPath = async (client: QueryableClient) => {
 class Postgres {
   private logger = new Logger('Postgres');
   private pool;
-  private connected = false;
 
   getConnection(connectionString: string) {
-    if (this.connected) {
+    if (this.pool) {
       return this.pool;
     } else {
       this.pool = new Pool({
@@ -36,16 +35,10 @@ class Postgres {
 
       this.pool.on('error', () => {
         this.logger.error('postgres disconnected');
-        this.connected = false;
       });
 
-      try {
-        this.connected = true;
-      } catch (e) {
-        this.connected = false;
-        this.logger.error('postgres connect exception caught: ' + e);
-        return null;
-      }
+      // pg-pool removes failed idle clients itself. Keep the long-lived pool:
+      // replacing it here splits callers across pools and their connection budgets.
 
       return this.pool;
     }

@@ -124,6 +124,10 @@ export class ChatwootInboundQueue {
   private attempt(item: InboundDelivery): Promise<InboundAck | undefined> {
     const known = this.active.get(item.id);
     if (known) return known;
+    // Live submissions and polling share the same two receiver slots. Overflow
+    // is already committed to the ledger: polling can claim it later, without
+    // retaining another in-memory payload or starting a lease while waiting.
+    if (this.stopped || this.active.size >= 2) return Promise.resolve(undefined);
     const work = this.perform(item).finally(() => this.active.delete(item.id));
     this.active.set(item.id, work);
     return work;
