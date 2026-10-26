@@ -1135,3 +1135,18 @@ router/controller/monitor delta during upstream merges.
 Focused regression: `npx tsx --test tests/instance-inventory.test.ts`; local real
 Prisma synthetic comparison must demonstrate equal fields and zero count SQL in
 lightweight mode before release.
+
+### Single production bundle (same optimization release)
+
+`tsup.config.ts` now builds only `src/main.ts` as CommonJS. `package.json` and
+Docker have always executed `dist/main.js`; no internal `dist/api/...` or ESM
+entrypoint is consumed by the application. Keep minification, source maps,
+translation copying, typechecking and all runtime dependencies unchanged.
+The old 1,007-file / 564,558,034-byte `dist` becomes five files / 3,605,241
+bytes. The complete old and new `main.js`, `main.js.map` and all three runtime
+translation JSON files have identical SHA-256 hashes on the same source.
+This is a build-output reduction, not a claimed runtime memory improvement or
+compressed image-size measurement. Upstream reapply must preserve the single
+entrypoint and repeat artifact comparison plus an isolated built-API boot test
+if build settings or dynamic imports change. Rollback restores the old config;
+there is no data/schema migration or Baileys change.
