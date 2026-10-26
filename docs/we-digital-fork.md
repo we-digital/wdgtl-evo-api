@@ -1175,3 +1175,33 @@ This qualification covers the named Node release and direct HTTP client; it
 is not an assertion that the whole dependency graph or Alpine image has zero
 other CVEs. Full npm audit is retained separately, including remaining inherited
 findings; no audit suppression or major-version blanket upgrade is introduced.
+
+
+## 2026-10-26 holistic hot-path follow-up
+
+Independent diagnostic review of deployed main132c3882 identified five ranked
+items. This follow-up fixes bounded, independently testable behavior:
+
+- unread Chat selection uses the existing `(instanceId, remoteJid)` unique key;
+  another instance's counter is never overwritten for a shared peer;
+- live and polled inbound deliveries share two active receiver slots, after
+  durable enqueue; overflow holds neither a lease nor an extra in-memory queue;
+- one long-lived PostgreSQL pool survives idle-client errors and lets pg-pool
+  replace failed clients, preserving existing clients' shared pool identity;
+- disabled diagnostic formatting is lazy; INFO message receipts contain bounded
+  metadata instead of serializing the complete native media/message envelope.
+
+No schema/index migration, retention, source payload deletion, Baileys upgrade,
+retry policy or provider transport change. Additional read-state indexes remain
+unselected: production plan/write-overhead qualification is still required.
+
+The dominant inventory consumer is the separate bbc-automation sender. Its
+companion PR removes idle polling, uses `includeCounts=false` only when needed,
+and retains two fresh open observations before transport. The default EVO
+inventory API and exact counters remain unchanged for other consumers.
+
+Focused tests: `tests/hot-path-performance.test.ts` and
+`tests/chatwoot-inbound-queue.test.ts`. Optional real PostgreSQL fixtures are
+restricted to an isolated synthetic database; they kill one idle test connection,
+verify replacement in the same pool, and exercise direct/group read-state
+boundaries across two instances. No production/provider messages are tests.

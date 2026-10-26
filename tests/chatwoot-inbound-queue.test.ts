@@ -84,6 +84,79 @@ const item = (instanceId = 'one', inboxId = 42): InboundDelivery => {
 };
 const ack = (inbox_id = 42) => ({ id: 100 + inbox_id, inbox_id, conversation_id: 200 + inbox_id });
 
+test('live bursts and polling share two slots; overflow stays unleased and eventually confirms once', async () => {
+  const store = new Ledger();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  let active = 0;
+  let peak = 0;
+  const deliveries = new Map<string, number>();
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    peak = Math.max(peak, ++active);
+    deliveries.set(row.id, (deliveries.get(row.id) || 0) + 1);
+    await gate;
+    active--;
+    return ack();
+  });
+  const rows = Array.from({ length: 26 }, (_, i) => item(`burst-${i}`));
+  const submissions = rows.map((row) => queue.submit(row));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(store.rows.size, 26);
+  assert.equal(peak, 2);
+  for (const row of rows.slice(2)) {
+    assert.equal(store.rows.get(row.id)!.leaseOwner, null);
+    assert.equal(store.rows.get(row.id)!.attempts, 0);
+  }
+  const duplicate = queue.submit(rows[0]);
+  await queue.poll();
+  assert.equal(peak, 2);
+  release();
+  await Promise.all([...submissions, duplicate]);
+  for (let i = 0; i < 4; i++) await queue.poll();
+  assert.equal([...store.rows.values()].filter((row) => row.state === 'confirmed').length, 26);
+  assert.equal(deliveries.size, 26);
+  assert([...deliveries.values()].every((count) => count === 1));
+  assert.equal(peak, 2);
+  assert.deepEqual(await queue.submit(rows[2]), ack());
+  assert.equal(deliveries.get(rows[2].id), 1);
+  await queue.stop();
+});
+
+test('shutdown drains active receivers and leaves burst overflow recoverable by a new queue', async () => {
+  const store = new Ledger();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const delivered: string[] = [];
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    delivered.push(row.id);
+    await gate;
+    return ack();
+  });
+  const rows = Array.from({ length: 5 }, (_, i) => item(`restart-${i}`));
+  const submissions = rows.map((row) => queue.submit(row));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  let stopped = false;
+  const stopping = queue.stop().then(() => (stopped = true));
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(stopped, false);
+  const late = item('after-stop');
+  assert.equal(await queue.submit(late), undefined);
+  assert.equal(store.rows.get(late.id)!.attempts, 0);
+  release();
+  await Promise.all([...submissions, stopping]);
+  assert.equal(stopped, true);
+  const resumed = new ChatwootInboundQueue(store, async (row) => {
+    delivered.push(row.id);
+    return ack();
+  });
+  await resumed.poll();
+  assert.equal(store.rows.size, 6);
+  assert([...store.rows.values()].every((row) => row.state === 'confirmed'));
+  assert.equal(new Set(delivered).size, delivered.length);
+  assert.equal(delivered.length, 6);
+  await resumed.stop();
+});
+
 test('durable commit precedes receiver attempt and independent confirmation precedes final receipt', async () => {
   const store = new Ledger();
   const queue = new ChatwootInboundQueue(store, async () => {
