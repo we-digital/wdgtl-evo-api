@@ -2,6 +2,7 @@ import { RouterBroker } from '@api/abstract/abstract.router';
 import { InstanceDto, SetPresenceDto } from '@api/dto/instance.dto';
 import { instanceController } from '@api/server.module';
 import { ConfigService } from '@config/env.config';
+import { BadRequestException } from '@exceptions';
 import { instanceSchema, presenceOnlySchema } from '@validate/validate.schema';
 import { RequestHandler, Router } from 'express';
 
@@ -56,12 +57,16 @@ export class InstanceRouter extends RouterBroker {
       })
       .get(this.routerPath('fetchInstances', false), ...guards, async (req, res) => {
         const key = req.get('apikey');
+        const includeCounts = req.query.includeCounts;
+        if (includeCounts !== undefined && includeCounts !== 'true' && includeCounts !== 'false') {
+          throw new BadRequestException('includeCounts must be true or false');
+        }
 
         const response = await this.dataValidate<InstanceDto>({
           request: req,
           schema: null,
           ClassRef: InstanceDto,
-          execute: (instance) => instanceController.fetchInstances(instance, key),
+          execute: (instance) => instanceController.fetchInstances(instance, key, includeCounts !== 'false'),
         });
 
         return res.status(HttpStatus.OK).json(response);

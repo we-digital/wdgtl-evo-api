@@ -1112,3 +1112,26 @@ Rollback is the preceding immutable EVO image; no data rollback is needed.
 Remove obsolete phone/name text prefixes from new inbound group text and media captions; the native v2 participant sender is already displayed by Chatwoot. Source IDs, native identity, ingress attributes, mentions, replies, attachment bytes, queues and outgoing delivery are unchanged. Native retry reconciliation compares the same undecorated projection. No history update/backfill/job is run; previously stored messages are untouched. Legacy formatter retained ONLY for read-only reconciliation of a pre-upgrade interrupted delivery; never used for a new write. Upstream conflicts: keep clean content in live text/media and durable reconciliation paths. Rollback requires reverting all three projections together. Focused checks: chatwoot-group-display, chatwoot-inbound-service, native ingress/reply/mentions contracts and ESLint; shared Linux lab and immutable release readback.
 
 Release dispatch binds receiver_revision=2bfeb71cc529a4b21ded6dd85ec13dfb05997dac; native receiver validation rejects changed/missing/non-main revision before the Environment-bound deployment. Closed packaging manifest updated; no host or provider configuration changes.
+
+
+## 2026-10-26: lightweight instance inventory
+
+`GET /instance/fetchInstances?includeCounts=false` skips the Message/Contact/Chat
+relation aggregates. Omitted or `true` preserves the existing full response and
+exact counters. All other instance fields and integration settings remain unchanged;
+connection state is read fresh on each request, never cached. Only `_count` is
+absent in the opt-in response. The same global/instance-key authorization and
+name/ID/number paths apply. Invalid values, including repeated/structured query
+parameters, are rejected with the existing BadRequestException contract.
+
+Owner: infrastructure optimization request, 2026-10-26. No schema, provider,
+Baileys, message delivery, history, or queue retention change. Existing Manager
+UI callers require counters and are deliberately unchanged. Health-only callers
+may opt in after this server release; deploy server before consumers. Rollback
+consumers first if their acceptance requires the no-count guarantee (older servers
+ignore this parameter and return the larger full response). Reapply the small
+router/controller/monitor delta during upstream merges.
+
+Focused regression: `npx tsx --test tests/instance-inventory.test.ts`; local real
+Prisma synthetic comparison must demonstrate equal fields and zero count SQL in
+lightweight mode before release.
