@@ -37,7 +37,26 @@ export function extractWhatsappMentionJids(body: {
 
 export function stripWhatsappMentionMarkdown(text: string | null | undefined): string {
   if (!text) return '';
-  return text.replace(WHATSAPP_MENTION_MARKDOWN, (_full, display: string) => display);
+  if (/mention:\/\/(user|team|telegram)\//i.test(text)) {
+    throw new Error('Only WhatsApp group participants can be mentioned in a WhatsApp reply');
+  }
+  return text.replace(WHATSAPP_MENTION_MARKDOWN, (_full, _display: string, rawId: string) => {
+    const jid = normalizeWhatsappJid(decodeURIComponent(rawId));
+    if (!/^\d+@(s\.whatsapp\.net|lid|hosted\.lid)$/.test(jid)) throw new Error('Invalid WhatsApp mention identity');
+    return `@${jid.split('@')[0]}`;
+  });
+}
+
+export function assertWhatsappMentionParticipants(
+  jids: string[],
+  participants: Array<{ id: string; phoneNumber?: string; lid?: string }>,
+): void {
+  const allowed = new Set(
+    participants.flatMap((p) => [p.id, p.phoneNumber, p.lid].filter(Boolean).map(normalizeWhatsappJid)),
+  );
+  if (jids.some((jid) => !/^\d+@(s\.whatsapp\.net|lid|hosted\.lid)$/.test(jid) || !allowed.has(jid))) {
+    throw new Error('WhatsApp mention is not a current group participant');
+  }
 }
 
 export function channelMentionsFromAttributes(
@@ -84,7 +103,8 @@ export function formatIncomingWhatsappMentions(
   mentionedJids: string[],
   participants: WhatsappGroupParticipantSnapshot[],
 ): string {
-  let formatted = text || '';
+  const formatted = text || '';
+  const replacements = new Map<string, string>();
   const byId = new Map<string, WhatsappGroupParticipantSnapshot>();
   for (const participant of participants) {
     const participantId = normalizeWhatsappJid(participant.id);
@@ -98,19 +118,23 @@ export function formatIncomingWhatsappMentions(
     const participant = byId.get(jid);
     if (!participant) continue;
 
-    const token = String(participant.phone || jid.split('@')[0] || '').replace(/\D/g, '');
-    if (!token) continue;
-    const nativeMention = `@${token}`;
-    if (!formatted.includes(nativeMention)) continue;
-
-    const name = participant.name?.trim() || token;
+    const tokens = [
+      ...new Set(
+        [jid.split('@')[0], participant.id.split('@')[0], participant.phone].filter((v) => /^\d+$/.test(v || '')),
+      ),
+    ];
+    const name = participant.name?.trim() || participant.phone || 'WhatsApp participant';
     const display = `@${name}`;
     const participantId = normalizeWhatsappJid(participant.id);
     const markup = `[${display}](mention://whatsapp/${encodeURIComponent(participantId)}/${encodeURIComponent(name)})`;
-    formatted = formatted.replace(new RegExp(`${nativeMention}(?!\\d)`, 'g'), markup);
+    for (const token of tokens) replacements.set(token, markup);
   }
 
-  return formatted;
+  if (!replacements.size) return formatted;
+  return formatted.replace(
+    new RegExp(`@(${[...replacements.keys()].join('|')})(?![\\d@])`, 'g'),
+    (_match, token) => replacements.get(token)!,
+  );
 }
 
 export function buildWhatsappGroupParticipantSnapshots(
@@ -119,11 +143,15 @@ export function buildWhatsappGroupParticipantSnapshots(
   return participants.flatMap((participant) => {
     const id = normalizeWhatsappJid(participant.id || '');
     if (!id) return [];
-    const phone = participant.phoneNumber ? String(participant.phoneNumber).replace(/\D/g, '') : id.split('@')[0];
+    const phone = participant.phoneNumber
+      ? normalizeWhatsappJid(participant.phoneNumber).split('@')[0]
+      : id.endsWith('@s.whatsapp.net')
+        ? id.split('@')[0]
+        : undefined;
     const snapshot: WhatsappGroupParticipantSnapshot = {
       id,
-      name: participant.name?.trim() || phone,
-      phone,
+      name: participant.name?.trim() || phone || 'WhatsApp participant',
+      ...(phone ? { phone } : {}),
     };
     return [snapshot];
   });

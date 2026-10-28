@@ -82,9 +82,21 @@ test('actual native sender rejects expired edits before send and preserves origi
   assert.equal(persisted.message.extendedTextMessage.text, 'edited');
   assert.equal(persisted.contextInfo[ORIGINAL_WHATSAPP_TIMESTAMP], originalTime);
   assert.equal(persisted.messageTimestamp, undefined);
+  source.key.remoteJid = '120363000000@g.us';
+  service.client.groupMetadata = async () => ({ participants: [] });
+  await assert.rejects(service.updateMessage({ number: source.key.remoteJid, key, text: '@90001' }, ['90001@lid']), /not a current group participant/);
+  assert.equal(sent, 1);
+  service.client.groupMetadata = async () => ({ participants: [{ id: '90001@lid' }] });
+  service.client.sendMessage = async (_jid: string, message: any) => {
+    sent++;
+    assert.deepEqual(message.mentions, ['90001@lid']);
+    return null;
+  };
+  await service.updateMessage({ number: source.key.remoteJid, key, text: '@90001' }, ['90001@lid']);
+  assert.equal(sent, 2);
   source.messageTimestamp = Math.floor(Date.now() / 1000) - 16 * 60;
-  await assert.rejects(service.updateMessage({ number: '123', key, text: 'too late' }), (error: any) =>
+  await assert.rejects(service.updateMessage({ number: source.key.remoteJid, key, text: 'too late' }), (error: any) =>
     error.message.includes('whatsapp_edit_time_expired'),
   );
-  assert.equal(sent, 1);
+  assert.equal(sent, 2);
 });

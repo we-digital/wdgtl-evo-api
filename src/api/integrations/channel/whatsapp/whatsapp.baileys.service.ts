@@ -56,6 +56,10 @@ import {
   TypeButton,
 } from '@api/dto/sendMessage.dto';
 import {
+  assertWhatsappMentionParticipants,
+  normalizeWhatsappJid,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
+import {
   shouldEnrichChatwootContacts,
   shouldForwardChatwootMessageUpsert,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
@@ -2768,7 +2772,9 @@ export class BaileysStartupService extends ChannelStartupService {
         let group;
         try {
           const cache = this.configService.get<CacheConf>('CACHE');
-          if (!cache.REDIS.ENABLED && !cache.LOCAL.ENABLED) group = await this.findGroup({ groupJid: sender }, 'inner');
+          if (options?.mentioned?.length) group = await this.client.groupMetadata(sender);
+          else if (!cache.REDIS.ENABLED && !cache.LOCAL.ENABLED)
+            group = await this.findGroup({ groupJid: sender }, 'inner');
           else group = await this.getGroupMetadataCache(sender);
           // group = await this.findGroup({ groupJid: sender }, 'inner');
         } catch {
@@ -2782,6 +2788,7 @@ export class BaileysStartupService extends ChannelStartupService {
         if (options?.mentionsEveryOne) {
           mentions = group.participants.map((participant) => participant.id);
         } else if (options?.mentioned?.length) {
+          assertWhatsappMentionParticipants(options.mentioned.map(normalizeWhatsappJid), group.participants);
           mentions = options.mentioned.map((mention) => {
             const jid = createJid(mention);
             if (isJidGroup(jid)) {
@@ -2805,6 +2812,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }),
         );
       } else {
+        if (options?.mentioned?.length) throw new BadRequestException('WhatsApp mentions require a group');
         contextInfo = {
           mentionedJid: [],
           groupMentions: [],
@@ -4807,7 +4815,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
-  public async updateMessage(data: UpdateMessageDto) {
+  public async updateMessage(data: UpdateMessageDto, mentioned: string[] = []) {
     const jid = createJid(data.number);
 
     const options = await this.formatUpdateMessage(data);
@@ -4853,7 +4861,16 @@ export class BaileysStartupService extends ChannelStartupService {
         throw new BadRequestException(expired ? 'whatsapp_edit_time_expired' : 'whatsapp_edit_restricted');
       }
 
-      const messageSent = await this.client.sendMessage(jid, { ...(options as any), edit: oldMessage.key });
+      if (mentioned.length) {
+        if (!isJidGroup(jid)) throw new BadRequestException('WhatsApp mentions require a group');
+        const group = await this.client.groupMetadata(jid);
+        assertWhatsappMentionParticipants(mentioned, group.participants);
+      }
+      const messageSent = await this.client.sendMessage(jid, {
+        ...(options as any),
+        mentions: mentioned,
+        edit: oldMessage.key,
+      });
       if (messageSent) {
         const editedMessage =
           messageSent?.message?.protocolMessage || messageSent?.message?.editedMessage?.message?.protocolMessage;
@@ -5251,10 +5268,15 @@ export class BaileysStartupService extends ChannelStartupService {
     try {
       const participants = (await this.client.groupMetadata(id.groupJid)).participants;
       const contacts = await this.prismaRepository.contact.findMany({
-        where: { instanceId: this.instanceId, remoteJid: { in: participants.map((p) => p.id) } },
+        where: {
+          instanceId: this.instanceId,
+          remoteJid: { in: participants.flatMap((p) => [p.id, p.phoneNumber, p.lid].filter(Boolean)) },
+        },
       });
       const parsedParticipants = participants.map((participant) => {
-        const contact = contacts.find((c) => c.remoteJid === participant.id);
+        const contact = contacts.find((c) =>
+          [participant.id, participant.phoneNumber, participant.lid].includes(c.remoteJid),
+        );
         return {
           ...participant,
           name: participant.name ?? contact?.pushName,

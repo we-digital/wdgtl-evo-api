@@ -1,3 +1,9 @@
+## Native WhatsApp mention identity (2026-10-28)
+
+Mention markdown is converted to matching native `@<JID-localpart>` text plus Baileys `mentionedJid`, not arbitrary display labels. LID is opaque and never a phone fallback; real PN aliases enrich names only when known. Incoming PN/LID tokens resolve through the provider-mentioned participant snapshots in one pass. Staff/team/Telegram tokens are rejected on public WhatsApp dispatch. Fresh metadata for the exact destination group validates explicit mention recipients immediately before sends and edits; cached/removed participants cannot reach transport. Reply/caption transport options remain unchanged. Participant name lookup batches known PN/LID aliases without scanning other groups or accounts.
+
+No dependency, Signal identity, session or native send retry changes. Provider/client contact books still control how a recipient displays a native mention; an unsaved participant can legitimately appear as a number. Synthetic tests cover actual sender/edit pre-transport fences, replies/captions, incoming conversion and real Baileys message serialization without network. Rollback is the previous immutable main image. Reapply helpers and transport boundaries on upstream upgrades; no live sends are part of automated acceptance.
+
 ## Native group forwarding and delivery error diagnostics (2026-10-19)
 
 Native WhatsApp forwards now use the same group device/session/sender-key

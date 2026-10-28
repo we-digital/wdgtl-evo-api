@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+  assertWhatsappMentionParticipants,
   buildWhatsappGroupParticipantSnapshots,
   channelMentionsFromAttributes,
   extractWhatsappMentionJids,
@@ -28,7 +29,7 @@ test('extracts mention jids from content_attributes and markdown', () => {
     },
   });
   assert.deepEqual(jids, [jid]);
-  assert.equal(stripWhatsappMentionMarkdown(content), 'hi @Alice');
+  assert.equal(stripWhatsappMentionMarkdown(content), 'hi @628111');
 });
 
 test('channelMentionsFromAttributes drops nullish and incomplete entries', () => {
@@ -84,4 +85,31 @@ test('matches a phone mention to a LID roster participant and emits the roster i
     ),
     'hello [@Alice](mention://whatsapp/1555000111%40lid/Alice)',
   );
+});
+
+test('does not invent a phone number from an unknown LID', () => {
+  assert.deepEqual(buildWhatsappGroupParticipantSnapshots([{ id: '1555111@lid' }]), [
+    { id: '1555111@lid', name: 'WhatsApp participant' },
+  ]);
+});
+
+test('matches native LID and PN tokens without changing unmentioned numbers', () => {
+  const roster = [{ id: '1555111@lid', name: 'Alice', phone: '628111' }];
+  const markup = '[@Alice](mention://whatsapp/1555111%40lid/Alice)';
+  assert.equal(formatIncomingWhatsappMentions('@1555111 @628111 @15551119', ['1555111@lid'], roster), `${markup} ${markup} @15551119`);
+});
+
+test('rejects staff tokens and validates current group membership including known PN aliases', () => {
+  assert.throws(() => stripWhatsappMentionMarkdown('[@Staff](mention://user/1/Staff)'), /Only WhatsApp/);
+  assert.throws(() => assertWhatsappMentionParticipants(['1555111@lid'], []), /current group participant/);
+  assert.doesNotThrow(() => assertWhatsappMentionParticipants(['628111@s.whatsapp.net'], [{ id: '1555111@lid', phoneNumber: '628111@s.whatsapp.net' }]));
+  assert.throws(() => assertWhatsappMentionParticipants(['777@g.us'], [{ id: '777@g.us' }]), /current group participant/);
+});
+
+test('serializes matching LID text and native mentionedJid through real Baileys without transport', async () => {
+  const { generateWAMessageContent } = await import('baileys');
+  const content = 'Hi [@Alice](mention://whatsapp/1555111%40lid/Alice)';
+  const wire = await generateWAMessageContent({ text: stripWhatsappMentionMarkdown(content), mentions: extractWhatsappMentionJids({ content }) }, {});
+  assert.equal(wire.extendedTextMessage?.text, 'Hi @1555111');
+  assert.deepEqual(wire.extendedTextMessage?.contextInfo?.mentionedJid, ['1555111@lid']);
 });

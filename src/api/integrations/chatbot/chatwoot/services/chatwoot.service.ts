@@ -4491,7 +4491,7 @@ export class ChatwootService {
     body: any,
     instance: InstanceDto,
   ): Promise<any | null> {
-    const text = typeof body?.content === 'string' ? body.content : '';
+    const text = stripWhatsappMentionMarkdown(typeof body?.content === 'string' ? body.content : '');
     if (!text.trim() || !waInstance?.updateMessage) return null;
 
     const stored = await this.prismaRepository.message.findFirst({
@@ -4504,11 +4504,14 @@ export class ChatwootService {
     if (!key?.id) return null;
 
     try {
-      const messageSent = await waInstance.updateMessage({
-        number: chatId,
-        key,
-        text,
-      });
+      const messageSent = await waInstance.updateMessage(
+        {
+          number: chatId,
+          key,
+          text,
+        },
+        extractWhatsappMentionJids(body),
+      );
       this.logger.verbose(
         JSON.stringify({
           event: 'chatwoot_native_edit_sent',
