@@ -5272,11 +5272,20 @@ export class BaileysStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
           remoteJid: { in: participants.flatMap((p) => [p.id, p.phoneNumber, p.lid].filter(Boolean)) },
         },
+        select: { remoteJid: true, pushName: true, profilePicUrl: true },
+      });
+      const contactIndexes = new Map<string, number>();
+      contacts.forEach((contact, index) => {
+        if (!contactIndexes.has(contact.remoteJid)) contactIndexes.set(contact.remoteJid, index);
       });
       const parsedParticipants = participants.map((participant) => {
-        const contact = contacts.find((c) =>
-          [participant.id, participant.phoneNumber, participant.lid].includes(c.remoteJid),
-        );
+        // Preserve the first returned contact across all aliases, not an alias-priority policy.
+        let contactIndex = contacts.length;
+        for (const jid of [participant.id, participant.phoneNumber, participant.lid]) {
+          const index = contactIndexes.get(jid);
+          if (index !== undefined && index < contactIndex) contactIndex = index;
+        }
+        const contact = contacts[contactIndex];
         return {
           ...participant,
           name: participant.name ?? contact?.pushName,

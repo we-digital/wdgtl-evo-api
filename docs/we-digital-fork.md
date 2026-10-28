@@ -1,3 +1,26 @@
+## Request-local group roster enrichment (2026-10-29)
+
+`BaileysStartupService.findParticipants` replaces per-participant Contact scans
+with a request-local JID-to-returned-row-index map and selects only remote JID,
+name and photo columns through native Prisma. Preserve instance-scoped alias
+selection, first returned contact across PN/LID aliases (not a new alias priority),
+provider fields/order, nullish name/photo precedence and existing cache writes.
+No persistent cache, schema/index, dependency, metadata call, provider transport,
+retry, session or Signal-recovery change. One runtime method: 12 added / 3 removed
+lines. Both provider schemas already contain the selected fields.
+
+Literal-method synthetic CPU at 1,024 participants / 2,048 contacts: median
+11.839 → 0.413ms; Contact JID reads 1,048,576 → 4,096. Small-roster behavior and
+full response parity also pass. These are mocked-I/O CPU measurements, not
+production/API latency. Evidence, limitations and reproduction:
+`docs/performance/2026-10-29-group-participants.md`. Architecture invariants:
+`docs/architecture/we-digital-read-paths.md`; regression:
+`tests/group-participant-lookup.test.ts`.
+
+On upstream updates, reapply only if the repeated scan remains and re-run the
+literal-method contract; remove when upstream offers an equivalent lookup.
+Rollback is the previous immutable application image; no data migration.
+
 ## Narrow chat-list history projection (2026-10-28)
 
 `ChannelStartupService.fetchChats` selects the latest message IDs per peer before
