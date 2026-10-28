@@ -6,7 +6,8 @@ filters remain inside the selector; existing pagination, JSON projection and
 latest-timestamp tie semantics remain unchanged. No contact-only chats are added.
 No schema/index, dependency, Baileys/Signal, provider send, retry or session change.
 
-The runtime delta is one SQL method (11 added / 7 removed lines). Reapply that
+The runtime delta is one SQL method (11 added / 7 removed lines).
+The deployment payload also pins the current reviewed receiver f0e6f38ff2fe36c75773e12496b8ac06a9447428; the old receiver pin would fail the current main admission gate. The closed Actions allowlist is refreshed for that exact workflow. Reapply that
 selector boundary during upstream upgrades, then run the literal method's
 PostgreSQL contract and payload-parity benchmark. Rollback is the previous
 immutable application image. Details and measured limitations:
