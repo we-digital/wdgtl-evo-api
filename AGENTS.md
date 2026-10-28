@@ -28,6 +28,17 @@
 
 This document provides comprehensive guidelines for AI agents (Claude, GPT, Cursor, etc.) working with the Evolution API codebase.
 
+### Fork architecture and performance boundaries
+
+Read `docs/architecture/we-digital-read-paths.md` before changing inventory,
+chat-list/history, group-roster or Chatwoot ingress hot paths. Keep significant
+fork behavior and its upstream reapply/removal notes in `docs/we-digital-fork.md`.
+Preserve the native router/controller/service/Prisma boundaries and instance
+scope; optimize measured work without changing provider send, PN/LID identity,
+Signal recovery, ordering or retry contracts. A per-request lookup is not a
+cross-request cache. Synthetic CPU evidence does not establish endpoint or
+production latency.
+
 ## Project Overview
 
 **Evolution API** is a production-ready, multi-tenant WhatsApp API platform built with Node.js, TypeScript, and Express.js. It supports multiple WhatsApp providers and extensive integrations with chatbots, CRM systems, and messaging platforms.
@@ -287,14 +298,15 @@ const result = await this.prismaRepository.instance.findUnique({
 ## Testing Guidelines
 
 ### Current State
-- **No formal test suite** currently implemented
-- **Manual testing** is the primary approach
-- **Integration testing** in development environment
+- `npm run test:unit` runs the fork's Node test-runner regressions in `tests/*.test.ts`.
+- `npm test` still points at the inherited `test/all.test.ts` watcher (target absent in this fork); use `test:unit`.
+- Database-backed tests explicitly opt in to isolated synthetic fixtures; record skipped tests separately.
+- Shared-lab integration acceptance and real-device WhatsApp acceptance remain separate gates.
 
 ### Testing Strategy
 ```typescript
-// Place tests in test/ directory as *.test.ts
-// Run: npm test (watches test/all.test.ts)
+// Add focused fork regressions in tests/ as *.test.ts using node:test.
+// Run: npx tsx --test tests/<affected-contract>.test.ts
 
 describe('ExampleService', () => {
   it('should create example', async () => {
