@@ -2781,6 +2781,7 @@ export class ChatwootService {
           audio: media,
           delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
           quoted: options?.quoted,
+          mentioned: options?.mentioned,
           messageId: options?.messageId,
           beforeTransport: options?.beforeTransport,
           signal: options?.signal,
@@ -2806,6 +2807,7 @@ export class ChatwootService {
         media: media,
         delay: 1200,
         quoted: options?.quoted,
+        mentioned: options?.mentioned,
         messageId: options?.messageId,
         beforeTransport: options?.beforeTransport,
         signal: options?.signal,
@@ -3094,7 +3096,13 @@ export class ChatwootService {
         payload.chatId,
         payload.attachmentUrl,
         payload.text,
-        { quoted, messageId: operation.plannedWhatsappMessageId, beforeTransport: onTransportStart, signal },
+        {
+          quoted,
+          mentioned: payload.mentioned,
+          messageId: operation.plannedWhatsappMessageId,
+          beforeTransport: onTransportStart,
+          signal,
+        },
         provenance,
       );
     } else {
