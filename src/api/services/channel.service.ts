@@ -734,8 +734,15 @@ export class ChannelStartupService {
     const offset = query?.skip ? Prisma.sql`OFFSET ${query.skip}` : Prisma.sql``;
 
     const results = await this.prismaRepository.$queryRaw`
-      WITH rankedMessages AS (
-        SELECT DISTINCT ON ("Message"."key"->>'remoteJid') 
+      WITH latestMessageIds AS (
+        SELECT DISTINCT ON ("Message"."key"->>'remoteJid') "Message"."id"
+        FROM "Message"
+        WHERE "Message"."instanceId" = ${this.instanceId}
+        ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
+        ${timestampFilter}
+        ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
+      ), rankedMessages AS (
+        SELECT
           "Contact"."id" as "contactId",
           "Message"."key"->>'remoteJid' as "remoteJid",
           CASE 
@@ -767,13 +774,10 @@ export class ChannelStartupService {
           "Message"."instanceId" AS "lastMessageInstanceId",
           "Message"."sessionId" AS "lastMessageSessionId",
           "Message"."status" AS "lastMessageStatus"
-        FROM "Message"
+        FROM latestMessageIds
+        JOIN "Message" ON "Message"."id" = latestMessageIds."id"
         LEFT JOIN "Contact" ON "Contact"."remoteJid" = "Message"."key"->>'remoteJid' AND "Contact"."instanceId" = "Message"."instanceId"
         LEFT JOIN "Chat" ON "Chat"."remoteJid" = "Message"."key"->>'remoteJid' AND "Chat"."instanceId" = "Message"."instanceId"
-        WHERE "Message"."instanceId" = ${this.instanceId}
-        ${remoteJid ? Prisma.sql`AND "Message"."key"->>'remoteJid' = ${remoteJid}` : Prisma.sql``}
-        ${timestampFilter}
-        ORDER BY "Message"."key"->>'remoteJid', "Message"."messageTimestamp" DESC
       )
       SELECT * FROM rankedMessages 
       ORDER BY "updatedAt" DESC NULLS LAST

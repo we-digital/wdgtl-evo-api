@@ -1,3 +1,17 @@
+## Narrow chat-list history projection (2026-10-28)
+
+`ChannelStartupService.fetchChats` selects the latest message IDs per peer before
+joining Contact/Chat and loading message payloads. Instance, peer and timestamp
+filters remain inside the selector; existing pagination, JSON projection and
+latest-timestamp tie semantics remain unchanged. No contact-only chats are added.
+No schema/index, dependency, Baileys/Signal, provider send, retry or session change.
+
+The runtime delta is one SQL method (11 added / 7 removed lines). Reapply that
+selector boundary during upstream upgrades, then run the literal method's
+PostgreSQL contract and payload-parity benchmark. Rollback is the previous
+immutable application image. Details and measured limitations:
+`docs/performance/2026-10-28-chat-list.md`.
+
 ## Native WhatsApp mention identity (2026-10-28)
 
 Mention markdown is converted to matching native `@<JID-localpart>` text plus Baileys `mentionedJid`, not arbitrary display labels. LID is opaque and never a phone fallback; real PN aliases enrich names only when known. Incoming PN/LID tokens resolve through the provider-mentioned participant snapshots in one pass. Staff/team/Telegram tokens are rejected on public WhatsApp dispatch. Fresh metadata for the exact destination group validates explicit mention recipients immediately before sends and edits; cached/removed participants cannot reach transport. Reply/caption transport options remain unchanged. Participant name lookup batches known PN/LID aliases without scanning other groups or accounts.
