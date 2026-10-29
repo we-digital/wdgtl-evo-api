@@ -1249,3 +1249,24 @@ Focused tests: `tests/hot-path-performance.test.ts` and
 restricted to an isolated synthetic database; they kill one idle test connection,
 verify replacement in the same pool, and exercise direct/group read-state
 boundaries across two instances. No production/provider messages are tests.
+
+
+## 2026-10-29 — WhatsApp peer names, not outbound sender labels
+
+EVO owns names in live ingress, imported contacts and stored/cached history.
+`utils/whatsapp-contact-name.ts` rejects exact Você/Voce placeholders, separates
+incoming sender names from outgoing office names, and prefers Baileys `notify`
+(the self-set profile name) before saved address-book/verified fallbacks. Group
+subjects and message display pushName remain unchanged. History metadata donors
+now require explicit incoming direction; existing source locks/fingerprints remain.
+Live provider conversations can fill a placeholder/number when a real incoming
+name arrives. Contact imports/enrichment preserve existing non-placeholder names.
+No schema, feature flag, dependency, PN/LID routing, or provider send changes.
+
+Focused checks: `npx tsx --test tests/chatwoot-contact-names.test.ts
+tests/chatwoot-contact-sync.test.ts tests/chatwoot-history-sync.test.ts
+tests/history-memory-budget.test.ts`, `npx tsc --noEmit`, affected-source ESLint.
+Reapply at profile extraction, live peer creation/update and both history donor
+paths when upgrading upstream; remove only when upstream enforces sender direction
+and preserves real/manual names at these boundaries. Rollback restores prior source;
+historical placeholder repair is a separately reviewed, reversible one-off operation.
