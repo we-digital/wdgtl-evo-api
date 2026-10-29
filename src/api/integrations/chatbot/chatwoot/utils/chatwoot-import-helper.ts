@@ -38,6 +38,7 @@ import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
 import { Chatwoot as ChatwootModel, Contact, Message } from '@prisma/client';
+import { incomingWhatsappName, whatsappContactName } from '@utils/whatsapp-contact-name';
 import { proto } from 'baileys';
 import type { Pool } from 'pg';
 
@@ -170,7 +171,9 @@ class ChatwootImport {
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
 
-          const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
+          const contactName = isGroup
+            ? `${contact.pushName} (GROUP)`
+            : whatsappContactName(contact.pushName) || contact.remoteJid.split('@')[0];
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
@@ -191,7 +194,12 @@ class ChatwootImport {
         }
         sqlInsert += ` ON CONFLICT (identifier, account_id)
                        DO UPDATE SET
-                        name = EXCLUDED.name,
+                        name = CASE WHEN contacts.identifier LIKE '%@g.us'
+                          OR contacts.name IS NULL OR btrim(contacts.name) = ''
+                          OR lower(btrim(contacts.name)) IN ('voce', 'você')
+                          OR contacts.name = split_part(contacts.identifier, '@', 1)
+                          OR contacts.name = contacts.phone_number
+                          THEN EXCLUDED.name ELSE contacts.name END,
                         phone_number = EXCLUDED.phone_number,
                         updated_at = NOW()`;
 
@@ -1424,8 +1432,7 @@ class ChatwootImport {
   ): HistoryIdentity {
     const canonicalJid = toCanonicalHistoryJid(identityKey);
     const jidUser = canonicalJid.split('@')[0].split(':')[0];
-    const firstPushName =
-      plannedPushName || messages.find((message) => Boolean(message.pushName?.trim()))?.pushName?.trim();
+    const firstPushName = whatsappContactName(plannedPushName) || messages.map(incomingWhatsappName).find(Boolean);
 
     if (isPhoneJid(canonicalJid)) {
       return {

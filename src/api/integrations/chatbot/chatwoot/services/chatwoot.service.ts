@@ -220,6 +220,7 @@ import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageM
 import { formatCaughtError } from '@utils/formatCaughtError';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
+import { incomingWhatsappName, replaceableWhatsappName, whatsappContactName } from '@utils/whatsapp-contact-name';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
@@ -580,6 +581,14 @@ export class ChatwootService {
     let contact: any = await this.findProviderContact(instance, peer);
     const isGroup = isGroupJid(peer);
     const user = peer.split('@')[0];
+    let peerName = incomingWhatsappName(body);
+    if (!isGroup && !peerName && (!contact || replaceableWhatsappName(contact.name, user))) {
+      const stored = await this.prismaRepository.contact.findFirst({
+        where: { instanceId: provider.instanceId, remoteJid: peer },
+        select: { pushName: true },
+      });
+      peerName = whatsappContactName(stored?.pushName);
+    }
     if (!contact) {
       const group = isGroup
         ? rosterGroup || (await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer))
@@ -589,11 +598,20 @@ export class ChatwootService {
         isGroup ? peer : user,
         inboxId,
         isGroup,
-        isGroup ? `${group.subject} (GROUP)` : body.pushName || user,
+        isGroup ? `${group.subject} (GROUP)` : peerName || user,
         undefined,
         peer,
         rosterGroup ? inboxId : undefined,
       );
+    }
+    if (
+      contact?.id &&
+      contact.identifier === peer &&
+      !isGroup &&
+      peerName &&
+      replaceableWhatsappName(contact.name, user)
+    ) {
+      await this.updateContact(instance, contact.id, { name: peerName });
     }
     const contactId = Number(contact?.payload?.id || contact?.payload?.contact?.id || contact?.id);
     if (!Number.isSafeInteger(contactId) || contactId <= 0)
@@ -832,7 +850,7 @@ export class ChatwootService {
     if (contact) {
       if ((isPhoneJid(contact.identifier) || isLidJid(contact.identifier)) && contact.identifier !== participant)
         throw new Error('Group participant contact identity conflicts');
-      if (body.pushName && (!contact.name || contact.name === user))
+      if (incomingWhatsappName(body) && replaceableWhatsappName(contact.name, user))
         await this.updateContact(instance, contact.id, { name: body.pushName });
       return;
     }
@@ -1209,7 +1227,7 @@ export class ChatwootService {
         const isLidIdentifier = typeof jid === 'string' && (jid.endsWith('@lid') || jid.endsWith('@hosted.lid'));
         data = {
           inbox_id: inboxId,
-          name: name || phoneNumber,
+          name: whatsappContactName(name) || phoneNumber,
           identifier: jid,
           avatar_url: avatar_url,
         };
@@ -1273,6 +1291,11 @@ export class ChatwootService {
   }
 
   public async updateContact(instance: InstanceDto, id: number, data: any) {
+    if (Object.prototype.hasOwnProperty.call(data, 'name') && !whatsappContactName(data.name)) {
+      data = { ...data };
+      delete data.name;
+      if (Object.keys(data).length === 0) return null;
+    }
     const context = await this.clientCw(instance);
 
     if (!context) {
@@ -1668,7 +1691,7 @@ export class ChatwootService {
         }
 
         const chatId = isGroup ? remoteJid : isProvisionalLid ? phoneNumber : phoneNumber.split('@')[0].split(':')[0];
-        let nameContact = !body.key.fromMe ? body.pushName : chatId;
+        let nameContact = incomingWhatsappName(body) || chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;
 
@@ -1730,7 +1753,7 @@ export class ChatwootService {
               picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
             const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
             const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = !contact.name || contact.name === chatId;
+            const nameNeedsUpdate = replaceableWhatsappName(contact.name, chatId);
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
             if (pictureNeedsUpdate || nameNeedsUpdate) {
@@ -6500,8 +6523,9 @@ export class ChatwootService {
             });
             const donors = identityDonors.get(peer) || { first: message.id, last: message.id };
             donors.last = message.id;
-            if (!identityPushNames.has(peer) && message.pushName?.trim()) {
-              identityPushNames.set(peer, message.pushName.trim());
+            const peerName = incomingWhatsappName(message);
+            if (!identityPushNames.has(peer) && peerName) {
+              identityPushNames.set(peer, peerName);
               donors.name = message.id;
             }
             identityDonors.set(peer, donors);

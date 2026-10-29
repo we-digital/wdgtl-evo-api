@@ -118,6 +118,7 @@ import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
 import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-redis-db';
+import { replaceableWhatsappName, whatsappProfileName } from '@utils/whatsapp-contact-name';
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
@@ -1102,7 +1103,7 @@ export class BaileysStartupService extends ChannelStartupService {
       try {
         const contactsRaw: any = contacts.map((contact) => ({
           remoteJid: contact.id,
-          pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+          pushName: whatsappProfileName(contact) || contact.id.split('@')[0],
           profilePicUrl: null,
           instanceId: this.instanceId,
         }));
@@ -1144,7 +1145,7 @@ export class BaileysStartupService extends ChannelStartupService {
         for (const contact of contacts) {
           updatedContacts.push({
             remoteJid: contact.id,
-            pushName: contact?.name || contact?.verifiedName || contact.id.split('@')[0],
+            pushName: whatsappProfileName(contact) || contact.id.split('@')[0],
             profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
             instanceId: this.instanceId,
           });
@@ -1175,7 +1176,9 @@ export class BaileysStartupService extends ChannelStartupService {
               }
 
               await this.chatwootService.updateContact(instance, findParticipant.id, {
-                name: contact.pushName,
+                ...(replaceableWhatsappName(findParticipant.name, contact.remoteJid.split('@')[0]) && {
+                  name: contact.pushName,
+                }),
                 avatar_url: contact.profilePicUrl,
               });
             }
@@ -1193,7 +1196,7 @@ export class BaileysStartupService extends ChannelStartupService {
         this.logger.debug(() => `Updating contact: ${JSON.stringify(contact, null, 2)}`);
         contactsRaw.push({
           remoteJid: contact.id,
-          pushName: contact?.name ?? contact?.verifiedName,
+          pushName: whatsappProfileName(contact),
           profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
           instanceId: this.instanceId,
         });
@@ -1267,7 +1270,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
         for (const contact of contacts) {
           if (contact.id && (contact.notify || contact.name)) {
-            contactsMap.set(contact.id, { name: contact.name ?? contact.notify, jid: contact.id });
+            contactsMap.set(contact.id, { name: whatsappProfileName(contact), jid: contact.id });
           }
         }
 
@@ -1357,7 +1360,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         await this.contactHandle['contacts.upsert'](
-          contacts.filter((c) => !!c.notify || !!c.name).map((c) => ({ id: c.id, name: c.name ?? c.notify })),
+          contacts.filter((c) => !!whatsappProfileName(c)).map((c) => ({ id: c.id, name: whatsappProfileName(c) })),
           { enrich: false },
         );
 

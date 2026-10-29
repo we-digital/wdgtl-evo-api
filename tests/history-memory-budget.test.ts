@@ -1,3 +1,4 @@
+import { incomingWhatsappName } from '../src/utils/whatsapp-contact-name';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
@@ -98,6 +99,7 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
   const context = {
     module: { exports: undefined as any },
     ...normalization,
+    incomingWhatsappName,
     ...coordinator,
     storedHistoryPages,
     withLockedHistoryDependencies: (uri: string, name: string, ids: string[], verify: any, write: any) =>
@@ -286,6 +288,8 @@ test('metrics allowlist binds actual TCP peer, including mapped loopback; memory
 test('planning retains whole-conversation last timestamp and first human name beyond the first page', async () => {
   const rows = fixture();
   for (const row of rows) row.pushName = '';
+  rows[0].pushName = 'Você';
+  rows[2].pushName = 'Office Agent';
   rows[501].pushName = 'Late synthetic human';
   const next = service(current, rows);
   await next.svc.syncStoredHistory({ instanceName: 'synthetic' }, { scope: 'all', dryRun: false, limit: 777 });
