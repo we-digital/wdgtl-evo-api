@@ -77,7 +77,6 @@ import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
-import { findStoredHistoryIds } from '@api/integrations/chatbot/chatwoot/utils/history-memory-budget';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -1243,7 +1242,7 @@ export class BaileysStartupService extends ChannelStartupService {
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
-        const instance: InstanceDto = { instanceName: this.instance.name };
+        const instance: InstanceDto = { instanceName: this.instance.name, instanceId: this.instanceId };
 
         let timestampLimitToImport = null;
 
@@ -1298,13 +1297,7 @@ export class BaileysStartupService extends ChannelStartupService {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
         }
 
-        const messagesRaw: any[] = [];
-
-        const messagesRepository = await findStoredHistoryIds(
-          this.prismaRepository.message,
-          this.instanceId,
-          messages.map((message) => message.key?.id),
-        );
+        let messagesRaw: any[] = [];
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
@@ -1321,10 +1314,6 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (messagesRepository?.has(m.key.id)) {
-            continue;
-          }
-
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             if (participantJid && contactsMap.has(participantJid)) {
@@ -1337,27 +1326,11 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
-          isLatest,
-          progress,
-        });
-
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          messagesRaw = await this.chatwootService.persistReceivedHistory(instance, messagesRaw);
         }
 
-        if (
-          this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
-          !this.isManagedHistoryReconciliation() &&
-          this.localChatwoot?.enabled &&
-          this.localChatwoot.importMessages &&
-          messagesRaw.length > 0
-        ) {
-          this.chatwootService.addHistoryMessages(
-            instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
-          );
-        }
+        this.sendDataWebhook(Events.MESSAGES_SET, messagesRaw, true, undefined, { isLatest, progress });
 
         await this.contactHandle['contacts.upsert'](
           contacts.filter((c) => !!whatsappProfileName(c)).map((c) => ({ id: c.id, name: whatsappProfileName(c) })),
@@ -1379,8 +1352,8 @@ export class BaileysStartupService extends ChannelStartupService {
       settings: any,
     ) => {
       const ingressReceivedAt = Date.now();
-      try {
-        for (const received of messages) {
+      for (const received of messages) {
+        try {
           if (
             received?.messageStubParameters?.some?.((param) =>
               [
@@ -1415,8 +1388,9 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
+          const protocol =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const editedMessage = protocol?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT ? protocol : null;
 
           if (editedMessage) {
             if (received.key?.id && editedMessage.key?.id) {
@@ -1432,7 +1406,7 @@ export class BaileysStartupService extends ChannelStartupService {
             );
           }
 
-          if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
+          if ((type !== 'notify' && type !== 'append') || protocol || !received?.message) {
             continue;
           }
 
@@ -1471,6 +1445,38 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+          if (type === 'append' && this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+            const saved = await this.chatwootService.persistReceivedHistory(
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              [messageRaw],
+            );
+            if (
+              this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE &&
+              this.configService.get<S3>('S3').ENABLE
+            ) {
+              const sources = await this.prismaRepository.message.findMany({
+                where: {
+                  instanceId: this.instanceId,
+                  AND: [
+                    { key: { path: ['id'], equals: received.key.id } },
+                    { key: { path: ['remoteJid'], equals: received.key.remoteJid } },
+                    { key: { path: ['fromMe'], equals: received.key.fromMe } },
+                  ],
+                },
+                take: 2,
+              });
+              if (sources.length !== 1) throw new Error('InboundNativeSourceAmbiguous');
+              if (
+                !(await this.prismaRepository.media.findFirst({
+                  where: { instanceId: this.instanceId, messageId: sources[0].id },
+                }))
+              )
+                await this.retainNativeMessageMedia(received, messageRaw, sources[0]);
+            }
+            if (saved.length) this.sendDataWebhook(Events.MESSAGES_SET, saved);
+            continue;
+          }
+
           const ingressContextKey = `chatwoot_ingress_context:${received.key.remoteJid}:${received.key.id}`;
           const cachedIngressContext = type === 'notify' ? await this.baileysCache.get(ingressContextKey) : null;
           const ingressContext = compactChatwootIngressContext(messageRaw.contextInfo);
@@ -1592,8 +1598,6 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.ptvMessage ||
             received?.message?.audioMessage;
 
-          const isVideo = received?.message?.videoMessage;
-
           if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
           }
@@ -1680,61 +1684,7 @@ export class BaileysStartupService extends ChannelStartupService {
               this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
             }
 
-            if (isMedia) {
-              if (this.configService.get<S3>('S3').ENABLE) {
-                try {
-                  if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
-                    this.logger.warn('Video upload is disabled. Skipping video upload.');
-                    // Skip video upload by returning early from this block
-                    return;
-                  }
-
-                  const message: any = received;
-
-                  // Verificação adicional para garantir que há conteúdo de mídia real
-                  const hasRealMedia = this.hasValidMediaContent(message);
-
-                  if (!hasRealMedia) {
-                    this.logger.warn('Message detected as media but contains no valid media content');
-                  } else {
-                    const media = await this.getBase64FromMediaMessage({ message }, true);
-
-                    if (!media) {
-                      this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
-                      return;
-                    }
-
-                    const { buffer, mediaType, fileName, size } = media;
-                    const mimetype = mimeTypes.lookup(fileName).toString();
-                    const fullName = join(
-                      `${this.instance.id}`,
-                      received.key.remoteJid,
-                      mediaType,
-                      `${Date.now()}_${fileName}`,
-                    );
-                    await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
-
-                    await this.prismaRepository.media.create({
-                      data: {
-                        messageId: msg.id,
-                        instanceId: this.instanceId,
-                        type: mediaType,
-                        fileName: fullName,
-                        mimetype,
-                      },
-                    });
-
-                    const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-                    messageRaw.message.mediaUrl = mediaUrl;
-
-                    await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
-                  }
-                } catch (error) {
-                  this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
-                }
-              }
-            }
+            await this.retainNativeMessageMedia(received, messageRaw, msg);
           }
 
           if (this.localWebhook.enabled) {
@@ -1845,9 +1795,9 @@ export class BaileysStartupService extends ChannelStartupService {
               update: contactRaw,
               create: contactRaw,
             });
+        } catch (error) {
+          this.logger.error(error);
         }
-      } catch (error) {
-        this.logger.error(error);
       }
     },
 
@@ -5490,8 +5440,75 @@ export class BaileysStartupService extends ChannelStartupService {
     return group?.subject || group?.Name || null;
   }
 
+  private async retainNativeMessageMedia(received: proto.IWebMessageInfo, messageRaw: any, msg: any) {
+    const isMedia =
+      received?.message?.imageMessage ||
+      received?.message?.videoMessage ||
+      received?.message?.stickerMessage ||
+      received?.message?.documentMessage ||
+      received?.message?.documentWithCaptionMessage ||
+      received?.message?.ptvMessage ||
+      received?.message?.audioMessage;
+    const isVideo = received?.message?.videoMessage;
+    if (isMedia) {
+      if (this.configService.get<S3>('S3').ENABLE) {
+        try {
+          if (isVideo && !this.configService.get<S3>('S3').SAVE_VIDEO) {
+            this.logger.warn('Video upload is disabled. Skipping video upload.');
+            // Skip video upload by returning early from this block
+            return;
+          }
+
+          const message: any = received;
+
+          // Verificação adicional para garantir que há conteúdo de mídia real
+          const hasRealMedia = this.hasValidMediaContent(message);
+
+          if (!hasRealMedia) {
+            this.logger.warn('Message detected as media but contains no valid media content');
+          } else {
+            const media = await this.getBase64FromMediaMessage({ message }, true);
+
+            if (!media) {
+              this.logger.verbose('No valid media to upload (messageContextInfo only), skipping MinIO');
+              return;
+            }
+
+            const { buffer, mediaType, fileName, size } = media;
+            const mimetype = mimeTypes.lookup(fileName).toString();
+            const fullName = join(
+              `${this.instance.id}`,
+              received.key.remoteJid,
+              mediaType,
+              `${Date.now()}_${fileName}`,
+            );
+            await s3Service.uploadFile(fullName, buffer, size.fileLength?.low, { 'Content-Type': mimetype });
+
+            await this.prismaRepository.media.create({
+              data: {
+                messageId: msg.id,
+                instanceId: this.instanceId,
+                type: mediaType,
+                fileName: fullName,
+                mimetype,
+              },
+            });
+
+            const mediaUrl = await s3Service.getObjectUrl(fullName);
+
+            messageRaw.message.mediaUrl = mediaUrl;
+
+            await this.prismaRepository.message.update({ where: { id: msg.id }, data: messageRaw });
+          }
+        } catch (error) {
+          this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
+        }
+      }
+    }
+  }
+
   private async syncChatwootLostMessages(awaitFullHistory = false) {
-    if (this.isManagedHistoryReconciliation()) return;
+    if (this.isManagedHistoryReconciliation() || !this.localChatwoot?.importMessages) return;
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       if (!awaitFullHistory) {
         this.chatwootService

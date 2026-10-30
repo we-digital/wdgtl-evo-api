@@ -1270,3 +1270,34 @@ Reapply at profile extraction, live peer creation/update and both history donor
 paths when upgrading upstream; remove only when upstream enforces sender direction
 and preserves real/manual names at these boundaries. Rollback restores prior source;
 historical placeholder repair is a separately reviewed, reversible one-off operation.
+
+
+## 2026-10-30 — Native history ingress without periodic full scans
+
+Baileys history packets (including syncType 0/2/3/6) and append arrivals persist
+native source plus delivery intent atomically in batches of 50. Existing source
+rows can acquire missing intents; exact live/confirmed receipts are never reset.
+The existing indexed inbound ledger adds a `history_pending` lane: at most seven
+live and one historical row per poll, still two shared receiver writers. History
+uses the destination-aware v2 importer with source/destination proofs, physical
+media verification and silent historical writes, never live callbacks. Route
+import window, ignored JIDs (including resolved aliases) and groupsIgnore remain
+enforced at admission and the importer write boundary. Native source identity
+includes peer and direction, not only WAID. Append retains the configured native
+S3 capture without running live automation. Receiver ACK requires content/time
+and actual stored attachment SHA-256 proof, including legacy untagged attachments
+through the existing bounded trusted proxy. No schema, new daemon or cron.
+
+Keep CHATWOOT_MANAGED_HISTORY_RECONCILIATION_ENABLED=true: it suppresses legacy
+startup/full-history/30-second scans, but no longer suppresses received history
+packets. Full reconciliation remains an explicit local on-demand operation.
+Only MESSAGE_EDIT protocol records enter edit handling; per-message failures
+no longer discard the remainder of an upsert batch.
+
+Tests: history-ingress (including isolated real PostgreSQL rollback/restart/ACK),
+inbound queue/service, normalized edits, memory budget and cached media. Synthetic
+fixtures do not establish production latency or completeness of provider history.
+Reapply these ingress and ledger changes only while upstream lacks atomic native
+history delivery. Rollback to the previous immutable image leaves history_pending
+rows durable but undrained; retain them for forward recovery, never rewrite them
+as live pending jobs or clear confirmed receipts.
