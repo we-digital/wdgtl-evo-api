@@ -51,6 +51,7 @@ import {
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
 import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
+import { persistHistoryIngress } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
 import { reconcileHistoryMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-message-binding';
 import {
   chatwootInboxCacheKey,
@@ -5062,13 +5063,41 @@ export class ChatwootService {
       )
     )
       return null;
+    return this.inboundQueue.submit(this.inboundRecord(instance, provider, body, 'pending'));
+  }
+
+  public async persistReceivedHistory(instance: InstanceDto, messages: any[]) {
+    if (!instance.instanceId || messages.some((message) => message.instanceId !== instance.instanceId))
+      throw new Error('InboundHistoryInstanceMismatch');
+    const provider = await this.getProvider(instance);
+    const enabled =
+      this.configService.get<Chatwoot>('CHATWOOT').ENABLED && provider?.enabled && provider?.importMessages;
+    const ignored = Array.isArray(provider?.ignoreJids) ? provider.ignoreJids : [];
+    const days = Number(provider?.daysLimitImportMessages);
+    const since = Date.now() / 1000 - (Number.isFinite(days) && days > 0 ? days : 0) * 86400;
+    return persistHistoryIngress(this.prismaRepository, instance.instanceId, messages, (body) =>
+      enabled &&
+      body.messageTimestamp >= since &&
+      this.isDurableInboundBody(body) &&
+      body.key.remoteJid !== '0@s.whatsapp.net' &&
+      !ignored.some(
+        (jid) =>
+          body.key.remoteJid === jid ||
+          ((jid === '@g.us' || jid === '@s.whatsapp.net') && body.key.remoteJid.endsWith(jid)),
+      )
+        ? this.inboundRecord(instance, provider, body, 'history_pending')
+        : null,
+    );
+  }
+
+  private inboundRecord(instance: InstanceDto, provider: ChatwootModel, body: any, state: string): InboundDelivery {
     const accountId = Number(provider.accountId);
     if (!Number.isSafeInteger(accountId) || accountId <= 0 || !instance.instanceId)
       throw new Error('InboundRouteUnavailable');
     const raw = JSON.stringify(body);
     if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new Error('InboundPayloadTooLarge');
     const now = new Date();
-    return this.inboundQueue.submit({
+    return {
       id: inboundDeliveryId(instance.instanceId, body),
       instanceId: instance.instanceId,
       instanceName: instance.instanceName,
@@ -5081,13 +5110,13 @@ export class ChatwootService {
       fromMe: body.key.fromMe,
       payload: JSON.parse(raw),
       payloadHash: inboundPayloadHash(body),
-      state: 'pending',
+      state,
       attempts: 0,
       nextAttemptAt: now,
       leaseOwner: null,
       leaseExpiresAt: null,
       result: null,
-    });
+    };
   }
 
   private isDurableInboundBody(body: any): boolean {
@@ -5119,7 +5148,95 @@ export class ChatwootService {
       .digest('hex');
   }
 
+  private async deliverQueuedHistory(item: InboundDelivery) {
+    const instance: InstanceDto = { instanceId: item.instanceId, instanceName: item.instanceName };
+    const native = await this.prismaRepository.instance.findUnique({
+      where: { id: item.instanceId },
+      select: { name: true },
+    });
+    const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: item.instanceId } });
+    if (
+      !native ||
+      native.name !== item.instanceName ||
+      !provider?.enabled ||
+      !provider.importMessages ||
+      provider.id !== item.providerId ||
+      this.inboundProviderFingerprint(provider) !== item.providerFingerprint
+    )
+      throw new Error('InboundRouteNotReady');
+    if (
+      inboundDeliveryId(item.instanceId, item.payload) !== item.id ||
+      inboundPayloadHash(item.payload) !== item.payloadHash
+    )
+      throw new Error('InboundStoredSourceChanged');
+    const sources = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: item.instanceId,
+        AND: [
+          { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+          { key: { path: ['remoteJid'], equals: item.peer } },
+          { key: { path: ['fromMe'], equals: item.fromMe } },
+        ],
+      },
+      take: 3,
+    });
+    if (!sources.length) throw new Error('InboundNativeSourceUnavailable');
+    const resolved = resolveInboundNativeBody(sources, item.payload);
+    const source = sources.find((row) => inboundPayloadHash(row) === inboundPayloadHash(resolved));
+    if (!source) throw new Error('InboundNativeSourceAmbiguous');
+    const inbox = await this.getStoredHistoryRecoveryInbox(provider);
+    if (
+      !inbox ||
+      (item.inboxId !== null && item.inboxId !== Number(inbox.id)) ||
+      !(await this.inboundStore.bindInbox(item.id, item.leaseOwner, Number(inbox.id)))
+    )
+      throw new Error('InboundDestinationChanged');
+    const destination = historyRecoveryDestination(provider.accountId, inbox.id);
+    // The existing v2 importer proves identity/content and physical media, and
+    // uses silent historical writes. Never route this through live callbacks.
+    const result = await this.syncStoredHistoryRecoveryBatch(instance, {
+      contractVersion: '2026-08-28',
+      dryRun: false,
+      scope: item.peer.endsWith('@g.us') ? 'groups' : 'direct',
+      unresolvedLidMode: 'provisional',
+      refreshLidMappings: false,
+      recoveryMode: 'standard',
+      expectedDestinationKey: destination.destinationKey,
+      expectedInboxId: inbox.id,
+      messages: [
+        {
+          sourceId: item.sourceId,
+          message: source as unknown as Record<string, unknown>,
+          expectedDirection: item.fromMe ? 'outgoing' : 'incoming',
+        },
+      ],
+    });
+    const binding = result.nativeBindings[0];
+    if (
+      result.skippedMessages ||
+      result.placeholderMessages ||
+      result.outcomes.length !== 1 ||
+      !['existing', 'imported'].includes(result.outcomes[0].status) ||
+      result.outcomes[0].sourceId !== item.sourceId ||
+      result.nativeBindings.length !== 1 ||
+      binding.sourceId !== item.sourceId ||
+      !['bound', 'existing'].includes(binding.status)
+    )
+      throw new Error('InboundHistoryOutcomeUnconfirmed');
+    const fresh = await this.prismaRepository.message.findUnique({ where: { id: source.id } });
+    if (
+      !fresh ||
+      inboundPayloadHash(fresh) !== inboundPayloadHash(source) ||
+      fresh.chatwootMessageId !== binding.messageId ||
+      fresh.chatwootInboxId !== inbox.id ||
+      fresh.chatwootConversationId !== binding.conversationId
+    )
+      throw new Error('InboundNativePointerContradiction');
+    return { id: binding.messageId, inbox_id: inbox.id, conversation_id: binding.conversationId };
+  }
+
   private async deliverQueuedInbound(item: InboundDelivery) {
+    if (item.state === 'history_pending') return this.deliverQueuedHistory(item);
     const instance: InstanceDto = { instanceId: item.instanceId, instanceName: item.instanceName };
     const nativeInstance = await this.prismaRepository.instance.findUnique({
       where: { id: item.instanceId },

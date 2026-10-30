@@ -77,7 +77,6 @@ import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
-import { findStoredHistoryIds } from '@api/integrations/chatbot/chatwoot/utils/history-memory-budget';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -1243,7 +1242,7 @@ export class BaileysStartupService extends ChannelStartupService {
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
         );
 
-        const instance: InstanceDto = { instanceName: this.instance.name };
+        const instance: InstanceDto = { instanceName: this.instance.name, instanceId: this.instanceId };
 
         let timestampLimitToImport = null;
 
@@ -1298,13 +1297,7 @@ export class BaileysStartupService extends ChannelStartupService {
           await this.prismaRepository.chat.createMany({ data: chatsRaw, skipDuplicates: true });
         }
 
-        const messagesRaw: any[] = [];
-
-        const messagesRepository = await findStoredHistoryIds(
-          this.prismaRepository.message,
-          this.instanceId,
-          messages.map((message) => message.key?.id),
-        );
+        let messagesRaw: any[] = [];
 
         for (const m of messages) {
           if (!m.message || !m.key || !m.messageTimestamp) {
@@ -1321,10 +1314,6 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (messagesRepository?.has(m.key.id)) {
-            continue;
-          }
-
           if (!m.pushName && !m.key.fromMe) {
             const participantJid = m.participant || m.key.participant || m.key.remoteJid;
             if (participantJid && contactsMap.has(participantJid)) {
@@ -1337,27 +1326,11 @@ export class BaileysStartupService extends ChannelStartupService {
           messagesRaw.push(this.prepareMessage(m));
         }
 
-        this.sendDataWebhook(Events.MESSAGES_SET, [...messagesRaw], true, undefined, {
-          isLatest,
-          progress,
-        });
-
         if (this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
-          await this.prismaRepository.message.createMany({ data: messagesRaw, skipDuplicates: true });
+          messagesRaw = await this.chatwootService.persistReceivedHistory(instance, messagesRaw);
         }
 
-        if (
-          this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
-          !this.isManagedHistoryReconciliation() &&
-          this.localChatwoot?.enabled &&
-          this.localChatwoot.importMessages &&
-          messagesRaw.length > 0
-        ) {
-          this.chatwootService.addHistoryMessages(
-            instance,
-            messagesRaw.filter((msg) => !chatwootImport.isIgnorePhoneNumber(msg.key?.remoteJid)),
-          );
-        }
+        this.sendDataWebhook(Events.MESSAGES_SET, messagesRaw, true, undefined, { isLatest, progress });
 
         await this.contactHandle['contacts.upsert'](
           contacts.filter((c) => !!whatsappProfileName(c)).map((c) => ({ id: c.id, name: whatsappProfileName(c) })),
@@ -1379,8 +1352,8 @@ export class BaileysStartupService extends ChannelStartupService {
       settings: any,
     ) => {
       const ingressReceivedAt = Date.now();
-      try {
-        for (const received of messages) {
+      for (const received of messages) {
+        try {
           if (
             received?.messageStubParameters?.some?.((param) =>
               [
@@ -1415,8 +1388,9 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          const editedMessage =
+          const protocol =
             received?.message?.protocolMessage || received?.message?.editedMessage?.message?.protocolMessage;
+          const editedMessage = protocol?.type === proto.Message.ProtocolMessage.Type.MESSAGE_EDIT ? protocol : null;
 
           if (editedMessage) {
             if (received.key?.id && editedMessage.key?.id) {
@@ -1432,7 +1406,7 @@ export class BaileysStartupService extends ChannelStartupService {
             );
           }
 
-          if ((type !== 'notify' && type !== 'append') || editedMessage || !received?.message) {
+          if ((type !== 'notify' && type !== 'append') || protocol || !received?.message) {
             continue;
           }
 
@@ -1471,6 +1445,15 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           const messageRaw = this.prepareMessage(received);
+          if (type === 'append' && this.configService.get<Database>('DATABASE').SAVE_DATA.HISTORIC) {
+            const saved = await this.chatwootService.persistReceivedHistory(
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              [messageRaw],
+            );
+            if (saved.length) this.sendDataWebhook(Events.MESSAGES_SET, saved);
+            continue;
+          }
+
           const ingressContextKey = `chatwoot_ingress_context:${received.key.remoteJid}:${received.key.id}`;
           const cachedIngressContext = type === 'notify' ? await this.baileysCache.get(ingressContextKey) : null;
           const ingressContext = compactChatwootIngressContext(messageRaw.contextInfo);
@@ -1845,9 +1828,9 @@ export class BaileysStartupService extends ChannelStartupService {
               update: contactRaw,
               create: contactRaw,
             });
+        } catch (error) {
+          this.logger.error(error);
         }
-      } catch (error) {
-        this.logger.error(error);
       }
     },
 
@@ -5491,7 +5474,7 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async syncChatwootLostMessages(awaitFullHistory = false) {
-    if (this.isManagedHistoryReconciliation()) return;
+    if (this.isManagedHistoryReconciliation() || !this.localChatwoot?.importMessages) return;
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
       if (!awaitFullHistory) {
         this.chatwootService

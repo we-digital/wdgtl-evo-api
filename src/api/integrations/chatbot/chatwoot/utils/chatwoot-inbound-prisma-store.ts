@@ -18,15 +18,25 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     return this.rows.upsert({ where: { id: item.id }, create: item, update: {} });
   }
   due(now: Date, limit: number) {
-    return this.rows.findMany({
-      where: {
-        state: 'pending',
-        nextAttemptAt: { lte: now },
-        OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
-      },
-      orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
-      take: Math.min(limit, 8),
-    });
+    const size = Math.max(0, Math.min(Math.trunc(limit), 8));
+    if (!size) return Promise.resolve([]);
+    const due = (state: string, take: number) =>
+      this.rows.findMany({
+        where: {
+          state,
+          nextAttemptAt: { lte: now },
+          OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
+        },
+        orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
+        take,
+      });
+    // Reserve history capacity without putting reconnect backlogs ahead of live
+    // delivery. Both index-bounded lanes still share the queue's two writers.
+    return Promise.all([due('pending', size - 1), due('history_pending', 1)]).then(([live, history]) => [
+      ...live.slice(0, 1),
+      ...history,
+      ...live.slice(1),
+    ]);
   }
   async claim(id: string, owner: string, now: Date, until: Date) {
     return (
@@ -34,7 +44,7 @@ export class ChatwootInboundPrismaStore implements InboundStore {
         await this.rows.updateMany({
           where: {
             id,
-            state: 'pending',
+            state: { in: ['pending', 'history_pending'] },
             nextAttemptAt: { lte: now },
             OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
           },
@@ -47,7 +57,7 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     return (
       (
         await this.rows.updateMany({
-          where: { id, state: 'pending', leaseOwner: owner },
+          where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
           data: { leaseExpiresAt: until },
         })
       ).count === 1
@@ -57,7 +67,12 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     return (
       (
         await this.rows.updateMany({
-          where: { id, state: 'pending', leaseOwner: owner, OR: [{ inboxId: null }, { inboxId }] },
+          where: {
+            id,
+            state: { in: ['pending', 'history_pending'] },
+            leaseOwner: owner,
+            OR: [{ inboxId: null }, { inboxId }],
+          },
           data: { inboxId },
         })
       ).count === 1
@@ -67,7 +82,7 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     return (
       (
         await this.rows.updateMany({
-          where: { id, state: 'pending', leaseOwner: owner },
+          where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
           data: {
             state: 'confirmed',
             result: ack,
@@ -82,7 +97,7 @@ export class ChatwootInboundPrismaStore implements InboundStore {
   }
   async defer(id: string, owner: string, errorClass: string, until: Date) {
     await this.rows.updateMany({
-      where: { id, state: 'pending', leaseOwner: owner },
+      where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
       data: { nextAttemptAt: until, lastErrorClass: errorClass.slice(0, 100), leaseOwner: null, leaseExpiresAt: null },
     });
   }

@@ -1,3 +1,4 @@
+import { persistHistoryIngress } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
 import { legacyWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -45,8 +46,11 @@ function literalService() {
   const klass = file.statements.find(ts.isClassDeclaration)!;
   const methods = [
     'isDurableInboundBody',
+    'persistReceivedHistory',
+    'inboundRecord',
     'inboundProviderFingerprint',
     'deliverQueuedInbound',
+    'deliverQueuedHistory',
     'requestInboundConversation',
     'createMessage',
     'processWhatsappEvent',
@@ -56,7 +60,9 @@ function literalService() {
   }).outputText;
   const context = {
     module: { exports: undefined as any },
+    historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,
+    persistHistoryIngress,
     createHash,
     isDeepStrictEqual,
     legacyWhatsappGroupContent,
@@ -67,7 +73,7 @@ function literalService() {
     inboundNativeSnapshot,
     resolveInboundNativeBody,
     isLidJid,
-    isGroupJid,
+      isGroupJid,
     isChatwootLinkedClientSentEvent,
     extractWhatsappReplyStanzaId,
     isChatwootOutboundEcho: async () => false,
@@ -244,6 +250,41 @@ test('literal delivery reads scoped aliases before POST then fresh native versio
   assert.equal(f.updates[0].where.key.equals.remoteJid, f.item.peer);
   assert.equal(f.updates[0].data.chatwootInboxId, 42);
   assert.equal(f.updates[0].data.chatwootContactInboxSourceId, 'source-ci');
+});
+
+test('historical delivery uses verified v2 importer while offline, never live callbacks, and requires native readback', async () => {
+  const f = fixture();
+  (f.provider as any).importMessages = true;
+  f.item.state = 'history_pending';
+  f.service.waMonitor.waInstances.one.connectionStatus.state = 'close';
+  f.service.getStoredHistoryRecoveryInbox = async () => ({id:42});
+  let imports = 0, corrupt = false;
+  f.service.syncStoredHistoryRecoveryBatch = async (_instance: any, batch: any) => {
+    imports++;
+    assert.equal(batch.contractVersion, '2026-08-28');
+    assert.equal(batch.messages.length, 1);
+    assert.equal(batch.messages[0].sourceId, f.item.sourceId);
+    assert.equal(batch.messages[0].expectedDirection, 'incoming');
+    assert.equal(batch.scope, 'groups');
+    assert.equal(batch.refreshLidMappings, false);
+    assert.equal(batch.recoveryMode, 'standard');
+    assert.equal(batch.expectedInboxId,42);
+    return { skippedMessages:0, placeholderMessages:0,
+      outcomes:[{sourceId:f.item.sourceId,status:'imported'}],
+      nativeBindings:[{sourceId:f.item.sourceId,status:'bound',messageId:9,conversationId:77}] };
+  };
+  f.service.prismaRepository.message.findUnique = async () => ({...f.native,
+    chatwootMessageId:corrupt?10:9,chatwootInboxId:42,chatwootConversationId:77});
+  assert.deepEqual({...await f.service.deliverQueuedInbound(f.item)},{id:9,inbox_id:42,conversation_id:77});
+  assert.equal(imports,1);assert.equal(f.creates,0);assert.equal(f.queries.length,0);
+  corrupt=true;
+  await assert.rejects(f.service.deliverQueuedInbound(f.item),/InboundNativePointerContradiction/);
+});
+
+test('history importer disabled after capture retains the task without a destination write', async () => {
+  const f=fixture();f.item.state='history_pending';
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundRouteNotReady/);
+  assert.equal(f.creates,0);assert.equal(f.queries.length,0);
 });
 test('lost POST ACK is recovered by unique scoped readback without another write', async () => {
   const f = fixture();
@@ -963,4 +1004,22 @@ test('existing document reaches only the official leased queue finish; lost fini
   assert.equal(f.creates, 0);
   assert.equal(f.updates.length, 1);
   assert.equal(f.rows[0].content, '**sender:**\n\nsynthetic');
+});
+
+
+test('native history capture keeps source-only records outside import window and ignored routes', async () => {
+  const service = literalService();
+  const native: any[] = [], intents: any[] = [];
+  const provider = {id:'route',instanceId:'one',enabled:true,importMessages:true,accountId:'1',daysLimitImportMessages:1,ignoreJids:['@g.us','10000000001@s.whatsapp.net']};
+  service.getProvider = async () => provider;
+  service.configService = {get:() => ({ENABLED:true})};
+  service.prismaRepository = {$transaction:async (fn:any) => fn({message:{findMany:async()=>[],createMany:async({data}:any)=>native.push(...data)},chatwootInboundDelivery:{createMany:async({data}:any)=>intents.push(...data)}})};
+  const row = (id:string,peer:string,age=0) => ({instanceId:'one',key:{id,remoteJid:peer,fromMe:false},message:{conversation:'Synthetic'},messageType:'conversation',messageTimestamp:Math.floor(Date.now()/1000)-age});
+  const rows=[row('allowed','10000000002@s.whatsapp.net'),row('group','10000000000@g.us'),row('ignored','10000000001@s.whatsapp.net'),row('old','10000000002@s.whatsapp.net',172800),row('zero','0@s.whatsapp.net')];
+  await service.persistReceivedHistory({instanceId:'one',instanceName:'synthetic'},rows);
+  assert.equal(native.length,5); assert.equal(intents.length,1);
+  assert.equal(intents[0].sourceId,'WAID:allowed'); assert.equal(intents[0].state,'history_pending');
+  provider.importMessages=false;
+  await service.persistReceivedHistory({instanceId:'one',instanceName:'synthetic'},[row('disabled','10000000002@s.whatsapp.net')]);
+  assert.equal(native.length,6); assert.equal(intents.length,1);
 });
