@@ -1,4 +1,6 @@
-import { persistHistoryIngress } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
+import { cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
+import { retainedVideoProxyUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video';
+import { ignoresHistoryPeer, persistHistoryIngress } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
 import { legacyWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
@@ -11,6 +13,8 @@ import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
+  normalizeStoredHistoryMessages,
+  toChatwootSourceId,
   isGroupJid,
   isLidJid,
   toCanonicalHistoryJid,
@@ -51,6 +55,7 @@ function literalService() {
     'inboundProviderFingerprint',
     'deliverQueuedInbound',
     'deliverQueuedHistory',
+    'verifyQueuedHistoryDestination',
     'requestInboundConversation',
     'createMessage',
     'processWhatsappEvent',
@@ -62,7 +67,9 @@ function literalService() {
     module: { exports: undefined as any },
     historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,
-    persistHistoryIngress,
+    persistHistoryIngress, ignoresHistoryPeer, normalizeStoredHistoryMessages, toChatwootSourceId,
+    cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT, retainedVideoProxyUrl, URL,
+    chatwootImport:{getHistoryContentMessage:(service:any,body:any)=>service.getConversationMessage(body.message)},
     createHash,
     isDeepStrictEqual,
     legacyWhatsappGroupContent,
@@ -174,6 +181,7 @@ function fixture() {
   });
   service.prismaRepository = {
     instance: { findUnique: async () => ({ name: 'one' }) },
+    setting: {findUnique:async()=>({groupsIgnore:false})},
     chatwoot: { findUnique: async () => provider },
     message: {
       findMany: async () => [structuredClone(native)],
@@ -196,7 +204,7 @@ function fixture() {
     },
   };
   service.createConversation = async () => 77;
-  service.getConversationMessage = async (msg: any) => msg.conversation;
+  service.getConversationMessage = (msg: any) => msg.conversation;
   service.isMediaMessage = (msg: any) => Boolean(msg.imageMessage || msg.documentMessage);
   service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
   service.durableInboundBodies = new WeakSet();
@@ -258,6 +266,7 @@ test('historical delivery uses verified v2 importer while offline, never live ca
   f.item.state = 'history_pending';
   f.service.waMonitor.waInstances.one.connectionStatus.state = 'close';
   f.service.getStoredHistoryRecoveryInbox = async () => ({id:42});
+  f.rows=[{...f.owner(),display_id:77,created_at_epoch:f.native.messageTimestamp}];
   let imports = 0, corrupt = false;
   f.service.syncStoredHistoryRecoveryBatch = async (_instance: any, batch: any) => {
     imports++;
@@ -276,7 +285,7 @@ test('historical delivery uses verified v2 importer while offline, never live ca
   f.service.prismaRepository.message.findUnique = async () => ({...f.native,
     chatwootMessageId:corrupt?10:9,chatwootInboxId:42,chatwootConversationId:77});
   assert.deepEqual({...await f.service.deliverQueuedInbound(f.item)},{id:9,inbox_id:42,conversation_id:77});
-  assert.equal(imports,1);assert.equal(f.creates,0);assert.equal(f.queries.length,0);
+  assert.equal(imports,1);assert.equal(f.creates,0);assert.equal(f.queries.length,2);
   corrupt=true;
   await assert.rejects(f.service.deliverQueuedInbound(f.item),/InboundNativePointerContradiction/);
 });
@@ -1013,13 +1022,51 @@ test('native history capture keeps source-only records outside import window and
   const provider = {id:'route',instanceId:'one',enabled:true,importMessages:true,accountId:'1',daysLimitImportMessages:1,ignoreJids:['@g.us','10000000001@s.whatsapp.net']};
   service.getProvider = async () => provider;
   service.configService = {get:() => ({ENABLED:true})};
-  service.prismaRepository = {$transaction:async (fn:any) => fn({message:{findMany:async()=>[],createMany:async({data}:any)=>native.push(...data)},chatwootInboundDelivery:{createMany:async({data}:any)=>intents.push(...data)}})};
+  service.prismaRepository = {setting:{findUnique:async()=>({groupsIgnore:true})},$transaction:async (fn:any) => fn({message:{findMany:async()=>[],createMany:async({data}:any)=>native.push(...data)},chatwootInboundDelivery:{createMany:async({data}:any)=>intents.push(...data)}})};
   const row = (id:string,peer:string,age=0) => ({instanceId:'one',key:{id,remoteJid:peer,fromMe:false},message:{conversation:'Synthetic'},messageType:'conversation',messageTimestamp:Math.floor(Date.now()/1000)-age});
-  const rows=[row('allowed','10000000002@s.whatsapp.net'),row('group','10000000000@g.us'),row('ignored','10000000001@s.whatsapp.net'),row('old','10000000002@s.whatsapp.net',172800),row('zero','0@s.whatsapp.net')];
+  const rows=[row('allowed','10000000002@s.whatsapp.net'),row('group','10000000000@g.us'),row('ignored','10000000001@s.whatsapp.net'),row('old','10000000002@s.whatsapp.net',172800),row('zero','0@s.whatsapp.net'),{...row('lid','90000000001@lid'),key:{id:'lid',remoteJid:'90000000001@lid',remoteJidAlt:'10000000001@s.whatsapp.net',fromMe:false}}];
   await service.persistReceivedHistory({instanceId:'one',instanceName:'synthetic'},rows);
-  assert.equal(native.length,5); assert.equal(intents.length,1);
+  assert.equal(native.length,6); assert.equal(intents.length,1);
   assert.equal(intents[0].sourceId,'WAID:allowed'); assert.equal(intents[0].state,'history_pending');
   provider.importMessages=false;
   await service.persistReceivedHistory({instanceId:'one',instanceName:'synthetic'},[row('disabled','10000000002@s.whatsapp.net')]);
-  assert.equal(native.length,6); assert.equal(intents.length,1);
+  assert.equal(native.length,7); assert.equal(intents.length,1);
+});
+
+
+test('history delivery refuses groupsIgnore and late resolved ignored LID aliases before importer writes', async()=>{
+ for(const kind of ['group','exact','wildcard']) {
+  const f=fixture();(f.provider as any).importMessages=true;f.item.state='history_pending';
+  if(kind==='group') f.service.prismaRepository.setting.findUnique=async()=>({groupsIgnore:true});
+  else {
+   f.native.key.remoteJid='90000000001@lid';f.item.peer=f.native.key.remoteJid;f.item.payload=structuredClone(f.native);f.item.id=inboundDeliveryId('one',f.item.payload);f.item.payloadHash=inboundPayloadHash(f.item.payload);
+   (f.provider as any).ignoreJids=[kind==='exact'?'10000000001@s.whatsapp.net':'@s.whatsapp.net'];
+   f.service.resolvePhoneJidForLid=async()=> '10000000001@s.whatsapp.net';
+  }
+  f.item.providerFingerprint=f.service.inboundProviderFingerprint(f.provider);
+  await assert.rejects(f.service.deliverQueuedInbound(f.item),/InboundHistoryRouteIgnored/);
+  assert.equal(f.creates,0);assert.equal(f.queries.length,0);
+ }
+});
+
+test('existing historical media requires actual bytes, preserves verified legacy attachment, and rejects wrong content/time',async()=>{
+ const f=fixture(); const bytes=Buffer.from('synthetic-document');const digest=createHash('sha256').update(bytes).digest();
+ const native={...f.native,messageType:'documentMessage',message:{documentMessage:{caption:'synthetic',mimetype:'application/pdf',fileLength:bytes.length,fileSha256:digest.toString('base64')}}};
+ const binding={messageId:9,conversationId:77};const instance={instanceId:'one',instanceName:'one'};
+ f.service.getConversationMessage=(msg:any)=>msg.documentMessage?.caption || msg.conversation;
+ f.service.configService={get:()=>({TRUSTED_BASE_URL:'https://cw.synthetic',NATIVE_BRIDGE_TOKEN:'synthetic'})};
+ const row={...f.owner(),display_id:77,created_at_epoch:native.messageTimestamp,content:'synthetic'};f.rows=[row];
+ let downloads=0, corrupt=false;f.service.testAxios.request=async (request:any)=>{
+  if(request.responseType==='arraybuffer'){downloads++;return {data:corrupt?Buffer.from('corrupt'):bytes}};
+  return {data:{payload:[{...row,conversation_id:77,created_at:native.messageTimestamp,attachments:[{id:5,message_id:9,account_id:1,file_type:'file',content_type:'application/pdf',file_size:bytes.length,download_url:'https://cw.synthetic/rails/active_storage/blobs/proxy/synthetic/file.pdf'}]}]}};
+ };
+ await assert.rejects(f.service.verifyQueuedHistoryDestination(native,instance,f.provider,42,binding),/InboundReceiverMediaUnconfirmed/);assert.equal(downloads,0);
+ f.rows=[{...row,attachment_id:5,blob_id:'8',byte_size:String(bytes.length),content_type:'application/pdf'}];
+ await f.service.verifyQueuedHistoryDestination(native,instance,f.provider,42,binding);assert.equal(downloads,1);
+ corrupt=true;
+ await assert.rejects(f.service.verifyQueuedHistoryDestination(native,instance,f.provider,42,binding));
+ for(const changed of [{content:'wrong'},{created_at_epoch:native.messageTimestamp+1}]) {
+  f.rows=[{...row,...changed}];await assert.rejects(f.service.verifyQueuedHistoryDestination(native,instance,f.provider,42,binding),/InboundHistoryDestinationUnconfirmed/);
+ }
+ assert.equal(f.creates,0);
 });

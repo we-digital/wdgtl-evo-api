@@ -51,7 +51,10 @@ import {
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
 import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
-import { persistHistoryIngress } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
+import {
+  ignoresHistoryPeer,
+  persistHistoryIngress,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
 import { reconcileHistoryMessageBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-message-binding';
 import {
   chatwootInboxCacheKey,
@@ -5072,19 +5075,28 @@ export class ChatwootService {
     const provider = await this.getProvider(instance);
     const enabled =
       this.configService.get<Chatwoot>('CHATWOOT').ENABLED && provider?.enabled && provider?.importMessages;
-    const ignored = Array.isArray(provider?.ignoreJids) ? provider.ignoreJids : [];
+    const settings = await this.prismaRepository.setting.findUnique({ where: { instanceId: instance.instanceId } });
+    const normalized = enabled
+      ? await normalizeStoredHistoryMessages(
+          messages.map((body) => ({ ...body, historyIngressIdentity: inboundDeliveryId(instance.instanceId, body) })),
+          messages,
+          (lid) => this.resolvePhoneJidForLid(instance, lid),
+          { retainProviderAliases: true, includeGroups: !settings?.groupsIgnore, includeUnresolvedLids: true },
+        )
+      : { messages: [] };
+    const allowed = new Set(
+      normalized.messages
+        .filter((body) => !ignoresHistoryPeer(provider, body, settings?.groupsIgnore))
+        .map((body: any) => body.historyIngressIdentity),
+    );
     const days = Number(provider?.daysLimitImportMessages);
     const since = Date.now() / 1000 - (Number.isFinite(days) && days > 0 ? days : 0) * 86400;
     return persistHistoryIngress(this.prismaRepository, instance.instanceId, messages, (body) =>
       enabled &&
       body.messageTimestamp >= since &&
       this.isDurableInboundBody(body) &&
-      body.key.remoteJid !== '0@s.whatsapp.net' &&
-      !ignored.some(
-        (jid) =>
-          body.key.remoteJid === jid ||
-          ((jid === '@g.us' || jid === '@s.whatsapp.net') && body.key.remoteJid.endsWith(jid)),
-      )
+      allowed.has(inboundDeliveryId(instance.instanceId, body)) &&
+      !ignoresHistoryPeer(provider, body, settings?.groupsIgnore)
         ? this.inboundRecord(instance, provider, body, 'history_pending')
         : null,
     );
@@ -5148,6 +5160,96 @@ export class ChatwootService {
       .digest('hex');
   }
 
+  private async verifyQueuedHistoryDestination(
+    message: MessageModel,
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    binding: { messageId: number; conversationId: number },
+  ) {
+    const sourceId = toChatwootSourceId((message.key as any).id);
+    const read = async () =>
+      (
+        await this.pgClient.query(
+          `SELECT m.id,m.account_id,m.inbox_id,m.source_id,m.message_type,m.private,m.content,m.content_attributes,
+        extract(epoch from m.created_at)::double precision AS created_at_epoch,c.display_id,pc.peer,
+        a.id AS attachment_id,b.id::text AS blob_id,b.byte_size::text,b.content_type
+       FROM messages m JOIN conversations c ON c.id=m.conversation_id AND c.account_id=m.account_id AND c.inbox_id=m.inbox_id
+       JOIN provider_conversation_bindings pc ON pc.conversation_id=c.id AND pc.account_id=c.account_id AND pc.inbox_id=c.inbox_id AND pc.provider='whatsapp'
+       LEFT JOIN attachments a ON a.message_id=m.id AND a.account_id=m.account_id
+       LEFT JOIN active_storage_attachments sa ON sa.record_type='Attachment' AND sa.record_id=a.id AND sa.name='file'
+       LEFT JOIN active_storage_blobs b ON b.id=sa.blob_id
+       WHERE m.account_id=$1 AND m.inbox_id=$2 AND m.source_id=ANY($3::text[]) ORDER BY m.id,a.id LIMIT 3`,
+          [Number(provider.accountId), inboxId, [sourceId, sourceId.slice(5)]],
+        )
+      ).rows;
+    const rows = await read(),
+      row = rows[0];
+    const mediaType = ['image', 'audio', 'video', 'document'].includes(cachedHistoryMediaType(message));
+    const plain = this.getConversationMessage(message.message) || '';
+    const contents = mediaType
+      ? [plain]
+      : [
+          plain,
+          chatwootImport.getHistoryContentMessage(this, message as any, true) || '',
+          plain
+            .replaceAll(/\*((?!\s)([^\n*]+?)(?<!\s))\*/g, '**$1**')
+            .replaceAll(/_((?!\s)([^\n_]+?)(?<!\s))_/g, '*$1*')
+            .replaceAll(/~((?!\s)([^\n~]+?)(?<!\s))~/g, '~~$1~~'),
+        ];
+    if (
+      rows.length !== 1 ||
+      Number(row.id) !== binding.messageId ||
+      Number(row.display_id) !== binding.conversationId ||
+      row.private !== false ||
+      Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
+      row.peer !== (message.key as any).remoteJid ||
+      Math.floor(Number(row.created_at_epoch)) !== message.messageTimestamp ||
+      !contents.includes(row.content || '') ||
+      row.content_attributes?.deleted ||
+      row.content_attributes?.message_deleted
+    )
+      throw new Error('InboundHistoryDestinationUnconfirmed');
+    if (mediaType) {
+      if (
+        !row.attachment_id ||
+        !row.blob_id ||
+        !Number.isSafeInteger(Number(row.byte_size)) ||
+        Number(row.byte_size) < 1 ||
+        Number(row.byte_size) > CACHED_MEDIA_FILE_LIMIT
+      )
+        throw new Error('InboundReceiverMediaUnconfirmed');
+      const trusted = this.configService.get<Chatwoot>('CHATWOOT');
+      const response = await axios.request({
+        method: 'GET',
+        maxRedirects: 0,
+        timeout: 15000,
+        maxContentLength: 1024 * 1024,
+        url: requireTrustedChatwootUrl(
+          provider.url,
+          trusted.TRUSTED_BASE_URL,
+          `/api/v1/accounts/${provider.accountId}/conversations/${row.display_id}/messages`,
+        ),
+        params: { source_ids: [row.source_id] },
+        headers: { 'api-access-token': provider.token, 'X-Chatwoot-Native-Bridge-Token': trusted.NATIVE_BRIDGE_TOKEN },
+      });
+      const url = retainedVideoProxyUrl(row, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin);
+      const stored = await axios.request({
+        method: 'GET',
+        url,
+        responseType: 'arraybuffer',
+        maxRedirects: 0,
+        timeout: 15000,
+        maxContentLength: CACHED_MEDIA_FILE_LIMIT,
+      });
+      const bytes = Buffer.from(stored.data),
+        native = nativeCachedMediaPayload(message);
+      if (bytes.length !== Number(row.byte_size) || !createHash('sha256').update(bytes).digest().equals(native.digest))
+        throw new Error('InboundReceiverMediaUnconfirmed');
+    }
+    if (!isDeepStrictEqual(await read(), rows)) throw new Error('InboundReceiverChangedDuringConfirmation');
+  }
+
   private async deliverQueuedHistory(item: InboundDelivery) {
     const instance: InstanceDto = { instanceId: item.instanceId, instanceName: item.instanceName };
     const native = await this.prismaRepository.instance.findUnique({
@@ -5184,6 +5286,19 @@ export class ChatwootService {
     const resolved = resolveInboundNativeBody(sources, item.payload);
     const source = sources.find((row) => inboundPayloadHash(row) === inboundPayloadHash(resolved));
     if (!source) throw new Error('InboundNativeSourceAmbiguous');
+    const settings = await this.prismaRepository.setting.findUnique({ where: { instanceId: item.instanceId } });
+    const normalized = await normalizeStoredHistoryMessages(
+      [source],
+      [source],
+      (lid) => this.resolvePhoneJidForLid(instance, lid),
+      { retainProviderAliases: true, includeGroups: !settings?.groupsIgnore, includeUnresolvedLids: true },
+    );
+    if (
+      normalized.messages.length !== 1 ||
+      ignoresHistoryPeer(provider, source, settings?.groupsIgnore) ||
+      ignoresHistoryPeer(provider, normalized.messages[0], settings?.groupsIgnore)
+    )
+      throw new Error('InboundHistoryRouteIgnored');
     const inbox = await this.getStoredHistoryRecoveryInbox(provider);
     if (
       !inbox ||
@@ -5194,23 +5309,27 @@ export class ChatwootService {
     const destination = historyRecoveryDestination(provider.accountId, inbox.id);
     // The existing v2 importer proves identity/content and physical media, and
     // uses silent historical writes. Never route this through live callbacks.
-    const result = await this.syncStoredHistoryRecoveryBatch(instance, {
-      contractVersion: '2026-08-28',
-      dryRun: false,
-      scope: item.peer.endsWith('@g.us') ? 'groups' : 'direct',
-      unresolvedLidMode: 'provisional',
-      refreshLidMappings: false,
-      recoveryMode: 'standard',
-      expectedDestinationKey: destination.destinationKey,
-      expectedInboxId: inbox.id,
-      messages: [
-        {
-          sourceId: item.sourceId,
-          message: source as unknown as Record<string, unknown>,
-          expectedDirection: item.fromMe ? 'outgoing' : 'incoming',
-        },
-      ],
-    });
+    const result = await this.syncStoredHistoryRecoveryBatch(
+      instance,
+      {
+        contractVersion: '2026-08-28',
+        dryRun: false,
+        scope: item.peer.endsWith('@g.us') ? 'groups' : 'direct',
+        unresolvedLidMode: 'provisional',
+        refreshLidMappings: false,
+        recoveryMode: 'standard',
+        expectedDestinationKey: destination.destinationKey,
+        expectedInboxId: inbox.id,
+        messages: [
+          {
+            sourceId: item.sourceId,
+            message: source as unknown as Record<string, unknown>,
+            expectedDirection: item.fromMe ? 'outgoing' : 'incoming',
+          },
+        ],
+      },
+      true,
+    );
     const binding = result.nativeBindings[0];
     if (
       result.skippedMessages ||
@@ -5223,6 +5342,7 @@ export class ChatwootService {
       !['bound', 'existing'].includes(binding.status)
     )
       throw new Error('InboundHistoryOutcomeUnconfirmed');
+    await this.verifyQueuedHistoryDestination(normalized.messages[0], instance, provider, inbox.id, binding);
     const fresh = await this.prismaRepository.message.findUnique({ where: { id: source.id } });
     if (
       !fresh ||
@@ -7024,7 +7144,11 @@ export class ChatwootService {
     }
   }
 
-  public async syncStoredHistoryRecoveryBatch(instance: InstanceDto, data: ChatwootHistoryRecoveryBatchDto) {
+  public async syncStoredHistoryRecoveryBatch(
+    instance: InstanceDto,
+    data: ChatwootHistoryRecoveryBatchDto,
+    historyIngress = false,
+  ) {
     if (!this.isImportHistoryAvailable()) {
       throw new BadRequestException('Chatwoot history import database connection is not configured');
     }
@@ -7416,6 +7540,17 @@ export class ChatwootService {
             data.unresolvedLidMode === 'provisional' && (data.scope === 'direct' || data.scope === 'all'),
         },
       );
+      if (historyIngress) {
+        const settings = await this.prismaRepository.setting.findUnique({ where: { instanceId: instance.instanceId } });
+        const current = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: instance.instanceId } });
+        if (
+          !current?.enabled ||
+          !current.importMessages ||
+          this.inboundProviderFingerprint(current) !== this.inboundProviderFingerprint(provider) ||
+          normalized.messages.some((message) => ignoresHistoryPeer(current, message, settings?.groupsIgnore))
+        )
+          throw new Error('InboundHistoryRouteIgnored');
+      }
       const normalizedSourceIds = new Set(
         normalized.messages.map((message) => toChatwootSourceId((message.key as { id: string }).id)),
       );

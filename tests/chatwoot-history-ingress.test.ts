@@ -33,7 +33,7 @@ test('received batches use bounded atomic writes; replay preserves live ownershi
         findMany: async ({ where }: any) => {
           assert.equal(where.instanceId, 'history-synthetic');
           assert.ok(where.OR.length <= 50);
-          return n.filter(row => where.OR.some((term: any) => term.key.equals === row.key.id));
+          return n.filter(row => where.OR.some((term: any) => term.AND.every((q: any) => row.key[q.key.path[0]] === q.key.equals)));
         },
         createMany: async ({ data }: any) => { sizes.push(data.length); n.push(...structuredClone(data)); },
       },
@@ -55,6 +55,11 @@ test('received batches use bounded atomic writes; replay preserves live ownershi
   fail = true;
   await assert.rejects(persistHistoryIngress(repository, 'history-synthetic', [source(122)], intent), /ledger failure/);
   assert.equal(native.length, 121); assert.equal(queued.length, 121);
+  fail=false;
+  const shared=[source(200),{...source(200),key:{...source(200).key,remoteJid:'10000000002@s.whatsapp.net'}},{...source(200),key:{...source(200).key,fromMe:true}}];
+  assert.equal((await persistHistoryIngress(repository,'history-synthetic',shared,intent)).length,3);
+  assert.equal((await persistHistoryIngress(repository,'history-synthetic',shared,intent)).length,0);
+
 });
 
 test('indexed due lanes reserve history progress without increasing eight-row fetch or two-writer contract', async () => {
@@ -141,3 +146,22 @@ test('real PostgreSQL/Prisma source+intent rollback, restart, replay, and histor
       assert.equal((await store.due(new Date(),8)).length,0);
     } finally {await prisma?.$disconnect();await client.query(`DROP SCHEMA IF EXISTS ${schema} CASCADE`);await client.end();}
   });
+
+for (const importEnabled of [true,false]) test(`append retains native S3 bytes without live delivery (import=${importEnabled})`,async()=>{
+  const f=receiver();let uploaded=0, retained=0, updated=0;
+  const message={...source(),messageType:'imageMessage',message:{imageMessage:{url:'synthetic'}}};
+  f.context.localChatwoot.enabled=importEnabled;
+  f.context.configService={get:(name:string)=>name==='S3'?{ENABLE:true,SAVE_VIDEO:true}:name==='CHATWOOT'?{ENABLED:importEnabled}:{SAVE_DATA:{HISTORIC:true,NEW_MESSAGE:true}}};
+  f.context.instance.id='history-synthetic';
+  f.context.prismaRepository.message={findMany:async()=>[{...message,id:'retained-source'}],update:async({where}:any)=>{assert.equal(where.id,'retained-source');updated++}};
+  f.context.prismaRepository.media={findFirst:async()=>null,create:async({data}:any)=>{assert.equal(data.messageId,'retained-source');retained++}};
+  f.context.hasValidMediaContent=()=>true;
+  f.context.getBase64FromMediaMessage=async()=>({buffer:Buffer.from('synthetic'),mediaType:'image',fileName:'synthetic.jpg',size:{fileLength:{low:9}}});
+  const klass=ast.statements.find(ts.isClassDeclaration)!;
+  const method=klass.members.find(m=>m.name?.getText(ast)==='retainNativeMessageMedia')!.getText(ast);
+  const code=ts.transpileModule('class C {'+method+'}; return C.prototype.retainNativeMessageMedia',{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+  f.context.retainNativeMessageMedia=new Function('s3Service','mimeTypes','join',code)({uploadFile:async()=>{uploaded++},getObjectUrl:async()=> 'https://synthetic.invalid/media'},{lookup:()=> 'image/jpeg'},(...parts:string[])=>parts.join('/'));
+  await callback('messages.upsert',f.context)({type:'append',messages:[message]},{});
+  assert.equal(f.calls.errors,0);assert.equal(f.calls.saved,1);assert.equal(uploaded,1);assert.equal(retained,1);assert.equal(updated,1);
+  assert.deepEqual(f.calls.events,['messages.set']);
+});

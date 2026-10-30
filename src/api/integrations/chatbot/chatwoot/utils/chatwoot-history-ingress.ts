@@ -1,5 +1,4 @@
-import { InboundDelivery } from './chatwoot-inbound-queue';
-import { findStoredHistoryIds } from './history-memory-budget';
+import { InboundDelivery, inboundDeliveryId } from './chatwoot-inbound-queue';
 
 export const HISTORY_INGRESS_BATCH_SIZE = 50;
 
@@ -15,14 +14,26 @@ export async function persistHistoryIngress(
   for (let offset = 0; offset < messages.length; offset += HISTORY_INGRESS_BATCH_SIZE) {
     const batch = messages.slice(offset, offset + HISTORY_INGRESS_BATCH_SIZE);
     const saved = await repository.$transaction(async (tx: any) => {
-      const known = await findStoredHistoryIds(
-        tx.message,
-        instanceId,
-        batch.map((message) => message.key?.id),
-      );
+      const stored = await tx.message.findMany({
+        where: {
+          instanceId,
+          OR: batch.map(({ key }) => ({
+            AND: [
+              { key: { path: ['id'], equals: key.id } },
+              { key: { path: ['remoteJid'], equals: key.remoteJid } },
+              { key: { path: ['fromMe'], equals: key.fromMe } },
+            ],
+          })),
+        },
+        select: { key: true },
+        take: HISTORY_INGRESS_BATCH_SIZE * 3 + 1,
+      });
+      if (stored.length > HISTORY_INGRESS_BATCH_SIZE * 3) throw new Error('InboundNativeSourceAmbiguous');
+      const known = new Set(stored.map((message) => inboundDeliveryId(instanceId, message)));
       const fresh = batch.filter((message) => {
-        if (known.has(message.key.id)) return false;
-        known.add(message.key.id);
+        const identity = inboundDeliveryId(instanceId, message);
+        if (known.has(identity)) return false;
+        known.add(identity);
         return true;
       });
       if (fresh.length) await tx.message.createMany({ data: fresh, skipDuplicates: true });
@@ -33,4 +44,18 @@ export async function persistHistoryIngress(
     created.push(...saved);
   }
   return created;
+}
+
+export function ignoresHistoryPeer(provider: { ignoreJids?: unknown }, message: any, groupsIgnore = false): boolean {
+  const peers = [message.key?.remoteJid, message.key?.remoteJidAlt].filter(
+    (peer): peer is string => typeof peer === 'string',
+  );
+  const ignored = Array.isArray(provider.ignoreJids) ? provider.ignoreJids : [];
+  return peers.some(
+    (peer) =>
+      peer === '0@s.whatsapp.net' ||
+      peer.endsWith('@broadcast') ||
+      (groupsIgnore && peer.endsWith('@g.us')) ||
+      ignored.some((jid) => peer === jid || ((jid === '@g.us' || jid === '@s.whatsapp.net') && peer.endsWith(jid))),
+  );
 }
