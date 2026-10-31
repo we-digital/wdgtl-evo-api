@@ -6,6 +6,10 @@ const transportByteFields = new Set([
   'recipientKeyHash',
   'senderKeyHash',
   'messageSecret',
+  'fileSha256',
+  'fileEncSha256',
+  'mediaKey',
+  'jpegThumbnail',
 ]);
 
 // Prisma persists protobuf bytes as base64; events can serialize Uint8Array as numeric-key objects.
@@ -65,6 +69,35 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
       );
     });
     if (anchor && sameEntity) return stored;
+  }
+  // Sender-key retransmissions can retain the exact image with a newer transport timestamp.
+  if (
+    stored.key?.fromMe === false &&
+    stored.messageType === 'imageMessage' &&
+    stored.status !== 'EDITED' &&
+    stored.message?.imageMessage &&
+    sources.length
+  ) {
+    const normalized = transportBytes(stored);
+    const anchor = sources.some(
+      (source) => inboundPayloadHash(transportBytes(source)) === inboundPayloadHash(normalized),
+    );
+    const semantic = (source: InboundPayload) => {
+      const projected = transportBytes(source);
+      const message = { ...projected.message };
+      delete message.senderKeyDistributionMessage;
+      return { ...projected, message, messageTimestamp: stored.messageTimestamp };
+    };
+    if (
+      anchor &&
+      sources.every(
+        (source) =>
+          source.messageType === 'imageMessage' &&
+          source.status !== 'EDITED' &&
+          inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored)),
+      )
+    )
+      return stored;
   }
   if (sources.length > 1 && new Set(sources.map((source) => inboundPayloadHash(source))).size !== 1)
     throw new Error('InboundNativeSourceAmbiguous');

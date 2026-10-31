@@ -1070,3 +1070,81 @@ test('existing historical media requires actual bytes, preserves verified legacy
  }
  assert.equal(f.creates,0);
 });
+
+test('incoming image sender-key retransmission retains the exact original image and timestamp', async () => {
+  const f = fixture();
+  f.native.messageType = 'imageMessage';
+  f.native.message = {
+    imageMessage: { caption: 'synthetic passport', fileSha256: 'AQID', mediaKey: 'BAUG' },
+    senderKeyDistributionMessage: { groupId: f.item.peer, axolotlSenderKeyDistributionMessage: 'AQID' },
+  };
+  f.item.payload = structuredClone(f.native);
+  f.item.payload.message.imageMessage.fileSha256 = { 0: 1, 1: 2, 2: 3 };
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  const copy = structuredClone(f.native);
+  copy.id = 'image-transport-copy';
+  copy.messageTimestamp += 4;
+  copy.message.senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = 'BAUG';
+  f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), structuredClone(copy)];
+  f.service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
+    assert.equal(body.messageTimestamp, f.item.payload.messageTimestamp);
+    assert.equal(JSON.stringify(body.message), JSON.stringify(f.item.payload.message));
+    f.rows = [
+      {
+        ...f.owner(),
+        attachments: 1,
+        content_attributes: { we_digital_ingress: { source_payload_sha256: f.item.payloadHash } },
+      },
+    ];
+    return { id: 9 };
+  };
+  f.service.isMediaMessage = () => true;
+  assert.equal((await f.service.deliverQueuedInbound(f.item)).id, 9);
+  assert.equal(f.updates.length, 2);
+});
+
+for (const change of [
+  'caption',
+  'mediaKey',
+  'fileSha256',
+  'participant',
+  'edited',
+  'outgoing',
+  'missingAnchor',
+  'thirdSource',
+]) {
+  test(`image transport reconciliation rejects ${change}`, () => {
+    const original: any = {
+      instanceId: 'one',
+      key: { id: 'image', remoteJid: '120000000@g.us', fromMe: false, participant: '1@lid' },
+      messageType: 'imageMessage',
+      message: {
+        imageMessage: { caption: 'original', fileSha256: 'AQID', mediaKey: 'BAUG' },
+        senderKeyDistributionMessage: { axolotlSenderKeyDistributionMessage: 'AQID' },
+      },
+      messageTimestamp: 1700000000,
+      status: 'READ',
+    };
+    const stored = structuredClone(original);
+    const copy = structuredClone(original);
+    copy.messageTimestamp += 4;
+    copy.message.senderKeyDistributionMessage.axolotlSenderKeyDistributionMessage = 'BAUG';
+    if (['caption', 'mediaKey', 'fileSha256'].includes(change)) copy.message.imageMessage[change] = 'changed';
+    if (change === 'participant') copy.key.participant = '2@lid';
+    if (change === 'edited') copy.status = 'EDITED';
+    if (change === 'outgoing') {
+      original.key.fromMe = true;
+      stored.key.fromMe = true;
+      copy.key.fromMe = true;
+    }
+    const other = structuredClone(copy);
+    other.messageTimestamp += 1;
+    const sources =
+      change === 'missingAnchor'
+        ? [copy, other]
+        : change === 'thirdSource'
+          ? [original, copy, structuredClone(copy)]
+          : [original, copy];
+    assert.throws(() => resolveInboundNativeBody(sources, stored), /Ambiguous/);
+  });
+}
