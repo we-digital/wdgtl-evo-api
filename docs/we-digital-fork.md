@@ -1301,3 +1301,19 @@ Reapply these ingress and ledger changes only while upstream lacks atomic native
 history delivery. Rollback to the previous immutable image leaves history_pending
 rows durable but undrained; retain them for forward recovery, never rewrite them
 as live pending jobs or clear confirmed receipts.
+
+## 2026-10-31 — incoming image sender-key transport copies
+
+The local two-account WhatsApp → Chatwoot acceptance found two persisted native rows for one incoming image/peer/stanza: the exact provider-original image and a sender-key retransmission with a later transport timestamp. The prior source check treated this as conflicting content and left delivery pending.
+
+`resolveInboundNativeBody` now accepts that pair only for ordinary incoming images, with an exact original anchor after canonical protobuf-byte representation and identical image/context/sender/peer identity in every source. Only the sender-key envelope and retransmission timestamp differ; the frozen original timestamp/payload are delivered. Changed caption, file hash, media key, participant, edited/outgoing events, missing original anchor and a third source remain fenced. Native row CAS, source-roster rotation, receiver attachment verification, authentication and the two-receiver lease limit remain unchanged.
+
+The existing bounded native lookup (`take: 3`) and hash comparison are retained; no additional query, persistent cache or retry/send path is added. Focused tests cover the literal consumer, immutable financial-independent ingress and negative media cases. Synthetic local receiving-account attachment readback is separate from production delivery/latency evidence. Reapply this helper delta only while upstream lacks equivalent native transport reconciliation; rollback removes it without data migration and leaves uncertain deliveries pending.
+
+### 2026-11-01 release regression fixture
+
+The native LID-alias lock test now supplies the existing contact name used by
+its confirmed-contact path. It does not accidentally invoke the independent
+Prisma missing-name lookup through an incomplete fake. Production alias,
+identity, name lookup and message delivery behavior are unchanged. Verify the
+full unit suite and TypeScript/build before releasing the transport-copy change.

@@ -118,7 +118,7 @@ test('canonical provider resolution supplies a verified native LID alias to the 
   const { service } = serviceFixture(async () => '628100000001@s.whatsapp.net');
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
   const peer = '628100000001@s.whatsapp.net';
-  service.findProviderContact = async () => ({ id: 9, identifier: peer });
+  service.findProviderContact = async () => ({ id: 9, identifier: peer, name: 'Existing contact' });
   let captured: any;
   service.providerConversationRequest = async (_provider: unknown, method: string, data: any) => {
     if (method === 'GET') return { enabled: true, provider: 'whatsapp' };
