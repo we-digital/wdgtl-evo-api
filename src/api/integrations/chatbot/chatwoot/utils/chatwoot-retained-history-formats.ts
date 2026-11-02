@@ -68,6 +68,8 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       'contextInfo',
       'scanLengths',
       'scansSidecar',
+      'firstScanLength',
+      'firstScanSidecar',
       'fileEncSha256',
       'mediaKeyTimestamp',
       'midQualityFileSha256',
@@ -86,6 +88,13 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
     Number.isSafeInteger(size) &&
     size > 0 &&
     size <= 64 * 1024 * 1024 &&
+    ((value.firstScanLength === undefined && value.firstScanSidecar === undefined) ||
+      (Number.isSafeInteger(value.firstScanLength) &&
+        value.firstScanLength > 0 &&
+        value.firstScanLength <= size &&
+        typeof value.firstScanSidecar === 'string' &&
+        Buffer.from(value.firstScanSidecar, 'base64').length === 10 &&
+        Buffer.from(value.firstScanSidecar, 'base64').toString('base64') === value.firstScanSidecar)) &&
     [value.width, value.height].every(
       (dimension) => Number.isInteger(dimension) && dimension > 0 && dimension <= 65535,
     ) &&

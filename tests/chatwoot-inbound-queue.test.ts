@@ -364,3 +364,134 @@ test('installed SDK Buffer JSON serialization does not rotate frozen native sour
   persisted.message.imageMessage.fileSha256.data[0] = 8;
   assert.notEqual(inboundPayloadHash(original), inboundPayloadHash(persisted));
 });
+
+test('a slow receiver does not leave the other slot idle while queued sources are ready', async () => {
+  const store = new Ledger();
+  const rows = Array.from({ length: 8 }, (_, index) => item(`slot-${index}`));
+  for (const row of rows) await store.enqueue(row);
+  let release!: () => void;
+  const blocked = new Promise<void>((resolve) => (release = resolve));
+  const delivered: string[] = [];
+  let active = 0;
+  let peak = 0;
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    peak = Math.max(peak, ++active);
+    if (row.id === rows[0].id) await blocked;
+    delivered.push(row.id);
+    active--;
+    return ack();
+  });
+  const polling = queue.poll();
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(delivered.length, 7);
+    assert.equal(peak, 2);
+    assert.equal(store.rows.get(rows[0].id)!.state, 'pending');
+    assert(rows.slice(1).every((row) => store.rows.get(row.id)!.state === 'confirmed'));
+  } finally {
+    release();
+    await polling;
+    await queue.stop();
+  }
+  assert.equal(new Set(delivered).size, 8);
+});
+
+test('repeated failures back off across process restarts without losing or duplicating the source', async () => {
+  const store = new Ledger();
+  const row = item();
+  let clock = 0;
+  const retryMs = 20_000;
+  for (const expectedDelay of [20_000, 40_000, 80_000, 160_000]) {
+    const queue = new ChatwootInboundQueue(
+      store,
+      async () => {
+        throw new Error('InboundCanonicalUnavailable');
+      },
+      () => {},
+      retryMs,
+      120_000,
+      () => new Date(clock),
+    );
+    await queue.submit(row);
+    const pending = store.rows.get(row.id)!;
+    assert.equal(pending.state, 'pending');
+    assert.equal(pending.nextAttemptAt.getTime(), clock + expectedDelay);
+    const attempts = pending.attempts;
+    await queue.poll();
+    assert.equal(pending.attempts, attempts);
+    clock = pending.nextAttemptAt.getTime();
+    await queue.stop();
+  }
+  store.rows.get(row.id)!.attempts = 2_026;
+  const oldFailure = new ChatwootInboundQueue(
+    store,
+    async () => {
+      throw new Error('InboundNativeSourceUnavailable');
+    },
+    () => {},
+    retryMs,
+    120_000,
+    () => new Date(clock),
+  );
+  await oldFailure.poll();
+  assert.equal(store.rows.get(row.id)!.nextAttemptAt.getTime(), clock + 3_600_000);
+  await oldFailure.stop();
+  clock += 3_600_000;
+  let receiverCreates = 0;
+  const recovered = new ChatwootInboundQueue(
+    store,
+    async () => {
+      receiverCreates++;
+      return ack();
+    },
+    () => {},
+    retryMs,
+    120_000,
+    () => new Date(clock),
+  );
+  await recovered.poll();
+  await recovered.submit(row);
+  assert.equal(receiverCreates, 1);
+  assert.equal(store.rows.get(row.id)!.state, 'confirmed');
+  assert.equal(store.rows.get(row.id)!.payloadHash, row.payloadHash);
+  await recovered.stop();
+});
+
+test('poll refills a slot released by live delivery while its queued receiver is still blocked', async () => {
+  const store = new Ledger();
+  const live = item('live-first');
+  const queued = Array.from({ length: 8 }, (_, index) => item(`queued-${index}`));
+  let releaseLive!: () => void;
+  let releaseSlow!: () => void;
+  const liveGate = new Promise<void>((resolve) => (releaseLive = resolve));
+  const slowGate = new Promise<void>((resolve) => (releaseSlow = resolve));
+  const delivered: string[] = [];
+  let active = 0;
+  let peak = 0;
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    peak = Math.max(peak, ++active);
+    if (row.id === live.id) await liveGate;
+    if (row.id === queued[0].id) await slowGate;
+    delivered.push(row.id);
+    active--;
+    return ack();
+  });
+  const liveWork = queue.submit(live);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  for (const row of queued) await store.enqueue(row);
+  const polling = queue.poll();
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    releaseLive();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(delivered.filter((id) => id !== live.id).length, 7);
+    assert.equal(peak, 2);
+    assert.equal(store.rows.get(queued[0].id)!.state, 'pending');
+  } finally {
+    releaseLive();
+    releaseSlow();
+    await Promise.all([liveWork, polling]);
+    await queue.stop();
+  }
+  assert.equal(new Set(delivered).size, 9);
+});

@@ -16,6 +16,7 @@ import {
   normalizeStoredHistoryMessages,
   toChatwootSourceId,
   isGroupJid,
+  isPhoneJid,
   isLidJid,
   toCanonicalHistoryJid,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
@@ -97,6 +98,7 @@ function literalService() {
   vm.runInNewContext(js, context);
   const service = new context.module.exports();
   service.testAxios = context.axios;
+  service.testChatwootImport = context.chatwootImport;
   return service;
 }
 function fixture() {
@@ -1146,5 +1148,46 @@ for (const change of [
           ? [original, copy, structuredClone(copy)]
           : [original, copy];
     assert.throws(() => resolveInboundNativeBody(sources, stored), /Ambiguous/);
+  });
+}
+
+function useLiteralHistoryRenderer(service: any) {
+  const source = fs.readFileSync(
+    path.resolve('src/api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper.ts'),
+    'utf8',
+  );
+  const file = ts.createSourceFile('import.ts', source, ts.ScriptTarget.Latest, true);
+  const klass = file.statements.find(ts.isClassDeclaration)!;
+  const method = klass.members.find((m) => m.name?.getText(file) === 'getHistoryContentMessage')!.getText(file);
+  const js = ts.transpileModule(`module.exports=class Importer {${method}}`, {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
+  }).outputText;
+  const context = { module: { exports: undefined as any }, isGroupJid, isPhoneJid };
+  vm.runInNewContext(js, context);
+  const importer = new context.module.exports();
+  importer.getContentMessage = (consumer: any, body: any) => consumer.getConversationMessage(body.message);
+  service.testChatwootImport.getHistoryContentMessage = importer.getHistoryContentMessage.bind(importer);
+}
+
+for (const changed of [false, true]) {
+  test(`exact restored group text ${changed ? 'rejects a changed body' : 'confirms native history formatting'} without another POST`, async () => {
+    const f = fixture();
+    useLiteralHistoryRenderer(f.service);
+    f.native.key.participant = '14155552671@s.whatsapp.net';
+    f.native.message.conversation = '*synthetic*';
+    f.item.payload = structuredClone(f.native);
+    f.item.payloadHash = inboundPayloadHash(f.native);
+    const content = '**+14155552671 - sender:**\n\n*synthetic*';
+    f.rows = [{ ...f.owner(), content: content + (changed ? ' changed' : ''), content_attributes: {} }];
+    if (changed) {
+      await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverContentChanged/);
+      assert.equal(f.updates.length, 0);
+    } else {
+      const ack = await f.service.deliverQueuedInbound(f.item);
+      assert.equal(ack.id, 9);
+      assert.equal(f.updates.length, 1);
+      assert.equal(f.rows[0].content, content);
+    }
+    assert.equal(f.creates, 0);
   });
 }

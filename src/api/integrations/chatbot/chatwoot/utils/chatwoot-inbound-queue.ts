@@ -71,6 +71,8 @@ export function inboundDeliveryId(instanceId: string, body: InboundPayload): str
     .digest('hex');
 }
 
+const MAX_INBOUND_RETRY_MS = 60 * 60 * 1_000;
+
 export class ChatwootInboundQueue {
   private readonly owner = randomUUID();
   private readonly active = new Map<string, Promise<InboundAck | undefined>>();
@@ -110,13 +112,23 @@ export class ChatwootInboundQueue {
     await Promise.allSettled([...this.active.values()]);
   }
   async poll() {
-    if (this.stopped || this.polling) return;
+    if (this.stopped || this.polling || this.active.size >= 2) return;
     this.polling = true;
     try {
       const items = await this.store.due(this.now(), 8);
-      // Two receiver writers globally, with the existing exact-source fence inside each delivery.
-      for (let i = 0; i < items.length && !this.stopped; i += 2)
-        await Promise.all(items.slice(i, i + 2).map((item) => this.attempt(item)));
+      // Refill whichever receiver slot finishes first. A slow media read must not
+      // hold the other slot idle until an arbitrary pair has both completed.
+      let next = 0;
+      const drain = async () => {
+        while (next < items.length && !this.stopped) {
+          if (this.active.size >= 2) {
+            await Promise.race(this.active.values());
+            continue;
+          }
+          await this.attempt(items[next++]);
+        }
+      };
+      await Promise.all([drain(), drain()]);
     } finally {
       this.polling = false;
     }
@@ -186,7 +198,13 @@ export class ChatwootInboundQueue {
           : error instanceof Error
             ? error.name
             : 'Error',
-        new Date(this.now().getTime() + this.retryMs),
+        // Keep the first retry quick, but do not make old identity/media
+        // failures consume the shared receiver slots every twenty seconds.
+        // The count is durable; process restarts must not reset the cooldown.
+        new Date(
+          this.now().getTime() +
+            Math.min(this.retryMs * 2 ** Math.min(item.attempts, 16), Math.max(this.retryMs, MAX_INBOUND_RETRY_MS)),
+        ),
       );
       this.observe('chatwoot_inbound_pending', {
         instanceId: item.instanceId,

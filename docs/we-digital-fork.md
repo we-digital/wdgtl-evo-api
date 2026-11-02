@@ -1,3 +1,52 @@
+## 2026-11-02 — associated-image first-scan metadata (not deployed)
+
+Associated JPEG messages can include native `firstScanLength` and
+`firstScanSidecar` fields. The closed retained-media validator previously refused
+these images, leaving their original messages unavailable to history recovery.
+Accept the complete pair only when the length is a positive integer within the
+native file size and the sidecar is canonical base64 for ten bytes. Preserve both
+fields in the source; retain all existing route, file digest, size, encryption-key
+and metadata bounds. This does not change provider transport or enable sends.
+
+Owner: `utils/chatwoot-retained-history-formats.ts` under the Chatwoot integration.
+No schema or configuration change. Reapply this bounded native descriptor support
+on upstream updates; rollback restores rejection of this metadata shape without
+altering retained data. Production code remains unchanged pending release.
+Validation: `tests/chatwoot-associated-image-source-type.test.ts` round-trips the
+installed protobuf, verifies unchanged native authority and rejects malformed
+metadata pairs and invalid file proofs; interactive-template regressions retain
+their existing closed descriptor checks.
+
+## 2026-11-02 — bounded inbound retry pressure (not deployed)
+
+The shared two-slot Chatwoot receiver could spend its capacity retrying old
+identity/media failures every 20 seconds. Its pairwise poll also left a receiver
+slot idle while the other member of the pair was still running. Keep the first
+retry at 20 seconds, then exponentially increase the cooldown from the persisted
+attempt count up to one hour. Preserve pending records, exact source verification,
+leases, inbox scope and receiver readback before any repeated create. Polling now
+refills a free slot without waiting for an unrelated slow receiver, while keeping
+the combined live/poll concurrency at two and the poll batch at eight.
+
+The live receiver also recognizes the exact existing group-text representation
+produced by the native history importer. Its unformatted participant phone and
+native markdown can differ from the live renderer. Compare with the owning
+history renderer after the same inbox, source, peer and direction checks; do not
+rewrite the restored body or create another message. Changed text still fails.
+
+Owner: `utils/chatwoot-inbound-queue.ts` and `services/chatwoot.service.ts` under the Chatwoot integration. No schema,
+API, flags or provider-send behavior change. Upstream reapply: retain durable
+retry count and shared slot ownership; remove this delta only when upstream has
+equivalent bounded retry pressure and independent slot refill. Rollback requires
+only the previous application version; existing pending rows and dates remain
+valid. This change is local only until an explicitly authorized release.
+
+Validation: `tsx --test tests/chatwoot-inbound-queue.test.ts` covers restart-stable
+cooldowns, first retry timing, maximum cooldown, eventual single confirmation,
+slow-receiver isolation, shared concurrency, crash leases and uncertain ACKs.
+`tests/chatwoot-inbound-service.test.ts` exercises the actual history formatter
+and receiver methods for restored group text and rejection of changed content.
+
 ## Request-local group roster enrichment (2026-10-29)
 
 `BaileysStartupService.findParticipants` replaces per-participant Contact scans

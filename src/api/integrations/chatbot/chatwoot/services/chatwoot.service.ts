@@ -5475,7 +5475,16 @@ export class ChatwootService {
         peer.endsWith('@g.us') &&
         !item.fromMe &&
         (row.content || '') === legacyWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
-      if (!sameContent && !sameLegacyContent) throw new Error('InboundReceiverContentChanged');
+      // The bounded history importer uses native phone formatting and text.
+      // Accept that exact existing representation without rewriting or creating it.
+      const sameHistoryContent =
+        !sameContent &&
+        !sameLegacyContent &&
+        !this.isMediaMessage(body.message) &&
+        peer.endsWith('@g.us') &&
+        !item.fromMe &&
+        (row.content || '') === chatwootImport.getHistoryContentMessage(this, body);
+      if (!sameContent && !sameLegacyContent && !sameHistoryContent) throw new Error('InboundReceiverContentChanged');
       if (
         attributes?.we_digital_ingress?.source_payload_sha256 !== sourceHash &&
         (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
