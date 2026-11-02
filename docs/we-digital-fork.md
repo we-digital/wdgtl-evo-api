@@ -1,3 +1,22 @@
+## 2026-11-02 — associated-image first-scan metadata (not deployed)
+
+Associated JPEG messages can include native `firstScanLength` and
+`firstScanSidecar` fields. The closed retained-media validator previously refused
+these images, leaving their original messages unavailable to history recovery.
+Accept the complete pair only when the length is a positive integer within the
+native file size and the sidecar is canonical base64 for ten bytes. Preserve both
+fields in the source; retain all existing route, file digest, size, encryption-key
+and metadata bounds. This does not change provider transport or enable sends.
+
+Owner: `utils/chatwoot-retained-history-formats.ts` under the Chatwoot integration.
+No schema or configuration change. Reapply this bounded native descriptor support
+on upstream updates; rollback restores rejection of this metadata shape without
+altering retained data. Production code remains unchanged pending release.
+Validation: `tests/chatwoot-associated-image-source-type.test.ts` round-trips the
+installed protobuf, verifies unchanged native authority and rejects malformed
+metadata pairs and invalid file proofs; interactive-template regressions retain
+their existing closed descriptor checks.
+
 ## 2026-11-02 — bounded inbound retry pressure (not deployed)
 
 The shared two-slot Chatwoot receiver could spend its capacity retrying old

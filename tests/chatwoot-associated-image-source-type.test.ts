@@ -5,6 +5,7 @@ import test from 'node:test';
 import { proto } from 'baileys';
 
 import { cachedMediaDescriptor } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
+import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
   retainedHistoryDisplayBody,
   retainedHistoryMedia,
@@ -66,6 +67,44 @@ test('unknown or malformed source enums remain refused', () => {
       () => retainedHistoryMedia(record({ ...descriptor, imageSourceType } as any)),
       /wrapper is unsupported/,
     );
+  }
+});
+
+test('protobuf first-scan metadata preserves the full associated image and its native digest', () => {
+  const encoded = proto.Message.ImageMessage.encode(
+    proto.Message.ImageMessage.fromObject({
+      ...descriptor,
+      firstScanLength: 10,
+      firstScanSidecar: Buffer.alloc(10, 3),
+    }),
+  ).finish();
+  const native = proto.Message.ImageMessage.toObject(proto.Message.ImageMessage.decode(encoded), {
+    bytes: String,
+    longs: Number,
+  });
+  const source = record(native as any);
+  const before = JSON.stringify(source);
+  assert.equal(classifyCachedHistoryRecord(source, false), 'ordinary');
+  assert.deepEqual(retainedHistoryDisplayBody(source).imageMessage, native);
+  assert.equal(cachedMediaDescriptor(source, media).digest.toString('base64'), descriptor.fileSha256);
+  assert.equal(JSON.stringify(source), before);
+});
+
+test('first-scan metadata must be a bounded complete pair and cannot bypass native proof', () => {
+  const valid = { ...descriptor, firstScanLength: 10, firstScanSidecar: Buffer.alloc(10, 3).toString('base64') };
+  for (const change of [
+    { firstScanLength: undefined },
+    { firstScanLength: 0 },
+    { firstScanLength: bytes.length + 1 },
+    { firstScanLength: '10' },
+    { firstScanSidecar: undefined },
+    { firstScanSidecar: Buffer.alloc(11).toString('base64') },
+    { firstScanSidecar: 'not base64' },
+    { fileSha256: '' },
+    { mediaKey: '' },
+    { unknownScanMetadata: true },
+  ]) {
+    assert.throws(() => retainedHistoryMedia(record({ ...valid, ...change } as any)), /wrapper is unsupported/);
   }
 });
 
