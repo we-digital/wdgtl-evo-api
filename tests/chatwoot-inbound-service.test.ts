@@ -60,6 +60,7 @@ function literalService() {
     'inboundProviderFingerprint',
     'deliverQueuedInbound',
     'deliverQueuedHistory',
+    'receiverIdempotent',
     'verifyQueuedHistoryDestination',
     'requestInboundConversation',
     'createMessage',
@@ -216,6 +217,8 @@ function fixture() {
   service.getConversationMessage = (msg: any) => msg.conversation;
   service.isMediaMessage = (msg: any) => Boolean(msg.imageMessage || msg.documentMessage);
   service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
+  service.configService = { get: () => ({}) };
+  service.receiverIdempotencyChecks = new Map();
   service.durableInboundBodies = new WeakSet();
   service.inboundCanonicalContexts = new WeakMap();
   service.pgClient = {
@@ -1264,4 +1267,64 @@ test('a reaction row stored under the same key is not a content source (was Inbo
     f.updates.map((update) => update.where.id),
     ['native-A'],
   );
+});
+
+function idempotentReceiver(f: ReturnType<typeof fixture>, advertised: unknown = '2026-11-10') {
+  let capabilityReads = 0;
+  f.service.configService = { get: () => ({ INBOUND_RECEIVER_IDEMPOTENCY: true }) };
+  f.service.providerConversationRequest = async (_provider: any, method: string, data: any) => {
+    assert.equal(method, 'GET');
+    assert.equal(JSON.stringify(data), JSON.stringify({ inbox_id: 42 }));
+    capabilityReads++;
+    if (advertised instanceof Error) throw advertised;
+    return { enabled: true, provider: 'whatsapp', message_source_idempotency_contract_version: advertised };
+  };
+  return () => capabilityReads;
+}
+
+test('idempotent receiver: POST without the pre-POST owner read, post-POST confirmation kept', async () => {
+  const f = fixture();
+  const reads = idempotentReceiver(f);
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(ack.receiver_path, 'idempotent');
+  assert.equal(f.creates, 1);
+  assert.equal(f.queries.length, 1);
+  assert.equal(f.updates.length, 1);
+  // The capability is cached per inbox.
+  await f.service.deliverQueuedInbound({ ...f.item });
+  assert.equal(reads(), 1);
+});
+
+test('idempotent receiver replay: the receiver returns the existing message and the ack must match it', async () => {
+  const f = fixture();
+  idempotentReceiver(f);
+  f.rows = [f.owner()];
+  let posts = 0;
+  f.service.processWhatsappEvent = async () => {
+    posts++;
+    return { id: 9 };
+  };
+  assert.equal((await f.service.deliverQueuedInbound(f.item)).id, 9);
+  assert.equal(posts, 1);
+  f.service.processWhatsappEvent = async () => ({ id: 10 });
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverAckMismatch/);
+});
+
+test('idempotent receiver falls back to the verified path when off, not advertised, unreachable, or after a receiver refusal', async () => {
+  for (const setup of [
+    (f: any) => f,
+    (f: any) => idempotentReceiver(f, null),
+    (f: any) => idempotentReceiver(f, new Error('502')),
+    (f: any) => {
+      idempotentReceiver(f);
+      f.item.lastErrorClass = 'InboundReceiverOutcomeUnconfirmed';
+    },
+  ]) {
+    const f = fixture();
+    setup(f);
+    const ack = await f.service.deliverQueuedInbound(f.item);
+    assert.equal(ack.receiver_path, 'verified');
+    assert.equal(f.queries.length, 2);
+  }
 });
