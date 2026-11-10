@@ -1404,3 +1404,19 @@ another POST. The ack and `chatwoot_inbound_confirmed` carry
 Media key bytes are passed to Baileys as raw bytes from any stored encoding;
 the previous object conversion turned Buffer JSON (`{type, data}`) into two
 zero bytes, a wrong HKDF key and "bad decrypt".
+
+### 2026-11-10 receiver POST credential and present owners
+
+Durable live POSTs (text and multipart) now carry the native bridge credential
+and use the trusted receiver URL. Without it Chatwoot never applied its
+create-or-return-existing contract: a replay hit the new unique index and was
+answered 422 (`RecordNotUnique`), and an owner older than the index threshold
+could be duplicated. The idempotent fast path is taken only on a row's first
+attempt; every retry reads receiver owners before any POST. Receiver HTTP
+outcomes become ledger classes (`InboundReceiverSourceConflict`, `…Rejected`,
+`…Unavailable`, `…Refused`, `…Throttled`, `…Unreachable`), and
+`chatwoot_ingress_failed` logs `status`, the Chatwoot `code` (identifier-shaped
+values only) and a network code; never response bodies. An owner already in
+the same inbox with the right identity whose content or payload stamp cannot
+be proven closes as `already_present` (`InboundReceiverPresentUnverified`)
+instead of retrying; identity mismatches still refuse.
