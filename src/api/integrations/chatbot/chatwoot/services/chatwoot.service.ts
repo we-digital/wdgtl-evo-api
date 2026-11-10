@@ -158,6 +158,7 @@ import {
   ChatwootOutboundOrigin,
   ChatwootOutboundPhase,
   ChatwootOutboundQueue,
+  chatwootWebhookMessageCreatedAt,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 import {
@@ -337,12 +338,15 @@ export class ChatwootService {
         validate: (operation, phase, signal) => this.validateOutboundBinding(operation, phase, signal),
         revalidateTransport: (operation, signal) => this.revalidateQueuedOutboundTransport(operation, signal),
         isReady: (operation, context, signal) => this.isOutboundReady(operation, context, signal),
-        send: (operation, context, onTransportStart, signal) =>
-          this.sendQueuedOutbound(operation, context, onTransportStart, signal),
+        send: (operation, context, onTransportStart, signal, onTransportComplete) =>
+          this.sendQueuedOutbound(operation, context, onTransportStart, signal, onTransportComplete),
         confirm: (operation, callbackParts, signal) => this.confirmQueuedOutbound(operation, callbackParts, signal),
         fail: (operation, signal) => this.failQueuedOutbound(operation, signal),
         delete: (operation, signal) => this.deleteQueuedOutbound(operation, signal),
-        observe: (event, metrics) => this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
+        observe: (event, metrics) =>
+          event === 'chatwoot_outbound_latency'
+            ? this.logger.info(JSON.stringify({ event, ...metrics }))
+            : this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
       },
       1_000,
       600_000,
@@ -2843,11 +2847,14 @@ export class ChatwootService {
         const data: SendAudioDto = {
           number: number,
           audio: media,
-          delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
+          // The durable queue (transport fence present) sends without an
+          // artificial typing wait; legacy paths keep their delay.
+          delay: options?.beforeTransport ? undefined : Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
           quoted: options?.quoted,
           mentioned: options?.mentioned,
           messageId: options?.messageId,
           beforeTransport: options?.beforeTransport,
+          afterTransport: options?.afterTransport,
           signal: options?.signal,
         };
 
@@ -2869,11 +2876,12 @@ export class ChatwootService {
         fileName: fileName,
         mimetype: mimeType || undefined,
         media: media,
-        delay: 1200,
+        delay: options?.beforeTransport ? undefined : 1200,
         quoted: options?.quoted,
         mentioned: options?.mentioned,
         messageId: options?.messageId,
         beforeTransport: options?.beforeTransport,
+        afterTransport: options?.afterTransport,
         signal: options?.signal,
       };
 
@@ -2966,11 +2974,13 @@ export class ChatwootService {
     expectedDeleted = false,
     allowAuthoritativeDeletion = false,
   ) {
-    const instance = await this.outboundInstance(operation);
+    const [instance, provider] = await Promise.all([
+      this.outboundInstance(operation),
+      this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } }),
+    ]);
     if (!instance) return null;
     const localWaInstance = this.waMonitor.waInstances[instance.instanceName];
     const waInstance = localWaInstance?.instanceId === operation.instanceId ? localWaInstance : null;
-    const provider = await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } });
     if (
       !provider?.id ||
       provider.enabled !== true ||
@@ -3096,6 +3106,7 @@ export class ChatwootService {
     preparedContext: unknown,
     onTransportStart: () => Promise<void>,
     signal: AbortSignal,
+    onTransportComplete?: (sent: { whatsappMessageId: string; result: unknown }) => Promise<void>,
   ): Promise<{ whatsappMessageId: string; result: unknown }> {
     const context = preparedContext as Awaited<ReturnType<ChatwootService['currentOutboundContext']>>;
     if (!context) throw this.outboundBindingMismatch();
@@ -3128,6 +3139,23 @@ export class ChatwootService {
       chatwootInboxId: payload.origin.inboxId,
       chatwootConversationId: payload.origin.conversationId,
     };
+    // Commit the exact WAID as soon as WhatsApp accepted the relay, before
+    // local history, media storage and webhooks; that releases the chat lane.
+    const afterTransport = onTransportComplete
+      ? async (receipt: any) => {
+          const whatsappMessageId = receipt?.key?.id;
+          if (whatsappMessageId !== operation.plannedWhatsappMessageId) return;
+          await onTransportComplete({
+            whatsappMessageId,
+            result: {
+              key: receipt.key,
+              messageTimestamp: Long.isLong(receipt?.messageTimestamp)
+                ? receipt.messageTimestamp.toNumber()
+                : receipt?.messageTimestamp,
+            },
+          });
+        }
+      : undefined;
 
     let messageSent: any;
     if (payload.nativeForward) {
@@ -3165,6 +3193,7 @@ export class ChatwootService {
           mentioned: payload.mentioned,
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
+          afterTransport,
           signal,
         },
         provenance,
@@ -3178,6 +3207,7 @@ export class ChatwootService {
           quoted,
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
+          afterTransport,
           signal,
           mentioned: payload.mentioned,
         },
@@ -3418,9 +3448,7 @@ export class ChatwootService {
       mentioned: mentioned.length ? mentioned : undefined,
       nativeForward,
     });
-    const createdAtSeconds = Number(body.created_at);
-    const messageCreatedAt =
-      Number.isFinite(createdAtSeconds) && createdAtSeconds > 0 ? new Date(createdAtSeconds * 1_000) : undefined;
+    const messageCreatedAt = chatwootWebhookMessageCreatedAt(body?.created_at, admission.receivedAt);
     const receivedAt = admission.receivedAt;
     const enqueueResult = await this.outboundStore.enqueue(
       instance.instanceId,
