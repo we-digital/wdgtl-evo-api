@@ -226,6 +226,31 @@ Staging sequence:
 Production promotion uses the exact reviewed source change and immutable image
 digest only after the staging evidence is accepted.
 
+## Latency path
+
+- Admission wakes the transport worker directly; the 1-second poll is only a
+  fallback. Expired-lease recovery runs once per second per worker and is
+  shared by concurrent claims instead of running before every claim.
+- The exact WAID is committed (`callback_pending`, `sentAt`) from Baileys'
+  `afterTransport` receipt, immediately after WhatsApp accepted the relay and
+  before local history, media storage, chatbot and webhook work. The transport
+  worker keeps the lease until that local work finishes, so the Chatwoot
+  callback cannot start before the local `Message` row exists; the destination
+  lane is already free, so the next part or message of the same chat may relay.
+  WhatsApp order is unchanged: a successor relays only after its predecessor's
+  relay returned. A local error after that commit leaves the message
+  `callback_pending` instead of `ambiguous`. Paths without the receipt (native
+  forward) commit from the final send result as before.
+- Durable queued media and audio send without the legacy artificial typing
+  delay (1.2 s / 0.5–2 s), like queued text.
+- Exact-WAID reconciliation of a still unresolved `ambiguous`/`quarantined`
+  row backs off by claim generation up to the five-minute cap.
+- `chatwoot_outbound_latency` is logged at INFO every 60 seconds when anything
+  was sent: `sent`, and p50/p95 for `total` (webhook receipt to WhatsApp relay),
+  `receiptToClaim`, `validation` (first exact snapshot), `preTransport`
+  (recipient/quote preparation plus the transport-fence snapshot), `transport`
+  (relay) and `messageToReceipt` (Chatwoot `created_at` to receipt).
+
 ## Privacy-safe observation
 
 PostgreSQL state/depth query (returns no customer identifiers):

@@ -8,6 +8,7 @@ import { validatesCurrentChatwootOutboundSnapshot } from '@api/integrations/chat
 import {
   buildChatwootOutboundParts,
   ChatwootOutboundHandler,
+  chatwootWebhookMessageCreatedAt,
   ChatwootOutboundMessageStatus,
   ChatwootOutboundOrigin,
   ChatwootOutboundQueue,
@@ -336,6 +337,32 @@ class MemoryStore implements ChatwootOutboundStore {
     if (claimGeneration !== this.operation.claimGeneration) throw new Error('OutboundLeaseLost');
     this.operation.state = 'callback_pending';
     this.operation.whatsappMessageId = whatsappMessageId;
+  }
+
+  leaseHeld = false;
+  released = 0;
+
+  async markTransportSent(
+    _id: string,
+    _workerId: string,
+    claimGeneration: number,
+    whatsappMessageId: string,
+    _result: unknown,
+    now: Date,
+  ) {
+    if (this.operation.state !== 'sending' || claimGeneration !== this.operation.claimGeneration) return false;
+    this.operation.state = 'callback_pending';
+    this.operation.whatsappMessageId = whatsappMessageId;
+    this.operation.sentAt = now;
+    this.leaseHeld = true;
+    return true;
+  }
+
+  async releaseCallbackLease(_id: string, _workerId: string, claimGeneration: number) {
+    if (this.operation.state === 'callback_pending' && claimGeneration === this.operation.claimGeneration) {
+      this.leaseHeld = false;
+      this.released += 1;
+    }
   }
 
   async markFailureCallbackPending(
@@ -1255,4 +1282,162 @@ test('deletion webhook before callback claims deletion without callback or resen
   assert.equal(sends, 0);
   assert.equal(callbacks, 0);
   assert.equal(deletions, 1);
+});
+
+test('commits the exact WAID right after relay and releases the lane before local post-send work', async () => {
+  const store = new MemoryStore();
+  let stateAfterRelay: string | undefined;
+  let leaseHeldAfterRelay: boolean | undefined;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportStart();
+        await onTransportComplete({ whatsappMessageId: operation.plannedWhatsappMessageId, result: null });
+        stateAfterRelay = store.operation.state;
+        leaseHeldAfterRelay = store.leaseHeld;
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+  );
+
+  assert.equal(await queue.runOnce('transport'), true);
+  assert.equal(stateAfterRelay, 'callback_pending');
+  assert.equal(leaseHeldAfterRelay, true);
+  assert.equal(store.leaseHeld, false);
+  assert.equal(store.released, 1);
+  assert.equal(store.operation.sendAttempts, 1);
+  assert.equal(store.operation.whatsappMessageId, store.operation.plannedWhatsappMessageId);
+});
+
+test('keeps a relayed message callback-pending when local post-send persistence fails', async () => {
+  const store = new MemoryStore();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportStart();
+        await onTransportComplete({ whatsappMessageId: operation.plannedWhatsappMessageId, result: null });
+        throw Object.assign(new Error('history write failed'), { name: 'PrismaClientKnownRequestError' });
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  assert.equal(store.operation.state, 'callback_pending');
+  assert.equal(store.leaseHeld, false);
+  assert.equal(store.operation.sendAttempts, 1);
+  await queue.runOnce('maintenance');
+  assert.equal(store.operation.state, 'completed');
+});
+
+test('without an early relay receipt the final send result still commits the WAID once', async () => {
+  const store = new MemoryStore();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportStart();
+        await onTransportComplete({ whatsappMessageId: '', result: null });
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  assert.equal(store.operation.state, 'callback_pending');
+  assert.equal(store.released, 0);
+  assert.equal(store.operation.sendAttempts, 1);
+});
+
+test('ignores a relay receipt before the durable transport fence', async () => {
+  const store = new MemoryStore();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportComplete({ whatsappMessageId: operation.plannedWhatsappMessageId, result: null });
+        assert.equal(store.operation.state, 'preparing');
+        await onTransportStart();
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+  assert.equal(store.operation.state, 'callback_pending');
+  assert.equal(store.released, 0);
+});
+
+test('reports webhook-to-sent latency percentiles per window', async () => {
+  const store = new MemoryStore();
+  const events: { event: string; metrics: Record<string, unknown> }[] = [];
+  const receivedAt = new Date(Date.now() - 1_500);
+  store.operation.webhookReceivedAt = receivedAt;
+  store.operation.messageCreatedAt = new Date(receivedAt.getTime() - 200);
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportStart();
+        await onTransportComplete({ whatsappMessageId: operation.plannedWhatsappMessageId, result: null });
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+      observe: (event, metrics) => events.push({ event, metrics }),
+    }),
+  );
+
+  await queue.runOnce('transport');
+  queue.reportLatency();
+  queue.reportLatency();
+  const reports = events.filter(({ event }) => event === 'chatwoot_outbound_latency');
+  assert.equal(reports.length, 1);
+  assert.equal(reports[0].metrics.sent, 1);
+  assert.ok((reports[0].metrics.totalP50Ms as number) >= 1_500);
+  assert.equal(reports[0].metrics.totalP95Ms, reports[0].metrics.totalP50Ms);
+  assert.equal(reports[0].metrics.messageToReceiptP50Ms, 200);
+  assert.equal(typeof reports[0].metrics.transportP95Ms, 'number');
+});
+
+test('shares one expired-lease recovery pass across claims within the interval', async () => {
+  const store = new MemoryStore('completed');
+  const queue = new ChatwootOutboundQueue(store, validHandler());
+
+  await Promise.all([queue.runOnce('transport'), queue.runOnce('maintenance'), queue.runOnce('transport')]);
+  await queue.runOnce('transport');
+  assert.equal(store.recovered, 1);
+});
+
+test('backs off exact-WAID reconciliation for a long-unresolved ambiguous send', async () => {
+  const store = new MemoryStore('ambiguous');
+  store.operation.claimGeneration = 500;
+  let nextAttemptAt: Date | undefined;
+  store.scheduleAmbiguous = async (_id: string, _worker: string, _generation: number, next: Date) => {
+    nextAttemptAt = next;
+    store.operation.state = 'ambiguous';
+  };
+  const queue = new ChatwootOutboundQueue(store, validHandler());
+
+  await queue.runOnce('maintenance');
+  assert.ok(nextAttemptAt);
+  assert.ok(nextAttemptAt.getTime() - Date.now() > 290_000);
+});
+
+test('reads Chatwoot webhook created_at as ISO or epoch seconds', () => {
+  const receivedAt = new Date('2026-11-10T12:00:05.000Z');
+  assert.equal(
+    chatwootWebhookMessageCreatedAt('2026-11-10T12:00:04.250Z', receivedAt)?.toISOString(),
+    '2026-11-10T12:00:04.250Z',
+  );
+  assert.equal(
+    chatwootWebhookMessageCreatedAt(Date.parse('2026-11-10T12:00:04Z') / 1000, receivedAt)?.toISOString(),
+    '2026-11-10T12:00:04.000Z',
+  );
+  assert.equal(
+    chatwootWebhookMessageCreatedAt(String(Date.parse('2026-11-10T12:00:03Z') / 1000), receivedAt)?.toISOString(),
+    '2026-11-10T12:00:03.000Z',
+  );
+  assert.equal(chatwootWebhookMessageCreatedAt('2026-11-10T13:00:00Z', receivedAt), undefined);
+  assert.equal(chatwootWebhookMessageCreatedAt(null, receivedAt), undefined);
+  assert.equal(chatwootWebhookMessageCreatedAt('not a date', receivedAt), undefined);
 });

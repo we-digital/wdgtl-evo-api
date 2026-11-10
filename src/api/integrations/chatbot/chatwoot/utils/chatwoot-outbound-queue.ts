@@ -138,6 +138,21 @@ export interface ChatwootOutboundStore {
     result: unknown,
     now: Date,
   ): Promise<void>;
+  /**
+   * Durably records the exact WAID as soon as WhatsApp accepted the relay, while
+   * the transport worker keeps its lease for local post-send persistence. The
+   * lane is released (callback_pending is not lane blocking); the callback is
+   * not claimable until releaseCallbackLease.
+   */
+  markTransportSent(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    whatsappMessageId: string,
+    result: unknown,
+    now: Date,
+  ): Promise<boolean>;
+  releaseCallbackLease(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void>;
   markFailureCallbackPending(
     operation: StoredChatwootOutboundOperation,
     workerId: string,
@@ -237,6 +252,7 @@ export interface ChatwootOutboundHandler {
     context: unknown,
     onTransportStart: () => Promise<void>,
     signal: AbortSignal,
+    onTransportComplete?: (sent: { whatsappMessageId: string; result: unknown }) => Promise<void>,
   ): Promise<{ whatsappMessageId: string; result: unknown }>;
   confirm(
     operation: StoredChatwootOutboundOperation,
@@ -407,10 +423,46 @@ export function buildChatwootOutboundParts(params: {
   });
 }
 
+/**
+ * Chatwoot's message webhook serializes `created_at` as an ISO-8601 string
+ * (event payloads elsewhere use epoch seconds). Accept both; a value later than
+ * receipt (beyond clock skew) is not a usable creation time.
+ */
+export function chatwootWebhookMessageCreatedAt(value: unknown, receivedAt: Date): Date | undefined {
+  let ms: number;
+  if (typeof value === 'number' || (typeof value === 'string' && /^\d+(\.\d+)?$/.test(value.trim()))) {
+    const seconds = Number(value);
+    ms = seconds > 1e12 ? seconds : seconds * 1_000;
+  } else if (typeof value === 'string' && value.trim().length > 0) {
+    ms = Date.parse(value);
+  } else {
+    return undefined;
+  }
+  if (!Number.isFinite(ms) || ms <= 0 || ms > receivedAt.getTime() + 60_000) return undefined;
+  return new Date(ms);
+}
+
 export const outboundRetryDelayMs = (attempt: number): number =>
   Math.min(300_000, 5_000 * 2 ** Math.max(0, Math.min(attempt - 1, 6)));
 
 export const MAX_OUTBOUND_PREPARATION_ATTEMPTS = 6;
+// Expired-lease recovery is a five-statement transaction. Every worker slot
+// used to run it before each claim; one shared pass per interval is enough for
+// ten-minute leases and keeps it off the hot path of a woken send.
+const OUTBOUND_RECOVERY_INTERVAL_MS = 1_000;
+const OUTBOUND_LATENCY_REPORT_MS = 60_000;
+const OUTBOUND_LATENCY_SAMPLE_LIMIT = 10_000;
+
+const percentile = (sorted: number[], p: number): number | null =>
+  sorted.length ? sorted[Math.min(sorted.length - 1, Math.max(0, Math.ceil(p * sorted.length) - 1))] : null;
+
+type OutboundLatencyMetric =
+  | 'total'
+  | 'receiptToClaim'
+  | 'validation'
+  | 'preTransport'
+  | 'transport'
+  | 'messageToReceipt';
 export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
 
 const errorClass = (error: unknown): string => {
@@ -424,6 +476,9 @@ export class ChatwootOutboundQueue {
   private timer: NodeJS.Timeout | null = null;
   private readonly activeRuns = new Set<Promise<void>>();
   private stopped = true;
+  private recovery: { startedAt: number; promise: Promise<void> } | null = null;
+  private latencies: Record<OutboundLatencyMetric, number[]> = ChatwootOutboundQueue.emptyLatencies();
+  private latencyTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly store: ChatwootOutboundStore,
@@ -437,7 +492,9 @@ export class ChatwootOutboundQueue {
   public async start() {
     if (!this.stopped) return;
     this.stopped = false;
-    await this.store.recoverExpired(new Date());
+    await this.recoverExpired(new Date(), true);
+    this.latencyTimer = setInterval(() => this.reportLatency(), OUTBOUND_LATENCY_REPORT_MS);
+    this.latencyTimer.unref?.();
     this.schedule(0);
   }
 
@@ -445,7 +502,63 @@ export class ChatwootOutboundQueue {
     this.stopped = true;
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
+    if (this.latencyTimer) clearInterval(this.latencyTimer);
+    this.latencyTimer = null;
     await Promise.all(this.activeRuns);
+    this.reportLatency();
+  }
+
+  /** Emits and resets webhook-to-WhatsApp latency percentiles for the last window. */
+  public reportLatency() {
+    const window = this.latencies;
+    this.latencies = ChatwootOutboundQueue.emptyLatencies();
+    if (window.total.length === 0) return;
+    const metrics: Record<string, number | null> = { sent: window.total.length };
+    for (const [metric, samples] of Object.entries(window)) {
+      const sorted = [...samples].sort((a, b) => a - b);
+      metrics[`${metric}P50Ms`] = percentile(sorted, 0.5);
+      metrics[`${metric}P95Ms`] = percentile(sorted, 0.95);
+    }
+    metrics.totalMaxMs = Math.max(...window.total);
+    this.handler.observe?.('chatwoot_outbound_latency', metrics);
+  }
+
+  private static emptyLatencies(): Record<OutboundLatencyMetric, number[]> {
+    return { total: [], receiptToClaim: [], validation: [], preTransport: [], transport: [], messageToReceipt: [] };
+  }
+
+  private recordSent(operation: StoredChatwootOutboundOperation, transportStartedAt: Date | undefined, sentAt: Date) {
+    const samples: [OutboundLatencyMetric, number | null][] = [
+      ['total', this.duration(operation.webhookReceivedAt ?? operation.createdAt, sentAt)],
+      ['receiptToClaim', this.duration(operation.webhookReceivedAt ?? operation.createdAt, operation.claimedAt)],
+      ['validation', this.duration(operation.claimedAt, operation.validatedAt)],
+      ['preTransport', this.duration(operation.validatedAt, transportStartedAt)],
+      ['transport', this.duration(transportStartedAt, sentAt)],
+      ['messageToReceipt', this.duration(operation.messageCreatedAt, operation.webhookReceivedAt)],
+    ];
+    for (const [metric, value] of samples) {
+      if (value !== null && this.latencies[metric].length < OUTBOUND_LATENCY_SAMPLE_LIMIT) {
+        this.latencies[metric].push(value);
+      }
+    }
+    this.handler.observe?.('chatwoot_outbound_transport_sent', {
+      commitToClaimMs: this.duration(operation.createdAt, operation.claimedAt),
+      validationMs: this.duration(operation.claimedAt, operation.validatedAt),
+      preTransportMs: this.duration(operation.validatedAt, transportStartedAt),
+      transportMs: this.duration(transportStartedAt, sentAt),
+      receiptToSentMs: this.duration(operation.webhookReceivedAt, sentAt),
+    });
+  }
+
+  private async recoverExpired(now: Date, force = false) {
+    const current = this.recovery;
+    if (!force && current && now.getTime() - current.startedAt < OUTBOUND_RECOVERY_INTERVAL_MS) {
+      await current.promise;
+      return;
+    }
+    const promise = this.store.recoverExpired(now);
+    this.recovery = { startedAt: now.getTime(), promise: promise.catch(() => undefined) };
+    await promise;
   }
 
   public wake() {
@@ -456,7 +569,7 @@ export class ChatwootOutboundQueue {
 
   public async runOnce(workClass: ChatwootOutboundWorkClass = 'any'): Promise<boolean> {
     const now = new Date();
-    await this.store.recoverExpired(now);
+    await this.recoverExpired(now);
     const operation = await this.store.claim(this.workerId, now, new Date(now.getTime() + this.leaseMs), workClass);
     if (!operation) return false;
 
@@ -512,7 +625,7 @@ export class ChatwootOutboundQueue {
           operation.id,
           this.workerId,
           operation.claimGeneration,
-          new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
+          new Date(Date.now() + this.reconciliationDelayMs(operation)),
           'AwaitingExactWhatsappMessage',
         );
       }
@@ -534,7 +647,7 @@ export class ChatwootOutboundQueue {
           operation.id,
           this.workerId,
           operation.claimGeneration,
-          new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1)),
+          new Date(Date.now() + this.reconciliationDelayMs(operation)),
           'AwaitingExactWhatsappMessage',
         );
       }
@@ -583,6 +696,41 @@ export class ChatwootOutboundQueue {
 
     let transportStarted = false;
     let transportStartedAt: Date | undefined;
+    let transportCommitted = false;
+    let transportCommit: Promise<void> | null = null;
+    // Called by the provider right after WhatsApp accepted the relay and before
+    // optional local history/media/webhook work. Never throws into transport:
+    // without a durable commit the final result path below decides as before.
+    const onTransportComplete = (sent: { whatsappMessageId: string; result: unknown }) => {
+      if (!transportStarted || transportCommitted || transportCommit) return transportCommit ?? Promise.resolve();
+      if (typeof sent?.whatsappMessageId !== 'string' || sent.whatsappMessageId.length === 0) return Promise.resolve();
+      transportCommit = (async () => {
+        const sentAt = new Date();
+        try {
+          if (
+            !(await this.store.markTransportSent(
+              operation.id,
+              this.workerId,
+              operation.claimGeneration,
+              sent.whatsappMessageId,
+              sent.result,
+              sentAt,
+            ))
+          ) {
+            return;
+          }
+        } catch {
+          return;
+        }
+        transportCommitted = true;
+        operation.sendStartedAt = transportStartedAt;
+        operation.sentAt = sentAt;
+        this.recordSent(operation, transportStartedAt, sentAt);
+        // The destination lane is free now; the next message may start.
+        this.wake();
+      })();
+      return transportCommit;
+    };
     try {
       const sent = await this.withTimeout('OutboundSendTimeout', this.timeouts.send, (signal) =>
         this.handler.send(
@@ -628,8 +776,15 @@ export class ChatwootOutboundQueue {
             transportStarted = true;
           },
           signal,
+          onTransportComplete,
         ),
       );
+      if (transportCommit) await transportCommit;
+      if (transportCommitted) {
+        await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
+        this.wake();
+        return true;
+      }
       if (!transportStarted) throw new Error('TransportNotStarted');
       if (!sent.whatsappMessageId) throw new Error('MissingWhatsappMessageId');
       const sentAt = new Date();
@@ -643,13 +798,17 @@ export class ChatwootOutboundQueue {
         sent.result,
         sentAt,
       );
-      this.handler.observe?.('chatwoot_outbound_transport_sent', {
-        commitToClaimMs: this.duration(operation.createdAt, operation.claimedAt),
-        validationMs: this.duration(operation.claimedAt, operation.validatedAt),
-        transportMs: this.duration(transportStartedAt, sentAt),
-      });
+      this.recordSent(operation, transportStartedAt, sentAt);
       this.wake();
     } catch (error) {
+      if (transportCommit) await transportCommit;
+      if (transportCommitted) {
+        // The exact WAID is already durable; a later local persistence error
+        // or timeout must not turn a delivered message into an ambiguous one.
+        await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
+        this.wake();
+        return true;
+      }
       const classified = errorClass(error);
       const nextAttemptAt = new Date(Date.now() + outboundRetryDelayMs(operation.sendAttempts + 1));
       if (classified === 'OutboundMessageDeleted') {
@@ -671,6 +830,13 @@ export class ChatwootOutboundQueue {
       }
     }
     return true;
+  }
+
+  // Exact-WAID reconciliation scans retained messages. A row that stays
+  // unresolved backs off to the five-minute cap instead of rescanning every
+  // ten seconds forever; claimGeneration grows on every reconciliation claim.
+  private reconciliationDelayMs(operation: StoredChatwootOutboundOperation) {
+    return outboundRetryDelayMs(Math.max(operation.sendAttempts + 1, operation.claimGeneration));
   }
 
   private async deferUntilWhatsappReady(operation: StoredChatwootOutboundOperation) {

@@ -444,6 +444,40 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     if (updated.count !== 1) throw new Error('OutboundLeaseLost');
   }
 
+  public async markTransportSent(
+    id: string,
+    workerId: string,
+    claimGeneration: number,
+    whatsappMessageId: string,
+    result: unknown,
+    now: Date,
+  ): Promise<boolean> {
+    // The lease stays with the transport worker until its local post-send work
+    // finishes; callback_pending is not lane blocking, so the next part or
+    // message of the same destination may already be claimed.
+    const updated = await this.repository.chatwootOutboundOperation.updateMany({
+      where: { id, state: 'sending', leaseOwner: workerId, claimGeneration },
+      data: {
+        state: 'callback_pending',
+        whatsappMessageId,
+        result: (result ?? undefined) as any,
+        sentAt: now,
+        transportOutcomeUnresolved: false,
+        nextAttemptAt: now,
+        lastErrorClass: null,
+      },
+    });
+    return updated.count === 1;
+  }
+
+  public async releaseCallbackLease(id: string, workerId: string, claimGeneration: number, now: Date): Promise<void> {
+    // A lost lease (expired and reclaimed) needs no release; recovery owns it.
+    await this.repository.chatwootOutboundOperation.updateMany({
+      where: { id, state: 'callback_pending', leaseOwner: workerId, claimGeneration },
+      data: { leaseOwner: null, leaseExpiresAt: null, nextAttemptAt: now },
+    });
+  }
+
   public async markFailureCallbackPending(
     operation: StoredChatwootOutboundOperation,
     workerId: string,
