@@ -195,6 +195,7 @@ import {
   qualifyNativeWhatsappEditKey,
 } from './normalized-whatsapp-edit';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
+import { SendRecipientCache } from './send-recipient-cache';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 import {
   ORIGINAL_WHATSAPP_TIMESTAMP,
@@ -308,6 +309,12 @@ export class BaileysStartupService extends ChannelStartupService {
     checkperiod: 60,
     useClones: false,
   });
+
+  // Positive single-recipient resolutions for sends; cleared on every connection change.
+  private sendRecipientCache?: SendRecipientCache<OnWhatsAppDto>;
+  private get sendRecipients() {
+    return (this.sendRecipientCache ??= new SendRecipientCache<OnWhatsAppDto>());
+  }
 
   public resourceCacheStats() {
     return { devices: this.userDevicesCache.getStats().keys, retries: this.msgRetryCounterCache.getStats().keys };
@@ -490,6 +497,7 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     if (connection) {
+      this.sendRecipients.clear();
       this.stateConnection = {
         state: connection,
         statusReason: (lastDisconnect?.error as Boom)?.output?.statusCode ?? 200,
@@ -2671,7 +2679,11 @@ export class BaileysStartupService extends ChannelStartupService {
     isIntegration = false,
     provenance?: OutboundMessageProvenance,
   ) {
-    const isWA = (await this.whatsappNumber({ numbers: [number] }))?.shift();
+    const isWA = await this.sendRecipients.resolve(
+      number,
+      async () => (await this.whatsappNumber({ numbers: [number] }))?.shift(),
+      (resolved) => resolved?.exists === true,
+    );
 
     if (!isWA.exists && !isJidGroup(isWA.jid) && !isWA.jid.includes('@broadcast')) {
       throw new BadRequestException(isWA);
@@ -2948,6 +2960,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
       return messageRaw;
     } catch (error) {
+      this.sendRecipients.delete(number);
       this.logger.error(JSON.stringify({ event: 'whatsapp_send_error', errorClass: error?.name || 'Error' }));
       if (
         ['OutboundBindingMismatch', 'OutboundMessageDeleted', 'OutboundOperationAborted', 'WhatsappNotReady'].includes(
@@ -4166,10 +4179,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
     if (numbersToCache.length > 0) {
       this.logger.verbose(`Salvando ${numbersToCache.length} números no cache`);
+      const verifiedJids = new Set(verify.filter((v) => v.exists).map((v) => v.jid));
       await saveOnWhatsappCache(
         numbersToCache.map((user) => ({
           remoteJid: user.jid,
           lid: user.lid === 'lid' ? 'lid' : undefined,
+          verified: verifiedJids.has(user.jid),
         })),
       );
     }

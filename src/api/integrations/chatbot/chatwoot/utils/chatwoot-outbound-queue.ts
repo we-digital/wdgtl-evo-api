@@ -242,10 +242,15 @@ export interface ChatwootOutboundHandler {
     phase: ChatwootOutboundPhase,
     signal: AbortSignal,
   ): Promise<ChatwootOutboundValidation>;
+  /**
+   * Transport fence. `preparedContext` is this claim's preparation context; a
+   * handler may reuse its exact snapshot when still fresh (`snapshotReused`).
+   */
   revalidateTransport(
     operation: StoredChatwootOutboundOperation,
     signal: AbortSignal,
-  ): Promise<{ validation: ChatwootOutboundValidation; providerContext?: unknown }>;
+    preparedContext?: unknown,
+  ): Promise<{ validation: ChatwootOutboundValidation; providerContext?: unknown; snapshotReused?: boolean }>;
   isReady(operation: StoredChatwootOutboundOperation, context: unknown, signal: AbortSignal): Promise<boolean>;
   send(
     operation: StoredChatwootOutboundOperation,
@@ -461,8 +466,16 @@ type OutboundLatencyMetric =
   | 'receiptToClaim'
   | 'validation'
   | 'preTransport'
+  | 'preparation'
+  | 'fence'
   | 'transport'
   | 'messageToReceipt';
+
+interface OutboundTransportTiming {
+  fenceStartedAt?: Date;
+  transportStartedAt?: Date;
+  snapshotReused?: boolean;
+}
 export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
 
 const errorClass = (error: unknown): string => {
@@ -478,6 +491,7 @@ export class ChatwootOutboundQueue {
   private stopped = true;
   private recovery: { startedAt: number; promise: Promise<void> } | null = null;
   private latencies: Record<OutboundLatencyMetric, number[]> = ChatwootOutboundQueue.emptyLatencies();
+  private fenceSnapshotsReused = 0;
   private latencyTimer: NodeJS.Timeout | null = null;
 
   constructor(
@@ -511,9 +525,11 @@ export class ChatwootOutboundQueue {
   /** Emits and resets webhook-to-WhatsApp latency percentiles for the last window. */
   public reportLatency() {
     const window = this.latencies;
+    const fenceReused = this.fenceSnapshotsReused;
     this.latencies = ChatwootOutboundQueue.emptyLatencies();
+    this.fenceSnapshotsReused = 0;
     if (window.total.length === 0) return;
-    const metrics: Record<string, number | null> = { sent: window.total.length };
+    const metrics: Record<string, number | null> = { sent: window.total.length, fenceReused };
     for (const [metric, samples] of Object.entries(window)) {
       const sorted = [...samples].sort((a, b) => a - b);
       metrics[`${metric}P50Ms`] = percentile(sorted, 0.5);
@@ -524,15 +540,29 @@ export class ChatwootOutboundQueue {
   }
 
   private static emptyLatencies(): Record<OutboundLatencyMetric, number[]> {
-    return { total: [], receiptToClaim: [], validation: [], preTransport: [], transport: [], messageToReceipt: [] };
+    return {
+      total: [],
+      receiptToClaim: [],
+      validation: [],
+      preTransport: [],
+      preparation: [],
+      fence: [],
+      transport: [],
+      messageToReceipt: [],
+    };
   }
 
-  private recordSent(operation: StoredChatwootOutboundOperation, transportStartedAt: Date | undefined, sentAt: Date) {
+  private recordSent(operation: StoredChatwootOutboundOperation, timing: OutboundTransportTiming, sentAt: Date) {
+    const { fenceStartedAt, transportStartedAt } = timing;
+    if (timing.snapshotReused) this.fenceSnapshotsReused += 1;
     const samples: [OutboundLatencyMetric, number | null][] = [
       ['total', this.duration(operation.webhookReceivedAt ?? operation.createdAt, sentAt)],
       ['receiptToClaim', this.duration(operation.webhookReceivedAt ?? operation.createdAt, operation.claimedAt)],
       ['validation', this.duration(operation.claimedAt, operation.validatedAt)],
       ['preTransport', this.duration(operation.validatedAt, transportStartedAt)],
+      // preTransport = preparation (readiness, recipient/quote/media) + fence (transport snapshot).
+      ['preparation', this.duration(operation.validatedAt, fenceStartedAt)],
+      ['fence', this.duration(fenceStartedAt, transportStartedAt)],
       ['transport', this.duration(transportStartedAt, sentAt)],
       ['messageToReceipt', this.duration(operation.messageCreatedAt, operation.webhookReceivedAt)],
     ];
@@ -545,6 +575,9 @@ export class ChatwootOutboundQueue {
       commitToClaimMs: this.duration(operation.createdAt, operation.claimedAt),
       validationMs: this.duration(operation.claimedAt, operation.validatedAt),
       preTransportMs: this.duration(operation.validatedAt, transportStartedAt),
+      preparationMs: this.duration(operation.validatedAt, fenceStartedAt),
+      fenceMs: this.duration(fenceStartedAt, transportStartedAt),
+      fenceReused: timing.snapshotReused ? 1 : 0,
       transportMs: this.duration(transportStartedAt, sentAt),
       receiptToSentMs: this.duration(operation.webhookReceivedAt, sentAt),
     });
@@ -696,6 +729,8 @@ export class ChatwootOutboundQueue {
 
     let transportStarted = false;
     let transportStartedAt: Date | undefined;
+    let fenceStartedAt: Date | undefined;
+    let snapshotReused = false;
     let transportCommitted = false;
     let transportCommit: Promise<void> | null = null;
     // Called by the provider right after WhatsApp accepted the relay and before
@@ -725,7 +760,7 @@ export class ChatwootOutboundQueue {
         transportCommitted = true;
         operation.sendStartedAt = transportStartedAt;
         operation.sentAt = sentAt;
-        this.recordSent(operation, transportStartedAt, sentAt);
+        this.recordSent(operation, { fenceStartedAt, transportStartedAt, snapshotReused }, sentAt);
         // The destination lane is free now; the next message may start.
         this.wake();
       })();
@@ -743,11 +778,13 @@ export class ChatwootOutboundQueue {
               error.name = 'OutboundOperationAborted';
               throw error;
             }
+            fenceStartedAt = new Date();
             const transportSnapshot = await this.withTimeout(
               'OutboundValidationTimeout',
               this.timeouts.validation,
-              (signal) => this.handler.revalidateTransport(operation, signal),
+              (signal) => this.handler.revalidateTransport(operation, signal, preparedContext),
             );
+            snapshotReused = transportSnapshot.snapshotReused === true;
             const transportValidation = transportSnapshot.validation;
             if (transportValidation === 'deleted') {
               const error = new Error('Chatwoot message was deleted before transport');
@@ -798,7 +835,7 @@ export class ChatwootOutboundQueue {
         sent.result,
         sentAt,
       );
-      this.recordSent(operation, transportStartedAt, sentAt);
+      this.recordSent(operation, { fenceStartedAt, transportStartedAt, snapshotReused }, sentAt);
       this.wake();
     } catch (error) {
       if (transportCommit) await transportCommit;

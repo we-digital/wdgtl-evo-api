@@ -152,6 +152,11 @@ import {
   validatesCurrentChatwootOutboundSnapshot,
   validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
+import {
+  canReusePreparedOutboundSnapshot,
+  ChatwootOutboundFenceBinding,
+  outboundFenceSnapshotMaxAgeMs,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-fence';
 import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-prisma-store';
 import {
   buildChatwootOutboundParts,
@@ -297,6 +302,7 @@ export class ChatwootService {
   private readonly historySyncCheckpointKey = 'chatwoot:historySyncCheckpoint';
   private readonly outboundStore: ChatwootOutboundPrismaStore;
   private readonly outboundQueue: ChatwootOutboundQueue;
+  private readonly outboundFenceSnapshotMaxAgeMs: number;
   private readonly inboundStore: ChatwootInboundPrismaStore;
   private readonly inboundQueue: ChatwootInboundQueue;
   private readonly durableInboundBodies = new WeakSet<object>();
@@ -332,6 +338,9 @@ export class ChatwootService {
         failAfterMs: Math.max(3_600_000, outboundConfig.INBOUND_FAIL_AFTER_MS || 86_400_000),
       },
     );
+    this.outboundFenceSnapshotMaxAgeMs = outboundFenceSnapshotMaxAgeMs(
+      outboundConfig.OUTBOUND_FENCE_SNAPSHOT_MAX_AGE_MS,
+    );
     this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository, {
       maxWait: Math.max(500, Math.min(30_000, outboundConfig.OUTBOUND_ADMISSION_MAX_WAIT_MS)),
       timeout: Math.max(1_000, Math.min(60_000, outboundConfig.OUTBOUND_ADMISSION_TIMEOUT_MS)),
@@ -341,7 +350,8 @@ export class ChatwootService {
       {
         prepare: (operation, signal) => this.prepareQueuedOutbound(operation, signal),
         validate: (operation, phase, signal) => this.validateOutboundBinding(operation, phase, signal),
-        revalidateTransport: (operation, signal) => this.revalidateQueuedOutboundTransport(operation, signal),
+        revalidateTransport: (operation, signal, context) =>
+          this.revalidateQueuedOutboundTransport(operation, signal, context),
         isReady: (operation, context, signal) => this.isOutboundReady(operation, context, signal),
         send: (operation, context, onTransportStart, signal, onTransportComplete) =>
           this.sendQueuedOutbound(operation, context, onTransportStart, signal, onTransportComplete),
@@ -3018,6 +3028,7 @@ export class ChatwootService {
     }
 
     const client = new ChatwootClient({ config: this.getClientCwConfig(provider) });
+    const snapshotStartedAt = Date.now();
     const exactMessageResponse = await this.awaitCancelable(
       getExactChatwootMessage(
         this.getClientCwConfig(provider),
@@ -3069,6 +3080,8 @@ export class ChatwootService {
       client,
       currentMessage,
       authoritativelyDeleted,
+      snapshotStartedAt,
+      fenceBinding: this.outboundFenceBinding(instance, provider, origin.inboxId, waInstance),
       providerContext: {
         snapshot_version: Number(currentMessage.outbound_snapshot.version),
         snapshot_fingerprint: String(currentMessage.outbound_snapshot.fingerprint),
@@ -3086,8 +3099,58 @@ export class ChatwootService {
     };
   }
 
-  private async revalidateQueuedOutboundTransport(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
-    const context = await this.currentOutboundContext(operation, signal, false, true);
+  private outboundFenceBinding(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    waInstance: unknown,
+  ): ChatwootOutboundFenceBinding {
+    const updatedAt = (provider as any).updatedAt;
+    return {
+      instanceId: instance.instanceId,
+      instanceName: instance.instanceName,
+      ownerJid: instance.ownerJid ?? null,
+      number: instance.number ?? null,
+      providerId: provider.id,
+      providerUpdatedAt: updatedAt instanceof Date ? updatedAt.getTime() : null,
+      providerEnabled: provider.enabled === true,
+      providerUrl: provider.url,
+      providerToken: provider.token,
+      providerAccountId: provider.accountId,
+      providerNameInbox: provider.nameInbox,
+      route: this.buildEvoRouteBinding(instance, provider, inboxId),
+      waInstance,
+    };
+  }
+
+  /**
+   * Reuses this claim's preparation snapshot at the transport fence when it is
+   * fresh and the local binding it was validated against is unchanged; the
+   * instance and provider rows are re-read (two indexed lookups) instead of a
+   * second exact Chatwoot message read. Returns null to require the fresh read.
+   */
+  private async reusablePreparedOutboundContext(operation: StoredChatwootOutboundOperation, preparedContext: unknown) {
+    const prepared = preparedContext as Awaited<ReturnType<ChatwootService['currentOutboundContext']>>;
+    const maxAgeMs = this.outboundFenceSnapshotMaxAgeMs;
+    if (!prepared?.fenceBinding || maxAgeMs <= 0 || Date.now() - prepared.snapshotStartedAt > maxAgeMs) return null;
+    const [instance, provider] = await Promise.all([
+      this.outboundInstance(operation),
+      this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } }),
+    ]);
+    if (!instance || !provider?.id) return null;
+    const localWaInstance = this.waMonitor.waInstances[instance.instanceName];
+    const waInstance = localWaInstance?.instanceId === operation.instanceId ? localWaInstance : null;
+    const current = this.outboundFenceBinding(instance, provider, operation.payload.origin.inboxId, waInstance);
+    return canReusePreparedOutboundSnapshot({ prepared, current, now: Date.now(), maxAgeMs }) ? prepared : null;
+  }
+
+  private async revalidateQueuedOutboundTransport(
+    operation: StoredChatwootOutboundOperation,
+    signal: AbortSignal,
+    preparedContext?: unknown,
+  ) {
+    const reused = await this.reusablePreparedOutboundContext(operation, preparedContext);
+    const context = reused ?? (await this.currentOutboundContext(operation, signal, false, true));
     if (!context) return { validation: 'mismatch' as const };
     if (!context.waInstance || context.waInstance.connectionStatus?.state !== 'open') {
       throw Object.assign(new Error('WhatsApp socket is not ready'), { name: 'WhatsappNotReady' });
@@ -3095,6 +3158,7 @@ export class ChatwootService {
     return {
       validation: context.authoritativelyDeleted ? ('deleted' as const) : ('valid' as const),
       providerContext: context.providerContext,
+      snapshotReused: reused !== null,
     };
   }
 

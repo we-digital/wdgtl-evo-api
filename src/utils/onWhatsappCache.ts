@@ -63,6 +63,8 @@ interface ISaveOnWhatsappCacheParams {
   remoteJid: string;
   remoteJidAlt?: string;
   lid?: 'lid' | undefined;
+  /** Just verified by WhatsApp: renew the entry's freshness even when its data is unchanged. */
+  verified?: boolean;
 }
 
 function normalizeJid(jid: string | null | undefined): string | null {
@@ -147,6 +149,14 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
           existingRecord.lid === dataPayload.lid;
 
         if (isDataSame) {
+          // Without renewing updatedAt, an entry past IS_ON_WHATSAPP_DAYS stays a cache miss forever and
+          // every send to that number repeats the network onWhatsApp query.
+          if (item.verified) {
+            await prismaRepository.isOnWhatsapp.update({
+              where: { id: existingRecord.id },
+              data: { updatedAt: new Date() },
+            });
+          }
           logger.verbose(`[saveOnWhatsappCache] Data for ${remoteJid} is already up-to-date. Skipping update.`);
           return; // Pula para o próximo item
         }
