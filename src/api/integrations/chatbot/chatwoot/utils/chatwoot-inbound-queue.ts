@@ -324,6 +324,7 @@ export class ChatwootInboundQueue {
         attempts,
         providerLatencyMs: providerMs,
         queueLatencyMs: queueMs,
+        ...((ack as InboundAck & { media_unavailable?: boolean }).media_unavailable ? { mediaUnavailable: true } : {}),
       });
       return ack;
     } catch (error) {

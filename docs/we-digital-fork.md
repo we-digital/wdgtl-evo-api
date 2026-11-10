@@ -1386,3 +1386,21 @@ receiver path (owner read before any POST), so a message Chatwoot already has
 is confirmed, not created again. Filters: `--states=`, `--instances=`,
 `--exclude-instances=`, `--errors=`. Terminal failures now keep their lane in
 `result`; rows closed before that infer it from the WhatsApp-to-commit gap.
+
+### 2026-11-10 media no longer available
+
+A durable live delivery whose media bytes cannot be obtained definitively
+(expired/undecryptable, refresh impossible or unqualified, re-upload refused,
+bytes not matching the native SHA) is delivered as text: the caption, if any,
+then `[Photo|Video|Audio|Voice message|Sticker — file no longer available]` or
+`[Document “name” — file no longer available]`. Clearly transient errors
+(network, 429/5xx, refresh CAS race) retry normally and fall back after 12
+attempts; unclassified errors after 3. The text goes through the same
+source-id POST, receiver confirmation and native pointer CAS. A later attempt
+confirms an existing owner with no attachment and exactly that text, without
+another POST. The ack and `chatwoot_inbound_confirmed` carry
+`media_unavailable`. History deliveries keep the importer contract.
+
+Media key bytes are passed to Baileys as raw bytes from any stored encoding;
+the previous object conversion turned Buffer JSON (`{type, data}`) into two
+zero bytes, a wrong HKDF key and "bad decrypt".

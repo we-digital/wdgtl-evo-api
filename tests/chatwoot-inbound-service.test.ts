@@ -42,6 +42,11 @@ import {
   resolveInboundNativeBody,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 
+import {
+  deliverWithoutMedia,
+  mediaFailureKind,
+  mediaUnavailableContent,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-media-unavailable';
 import { extractWhatsappReplyStanzaId } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 import { requireTrustedChatwootUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
@@ -89,6 +94,9 @@ function literalService() {
     inboundSourceCandidates,
     inboundSourceIdentityHash,
     isInboundTransportOnly,
+    deliverWithoutMedia,
+    mediaFailureKind,
+    mediaUnavailableContent,
     isLidJid,
       isGroupJid,
     isChatwootLinkedClientSentEvent,
@@ -219,6 +227,7 @@ function fixture() {
   service.inboundDeliveryFence = new ChatwootIngressDeliveryFence();
   service.configService = { get: () => ({}) };
   service.receiverIdempotencyChecks = new Map();
+  service.inboundMediaFallbacks = new WeakMap();
   service.durableInboundBodies = new WeakSet();
   service.inboundCanonicalContexts = new WeakMap();
   service.pgClient = {
@@ -1327,4 +1336,92 @@ test('idempotent receiver falls back to the verified path when off, not advertis
     assert.equal(ack.receiver_path, 'verified');
     assert.equal(f.queries.length, 2);
   }
+});
+// Prod 2026-11-10: expired or undecryptable media kept rows failing forever.
+function mediaFixture(download: () => Promise<any>) {
+  const f = fixture();
+  f.native.messageType = 'imageMessage';
+  f.native.message = {
+    imageMessage: { mimetype: 'image/jpeg', mediaKey: Buffer.alloc(32, 1).toString('base64'), fileLength: 3 },
+  };
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.createConversation = async () => 77;
+  f.service.clientCw = async () => ({ client: {}, provider: f.provider });
+  f.service.processWhatsappEvent = f.literalProcess;
+  f.service.isMediaMessage = (msg: any) => Boolean(msg?.imageMessage || msg?.documentMessage);
+  f.service.getConversationMessage = (msg: any) => msg?.imageMessage?.caption ?? msg?.conversation;
+  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = download;
+  const calls = { texts: [] as string[], files: 0 };
+  f.service.sendData = async () => {
+    calls.files++;
+    return { id: 9 };
+  };
+  f.service.createMessage = async (_instance: any, conversation: number, content: string, direction: string) => {
+    assert.equal(conversation, 77);
+    assert.equal(direction, 'incoming');
+    calls.texts.push(content);
+    f.rows = [{ ...f.owner(), content, attachments: 0 }];
+    return { id: 9 };
+  };
+  return { f, calls };
+}
+
+test('media that cannot be obtained is delivered once as a text placeholder and acked media_unavailable', async () => {
+  for (const reason of [
+    'Error: error:1C800064:Provider routines::bad decrypt',
+    'Error: native_media_refresh_deadline_unknown_no_retry',
+    'Error: native_media_refresh_source_nonunique',
+    'Error: Failed to re-upload media (2)',
+    'Error: native_media_refresh_bytes_unqualified',
+  ]) {
+    const { f, calls } = mediaFixture(async () => {
+      throw Object.assign(new Error(reason), { name: 'BadRequestException' });
+    });
+    const ack = await f.service.deliverQueuedInbound(f.item);
+    assert.equal(ack.id, 9, reason);
+    assert.equal(ack.media_unavailable, true);
+    assert.deepEqual(calls.texts, ['[Photo — file no longer available]']);
+    assert.equal(calls.files, 0);
+    // A retry finds the placeholder owner and confirms it without another POST.
+    const again = await f.service.deliverQueuedInbound(f.item);
+    assert.equal(again.media_unavailable, true);
+    assert.equal(calls.texts.length, 1);
+  }
+});
+
+test('the caption is kept above the placeholder', async () => {
+  const { f, calls } = mediaFixture(async () => {
+    throw new Error('Failed to re-upload media (2)');
+  });
+  f.native.message.imageMessage.caption = 'passport scan';
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  await f.service.deliverQueuedInbound(f.item);
+  assert.deepEqual(calls.texts, ['passport scan\n\n[Photo — file no longer available]']);
+});
+
+test('transient download errors retry first; unknown errors fall back after a few attempts', async () => {
+  const transient = mediaFixture(async () => {
+    throw new Error('connect ETIMEDOUT');
+  });
+  await assert.rejects(transient.f.service.deliverQueuedInbound(transient.f.item), /ETIMEDOUT/);
+  assert.equal(transient.calls.texts.length, 0);
+  transient.f.item.attempts = 12;
+  assert.equal((await transient.f.service.deliverQueuedInbound(transient.f.item)).media_unavailable, true);
+  const unknown = mediaFixture(async () => {
+    throw new Error('something new');
+  });
+  unknown.f.item.attempts = 2;
+  await assert.rejects(unknown.f.service.deliverQueuedInbound(unknown.f.item), /something new/);
+  unknown.f.item.attempts = 3;
+  assert.equal((await unknown.f.service.deliverQueuedInbound(unknown.f.item)).media_unavailable, true);
+});
+
+test('a placeholder-looking owner with an attachment, or other text, is not taken for a media-unavailable delivery', async () => {
+  const { f } = mediaFixture(async () => assert.fail('no download for an existing owner'));
+  f.rows = [{ ...f.owner(), content: '[Photo — file no longer available]', attachments: 0 }];
+  assert.equal((await f.service.deliverQueuedInbound(f.item)).media_unavailable, true);
+  f.rows = [{ ...f.owner(), content: 'different', attachments: 0 }];
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverMediaUnconfirmed/);
 });

@@ -184,7 +184,7 @@ import { v4 } from 'uuid';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
-import { expiredNativeMediaStatus, refreshExpiredNativeMedia } from './native-media-refresh';
+import { expiredNativeMediaStatus, nativeMediaBytes, refreshExpiredNativeMedia } from './native-media-refresh';
 import {
   LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP,
   nativeWhatsappEditIdentity,
@@ -4465,8 +4465,12 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       }
 
-      if (typeof mediaMessage['mediaKey'] === 'object') {
-        msg.message[mediaType].mediaKey = Uint8Array.from(Object.values(mediaMessage['mediaKey']));
+      // Stored and frozen payloads carry protobuf bytes as base64 strings,
+      // numeric-key objects or Buffer JSON. Baileys derives keys with HKDF over
+      // raw bytes (a string or Buffer JSON yields a wrong key: "bad decrypt").
+      for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256']) {
+        const bytes = nativeMediaBytes(mediaMessage[field]);
+        if (bytes) msg.message[mediaType][field] = bytes;
       }
 
       let buffer: Buffer;

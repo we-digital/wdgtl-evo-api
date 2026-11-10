@@ -8,6 +8,24 @@ const MEDIA_TYPES = new Set(['imageMessage', 'documentMessage', 'videoMessage', 
 export const NATIVE_MEDIA_REFRESH_MAX_BYTES = 64 * 1024 * 1024;
 type ScopedMediaMessage = proto.IWebMessageInfo & Pick<WAMessage, 'key'>;
 
+// Stored and frozen payloads carry protobuf bytes as base64 strings, numeric-key
+// objects or Buffer JSON; Baileys needs raw bytes for its HKDF media keys.
+export function nativeMediaBytes(value: unknown): Uint8Array | null {
+  if (value instanceof Uint8Array) return value;
+  if (typeof value === 'string') return value ? Buffer.from(value, 'base64') : null;
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const record = value as Record<string, any>;
+  const data =
+    record.type === 'Buffer' && Array.isArray(record.data)
+      ? record.data
+      : Object.keys(record).every((key, index) => key === String(index))
+        ? Object.values(record)
+        : null;
+  return data && data.length && data.every((byte: any) => Number.isInteger(byte) && byte >= 0 && byte <= 255)
+    ? Uint8Array.from(data)
+    : null;
+}
+
 export function expiredNativeMediaStatus(error: unknown): number | undefined {
   const value = error as { status?: unknown; output?: { statusCode?: unknown } };
   const status = value?.status ?? value?.output?.statusCode;

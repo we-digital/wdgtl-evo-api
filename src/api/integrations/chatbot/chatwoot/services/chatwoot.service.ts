@@ -126,6 +126,11 @@ import {
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
+  deliverWithoutMedia,
+  mediaFailureKind,
+  mediaUnavailableContent,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-media-unavailable';
+import {
   getExactChatwootMessage,
   isChatwootOutgoingMessageType,
   unwrapChatwootPayload,
@@ -292,6 +297,8 @@ export class ChatwootService {
   private readonly inboundCanonicalContexts = new WeakMap<object, InboundCanonicalContext>();
   private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
   private readonly receiverIdempotencyChecks = new Map<string, { at: number; value: Promise<boolean> }>();
+  // Request-local: a durable delivery may fall back to a media-unavailable text.
+  private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -5534,8 +5541,13 @@ export class ChatwootService {
       const isMedia = this.isMediaMessage(body.message);
       if (attributes?.deleted === true || attributes?.message_deleted === true)
         throw new Error('InboundReceiverDeleted');
-      if (isMedia && Number(row.attachments) < 1) throw new Error('InboundReceiverMediaUnconfirmed');
-      const sameContent = (row.content || '') === (rendered || '');
+      // A media message delivered without its file: no attachment, exact placeholder text.
+      const placeholder = isMedia ? mediaUnavailableContent(rendered, body.message) : null;
+      const mediaUnavailable =
+        placeholder !== null && Number(row.attachments) === 0 && (row.content || '') === placeholder;
+      if (isMedia && Number(row.attachments) < 1 && !mediaUnavailable)
+        throw new Error('InboundReceiverMediaUnconfirmed');
+      const sameContent = mediaUnavailable || (row.content || '') === (rendered || '');
       const sameLegacyContent =
         !sameContent &&
         peer.endsWith('@g.us') &&
@@ -5546,7 +5558,7 @@ export class ChatwootService {
         !acceptedHashes.has(attributes?.we_digital_ingress?.source_payload_sha256) &&
         (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
       ) {
-        if (!isMedia) throw new Error('InboundReceiverPayloadUnconfirmed');
+        if (!isMedia || mediaUnavailable) throw new Error('InboundReceiverPayloadUnconfirmed');
         const projected = await inboundHistoryDocumentProjection(body, item.payload);
         const history = attributes?.provider_history_native;
         const replies = await this.getReplyToIds(body, instance);
@@ -5589,6 +5601,7 @@ export class ChatwootService {
         inbox_id: Number(row.inbox_id),
         conversation_id: Number(row.conversation_id),
         contact_inbox_source_id: row.contact_inbox_source_id,
+        ...(mediaUnavailable ? { media_unavailable: true } : {}),
       };
     };
     // Fast path: the receiver itself returns the existing message for a replayed
@@ -5617,11 +5630,13 @@ export class ChatwootService {
             routeBinding: expected,
           });
         let sent;
+        this.inboundMediaFallbacks.set(body, { attempts: item.attempts, used: false });
         try {
           sent = await this.processWhatsappEvent('messages.upsert', instance, body);
         } finally {
           this.inboundCanonicalContexts.delete(body);
           this.durableInboundBodies.delete(body);
+          this.inboundMediaFallbacks.delete(body);
         }
         if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
         ack = await confirm(await owners());
@@ -5867,11 +5882,54 @@ export class ChatwootService {
         }
 
         if (isMedia) {
-          const downloadBase64 = await waInstance?.getBase64FromMediaMessage({
-            message: {
-              ...body,
-            },
-          });
+          let downloadBase64: any;
+          try {
+            downloadBase64 = await waInstance?.getBase64FromMediaMessage({
+              message: {
+                ...body,
+              },
+            });
+            if (!downloadBase64?.base64) throw new Error('InboundNativeMediaUnavailable');
+            if (this.durableInboundBodies.has(body)) {
+              const native = nativeCachedMediaPayload(body);
+              const bytes = Buffer.from(downloadBase64.base64, 'base64');
+              if (bytes.length !== native.size || !createHash('sha256').update(bytes).digest().equals(native.digest))
+                throw new Error('InboundNativeMediaBytesUnconfirmed');
+            }
+          } catch (error) {
+            // Durable deliveries only: bytes that cannot be obtained definitively
+            // (expired, undecryptable, refresh impossible) no longer hold the message.
+            const fallback = this.inboundMediaFallbacks?.get(body);
+            const kind = mediaFailureKind(error);
+            const content = mediaUnavailableContent(isGroupMessage ? chatwootBodyMessage : bodyMessage, body.message);
+            if (!fallback || !content || !deliverWithoutMedia(kind, fallback.attempts)) throw error;
+            this.logger.warn(
+              JSON.stringify({
+                event: 'chatwoot_inbound_media_unavailable',
+                instanceId: instance.instanceId,
+                kind,
+                attempts: fallback.attempts,
+              }),
+            );
+            fallback.used = true;
+            const send = await this.createMessage(
+              instance,
+              getConversation,
+              content,
+              messageType,
+              false,
+              [],
+              body,
+              'WAID:' + body.key.id,
+              quotedMsg,
+              clientSent,
+            );
+            if (!send) {
+              this.logger.warn('message not sent');
+              return;
+            }
+            return send;
+          }
 
           let nameFile: string;
           const messageBody = body?.message[body?.messageType];
@@ -5889,14 +5947,6 @@ export class ChatwootService {
           }
 
           const fileData = Buffer.from(downloadBase64.base64, 'base64');
-          if (this.durableInboundBodies.has(body)) {
-            const native = nativeCachedMediaPayload(body);
-            if (
-              fileData.length !== native.size ||
-              !createHash('sha256').update(fileData).digest().equals(native.digest)
-            )
-              throw new Error('InboundNativeMediaBytesUnconfirmed');
-          }
 
           const fileStream = new Readable();
           fileStream._read = () => {};
