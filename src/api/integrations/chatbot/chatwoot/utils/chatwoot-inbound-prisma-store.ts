@@ -1,6 +1,6 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 
-import { InboundAck, InboundDelivery, InboundStore, InboundTerminalState } from './chatwoot-inbound-queue';
+import { InboundAck, InboundDelivery, InboundLane, InboundStore, InboundTerminalState } from './chatwoot-inbound-queue';
 
 // This delegate is generated from both supported provider schemas at image build time.
 interface Delegate {
@@ -114,12 +114,18 @@ export class ChatwootInboundPrismaStore implements InboundStore {
       ).count === 1
     );
   }
-  async fail(id: string, owner: string, state: InboundTerminalState, errorClass: string) {
+  async fail(id: string, owner: string, state: InboundTerminalState, errorClass: string, lane?: InboundLane) {
     return (
       (
         await this.rows.updateMany({
           where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
-          data: { state, lastErrorClass: errorClass.slice(0, 100), leaseOwner: null, leaseExpiresAt: null },
+          data: {
+            state,
+            lastErrorClass: errorClass.slice(0, 100),
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            ...(lane ? { result: { terminal: state, lane } } : {}),
+          },
         })
       ).count === 1
     );

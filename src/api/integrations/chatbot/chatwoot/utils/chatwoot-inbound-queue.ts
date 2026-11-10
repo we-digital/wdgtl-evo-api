@@ -32,9 +32,17 @@ export interface InboundStore {
   finish(id: string, owner: string, ack: InboundAck): Promise<boolean>;
   defer(id: string, owner: string, errorClass: string, until: Date): Promise<void>;
   // Terminal, visible end state: the row leaves the retry lanes with its reason kept.
-  fail(id: string, owner: string, state: InboundTerminalState, errorClass: string): Promise<boolean>;
+  // The lane is kept so recovery can requeue a closed row into its original lane.
+  fail(
+    id: string,
+    owner: string,
+    state: InboundTerminalState,
+    errorClass: string,
+    lane?: InboundLane,
+  ): Promise<boolean>;
 }
 export type InboundTerminalState = 'failed' | 'ignored';
+export type InboundLane = 'live' | 'history';
 export const INBOUND_ACTIVE_STATES = ['pending', 'history_pending'] as const;
 
 // Bounded retry: quick retries for transient receiver errors, then a slow
@@ -268,7 +276,7 @@ export class ChatwootInboundQueue {
     if (this.stopped || !(await this.store.claim(item.id, this.owner, now, new Date(now.getTime() + this.leaseMs))))
       return;
     const attempts = item.attempts + 1;
-    const lane = item.state === 'history_pending' ? 'history' : 'live';
+    const lane: InboundLane = item.state === 'history_pending' ? 'history' : 'live';
     let lost = false;
     let renewing = false;
     const heartbeat = setInterval(
@@ -331,7 +339,7 @@ export class ChatwootInboundQueue {
       const age = at - new Date(item.createdAt ?? at).getTime();
       const terminal: InboundTerminalState | undefined =
         terminalErrors[errorClass] ?? (age >= this.failAfterMs ? 'failed' : undefined);
-      if (terminal && !lost && (await this.store.fail(item.id, this.owner, terminal, errorClass))) {
+      if (terminal && !lost && (await this.store.fail(item.id, this.owner, terminal, errorClass, lane))) {
         if (terminal === 'failed') (this.latencies[lane] ??= { provider: [], queue: [], failed: 0 }).failed++;
         this.observe(terminal === 'failed' ? 'chatwoot_inbound_failed' : 'chatwoot_inbound_ignored', {
           instanceId: item.instanceId,

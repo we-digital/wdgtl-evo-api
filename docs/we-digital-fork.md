@@ -1354,3 +1354,21 @@ up to 9,275. Causes and changes:
   WhatsApp timestamp to confirmed and ledger-commit to confirmed per lane every
   minute. Exactly-once is unchanged: every attempt still reads receiver owners
   before any POST.
+
+### 2026-11-10 inbound recovery tool (stage 4)
+
+`node dist/chatwoot-inbound-recovery.js` (inside the evo-api container) reads
+`pending`, `history_pending` and `failed` ledger rows and their native
+`Message` rows and predicts, with the delivery rules, whether each row will
+deliver, confirm an existing Chatwoot owner, deliver from its frozen payload,
+close as transport, or stay blocked. The default is a read-only report of
+aggregates (masked instance hashes, no ids, peers, names or text) with a plan
+hash. `--apply --confirm=<planHash>` requeues exactly that plan: each row
+returns to its own lane (`history_pending` stays history and goes through the
+silent importer), `nextAttemptAt` is spaced oldest WhatsApp timestamp first,
+and the update is a CAS on state, attempts and an expired lease. Requeued rows
+carry `InboundReceiverRecoveryRequeued`, which keeps them on the verified
+receiver path (owner read before any POST), so a message Chatwoot already has
+is confirmed, not created again. Filters: `--states=`, `--instances=`,
+`--exclude-instances=`, `--errors=`. Terminal failures now keep their lane in
+`result`; rows closed before that infer it from the WhatsApp-to-commit gap.
