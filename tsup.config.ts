@@ -3,8 +3,12 @@ import { cpSync } from 'node:fs';
 import { defineConfig } from 'tsup';
 
 export default defineConfig({
-  // Production and package.json execute only this CommonJS entrypoint.
-  entry: ['src/main.ts'],
+  // Production and package.json execute main; the recovery tool is an
+  // operator-run entrypoint (node dist/chatwoot-inbound-recovery.js).
+  entry: {
+    main: 'src/main.ts',
+    'chatwoot-inbound-recovery': 'src/scripts/chatwoot-inbound-recovery.ts',
+  },
   outDir: 'dist',
   splitting: false,
   sourcemap: true,
