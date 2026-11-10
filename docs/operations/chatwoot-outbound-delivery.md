@@ -36,8 +36,14 @@ duplicate WhatsApp messages.
   message, contact and contact-inbox source) and the physical EVO
   receiver/instance binding are captured at enqueue. One compact authoritative
   exact-message snapshot validates the route, relationship, destination and
-  message during preparation, and a second fresh snapshot revalidates every
-  mutable delivery field immediately before transport. The callback uses the
+  message during preparation, and the transport fence revalidates every
+  mutable delivery field immediately before transport: it reuses the same
+  claim's preparation snapshot only while that snapshot's request started at
+  most `CHATWOOT_OUTBOUND_FENCE_SNAPSHOT_MAX_AGE_MS` ago (default 1500, max
+  5000, `0` always re-reads) and the re-read instance and provider rows
+  (including the provider's `updatedAt`), the derived route binding and the
+  exact local socket object are unchanged; otherwise it performs a second
+  fresh exact read as before. The callback uses the
   snapshot fingerprint stored by the transport fence in Chatwoot's conditional
   PATCH contract; legacy retained rows without that context perform one
   fail-closed reverse preflight. Reassignment, rename, or any other binding mismatch
@@ -245,11 +251,27 @@ digest only after the staging evidence is accepted.
   delay (1.2 s / 0.5–2 s), like queued text.
 - Exact-WAID reconciliation of a still unresolved `ambiguous`/`quarantined`
   row backs off by claim generation up to the five-minute cap.
+- The pre-transport wait used to be dominated by the transport fence's second
+  exact Chatwoot read (one Chatwoot round trip, 0.3–0.7 s in production),
+  repeated milliseconds after the preparation read of the same claim. The fence
+  now reuses that fresh snapshot (see above) and only re-reads the two local
+  binding rows.
+- Baileys memoizes positive single-recipient resolutions (contact and
+  `IsOnWhatsapp` reads, a possible USync `onWhatsApp` query, or group metadata
+  and picture for groups) per socket for five minutes. The memo is cleared on
+  every connection change and an entry is dropped after any failed send to it;
+  negative results are never memoized. An `IsOnWhatsapp` row that WhatsApp
+  just re-verified now renews its `updatedAt`, so a row older than
+  `DATABASE_SAVE_IS_ON_WHATSAPP_DAYS` no longer forces a USync query on every
+  later send.
 - `chatwoot_outbound_latency` is logged at INFO every 60 seconds when anything
-  was sent: `sent`, and p50/p95 for `total` (webhook receipt to WhatsApp relay),
+  was sent: `sent`, `fenceReused` (sends whose fence reused the preparation
+  snapshot), and p50/p95 for `total` (webhook receipt to WhatsApp relay),
   `receiptToClaim`, `validation` (first exact snapshot), `preTransport`
-  (recipient/quote preparation plus the transport-fence snapshot), `transport`
-  (relay) and `messageToReceipt` (Chatwoot `created_at` to receipt).
+  (validation to relay start) split into `preparation` (readiness and
+  recipient/quote/media preparation) and `fence` (transport-fence
+  revalidation), `transport` (relay) and `messageToReceipt` (Chatwoot
+  `created_at` to receipt).
 
 ## Privacy-safe observation
 

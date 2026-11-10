@@ -1399,6 +1399,46 @@ test('reports webhook-to-sent latency percentiles per window', async () => {
   assert.equal(typeof reports[0].metrics.transportP95Ms, 'number');
 });
 
+test('passes the preparation context to the transport fence and reports its phases', async () => {
+  const store = new MemoryStore();
+  const events: { event: string; metrics: Record<string, unknown> }[] = [];
+  store.operation.webhookReceivedAt = new Date(Date.now() - 500);
+  const prepared = { prepared: 'snapshot' };
+  let fenceContext: unknown;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => ({ validation: 'valid', context: prepared }),
+      revalidateTransport: async (_operation, _signal, context) => {
+        fenceContext = context;
+        return { validation: 'valid', providerContext: { snapshot: true }, snapshotReused: true };
+      },
+      send: async (operation, _context, onTransportStart, _signal, onTransportComplete) => {
+        await onTransportStart();
+        await onTransportComplete({ whatsappMessageId: operation.plannedWhatsappMessageId, result: null });
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+      observe: (event, metrics) => events.push({ event, metrics }),
+    }),
+  );
+
+  await queue.runOnce('transport');
+  queue.reportLatency();
+  assert.equal(fenceContext, prepared);
+  const sent = events.find(({ event }) => event === 'chatwoot_outbound_transport_sent');
+  assert.equal(sent?.metrics.fenceReused, 1);
+  assert.equal(typeof sent?.metrics.preparationMs, 'number');
+  assert.equal(typeof sent?.metrics.fenceMs, 'number');
+  const report = events.find(({ event }) => event === 'chatwoot_outbound_latency');
+  assert.equal(report?.metrics.fenceReused, 1);
+  assert.equal(typeof report?.metrics.preparationP50Ms, 'number');
+  assert.equal(typeof report?.metrics.fenceP95Ms, 'number');
+  assert.ok(
+    (report?.metrics.preparationP50Ms as number) + (report?.metrics.fenceP50Ms as number) <=
+      (report?.metrics.preTransportP50Ms as number) + 1,
+  );
+});
+
 test('shares one expired-lease recovery pass across claims within the interval', async () => {
   const store = new MemoryStore('completed');
   const queue = new ChatwootOutboundQueue(store, validHandler());
