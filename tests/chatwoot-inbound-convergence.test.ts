@@ -449,3 +449,22 @@ test('history of one instance runs one delivery at a time (the stored-history im
   assert.equal([...store.rows.values()].filter((r) => r.state === 'confirmed').length, 6);
   await queue.stop();
 });
+
+test('a present-but-unverifiable receiver owner closes as already_present and is never reopened by a notify', async () => {
+  const store = new Ledger();
+  const events: string[] = [];
+  const queue = new ChatwootInboundQueue(
+    store,
+    async () => {
+      throw new Error('InboundReceiverPresentUnverified');
+    },
+    (event) => events.push(event),
+  );
+  const item = row('present');
+  await queue.submit(item);
+  assert.equal(store.rows.get(item.id)!.state, 'already_present');
+  assert.deepEqual(events, ['chatwoot_inbound_already_present']);
+  assert.equal(await queue.submit(item), undefined);
+  assert.equal(store.rows.get(item.id)!.attempts, 1);
+  await queue.stop();
+});

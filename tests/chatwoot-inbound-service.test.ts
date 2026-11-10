@@ -47,6 +47,11 @@ import {
   mediaFailureKind,
   mediaUnavailableContent,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-media-unavailable';
+import {
+  chatwootErrorFields,
+  inboundPresentUnverifiedClasses,
+  inboundReceiverHttpError,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-receiver-errors';
 import { extractWhatsappReplyStanzaId } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
 import { requireTrustedChatwootUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
@@ -94,6 +99,9 @@ function literalService() {
     inboundSourceCandidates,
     inboundSourceIdentityHash,
     isInboundTransportOnly,
+    chatwootErrorFields,
+    inboundPresentUnverifiedClasses,
+    inboundReceiverHttpError,
     deliverWithoutMedia,
     mediaFailureKind,
     mediaUnavailableContent,
@@ -415,7 +423,8 @@ test('native pointer contradiction is not overwritten after unique receiver read
 test('contradictory recorded source payload hash holds even when rendered text matches', async () => {
   const f = fixture();
   f.rows = [{ ...f.owner(), content_attributes: { we_digital_ingress: { source_payload_sha256: 'f'.repeat(64) } } }];
-  await assert.rejects(f.service.deliverQueuedInbound(f.item), /PayloadUnconfirmed/);
+  // Present in the same inbox with the right identity but an unprovable stamp: closed, never confirmed or POSTed.
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverPresentUnverified/);
   assert.equal(f.creates, 0);
 });
 test('bounded native selection refuses overflow rather than assuming an unseen version matches', async () => {
@@ -449,7 +458,9 @@ for (const mode of ['ack', 'timeout', '502'])
         },
       },
     });
-    f.service.configService = { get: () => ({ TRUSTED_BASE_URL: 'https://cw.synthetic' }) };
+    f.service.configService = {
+      get: () => ({ TRUSTED_BASE_URL: 'https://cw.synthetic', NATIVE_BRIDGE_TOKEN: 'synthetic-bridge-token' }),
+    };
     f.service.getReplyToIds = async () => ({ in_reply_to_external_id: 'WAID:parent' });
     f.service.ingressAttributes = async () => ({
       we_digital_ingress: { source_payload_sha256: inboundPayloadHash(body) },
@@ -463,6 +474,8 @@ for (const mode of ['ack', 'timeout', '502'])
       assert.equal(config.timeout, 30000);
       assert.equal(config.maxRedirects, 0);
       assert.equal(config.headers['api-access-token'], 'synthetic-test-token');
+      // Without the bridge credential Chatwoot answers a replay with a 422 unique violation.
+      assert.equal(config.headers['X-Chatwoot-Native-Bridge-Token'], 'synthetic-bridge-token');
       assert.equal(data.source_id, 'WAID:A');
       assert.equal(data.message_type, 'incoming');
       assert.equal(data.private, false);
@@ -1244,7 +1257,7 @@ test('existing receiver row stamped from the frozen payload encoding confirms wi
   // A stamp from some other source still refuses.
   const g = encodedFixture();
   g.rows = [{ ...g.owner(), content_attributes: { we_digital_ingress: { source_payload_sha256: 'f'.repeat(64) } } }];
-  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundReceiverPayloadUnconfirmed/);
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundReceiverPresentUnverified/);
   assert.equal(g.creates, 0);
 });
 
@@ -1281,6 +1294,8 @@ test('a reaction row stored under the same key is not a content source (was Inbo
 function idempotentReceiver(f: ReturnType<typeof fixture>, advertised: unknown = '2026-11-10') {
   let capabilityReads = 0;
   f.service.configService = { get: () => ({ INBOUND_RECEIVER_IDEMPOTENCY: true }) };
+  // The fast path is for first attempts only.
+  f.item.attempts = 0;
   f.service.providerConversationRequest = async (_provider: any, method: string, data: any) => {
     assert.equal(method, 'GET');
     assert.equal(JSON.stringify(data), JSON.stringify({ inbox_id: 42 }));
@@ -1423,5 +1438,67 @@ test('a placeholder-looking owner with an attachment, or other text, is not take
   f.rows = [{ ...f.owner(), content: '[Photo — file no longer available]', attachments: 0 }];
   assert.equal((await f.service.deliverQueuedInbound(f.item)).media_unavailable, true);
   f.rows = [{ ...f.owner(), content: 'different', attachments: 0 }];
-  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverMediaUnconfirmed/);
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverPresentUnverified/);
+});
+
+// Prod 2026-11-10: requeued rows looped on AxiosError (Chatwoot 422 RecordNotUnique)
+// because the durable POST lacked the bridge credential and every retry skipped the owner read.
+test('a retry reads receiver owners first and confirms an existing message without POSTing', async () => {
+  for (const setup of [(f: any) => (f.item.attempts = 186), (f: any) => (f.item.lastErrorClass = 'AxiosError')]) {
+    const f = fixture();
+    f.service.configService = { get: () => ({ INBOUND_RECEIVER_IDEMPOTENCY: true }) };
+    f.service.providerConversationRequest = async () => ({ message_source_idempotency_contract_version: '2026-11-10' });
+    f.item.attempts = 0;
+    setup(f);
+    f.rows = [f.owner()];
+    const ack = await f.service.deliverQueuedInbound(f.item);
+    assert.equal(ack.id, 9);
+    assert.equal(ack.receiver_path, 'verified');
+    assert.equal(f.creates, 0);
+  }
+});
+
+test('receiver POST failures become ledger classes with status-specific retry semantics', async () => {
+  const axiosError = (status?: number, error?: string) =>
+    Object.assign(new Error('Request failed'), {
+      name: 'AxiosError',
+      isAxiosError: true,
+      ...(status
+        ? { response: { status, data: { error, message: 'Jane +62 811 personal text' } } }
+        : { code: 'ECONNRESET' }),
+    });
+  for (const [error, expected] of [
+    [axiosError(409, 'whatsapp_source_conflict'), /InboundReceiverSourceConflict/],
+    [axiosError(422, 'Validation failed'), /InboundReceiverRejected/],
+    [axiosError(502), /InboundReceiverUnavailable/],
+    [axiosError(), /InboundReceiverUnreachable/],
+  ] as const) {
+    const f = fixture();
+    f.service.processWhatsappEvent = async () => {
+      throw error;
+    };
+    await assert.rejects(f.service.deliverQueuedInbound(f.item), expected);
+  }
+  const fields = chatwootErrorFields(axiosError(409, 'whatsapp_source_conflict'));
+  assert.deepEqual(fields, { errorClass: 'AxiosError', status: 409, code: 'whatsapp_source_conflict' });
+  assert.deepEqual(chatwootErrorFields(axiosError(422, 'Validation failed: Jane')), {
+    errorClass: 'AxiosError',
+    status: 422,
+  });
+  assert.deepEqual(chatwootErrorFields(axiosError()), { errorClass: 'AxiosError', networkCode: 'ECONNRESET' });
+  assert.equal(JSON.stringify(chatwootErrorFields(axiosError(422, 'x'))).includes('Jane'), false);
+  assert.equal(inboundReceiverHttpError(new Error('plain')), null);
+});
+
+test('an owner already present but unverifiable is reported as present, without POST or pointer writes', async () => {
+  const f = fixture();
+  f.rows = [{ ...f.owner(), content: 'edited later in Chatwoot' }];
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverPresentUnverified/);
+  assert.equal(f.creates, 0);
+  assert.equal(f.updates.length, 0);
+  assert.ok(inboundPresentUnverifiedClasses.has('InboundReceiverContentChanged'));
+  // Identity mismatches are not "present": they still refuse as before.
+  const g = fixture();
+  g.rows = [{ ...g.owner(), private: true }];
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /IdentityMismatch/);
 });

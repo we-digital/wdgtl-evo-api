@@ -41,7 +41,8 @@ export interface InboundStore {
     lane?: InboundLane,
   ): Promise<boolean>;
 }
-export type InboundTerminalState = 'failed' | 'ignored';
+// already_present: the receiver inbox owns this source; it is never POSTed again.
+export type InboundTerminalState = 'failed' | 'ignored' | 'already_present';
 export type InboundLane = 'live' | 'history';
 export const INBOUND_ACTIVE_STATES = ['pending', 'history_pending'] as const;
 
@@ -59,6 +60,7 @@ export function inboundRetryDelayMs(attempts: number): number {
 // closed immediately with its reason instead of retrying for a day.
 const terminalErrors: Record<string, InboundTerminalState> = {
   InboundTransportOnly: 'ignored',
+  InboundReceiverPresentUnverified: 'already_present',
   InboundHistoryRouteIgnored: 'ignored',
   InboundPayloadTooLarge: 'failed',
   InboundStoredSourceChanged: 'failed',
@@ -166,7 +168,7 @@ export class ChatwootInboundQueue {
     // The database commit precedes all receiver reads/writes; no in-memory retry receipt substitutes for it.
     const stored = await this.store.enqueue(item);
     if (stored.state === 'confirmed') return stored.result ?? undefined;
-    if (stored.state === 'failed' || stored.state === 'ignored') return undefined;
+    if (stored.state === 'failed' || stored.state === 'ignored' || stored.state === 'already_present') return undefined;
     return this.attempt(stored) ?? Promise.resolve(undefined);
   }
   start() {
@@ -342,7 +344,7 @@ export class ChatwootInboundQueue {
         terminalErrors[errorClass] ?? (age >= this.failAfterMs ? 'failed' : undefined);
       if (terminal && !lost && (await this.store.fail(item.id, this.owner, terminal, errorClass, lane))) {
         if (terminal === 'failed') (this.latencies[lane] ??= { provider: [], queue: [], failed: 0 }).failed++;
-        this.observe(terminal === 'failed' ? 'chatwoot_inbound_failed' : 'chatwoot_inbound_ignored', {
+        this.observe(`chatwoot_inbound_${terminal}`, {
           instanceId: item.instanceId,
           lane,
           errorClass,

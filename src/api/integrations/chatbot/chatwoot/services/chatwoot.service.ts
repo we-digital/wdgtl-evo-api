@@ -173,6 +173,11 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reactions';
 import { buildExternalReadRequest } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-read-state';
 import {
+  chatwootErrorFields,
+  inboundPresentUnverifiedClasses,
+  inboundReceiverHttpError,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-receiver-errors';
+import {
   chatwootReplyReferences,
   compactReplyToIds,
   extractWhatsappReplyStanzaId,
@@ -2140,7 +2145,16 @@ export class ChatwootService {
               `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
             ),
             request.data,
-            { headers: { 'api-access-token': provider.token }, timeout: 30_000, maxRedirects: 0 },
+            {
+              // The bridge credential engages Chatwoot's create-or-return-existing
+              // by (inbox_id, source_id); without it a replay is a 422 unique violation.
+              headers: {
+                'api-access-token': provider.token,
+                'X-Chatwoot-Native-Bridge-Token': this.configService.get<Chatwoot>('CHATWOOT').NATIVE_BRIDGE_TOKEN,
+              },
+              timeout: 30_000,
+              maxRedirects: 0,
+            },
           )
         ).data
       : await client.messages.create(request);
@@ -2340,16 +2354,18 @@ export class ChatwootService {
       const binding = await this.assertSilentHistoryMediaCapability(instance, provider, recovery.inboxId);
       data.append('provider_receiver_fingerprint', binding.receiver_fingerprint);
     }
+    const durable = !recovery && this.durableInboundBodies.has(messageBody);
     const config = {
       method: 'post',
       maxBodyLength: Infinity,
-      url: recovery
-        ? requireTrustedChatwootUrl(
-            provider.url,
-            this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL,
-            `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
-          )
-        : `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+      url:
+        recovery || durable
+          ? requireTrustedChatwootUrl(
+              provider.url,
+              this.configService.get<Chatwoot>('CHATWOOT').TRUSTED_BASE_URL,
+              `/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
+            )
+          : `${provider.url}/api/v1/accounts/${provider.accountId}/conversations/${conversationId}/messages`,
       ...(recovery || this.durableInboundBodies.has(messageBody) ? { timeout: 30_000, maxRedirects: 0 } : {}),
       headers: {
         'api-access-token': provider.token,
@@ -2359,7 +2375,9 @@ export class ChatwootService {
               'X-Chatwoot-History-Import': '1',
               'X-Chatwoot-History-Inbox-Id': String(recovery.inboxId),
             }
-          : {}),
+          : durable
+            ? { 'X-Chatwoot-Native-Bridge-Token': this.configService.get<Chatwoot>('CHATWOOT').NATIVE_BRIDGE_TOKEN }
+            : {}),
         ...data.getHeaders(),
       },
       data: data,
@@ -2374,6 +2392,8 @@ export class ChatwootService {
       return recovery ? { message: data, expectedContentAttributes } : data;
     } catch (error) {
       if (recovery) throw new Error('cached_media_import_write_outcome_unconfirmed');
+      // A durable delivery needs the receiver outcome (status/code), not a silent null.
+      if (durable) throw error;
       this.logger.error(error);
     }
   }
@@ -5635,14 +5655,25 @@ export class ChatwootService {
     // Fast path: the receiver itself returns the existing message for a replayed
     // (inbox_id, source_id), so the pre-POST owner read is skipped. Any earlier
     // receiver-side refusal or unconfirmed outcome goes back to the verified path.
+    // Only a first attempt takes it: every retry reads receiver owners first,
+    // so an existing message is confirmed instead of being POSTed again.
     const idempotent =
-      !String(item.lastErrorClass ?? '').startsWith('InboundReceiver') &&
-      (await this.receiverIdempotent(provider, Number(inbox.id)));
+      item.attempts === 0 && !item.lastErrorClass && (await this.receiverIdempotent(provider, Number(inbox.id)));
     return (async () => {
       const before = idempotent ? [] : await owners();
       let ack;
-      if (before.length) ack = await confirm(before);
-      else {
+      if (before.length) {
+        try {
+          ack = await confirm(before);
+        } catch (error) {
+          // The same inbox already owns exactly this source with the right identity
+          // (account, inbox, routed conversation, direction, peer), but its content
+          // or payload stamp cannot be proven. Never POST again; close it visibly.
+          if (error instanceof Error && inboundPresentUnverifiedClasses.has(error.message))
+            throw new Error('InboundReceiverPresentUnverified');
+          throw error;
+        }
+      } else {
         this.durableInboundBodies.add(body);
         if (!item.fromMe)
           this.inboundCanonicalContexts.set(body, {
@@ -5661,6 +5692,8 @@ export class ChatwootService {
         this.inboundMediaFallbacks.set(body, { attempts: item.attempts, used: false });
         try {
           sent = await this.processWhatsappEvent('messages.upsert', instance, body);
+        } catch (error) {
+          throw inboundReceiverHttpError(error) ?? error;
         } finally {
           this.inboundCanonicalContexts.delete(body);
           this.durableInboundBodies.delete(body);
@@ -6377,7 +6410,7 @@ export class ChatwootService {
         }
       }
     } catch (error) {
-      this.logger.error(JSON.stringify({ event: 'chatwoot_ingress_failed', errorClass: error?.name || 'Error' }));
+      this.logger.error(JSON.stringify({ event: 'chatwoot_ingress_failed', ...chatwootErrorFields(error) }));
       if (event === 'messages.edit' || event === 'send.message.update') throw error;
       if ((event === 'messages.upsert' || event === 'send.message') && this.isDurableInboundBody(body)) throw error;
     }
