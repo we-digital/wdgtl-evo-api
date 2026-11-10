@@ -62,14 +62,29 @@ test('received batches use bounded atomic writes; replay preserves live ownershi
 
 });
 
-test('indexed due lanes reserve history progress without increasing eight-row fetch or two-writer contract', async () => {
+test('indexed due lanes put fresh live rows ahead of live retries, and history only fills what live leaves', async () => {
   const calls: any[] = [];
+  const rows: Record<string, any[]> = {
+    fresh: [{ id: 'live-new' }],
+    retry: [{ id: 'live-retry' }],
+    history: [{ id: 'history' }],
+  };
   const store = new ChatwootInboundPrismaStore({chatwootInboundDelivery:{findMany:async (args:any) => {
-    calls.push(args); return args.where.state === 'pending' ? [{id:'live-a'},{id:'live-b'}] : [{id:'history'}];
+    calls.push(args);
+    if (args.where.state === 'history_pending') return rows.history.slice(0, args.take);
+    return (args.where.attempts === 0 ? rows.fresh : rows.retry).slice(0, args.take);
   }}} as any);
-  assert.deepEqual((await store.due(new Date(),8)).map(row=>row.id),['live-a','history','live-b']);
-  assert.deepEqual(calls.map(call=>call.take),[7,1]);
+  assert.deepEqual((await store.due(new Date(),8)).map(row=>row.id),['live-new','live-retry','history']);
+  assert.deepEqual(calls.map(call=>[call.where.state, call.where.attempts ?? null, call.take]),[
+    ['pending', 0, 8], ['pending', { gt: 0 }, 7], ['history_pending', null, 6],
+  ]);
   assert.ok(calls.every(call=>call.where.nextAttemptAt && call.where.OR && call.orderBy));
+  // A full live window leaves no history fetch at all.
+  calls.length = 0;
+  rows.fresh = Array.from({ length: 8 }, (_, i) => ({ id: 'live-' + i }));
+  assert.equal((await store.due(new Date(), 8)).length, 8);
+  assert.deepEqual(calls.map(call=>call.where.state), ['pending']);
+  assert.equal((await store.due(new Date(), 500)).length <= 50, true);
 });
 
 const text = fs.readFileSync('src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts','utf8');

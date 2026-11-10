@@ -32,8 +32,13 @@ import {
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 
 import {
+  canonicalInboundBody,
+  inboundAcceptedSourceHashes,
   inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
+  inboundSourceCandidates,
+  inboundSourceIdentityHash,
+  isInboundTransportOnly,
   resolveInboundNativeBody,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 
@@ -79,6 +84,10 @@ function literalService() {
     inboundHistoryDocumentProjection,
     inboundNativeSnapshot,
     resolveInboundNativeBody,
+    inboundAcceptedSourceHashes,
+    inboundSourceCandidates,
+    inboundSourceIdentityHash,
+    isInboundTransportOnly,
     isLidJid,
       isGroupJid,
     isChatwootLinkedClientSentEvent,
@@ -1088,7 +1097,8 @@ test('incoming image sender-key retransmission retains the exact original image 
   f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), structuredClone(copy)];
   f.service.processWhatsappEvent = async (_event: string, _instance: any, body: any) => {
     assert.equal(body.messageTimestamp, f.item.payload.messageTimestamp);
-    assert.equal(JSON.stringify(body.message), JSON.stringify(f.item.payload.message));
+    // Same image, delivered in the persisted base64 byte encoding Baileys can decrypt.
+    assert.equal(JSON.stringify(body.message), JSON.stringify(canonicalInboundBody(f.item.payload).message));
     f.rows = [
       {
         ...f.owner(),
@@ -1148,3 +1158,110 @@ for (const change of [
     assert.throws(() => resolveInboundNativeBody(sources, stored), /Ambiguous/);
   });
 }
+
+// Prod 2026-11-10: the persisted Message row keeps protobuf bytes as base64,
+// the frozen ledger payload as numeric-key objects (JSON of a Uint8Array).
+function numericBytes(base64: string) {
+  return Object.fromEntries([...Buffer.from(base64, 'base64')].map((byte, i) => [String(i), byte]));
+}
+function encodedFixture() {
+  const f = fixture();
+  f.native.message = {
+    conversation: 'synthetic',
+    messageContextInfo: { messageSecret: Buffer.alloc(32, 7).toString('base64') },
+  };
+  f.item.payload = structuredClone(f.native);
+  f.item.payload.message.messageContextInfo.messageSecret = numericBytes(f.native.message.messageContextInfo.messageSecret);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  assert.notEqual(inboundPayloadHash(f.native), f.item.payloadHash);
+  return f;
+}
+
+test('history delivery finds the base64 native row for a numeric-key frozen payload (was InboundNativeSourceAmbiguous)', async () => {
+  const f = encodedFixture();
+  (f.provider as any).importMessages = true;
+  f.item.state = 'history_pending';
+  f.service.getStoredHistoryRecoveryInbox = async () => ({ id: 42 });
+  f.rows = [{ ...f.owner(), display_id: 77, created_at_epoch: f.native.messageTimestamp }];
+  let imported: any = null;
+  f.service.syncStoredHistoryRecoveryBatch = async (_instance: any, batch: any) => {
+    imported = batch.messages[0].message;
+    return {
+      skippedMessages: 0,
+      placeholderMessages: 0,
+      outcomes: [{ sourceId: f.item.sourceId, status: 'imported' }],
+      nativeBindings: [{ sourceId: f.item.sourceId, status: 'bound', messageId: 9, conversationId: 77 }],
+    };
+  };
+  f.service.prismaRepository.message.findUnique = async () => ({
+    ...f.native,
+    chatwootMessageId: 9,
+    chatwootInboxId: 42,
+    chatwootConversationId: 77,
+  });
+  assert.deepEqual({ ...(await f.service.deliverQueuedInbound(f.item)) }, { id: 9, inbox_id: 42, conversation_id: 77 });
+  // The importer receives the native row itself, not the frozen payload encoding.
+  assert.equal(imported.id, 'native-A');
+});
+
+test('history delivery closes sender-key-only blank copies as transport, without importer writes', async () => {
+  const f = fixture();
+  (f.provider as any).importMessages = true;
+  f.item.state = 'history_pending';
+  f.native.message = { conversation: '', senderKeyDistributionMessage: { groupId: f.item.peer, axolotlSenderKeyDistributionMessage: 'AQID' } };
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.syncStoredHistoryRecoveryBatch = async () => assert.fail('no importer write');
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundTransportOnly/);
+  f.item.state = 'pending';
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundTransportOnly/);
+  assert.equal(f.creates, 0);
+});
+
+test('existing receiver row stamped from the frozen payload encoding confirms without another POST (was ReceiverPayloadUnconfirmed)', async () => {
+  const f = encodedFixture();
+  f.rows = [
+    {
+      ...f.owner(),
+      content_attributes: { we_digital_ingress: { source_payload_sha256: f.item.payloadHash } },
+    },
+  ];
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(f.creates, 0);
+  // A stamp from some other source still refuses.
+  const g = encodedFixture();
+  g.rows = [{ ...g.owner(), content_attributes: { we_digital_ingress: { source_payload_sha256: 'f'.repeat(64) } } }];
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundReceiverPayloadUnconfirmed/);
+  assert.equal(g.creates, 0);
+});
+
+test('a native row never written after the ledger commit delivers from the frozen payload; another row under the key still refuses', async () => {
+  const f = fixture();
+  f.service.prismaRepository.message.findMany = async () => [];
+  f.service.prismaRepository.message.count = async () => 0;
+  assert.equal((await f.service.deliverQueuedInbound(f.item)).id, 9);
+  assert.equal(f.creates, 1);
+  const g = fixture();
+  g.service.prismaRepository.message.findMany = async () => [];
+  g.service.prismaRepository.message.count = async () => 1;
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundNativeSourceUnavailable/);
+  assert.equal(g.creates, 0);
+});
+
+test('a reaction row stored under the same key is not a content source (was InboundNativeSourceAmbiguous)', async () => {
+  const f = fixture();
+  const reaction = {
+    ...structuredClone(f.native),
+    id: 'native-reaction',
+    messageType: 'reactionMessage',
+    message: { reactionMessage: { key: f.native.key, text: 'x' } },
+  };
+  f.service.prismaRepository.message.findMany = async () => [structuredClone(f.native), structuredClone(reaction)];
+  assert.equal((await f.service.deliverQueuedInbound(f.item)).id, 9);
+  assert.equal(f.creates, 1);
+  assert.deepEqual(
+    f.updates.map((update) => update.where.id),
+    ['native-A'],
+  );
+});

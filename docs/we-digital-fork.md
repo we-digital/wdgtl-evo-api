@@ -1317,3 +1317,40 @@ its confirmed-contact path. It does not accidentally invoke the independent
 Prisma missing-name lookup through an incomplete fake. Production alias,
 identity, name lookup and message delivery behavior are unchanged. Verify the
 full unit suite and TypeScript/build before releasing the transport-copy change.
+
+### 2026-11-10 inbound ledger convergence (stage 1)
+
+Production held 2,457 undelivered rows (1,938 group messages) with retry counts
+up to 9,275. Causes and changes:
+
+- One source, two byte encodings. The native `Message` row keeps protobuf bytes
+  as base64; the frozen ledger payload keeps JSON of a `Uint8Array`
+  (numeric-key objects). The old normalizer knew only eight field names, so
+  `thumbnailSha256`, `streamingSidecar`, `scansSidecar`, `waveform`, ... and the
+  history path (raw hash `find`) compared different encodings of the same
+  source. `canonicalInboundBody` converts every byte shape; source identity
+  (`inboundSourceIdentityHash`) additionally ignores download locators
+  (`mediaUrl`, media `url`/`directPath`/`mediaKeyTimestamp`). Delivered bodies
+  use base64 bytes, which Baileys can decrypt (numeric `mediaKey` gave
+  `bad decrypt`). Receiver stamps written from either encoding of the same
+  source are accepted; any other stamp still refuses.
+- Sender-key-only blank copies are transport, not messages: not enqueued, and
+  existing rows close as `ignored` (`InboundTransportOnly`). Different content
+  under the same key reopens an `ignored` row.
+- Reaction rows stored under the content key are not content candidates.
+- A native row that was never written (the upsert handler threw after the
+  ledger commit) leaves the frozen payload as the only source; the handler now
+  persists the row even when Chatwoot forwarding fails. A row under the same
+  WhatsApp id with another peer/direction still refuses.
+- The importer-stamp projection covers image/video/audio/sticker, not only
+  documents; full stored-byte SHA/length verification is unchanged.
+- Queue: bounded backoff 2 s, 5 s, 15 s, 30 s, 60 s, then 5 min; after
+  `CHATWOOT_INBOUND_FAIL_AFTER_MS` (24 h) the row becomes `failed` with its
+  `lastErrorClass` and a `chatwoot_inbound_failed` error log. Concurrency
+  `CHATWOOT_INBOUND_CONCURRENCY` (10), one in-flight delivery per
+  instance+peer, history one per instance (importer writer) and at most half
+  the slots. Never-attempted live rows are fetched before live retries, history
+  only fills what live leaves. `chatwoot_inbound_latency` reports p50/p95 of
+  WhatsApp timestamp to confirmed and ledger-commit to confirmed per lane every
+  minute. Exactly-once is unchanged: every attempt still reads receiver owners
+  before any POST.
