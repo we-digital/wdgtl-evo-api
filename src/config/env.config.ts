@@ -340,6 +340,7 @@ export type Chatwoot = {
   OUTBOUND_MAINTENANCE_CONCURRENCY: number;
   INBOUND_CONCURRENCY: number;
   INBOUND_FAIL_AFTER_MS: number;
+  INBOUND_RECEIVER_IDEMPOTENCY: boolean;
   BOT_CONTACT: boolean;
   IMPORT: {
     DATABASE: {
@@ -856,6 +857,7 @@ export class ConfigService {
         OUTBOUND_MAINTENANCE_CONCURRENCY: Number.parseInt(process.env.CHATWOOT_OUTBOUND_MAINTENANCE_CONCURRENCY) || 2,
         INBOUND_CONCURRENCY: Number.parseInt(process.env.CHATWOOT_INBOUND_CONCURRENCY) || 10,
         INBOUND_FAIL_AFTER_MS: Number.parseInt(process.env.CHATWOOT_INBOUND_FAIL_AFTER_MS) || 86_400_000,
+        INBOUND_RECEIVER_IDEMPOTENCY: process.env.CHATWOOT_INBOUND_RECEIVER_IDEMPOTENCY === 'true',
         BOT_CONTACT: !process.env.CHATWOOT_BOT_CONTACT || process.env.CHATWOOT_BOT_CONTACT === 'true',
         IMPORT: {
           DATABASE: {

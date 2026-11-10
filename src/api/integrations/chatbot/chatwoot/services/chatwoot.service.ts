@@ -296,6 +296,7 @@ export class ChatwootService {
   private readonly durableInboundBodies = new WeakSet<object>();
   private readonly inboundCanonicalContexts = new WeakMap<object, InboundCanonicalContext>();
   private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
+  private readonly receiverIdempotencyChecks = new Map<string, { at: number; value: Promise<boolean> }>();
   // Request-local: a durable delivery may fall back to a media-unavailable text.
   private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
 
@@ -552,6 +553,21 @@ export class ChatwootService {
       timeout: 20_000,
       maxRedirects: 0,
     });
+  }
+
+  // Chatwoot advertises create-or-return-existing by (inbox_id, source_id) only
+  // while its partial unique index is valid. Checked at most once a minute per
+  // inbox; any error means the verified path.
+  private async receiverIdempotent(provider: ChatwootModel, inboxId: number): Promise<boolean> {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').INBOUND_RECEIVER_IDEMPOTENCY) return false;
+    const key = `${provider.id}:${provider.accountId}:${inboxId}`;
+    const cached = this.receiverIdempotencyChecks.get(key);
+    if (cached && Date.now() - cached.at < 60_000) return cached.value;
+    const value = this.providerConversationRequest(provider, 'GET', { inbox_id: inboxId })
+      .then((capability) => capability?.message_source_idempotency_contract_version === '2026-11-10')
+      .catch(() => false);
+    this.receiverIdempotencyChecks.set(key, { at: Date.now(), value });
+    return value;
   }
 
   private async providerConversationRequest(
@@ -5588,8 +5604,14 @@ export class ChatwootService {
         ...(mediaUnavailable ? { media_unavailable: true } : {}),
       };
     };
+    // Fast path: the receiver itself returns the existing message for a replayed
+    // (inbox_id, source_id), so the pre-POST owner read is skipped. Any earlier
+    // receiver-side refusal or unconfirmed outcome goes back to the verified path.
+    const idempotent =
+      !String(item.lastErrorClass ?? '').startsWith('InboundReceiver') &&
+      (await this.receiverIdempotent(provider, Number(inbox.id)));
     return (async () => {
-      const before = await owners();
+      const before = idempotent ? [] : await owners();
       let ack;
       if (before.length) ack = await confirm(before);
       else {
@@ -5668,7 +5690,7 @@ export class ChatwootService {
         });
         if (updated.count !== 1) throw new Error('InboundNativeVersionChanged');
       }
-      return { ...ack, native_source_hash: nativeHash };
+      return { ...ack, native_source_hash: nativeHash, receiver_path: idempotent ? 'idempotent' : 'verified' };
     })();
   }
 

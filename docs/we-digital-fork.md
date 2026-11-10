@@ -1355,6 +1355,20 @@ up to 9,275. Causes and changes:
   minute. Exactly-once is unchanged: every attempt still reads receiver owners
   before any POST.
 
+### 2026-11-10 idempotent receiver fast path (stage 3)
+
+With `CHATWOOT_INBOUND_RECEIVER_IDEMPOTENCY=true`, live delivery skips the
+pre-POST receiver owner read when the inbox capability
+(`GET provider_conversations?inbox_id=`) advertises
+`message_source_idempotency_contract_version: 2026-11-10`. Chatwoot then
+returns the existing message for a replayed `(inbox_id, source_id)` or
+answers 409 for a different owner. The capability is cached for a minute per
+inbox; an error or a missing version means the verified path. The post-POST
+owner confirmation, ack/id match and native pointer CAS are unchanged, and a
+row whose previous attempt ended with an `InboundReceiver*` class always takes
+the verified path. Per-chat ordering comes from the queue. The ledger ack
+records `receiver_path`.
+
 ### 2026-11-10 inbound recovery tool (stage 4)
 
 `node dist/chatwoot-inbound-recovery.js` (inside the evo-api container) reads
