@@ -97,8 +97,12 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  inboundAcceptedSourceHashes,
   inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
+  inboundSourceCandidates,
+  inboundSourceIdentityHash,
+  isInboundTransportOnly,
   resolveInboundNativeBody,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 import { ChatwootInboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
@@ -298,12 +302,22 @@ export class ChatwootService {
     private readonly cache: CacheService,
   ) {
     this.inboundStore = new ChatwootInboundPrismaStore(prismaRepository);
+    const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
     this.inboundQueue = new ChatwootInboundQueue(
       this.inboundStore,
       (item) => this.deliverQueuedInbound(item),
-      (event, fields) => this.logger.info(JSON.stringify({ event, ...fields })),
+      (event, fields) =>
+        event === 'chatwoot_inbound_failed'
+          ? this.logger.error(JSON.stringify({ event, ...fields }))
+          : this.logger.info(JSON.stringify({ event, ...fields })),
+      undefined,
+      120_000,
+      () => new Date(),
+      {
+        concurrency: Math.max(1, Math.min(32, outboundConfig.INBOUND_CONCURRENCY || 10)),
+        failAfterMs: Math.max(3_600_000, outboundConfig.INBOUND_FAIL_AFTER_MS || 86_400_000),
+      },
     );
-    const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
     this.outboundStore = new ChatwootOutboundPrismaStore(prismaRepository, {
       maxWait: Math.max(500, Math.min(30_000, outboundConfig.OUTBOUND_ADMISSION_MAX_WAIT_MS)),
       timeout: Math.max(1_000, Math.min(60_000, outboundConfig.OUTBOUND_ADMISSION_TIMEOUT_MS)),
@@ -5058,6 +5072,8 @@ export class ChatwootService {
 
     if (!this.isDurableInboundBody(body))
       return this.inboundDeliveryFence.run(deliveryKey, () => this.processWhatsappEvent(event, instance, body));
+    // Sender-key-only transport copies are not messages; nothing to deliver.
+    if (isInboundTransportOnly(body)) return null;
     const provider = await this.getProvider(instance);
     if (!provider?.enabled) return null;
     if (
@@ -5095,6 +5111,7 @@ export class ChatwootService {
       enabled &&
       body.messageTimestamp >= since &&
       this.isDurableInboundBody(body) &&
+      !isInboundTransportOnly(body) &&
       allowed.has(inboundDeliveryId(instance.instanceId, body)) &&
       !ignoresHistoryPeer(provider, body, settings?.groupsIgnore)
         ? this.inboundRecord(instance, provider, body, 'history_pending')
@@ -5271,21 +5288,29 @@ export class ChatwootService {
       inboundPayloadHash(item.payload) !== item.payloadHash
     )
       throw new Error('InboundStoredSourceChanged');
-    const sources = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: item.instanceId,
-        AND: [
-          { key: { path: ['id'], equals: item.sourceId.slice(5) } },
-          { key: { path: ['remoteJid'], equals: item.peer } },
-          { key: { path: ['fromMe'], equals: item.fromMe } },
-        ],
-      },
-      take: 3,
-    });
+    if (isInboundTransportOnly(item.payload)) throw new Error('InboundTransportOnly');
+    const sources = inboundSourceCandidates(
+      await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: item.instanceId,
+          AND: [
+            { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+            { key: { path: ['remoteJid'], equals: item.peer } },
+            { key: { path: ['fromMe'], equals: item.fromMe } },
+          ],
+        },
+        take: 3,
+      }),
+      item.payload,
+    );
     if (!sources.length) throw new Error('InboundNativeSourceUnavailable');
     const resolved = resolveInboundNativeBody(sources, item.payload);
-    const source = sources.find((row) => inboundPayloadHash(row) === inboundPayloadHash(resolved));
+    // The resolved body is in the persisted (base64) byte encoding, while the
+    // frozen payload is not: match the native row by encoding-insensitive identity.
+    const identity = inboundSourceIdentityHash(resolved);
+    const source = sources.find((row) => inboundSourceIdentityHash(row) === identity);
     if (!source) throw new Error('InboundNativeSourceAmbiguous');
+    if (isInboundTransportOnly(source)) throw new Error('InboundTransportOnly');
     const settings = await this.prismaRepository.setting.findUnique({ where: { instanceId: item.instanceId } });
     const normalized = await normalizeStoredHistoryMessages(
       [source],
@@ -5378,20 +5403,35 @@ export class ChatwootService {
       inboundPayloadHash(item.payload) !== item.payloadHash
     )
       throw new Error('InboundStoredSourceChanged');
-    const sources = await this.prismaRepository.message.findMany({
-      where: {
-        instanceId: item.instanceId,
-        AND: [
-          { key: { path: ['id'], equals: item.sourceId.slice(5) } },
-          { key: { path: ['remoteJid'], equals: item.peer } },
-          { key: { path: ['fromMe'], equals: item.fromMe } },
-        ],
-      },
-      take: 3,
-    });
-    if (sources.length === 0 && item.attempts > 0) throw new Error('InboundNativeSourceUnavailable');
+    if (isInboundTransportOnly(item.payload)) throw new Error('InboundTransportOnly');
+    const sources = inboundSourceCandidates(
+      await this.prismaRepository.message.findMany({
+        where: {
+          instanceId: item.instanceId,
+          AND: [
+            { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+            { key: { path: ['remoteJid'], equals: item.peer } },
+            { key: { path: ['fromMe'], equals: item.fromMe } },
+          ],
+        },
+        take: 3,
+      }),
+      item.payload,
+    );
+    // A native row that was never written (the upsert handler failed after the
+    // ledger commit) leaves the frozen payload as the only source. A row that
+    // exists under another peer/direction, or was removed, still refuses.
+    if (
+      sources.length === 0 &&
+      item.attempts > 0 &&
+      (await this.prismaRepository.message.count({
+        where: { instanceId: item.instanceId, key: { path: ['id'], equals: item.sourceId.slice(5) } },
+      })) !== 0
+    )
+      throw new Error('InboundNativeSourceUnavailable');
     const nativeSnapshot = inboundNativeSnapshot(sources);
     const body = JSON.parse(JSON.stringify(resolveInboundNativeBody(sources, item.payload)));
+    if (isInboundTransportOnly(body)) throw new Error('InboundTransportOnly');
     if (!this.isDurableInboundBody(body)) throw new Error('InboundNativePayloadUnavailable');
     const nativeHash = inboundPayloadHash(body);
     if (body.message?.ephemeralMessage?.message) body.message = body.message.ephemeralMessage.message;
@@ -5411,6 +5451,16 @@ export class ChatwootService {
       body.key.remoteJidAlt && isLidJid(body.key.remoteJid) ? body.key.remoteJidAlt : body.key.remoteJid,
     );
     const sourceHash = inboundPayloadHash(body);
+    // An earlier attempt may have stamped the receiver row from the frozen
+    // payload encoding (attempt 0 has no native row yet) or from the native row.
+    const acceptedHashes = inboundAcceptedSourceHashes(
+      body,
+      item.payload,
+      ...(item.payload.message?.ephemeralMessage?.message
+        ? [{ ...item.payload, message: item.payload.message.ephemeralMessage.message }]
+        : []),
+      ...sources,
+    );
     const sourceAliases = [item.sourceId, item.sourceId.slice(5)];
     const owners = async () =>
       (
@@ -5477,7 +5527,7 @@ export class ChatwootService {
         (row.content || '') === legacyWhatsappGroupContent(body, rendered, i18next.t('cw.contactMessage.contact'));
       if (!sameContent && !sameLegacyContent) throw new Error('InboundReceiverContentChanged');
       if (
-        attributes?.we_digital_ingress?.source_payload_sha256 !== sourceHash &&
+        !acceptedHashes.has(attributes?.we_digital_ingress?.source_payload_sha256) &&
         (attributes?.we_digital_ingress?.source_payload_sha256 != null || isMedia || typeof rendered !== 'string')
       ) {
         if (!isMedia) throw new Error('InboundReceiverPayloadUnconfirmed');
@@ -5555,17 +5605,20 @@ export class ChatwootService {
         ack = await confirm(await owners());
         if (Number(sent.id) !== ack.id) throw new Error('InboundReceiverAckMismatch');
       }
-      const after = await this.prismaRepository.message.findMany({
-        where: {
-          instanceId: item.instanceId,
-          AND: [
-            { key: { path: ['id'], equals: item.sourceId.slice(5) } },
-            { key: { path: ['remoteJid'], equals: item.peer } },
-            { key: { path: ['fromMe'], equals: item.fromMe } },
-          ],
-        },
-        take: 3,
-      });
+      const after = inboundSourceCandidates(
+        await this.prismaRepository.message.findMany({
+          where: {
+            instanceId: item.instanceId,
+            AND: [
+              { key: { path: ['id'], equals: item.sourceId.slice(5) } },
+              { key: { path: ['remoteJid'], equals: item.peer } },
+              { key: { path: ['fromMe'], equals: item.fromMe } },
+            ],
+          },
+          take: 3,
+        }),
+        item.payload,
+      );
       if (after.length >= 3 || inboundNativeSnapshot(after) !== nativeSnapshot)
         throw new Error('InboundNativeSourceChangedDuringDelivery');
       for (const source of after) {

@@ -1,29 +1,75 @@
 import { normalizeStoredHistoryMessages } from './chatwoot-history-sync';
 import { InboundPayload, inboundPayloadHash } from './chatwoot-inbound-queue';
 
-const transportByteFields = new Set([
-  'axolotlSenderKeyDistributionMessage',
-  'recipientKeyHash',
-  'senderKeyHash',
-  'messageSecret',
-  'fileSha256',
-  'fileEncSha256',
-  'mediaKey',
-  'jpegThumbnail',
-]);
-
-// Prisma persists protobuf bytes as base64; events can serialize Uint8Array as numeric-key objects.
-function transportBytes(value: any, field = ''): any {
-  if (transportByteFields.has(field) && value && typeof value === 'object') {
-    const bytes = value.type === 'Buffer' && Array.isArray(value.data) ? value.data : Object.values(value);
-    const numericKeys = Array.isArray(value.data) || Object.keys(value).every((key, i) => key === String(i));
-    if (numericKeys && bytes.length && bytes.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255))
-      return Buffer.from(bytes).toString('base64');
+// Protobuf bytes reach this bridge in three JSON shapes: base64 strings (the
+// persisted native Message row), numeric-key objects (JSON of a Uint8Array, as
+// frozen in the queue payload) and {type:'Buffer',data}. The field-name list
+// above missed thumbnailSha256, streamingSidecar, scansSidecar, waveform, ...,
+// so the same source hashed differently in the ledger and in the Message table.
+function jsonBytes(value: any): number[] | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const keys = Object.keys(value);
+  const bytes =
+    value.type === 'Buffer' && Array.isArray(value.data) && keys.length === 2
+      ? value.data
+      : keys.length && keys.every((key, i) => key === String(i))
+        ? keys.map((key) => value[key])
+        : null;
+  return bytes && bytes.every((byte: any) => Number.isInteger(byte) && byte >= 0 && byte <= 255) ? bytes : null;
+}
+function canonicalBytes(value: any): any {
+  if (Array.isArray(value)) return value.map(canonicalBytes);
+  if (value && typeof value === 'object') {
+    const bytes = jsonBytes(value);
+    if (bytes) return Buffer.from(bytes).toString('base64');
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, canonicalBytes(item)]));
   }
-  if (Array.isArray(value)) return value.map((item) => transportBytes(item));
-  if (value && typeof value === 'object')
-    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, transportBytes(item, key)]));
   return value;
+}
+// The persisted (base64) encoding of a payload. Baileys only accepts string or
+// Buffer media keys, so a numeric-key mediaKey fails with "bad decrypt".
+export function canonicalInboundBody(body: InboundPayload): InboundPayload {
+  return canonicalBytes(JSON.parse(JSON.stringify(body)));
+}
+// Download locators are refreshed by media re-upload and S3 retention; they are
+// not source content. Cryptographic media identity (mediaKey/fileSha256/...) stays.
+const mediaLocatorFields = new Set(['url', 'directPath', 'mediaKeyTimestamp', 'staticUrl']);
+function withoutLocators(value: any, top = false): any {
+  if (Array.isArray(value)) return value.map((item) => withoutLocators(item));
+  if (!value || typeof value !== 'object') return value;
+  const media = typeof value.mediaKey === 'string';
+  return Object.fromEntries(
+    Object.entries(value)
+      .filter(([key]) => !(media && mediaLocatorFields.has(key)) && !(top && (key === 'mediaUrl' || key === 'base64')))
+      .map(([key, item]) => [key, withoutLocators(item)]),
+  );
+}
+// Encoding- and locator-insensitive source identity for comparing the frozen
+// queue payload with native rows and receiver stamps of the same WhatsApp key.
+export function inboundSourceIdentityHash(body: InboundPayload): string {
+  const canonical = canonicalInboundBody(body);
+  return inboundPayloadHash({ ...canonical, message: withoutLocators(canonical.message, true) });
+}
+// Every hash a receiver row may legitimately carry for this exact source,
+// depending on which encoding an earlier attempt delivered.
+export function inboundAcceptedSourceHashes(...bodies: InboundPayload[]): Set<string> {
+  const hashes = new Set<string>();
+  for (const body of bodies) {
+    if (!body) continue;
+    hashes.add(inboundPayloadHash(body));
+    hashes.add(inboundPayloadHash(canonicalInboundBody(body)));
+  }
+  return hashes;
+}
+// A blank-text sender-key distribution copy carries no user content. WhatsApp
+// sends it to (re)distribute group keys; Chatwoot can never render it.
+export function isInboundTransportOnly(body: InboundPayload): boolean {
+  return plainTransportBody(body) && body.message.conversation === '' && !!body.message.senderKeyDistributionMessage;
+}
+// Rows that can never be the content source of a message under the same key.
+export function inboundSourceCandidates<T extends InboundPayload>(sources: T[], stored: InboundPayload): T[] {
+  if (stored?.messageType === 'reactionMessage') return sources;
+  return sources.filter((source) => source.messageType !== 'reactionMessage');
 }
 
 function plainTransportBody(body: InboundPayload): boolean {
@@ -46,12 +92,12 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
     stored.message.conversation.length > 0 &&
     sources.length
   ) {
-    const normalizedStored = transportBytes(stored);
+    const normalizedStored = canonicalInboundBody(stored);
     // An exact provider-original snapshot must still exist, including its timestamp and transport bytes.
     const anchor = sources.some(
       (source) =>
         plainTransportBody(source) &&
-        inboundPayloadHash(transportBytes(source)) === inboundPayloadHash(normalizedStored),
+        inboundPayloadHash(canonicalInboundBody(source)) === inboundPayloadHash(normalizedStored),
     );
     const semantic = (source: InboundPayload) => ({
       ...source,
@@ -65,10 +111,11 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
       if (text !== stored.message.conversation && !(text === '' && source.message.senderKeyDistributionMessage))
         return false;
       return (
-        inboundPayloadHash(transportBytes(semantic(source))) === inboundPayloadHash(transportBytes(semantic(stored)))
+        inboundPayloadHash(canonicalInboundBody(semantic(source))) ===
+        inboundPayloadHash(canonicalInboundBody(semantic(stored)))
       );
     });
-    if (anchor && sameEntity) return stored;
+    if (anchor && sameEntity) return normalizedStored;
   }
   // Sender-key retransmissions can retain the exact image with a newer transport timestamp.
   if (
@@ -78,12 +125,12 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
     stored.message?.imageMessage &&
     sources.length
   ) {
-    const normalized = transportBytes(stored);
+    const normalized = canonicalInboundBody(stored);
     const anchor = sources.some(
-      (source) => inboundPayloadHash(transportBytes(source)) === inboundPayloadHash(normalized),
+      (source) => inboundPayloadHash(canonicalInboundBody(source)) === inboundPayloadHash(normalized),
     );
     const semantic = (source: InboundPayload) => {
-      const projected = transportBytes(source);
+      const projected = canonicalInboundBody(source);
       const message = { ...projected.message };
       delete message.senderKeyDistributionMessage;
       return { ...projected, message, messageTimestamp: stored.messageTimestamp };
@@ -97,11 +144,11 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
           inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored)),
       )
     )
-      return stored;
+      return normalized;
   }
-  if (sources.length > 1 && new Set(sources.map((source) => inboundPayloadHash(source))).size !== 1)
+  if (sources.length > 1 && new Set(sources.map((source) => inboundSourceIdentityHash(source))).size !== 1)
     throw new Error('InboundNativeSourceAmbiguous');
-  return sources[0] ?? stored;
+  return canonicalInboundBody(sources[0] ?? stored);
 }
 
 // Back-pointer CAS remains per native row. Source roster changes still invalidate an in-flight delivery.
@@ -111,15 +158,20 @@ export function inboundNativeSnapshot(sources: InboundPayload[]): string {
   );
 }
 
-// This compatibility path is only for an unchanged ordinary PDF/document recovered
-// by the stock cached-media importer. It never substitutes a rendered-text hash.
+const historyMediaTypes = ['documentMessage', 'imageMessage', 'videoMessage', 'audioMessage', 'stickerMessage'];
+
+// Compatibility path for an unchanged ordinary media message whose receiver row
+// was written by the stock cached-media importer (history) and stamped with the
+// importer projection. It never substitutes a rendered-text hash: the caller
+// still verifies the full stored bytes against the native SHA/length.
 export async function inboundHistoryDocumentProjection(
   native: InboundPayload,
   queued: InboundPayload,
 ): Promise<InboundPayload> {
+  const type = native.messageType;
   if (
-    native.messageType !== 'documentMessage' ||
-    queued.messageType !== 'documentMessage' ||
+    !historyMediaTypes.includes(type) ||
+    queued.messageType !== type ||
     native.status === 'EDITED' ||
     queued.status === 'EDITED' ||
     !native.instanceId ||
@@ -133,63 +185,27 @@ export async function inboundHistoryDocumentProjection(
         !/^\d+(?::\d+)?@(s\.whatsapp\.net|hosted)$/.test(native.key.remoteJidAlt))) ||
     !Number.isSafeInteger(native.messageTimestamp) ||
     native.messageTimestamp <= 0 ||
-    !native.message?.documentMessage ||
-    !queued.message?.documentMessage
+    !native.message?.[type] ||
+    !queued.message?.[type]
   )
     throw new Error('InboundHistorySourceUnconfirmed');
-  const bytePaths = [
-    ['message', 'documentMessage', 'fileSha256'],
-    ['message', 'documentMessage', 'fileEncSha256'],
-    ['message', 'documentMessage', 'mediaKey'],
-    ['message', 'documentMessage', 'jpegThumbnail'],
-    ['message', 'messageContextInfo', 'messageSecret'],
-    ['message', 'messageContextInfo', 'deviceListMetadata', 'recipientKeyHash'],
-  ];
-  const normalize = (source: InboundPayload) => {
-    const result = JSON.parse(JSON.stringify(source));
-    for (const path of bytePaths) {
-      const parent = path.slice(0, -1).reduce((value, field) => value?.[field], result);
-      const field = path[path.length - 1];
-      if (parent?.[field] === undefined) continue;
-      const value = parent[field];
-      let bytes: Buffer;
-      if (typeof value === 'string') {
-        bytes = Buffer.from(value, 'base64');
-        if (bytes.toString('base64') !== value) throw new Error('InboundHistoryBytesInvalid');
-      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
-        const entries = value.type === 'Buffer' && Array.isArray(value.data) ? value.data : Object.values(value);
-        if (
-          !(value.type === 'Buffer' && Object.keys(value).length === 2 && Array.isArray(value.data)) &&
-          !Object.keys(value).every((key, index) => key === String(index))
-        )
-          throw new Error('InboundHistoryBytesInvalid');
-        if (!entries.every((byte) => Number.isInteger(byte) && byte >= 0 && byte <= 255))
-          throw new Error('InboundHistoryBytesInvalid');
-        bytes = Buffer.from(entries);
-      } else throw new Error('InboundHistoryBytesInvalid');
-      if (
-        !bytes.length ||
-        bytes.length > 65536 ||
-        (['fileSha256', 'fileEncSha256', 'mediaKey', 'messageSecret'].includes(field) && bytes.length !== 32)
-      )
+  for (const body of [native, queued]) {
+    const media = canonicalInboundBody(body).message[type];
+    for (const field of ['fileSha256', 'fileEncSha256', 'mediaKey'])
+      if (typeof media[field] !== 'string' || Buffer.from(media[field], 'base64').length !== 32)
         throw new Error('InboundHistoryBytesInvalid');
-      parent[field] = bytes.toString('base64');
-    }
-    return result;
-  };
-  const before = normalize(queued);
-  const current = normalize(native);
-  if (before.message.mediaUrl === undefined && current.message.mediaUrl !== undefined) {
-    if (
-      typeof current.message.mediaUrl !== 'string' ||
-      current.message.mediaUrl.length > 32768 ||
-      !/^https:\/\//.test(current.message.mediaUrl) ||
-      /[\r\n]/.test(current.message.mediaUrl)
-    )
-      throw new Error('InboundHistoryLocatorInvalid');
-    before.message.mediaUrl = current.message.mediaUrl;
   }
-  if (inboundPayloadHash(before) !== inboundPayloadHash(current)) throw new Error('InboundHistorySourceChanged');
+  const mediaUrl = canonicalInboundBody(native).message.mediaUrl;
+  if (
+    mediaUrl !== undefined &&
+    (typeof mediaUrl !== 'string' ||
+      mediaUrl.length > 32768 ||
+      !/^https:\/\//.test(mediaUrl) ||
+      /[\r\n]/.test(mediaUrl))
+  )
+    throw new Error('InboundHistoryLocatorInvalid');
+  if (inboundSourceIdentityHash(queued) !== inboundSourceIdentityHash(native))
+    throw new Error('InboundHistorySourceChanged');
   const normalized = await normalizeStoredHistoryMessages([native as any], [native as any], undefined, {
     retainProviderAliases: true,
     includeGroups: true,

@@ -1613,11 +1613,26 @@ export class BaileysStartupService extends ChannelStartupService {
             !received.key.id.includes('@broadcast')
           ) {
             const deliveryStartedAt = Date.now();
-            const chatwootSentMessage = await this.chatwootService.eventWhatsapp(
-              Events.MESSAGES_UPSERT,
-              { instanceName: this.instance.name, instanceId: this.instanceId },
-              messageRaw,
-            );
+            // A Chatwoot failure must not skip persisting the native Message row
+            // below: the durable inbound ledger retries from that row.
+            const chatwootSentMessage = await this.chatwootService
+              .eventWhatsapp(
+                Events.MESSAGES_UPSERT,
+                { instanceName: this.instance.name, instanceId: this.instanceId },
+                messageRaw,
+              )
+              .catch((error) => {
+                this.logger.error(
+                  JSON.stringify({
+                    event: 'chatwoot_ingress_forward_failed',
+                    instanceId: this.instanceId,
+                    errorClass: /^Inbound[A-Za-z]+$/.test(error?.message || '')
+                      ? error.message
+                      : error?.name || 'Error',
+                  }),
+                );
+                return null;
+              });
 
             if (chatwootSentMessage?.id) {
               messageRaw.chatwootMessageId = chatwootSentMessage.id;

@@ -1,6 +1,6 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 
-import { InboundAck, InboundDelivery, InboundStore } from './chatwoot-inbound-queue';
+import { InboundAck, InboundDelivery, InboundStore, InboundTerminalState } from './chatwoot-inbound-queue';
 
 // This delegate is generated from both supported provider schemas at image build time.
 interface Delegate {
@@ -13,30 +13,49 @@ export class ChatwootInboundPrismaStore implements InboundStore {
   constructor(repository: PrismaRepository) {
     this.rows = (repository as unknown as { chatwootInboundDelivery: Delegate }).chatwootInboundDelivery;
   }
-  enqueue(item: InboundDelivery) {
+  async enqueue(item: InboundDelivery) {
     // Repeated notify/append events do not replace a pending frozen native source or reset confirmed delivery.
-    return this.rows.upsert({ where: { id: item.id }, create: item, update: {} });
+    const stored = await this.rows.upsert({ where: { id: item.id }, create: item, update: {} });
+    // An 'ignored' row only proves its own frozen payload carried no content
+    // (e.g. a sender-key-only copy). Different content under the same key reopens it.
+    if (stored.state !== 'ignored' || stored.payloadHash === item.payloadHash) return stored;
+    const reopened = await this.rows.updateMany({
+      where: { id: item.id, state: 'ignored', payloadHash: stored.payloadHash },
+      data: {
+        payload: item.payload,
+        payloadHash: item.payloadHash,
+        state: item.state,
+        attempts: 0,
+        nextAttemptAt: item.nextAttemptAt,
+        lastErrorClass: null,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+      },
+    });
+    return reopened.count === 1 ? { ...stored, ...item, inboxId: stored.inboxId } : stored;
   }
-  due(now: Date, limit: number) {
-    const size = Math.max(0, Math.min(Math.trunc(limit), 8));
-    if (!size) return Promise.resolve([]);
-    const due = (state: string, take: number) =>
-      this.rows.findMany({
-        where: {
-          state,
-          nextAttemptAt: { lte: now },
-          OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
-        },
-        orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
-        take,
-      });
-    // Reserve history capacity without putting reconnect backlogs ahead of live
-    // delivery. Both index-bounded lanes still share the queue's two writers.
-    return Promise.all([due('pending', size - 1), due('history_pending', 1)]).then(([live, history]) => [
-      ...live.slice(0, 1),
-      ...history,
-      ...live.slice(1),
-    ]);
+  async due(now: Date, limit: number) {
+    const size = Math.max(0, Math.min(Math.trunc(limit), 50));
+    if (!size) return [];
+    const due = (state: string, take: number, fresh?: boolean) =>
+      take <= 0
+        ? Promise.resolve([] as InboundDelivery[])
+        : this.rows.findMany({
+            where: {
+              state,
+              nextAttemptAt: { lte: now },
+              OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
+              ...(fresh === undefined ? {} : { attempts: fresh ? 0 : { gt: 0 } }),
+            },
+            orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
+            take,
+          });
+    // Live first: never-attempted rows ahead of retries, so a retry backlog can
+    // not delay new messages. Reconnect history only fills what live leaves.
+    const fresh = await due('pending', size, true);
+    const retry = await due('pending', size - fresh.length, false);
+    const history = await due('history_pending', size - fresh.length - retry.length);
+    return [...fresh, ...retry, ...history];
   }
   async claim(id: string, owner: string, now: Date, until: Date) {
     return (
@@ -91,6 +110,16 @@ export class ChatwootInboundPrismaStore implements InboundStore {
             leaseExpiresAt: null,
             lastErrorClass: null,
           },
+        })
+      ).count === 1
+    );
+  }
+  async fail(id: string, owner: string, state: InboundTerminalState, errorClass: string) {
+    return (
+      (
+        await this.rows.updateMany({
+          where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
+          data: { state, lastErrorClass: errorClass.slice(0, 100), leaseOwner: null, leaseExpiresAt: null },
         })
       ).count === 1
     );
