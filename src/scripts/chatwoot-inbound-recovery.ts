@@ -11,7 +11,11 @@
 // --skip-unsupported closes types Chatwoot cannot render (stickers, templates,
 // buttons, polls, product/order) as ignored ledger rows: terminal, never delivered.
 // Run native gaps one instance at a time: the window index is read into memory.
+// Relink (already_present rows Chatwoot holds; writes native pointers only):
+//   node dist/chatwoot-inbound-recovery.js --relink --instances=a [--errors=InboundX,...]
+//   [--apply --confirm=<planHash>]   (needs CHATWOOT_IMPORT_DATABASE_CONNECTION_URI, read-only use)
 import { PrismaClient } from '@prisma/client';
+import postgresql from 'pg';
 
 import {
   applyNativeGaps,
@@ -27,6 +31,13 @@ import {
   prismaRecoveryWriter,
   recoveryReport,
 } from '../api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-recovery';
+import {
+  applyRelink,
+  planRelink,
+  prismaRelinkReader,
+  prismaRelinkWriter,
+  relinkReport,
+} from '../api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-relink';
 
 // Live messages younger than this are still the live path's job.
 const NATIVE_SETTLE_MS = 15 * 60_000;
@@ -72,11 +83,50 @@ async function nativeGaps(prisma: PrismaClient, now: Date) {
   console.log(JSON.stringify({ mode: 'native-apply', filter, planHash: plan.planHash, ...result }, null, 2));
 }
 
+async function relink(prisma: PrismaClient, now: Date) {
+  const uri = process.env.CHATWOOT_IMPORT_DATABASE_CONNECTION_URI;
+  if (!uri)
+    throw Object.assign(new Error('CHATWOOT_IMPORT_DATABASE_CONNECTION_URI is not set'), { name: 'UsageError' });
+  // Same TLS setting as the importer pool (libs/postgres.client.ts); this tool only reads Chatwoot.
+  const chatwoot = new postgresql.Client({
+    connectionString: uri.replace(/([?&])sslmode=[^&]*&?/, '$1').replace(/[?&]$/, ''),
+    ssl: { rejectUnauthorized: false },
+  });
+  await chatwoot.connect();
+  try {
+    await chatwoot.query('SET search_path TO public');
+    await chatwoot.query('SET SESSION CHARACTERISTICS AS TRANSACTION READ ONLY');
+    const filter = {
+      instanceNames: option('instances'),
+      excludeInstanceNames: option('exclude-instances'),
+      errorClasses: option('errors'),
+    };
+    const plan = await planRelink(prismaRelinkReader(prisma, chatwoot), filter);
+    const report = relinkReport(plan, now);
+    if (!process.argv.includes('--apply')) {
+      console.log(JSON.stringify({ mode: 'relink-dry-run', filter, ...report }, null, 2));
+      return;
+    }
+    if (option('confirm')?.[0] !== plan.planHash) {
+      console.error(
+        JSON.stringify({ mode: 'relink-apply', refused: 'plan hash mismatch: run the dry-run again', ...report }),
+      );
+      process.exitCode = 2;
+      return;
+    }
+    const result = await applyRelink(plan, prismaRelinkWriter(prisma));
+    console.log(JSON.stringify({ mode: 'relink-apply', filter, planHash: plan.planHash, ...result }, null, 2));
+  } finally {
+    await chatwoot.end();
+  }
+}
+
 async function main() {
   const prisma = new PrismaClient();
   try {
     const now = new Date();
     if (option('native-since')) return await nativeGaps(prisma, now);
+    if (process.argv.includes('--relink')) return await relink(prisma, now);
     const hours = Number(option('history-older-than-hours')?.[0]);
     const filter = {
       states: option('states'),

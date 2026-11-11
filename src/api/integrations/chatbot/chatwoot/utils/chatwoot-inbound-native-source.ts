@@ -147,25 +147,46 @@ function provenSameSender(a: InboundPayload, b: InboundPayload): boolean {
 const mediaCopyKeys = new Set(['senderKeyDistributionMessage', 'messageContextInfo', 'mediaUrl', 'base64']);
 // Same content, proven by text equality or by the sender's per-message media
 // secret and file hashes (a forward would carry another key id).
+// An album child carries its photo/video one level down; a copy stored before
+// the album unwrap (#181) holds the same media as a plain imageMessage.
+function mediaView(body: InboundPayload): { type: string; message: Record<string, any> } | null {
+  const canonical = canonicalInboundBody(body).message;
+  if (body.messageType === 'associatedChildMessage') {
+    const inner = canonical?.associatedChildMessage?.message;
+    const types = Object.keys(inner ?? {}).filter((key) => retransmittedMediaTypes.has(key));
+    return types.length === 1 ? { type: types[0], message: inner } : null;
+  }
+  return retransmittedMediaTypes.has(body.messageType) ? { type: body.messageType, message: canonical } : null;
+}
+
 function provenSameContent(a: InboundPayload, b: InboundPayload): boolean {
-  if (a.messageType !== b.messageType || a.status === 'EDITED' || b.status === 'EDITED') return false;
+  if (a.status === 'EDITED' || b.status === 'EDITED') return false;
   if ((a.contextInfo?.stanzaId ?? null) !== (b.contextInfo?.stanzaId ?? null)) return false;
-  if (a.messageType === 'conversation')
+  if (a.messageType === 'conversation' || b.messageType === 'conversation')
     return (
+      a.messageType === b.messageType &&
       plainTransportBody(a) &&
       plainTransportBody(b) &&
       a.message.conversation.length > 0 &&
       a.message.conversation === b.message.conversation
     );
-  if (!retransmittedMediaTypes.has(a.messageType)) return false;
-  const [left, right] = [canonicalInboundBody(a).message, canonicalInboundBody(b).message];
-  const type = a.messageType;
-  if (![left, right].every((m) => m?.[type] && Object.keys(m).every((k) => k === type || mediaCopyKeys.has(k))))
+  const [left, right] = [mediaView(a), mediaView(b)];
+  if (!left || !right || left.type !== right.type) return false;
+  const type = left.type;
+  if (
+    ![left.message, right.message].every(
+      (m) => m?.[type] && Object.keys(m).every((k) => k === type || mediaCopyKeys.has(k)),
+    )
+  )
     return false;
   return (
     ['mediaKey', 'fileSha256', 'fileEncSha256'].every(
-      (field) => typeof left[type][field] === 'string' && left[type][field] === right[type][field],
-    ) && ['caption', 'fileName', 'mimetype'].every((field) => (left[type][field] ?? '') === (right[type][field] ?? ''))
+      (field) =>
+        typeof left.message[type][field] === 'string' && left.message[type][field] === right.message[type][field],
+    ) &&
+    ['caption', 'fileName', 'mimetype'].every(
+      (field) => (left.message[type][field] ?? '') === (right.message[type][field] ?? ''),
+    )
   );
 }
 

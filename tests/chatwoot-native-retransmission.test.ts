@@ -270,3 +270,28 @@ test('a group copy that names its sender is stored when every stored copy names 
     true,
   );
 });
+
+test('an album-child copy and the same photo stored plain resolve to one message; another photo refuses', async () => {
+  const { resolveInboundNativeBody } = await import(
+    '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source'
+  );
+  const b64 = (byte: number) => Buffer.alloc(32, byte).toString('base64');
+  const image = (byte: number) => ({
+    mimetype: 'image/jpeg',
+    mediaKey: b64(byte),
+    fileSha256: b64(byte + 1),
+    fileEncSha256: b64(byte + 2),
+  });
+  const key = { id: 'ALBUM1', remoteJid: '120363000000000077@g.us', fromMe: false };
+  const child = {
+    key: { ...key, participant: '62800000000002@s.whatsapp.net' },
+    messageType: 'associatedChildMessage',
+    message: { associatedChildMessage: { message: { imageMessage: image(5), messageContextInfo: {} } } },
+    messageTimestamp: 1_700_000_000,
+    pushName: 'Sender',
+  };
+  const plain = { key, messageType: 'imageMessage', message: { imageMessage: image(5) }, messageTimestamp: 1_700_000_000 };
+  assert.equal(resolveInboundNativeBody([child, plain] as any, child as any).messageType, 'associatedChildMessage');
+  const other = { ...plain, message: { imageMessage: image(9) } };
+  assert.throws(() => resolveInboundNativeBody([child, other] as any, child as any), /InboundNativeSourceAmbiguous/);
+});
