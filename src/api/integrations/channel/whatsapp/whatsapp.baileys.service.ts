@@ -65,6 +65,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import { toCanonicalHistoryJid } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-sync';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { isNativeRetransmission } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 import {
   compactChatwootIngressContext,
   mergeChatwootIngressContext,
@@ -1675,7 +1676,18 @@ export class BaileysStartupService extends ChannelStartupService {
             }
           }
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+          if (
+            this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE &&
+            (await this.isStoredRetransmission(type, messageRaw))
+          ) {
+            this.logger.info(
+              JSON.stringify({
+                event: 'native_retransmission_not_stored',
+                instanceId: this.instanceId,
+                messageType: messageRaw.messageType,
+              }),
+            );
+          } else if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { pollUpdates, ...messageData } = messageRaw;
             const msg = await this.prismaRepository.message.create({ data: messageData });
@@ -5472,6 +5484,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const group = await this.getGroupMetadataCache(groupJid);
     return group?.subject || group?.Name || null;
+  }
+
+  // One native row per WhatsApp key: a notify retransmission of a stored key
+  // (same content type, or a blank sender-key-only copy) is not stored again.
+  private async isStoredRetransmission(type: string, messageRaw: any): Promise<boolean> {
+    if (type !== 'notify' || typeof messageRaw?.key?.id !== 'string') return false;
+    const existing = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: this.instanceId,
+        AND: [
+          { key: { path: ['id'], equals: messageRaw.key.id } },
+          { key: { path: ['remoteJid'], equals: messageRaw.key.remoteJid } },
+          { key: { path: ['fromMe'], equals: messageRaw.key.fromMe } },
+        ],
+      },
+      select: { messageType: true, status: true },
+      take: 3,
+    });
+    return isNativeRetransmission(existing, messageRaw);
   }
 
   private async retainNativeMessageMedia(received: proto.IWebMessageInfo, messageRaw: any, msg: any) {

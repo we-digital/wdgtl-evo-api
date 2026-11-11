@@ -66,6 +66,27 @@ export function inboundAcceptedSourceHashes(...bodies: InboundPayload[]): Set<st
 export function isInboundTransportOnly(body: InboundPayload): boolean {
   return plainTransportBody(body) && body.message.conversation === '' && !!body.message.senderKeyDistributionMessage;
 }
+const retransmittedMediaTypes = new Set([
+  'imageMessage',
+  'documentMessage',
+  'videoMessage',
+  'audioMessage',
+  'stickerMessage',
+  'ptvMessage',
+]);
+// A notify upsert under a key that already has a native row is a WhatsApp
+// retransmission (edits arrive as protocol messages, history as append), not
+// new content. Storing it again made every later lookup of the key ambiguous.
+export function isNativeRetransmission(existing: InboundPayload[], incoming: InboundPayload): boolean {
+  if (isInboundTransportOnly(incoming)) return true;
+  return existing.some(
+    (row) =>
+      row.messageType === incoming.messageType &&
+      row.messageType !== 'reactionMessage' &&
+      row.status !== 'EDITED' &&
+      incoming.status !== 'EDITED',
+  );
+}
 // Rows that can never be the content source of a message under the same key.
 export function inboundSourceCandidates<T extends InboundPayload>(sources: T[], stored: InboundPayload): T[] {
   if (stored?.messageType === 'reactionMessage') return sources;
@@ -117,34 +138,37 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
     });
     if (anchor && sameEntity) return normalizedStored;
   }
-  // Sender-key retransmissions can retain the exact image with a newer transport timestamp.
+  // Sender-key retransmissions keep the exact media under the same key with a
+  // newer transport timestamp, a different sender-key/context envelope or a
+  // retained mediaUrl, or come as a blank sender-key-only copy (prod 2026-11-11:
+  // image+blank and document+document pairs on every instance of a group).
   if (
     stored.key?.fromMe === false &&
-    stored.messageType === 'imageMessage' &&
+    retransmittedMediaTypes.has(stored.messageType) &&
     stored.status !== 'EDITED' &&
-    stored.message?.imageMessage &&
-    sources.length
+    stored.message?.[stored.messageType] &&
+    sources.length > 1
   ) {
-    const normalized = canonicalInboundBody(stored);
-    const anchor = sources.some(
-      (source) => inboundPayloadHash(canonicalInboundBody(source)) === inboundPayloadHash(normalized),
-    );
+    // The provider-original row must still exist; S3 retention may have added a mediaUrl to it.
+    const anchor = sources.find((source) => inboundSourceIdentityHash(source) === inboundSourceIdentityHash(stored));
     const semantic = (source: InboundPayload) => {
       const projected = canonicalInboundBody(source);
-      const message = { ...projected.message };
+      const message = withoutLocators(projected.message, true);
       delete message.senderKeyDistributionMessage;
+      delete message.messageContextInfo;
       return { ...projected, message, messageTimestamp: stored.messageTimestamp };
     };
     if (
       anchor &&
       sources.every(
         (source) =>
-          source.messageType === 'imageMessage' &&
-          source.status !== 'EDITED' &&
-          inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored)),
+          (isInboundTransportOnly(source) && source.key?.fromMe === false) ||
+          (source.messageType === stored.messageType &&
+            source.status !== 'EDITED' &&
+            inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored))),
       )
     )
-      return normalized;
+      return canonicalInboundBody(anchor);
   }
   if (sources.length > 1 && new Set(sources.map((source) => inboundSourceIdentityHash(source))).size !== 1)
     throw new Error('InboundNativeSourceAmbiguous');
