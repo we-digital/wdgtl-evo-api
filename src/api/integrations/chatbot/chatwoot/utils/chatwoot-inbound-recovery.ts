@@ -4,6 +4,7 @@ import { Prisma } from '@prisma/client';
 
 import {
   inboundSourceCandidates,
+  MAX_NATIVE_COPIES,
   isInboundTransportOnly,
   resolveInboundNativeBody,
 } from './chatwoot-inbound-native-source';
@@ -155,7 +156,8 @@ export async function planRecovery(reader: RecoveryReader, filter: RecoveryFilte
       candidates.push({
         row,
         lane,
-        prediction: exact.length >= 3 ? 'blocked_ambiguous' : predictRecovery(row, lane, exact, sameId.length),
+        prediction:
+          exact.length > MAX_NATIVE_COPIES ? 'blocked_ambiguous' : predictRecovery(row, lane, exact, sameId.length),
         timestampMs: timestampMs(row.payload),
       });
     }

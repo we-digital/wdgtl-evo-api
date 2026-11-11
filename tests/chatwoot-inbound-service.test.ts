@@ -44,6 +44,8 @@ import {
   inboundSourceCandidates,
   inboundSourceIdentityHash,
   isInboundTransportOnly,
+  MAX_NATIVE_COPIES,
+  NATIVE_COPY_QUERY_LIMIT,
   resolveInboundNativeBody,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 
@@ -109,6 +111,8 @@ function literalService() {
     inboundHistoryDocumentProjection,
     inboundNativeSnapshot,
     resolveInboundNativeBody,
+    MAX_NATIVE_COPIES,
+    NATIVE_COPY_QUERY_LIMIT,
     inboundAcceptedSourceHashes,
     inboundSourceCandidates,
     inboundSourceIdentityHash,
@@ -444,7 +448,8 @@ test('contradictory recorded source payload hash holds even when rendered text m
 });
 test('bounded native selection refuses overflow rather than assuming an unseen version matches', async () => {
   const f = fixture();
-  f.service.prismaRepository.message.findMany = async () => Array.from({ length: 3 }, () => structuredClone(f.native));
+  f.service.prismaRepository.message.findMany = async () =>
+    Array.from({ length: NATIVE_COPY_QUERY_LIMIT }, () => structuredClone(f.native));
   await assert.rejects(f.service.deliverQueuedInbound(f.item), /Ambiguous/);
   assert.equal(f.creates, 0);
 });
@@ -1173,7 +1178,7 @@ for (const change of [
   'edited',
   'outgoing',
   'missingAnchor',
-  'thirdSource',
+  'overCopyLimit',
 ]) {
   test(`image transport reconciliation rejects ${change}`, () => {
     const original: any = {
@@ -1204,8 +1209,8 @@ for (const change of [
     const sources =
       change === 'missingAnchor'
         ? [copy, other]
-        : change === 'thirdSource'
-          ? [original, copy, structuredClone(copy)]
+        : change === 'overCopyLimit'
+          ? [original, ...Array.from({ length: MAX_NATIVE_COPIES }, () => structuredClone(copy))]
           : [original, copy];
     assert.throws(() => resolveInboundNativeBody(sources, stored), /Ambiguous/);
   });

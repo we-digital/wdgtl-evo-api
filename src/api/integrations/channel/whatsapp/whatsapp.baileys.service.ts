@@ -5499,7 +5499,7 @@ export class BaileysStartupService extends ChannelStartupService {
           { key: { path: ['fromMe'], equals: messageRaw.key.fromMe } },
         ],
       },
-      select: { messageType: true, status: true },
+      select: { messageType: true, status: true, key: true, participant: true },
       take: 3,
     });
     return isNativeRetransmission(existing, messageRaw);
