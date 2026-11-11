@@ -9,6 +9,7 @@ import {
   predictRecovery,
   prismaRecoveryWriter,
   RECOVERY_MARKER,
+  RECOVERY_UNSUPPORTED_TYPES,
   RecoveryNativeRow,
   recoveryLane,
   recoveryReport,
@@ -161,7 +162,12 @@ test('apply requeues into the original lane with ordered attempts and the verifi
       },
     },
   };
-  assert.deepEqual(await applyRecovery(plan, prismaRecoveryWriter(prisma), now), { requeued: 1, skipped: 1 });
+  assert.deepEqual(await applyRecovery(plan, prismaRecoveryWriter(prisma), now), {
+    requeued: 1,
+    skipped: 1,
+    skippedUnsupported: 0,
+    skipUnsupportedChanged: 0,
+  });
   assert.equal(calls[0].where.state, 'history_pending');
   assert.equal(calls[0].where.attempts, 40);
   assert.ok(calls[0].where.OR);
@@ -187,4 +193,75 @@ test('terminal failures keep their lane for recovery', async () => {
   assert.equal(await store.fail('id', 'owner', 'failed', 'InboundReceiverContentChanged', 'history'), true);
   assert.deepEqual(calls[0].data.result, { terminal: 'failed', lane: 'history' });
   assert.equal(calls[0].data.state, 'failed');
+});
+
+test('album child photos are no longer predicted unsupported; the other unsupported types still are', () => {
+  assert.equal(RECOVERY_UNSUPPORTED_TYPES.has('associatedChildMessage'), false);
+  for (const type of ['lottieStickerMessage', 'buttonsMessage', 'templateMessage'])
+    assert.equal(RECOVERY_UNSUPPORTED_TYPES.has(type), true);
+});
+
+test('old live rows with a native source move to the silent history lane when asked', async () => {
+  const now = new Date(1_700_000_000_000 + 10 * 3_600_000);
+  const old = native('O', { messageTimestamp: 1_700_000_000 });
+  const fresh = native('F', { messageTimestamp: Math.floor(now.getTime() / 1000) - 60 });
+  const orphan = native('P', { messageTimestamp: 1_700_000_000 });
+  const rows = [
+    row(old, { state: 'failed', result: { terminal: 'failed', lane: 'live' } }),
+    row(fresh, { state: 'failed', result: { terminal: 'failed', lane: 'live' } }),
+    row(orphan, { state: 'pending', attempts: 0 }),
+  ];
+  const lanes = async (filter: any) =>
+    Object.fromEntries(
+      (await planRecovery(reader(rows, [old, fresh]), filter, now)).candidates.map(({ row, lane, prediction }) => [
+        row.sourceId,
+        lane + '|' + prediction,
+      ]),
+    );
+  assert.deepEqual(await lanes({}), {
+    'WAID:O': 'live|deliver',
+    'WAID:F': 'live|deliver',
+    'WAID:P': 'live|deliver_from_payload',
+  });
+  // The orphan has no native row: only the live lane can deliver it from its payload.
+  assert.deepEqual(await lanes({ historyOlderThanMs: 2 * 3_600_000 }), {
+    'WAID:O': 'history|deliver',
+    'WAID:F': 'live|deliver',
+    'WAID:P': 'live|deliver_from_payload',
+  });
+  const plan = await planRecovery(reader(rows, [old, fresh]), { historyOlderThanMs: 2 * 3_600_000 }, now);
+  const states: string[] = [];
+  await applyRecovery(plan, { requeue: async (r, state) => (states.push(r.sourceId + '|' + state), true) }, now);
+  assert.ok(states.includes('WAID:O|history_pending'));
+});
+
+test('with skipUnsupported, likely_unsupported rows are closed as ignored, bound to the plan hash', async () => {
+  const now = new Date(1_700_000_000_000 + 10 * 3_600_000);
+  const sticker = native('S', { messageType: 'lottieStickerMessage', message: { lottieStickerMessage: { message: {} } } });
+  const text = native('T');
+  const rows = [row(sticker, { state: 'failed' }), row(text, { state: 'failed' })];
+  const off = await planRecovery(reader(rows, [sticker, text]), {}, now);
+  assert.equal(off.skip.length, 0);
+  const plan = await planRecovery(reader(rows, [sticker, text]), { skipUnsupported: true }, now);
+  assert.equal(plan.skip.length, 1);
+  assert.notEqual(plan.planHash, off.planHash);
+  assert.equal(recoveryReport(plan, now).toSkipUnsupported, 1);
+  const calls: string[] = [];
+  const result = await applyRecovery(
+    plan,
+    {
+      requeue: async (r, state) => (calls.push(r.sourceId + '|' + state), true),
+      skip: async (r) => (calls.push(r.sourceId + '|skip'), true),
+    },
+    now,
+  );
+  assert.deepEqual(calls, ['WAID:T|history_pending', 'WAID:S|skip']);
+  assert.equal(result.skippedUnsupported, 1);
+  // The writer closes it as terminal ignored with the skip reason, under the same CAS as a requeue.
+  const updates: any[] = [];
+  const writer = prismaRecoveryWriter({ chatwootInboundDelivery: { updateMany: async (q: any) => (updates.push(q), { count: 1 }) } });
+  assert.equal(await writer.skip!(rows[0], now), true);
+  assert.equal(updates[0].data.state, 'ignored');
+  assert.equal(updates[0].data.lastErrorClass, 'InboundUnsupportedTypeSkipped');
+  assert.equal(updates[0].where.attempts, rows[0].attempts);
 });

@@ -34,6 +34,7 @@ import {
   ChatwootInboundQueue,
   inboundDeliveryId,
   inboundPayloadHash,
+  inboundProviderFingerprint,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 
 import {
@@ -1693,4 +1694,18 @@ test('a queued album child is delivered as its own image with caption and confir
   assert.equal(delivered.body.messageType, 'imageMessage');
   assert.equal(f.updates.length, 1);
   assert.equal(f.updates[0].where.messageType, 'associatedChildMessage');
+});
+
+test('the recovery tool computes the same provider fingerprint as the service', () => {
+  const service = literalService();
+  const provider = {
+    id: 'provider',
+    instanceId: 'one',
+    accountId: '1',
+    url: 'https://chatwoot.invalid',
+    nameInbox: 'WA - One',
+    number: null,
+    ignoreJids: ['@g.us'],
+  };
+  assert.equal(inboundProviderFingerprint(provider), service.inboundProviderFingerprint(provider));
 });

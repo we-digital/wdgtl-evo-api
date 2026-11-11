@@ -56,10 +56,29 @@ export function inboundRetryDelayMs(attempts: number): number {
   return INBOUND_RETRY_SCHEDULE_MS[index] ?? INBOUND_RETRY_STEADY_MS;
 }
 
+// Message types Chatwoot cannot render (owner decision 2026-11-11): they are
+// not delivered. The row is closed at once as ignored with this reason, never
+// retried, so it holds no slot and never shows up as a failure.
+export const INBOUND_UNSUPPORTED_TYPES: ReadonlySet<string> = new Set([
+  'lottieStickerMessage',
+  'buttonsMessage',
+  'templateMessage',
+  'interactiveMessage',
+  'listMessage',
+  'pollCreationMessage',
+  'pollCreationMessageV2',
+  'pollCreationMessageV3',
+  'productMessage',
+  'orderMessage',
+  'eventMessage',
+]);
+export const INBOUND_UNSUPPORTED_SKIPPED = 'InboundUnsupportedTypeSkipped';
+
 // Errors that cannot change by retrying the same frozen source. The row is
 // closed immediately with its reason instead of retrying for a day.
 const terminalErrors: Record<string, InboundTerminalState> = {
   InboundTransportOnly: 'ignored',
+  [INBOUND_UNSUPPORTED_SKIPPED]: 'ignored',
   InboundReceiverPresentUnverified: 'already_present',
   InboundHistoryRouteIgnored: 'ignored',
   InboundPayloadTooLarge: 'failed',
@@ -115,6 +134,31 @@ export function inboundPayloadHash(body: InboundPayload): string {
         : v;
   return createHash('sha256')
     .update(JSON.stringify(stable(JSON.parse(JSON.stringify(source)))))
+    .digest('hex');
+}
+// Binds a ledger row to the exact Chatwoot provider configuration it was admitted under.
+// Must stay identical to ChatwootService.inboundProviderFingerprint (pinned by a test).
+export function inboundProviderFingerprint(provider: {
+  id: string;
+  instanceId: string;
+  accountId: unknown;
+  url: unknown;
+  nameInbox: unknown;
+  number: unknown;
+  ignoreJids: unknown;
+}): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        provider.id,
+        provider.instanceId,
+        provider.accountId,
+        provider.url,
+        provider.nameInbox,
+        provider.number,
+        provider.ignoreJids,
+      ]),
+    )
     .digest('hex');
 }
 export function inboundDeliveryId(instanceId: string, body: InboundPayload): string {
@@ -301,6 +345,7 @@ export class ChatwootInboundQueue {
     );
     heartbeat.unref?.();
     try {
+      if (INBOUND_UNSUPPORTED_TYPES.has(item.payload?.messageType)) throw new Error(INBOUND_UNSUPPORTED_SKIPPED);
       const ack = await this.deliver({ ...item, leaseOwner: this.owner });
       if (
         lost ||
