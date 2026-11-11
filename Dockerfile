@@ -14,7 +14,6 @@ COPY ./package*.json ./
 COPY ./tsconfig.json ./
 COPY ./tsup.config.ts ./
 
-COPY ./Docker/scripts/bound-signal-caches.cjs ./Docker/scripts/bound-signal-caches.cjs
 COPY ./Docker/scripts/verify-node-runtime.cjs ./Docker/scripts/verify-node-runtime.cjs
 
 RUN --mount=type=cache,target=/root/.npm,sharing=locked npm ci --silent
