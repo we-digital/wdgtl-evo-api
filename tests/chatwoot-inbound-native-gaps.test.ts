@@ -199,3 +199,15 @@ test('with --skip-unsupported, unsupported gaps are recorded as ignored ledger r
   assert.equal(ignored.lastErrorClass, INBOUND_UNSUPPORTED_SKIPPED);
   assert.equal(written.find((item) => item.sourceId === 'WAID:N').state, 'history_pending');
 });
+
+test('the delivered copy is the one with real content, then the fullest body', async () => {
+  const { nativeGapSource } = await import(
+    '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-gaps'
+  );
+  const blank = native('B', { message: { conversation: '' } });
+  const text = native('B', { messageTimestamp: 1_700_000_100 });
+  assert.equal(nativeGapSource([blank, text]), text);
+  const small = native('C', { message: { conversation: 'x' } });
+  const large = native('C', { message: { conversation: 'x', messageContextInfo: { messageSecret: b64(4) } } });
+  assert.equal(nativeGapSource([small, large]), large);
+});

@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 
 import { classifyCachedHistoryRecord } from './chatwoot-cached-history-record';
 import { ignoresHistoryPeer } from './chatwoot-history-ingress';
-import { isInboundTransportOnly, resolveInboundNativeBody } from './chatwoot-inbound-native-source';
+import { isBlankNativeCopy, isInboundTransportOnly, resolveInboundNativeBody } from './chatwoot-inbound-native-source';
 import {
   INBOUND_UNSUPPORTED_SKIPPED,
   InboundDelivery,
@@ -108,6 +108,22 @@ function ledgerPayload(row: NativeGapRow): Record<string, any> {
   );
 }
 
+// The copy the history lane delivers when a key has several: a copy with real
+// content before a blank stub, then the fullest body (an album child before the
+// same photo stored plain), then the earliest. The resolver still has to prove
+// every other copy is the same message.
+export function nativeGapSource<T extends NativeGapRow>(rows: T[]): T | undefined {
+  const real = rows.filter((row) => row.messageType !== 'reactionMessage' && !isInboundTransportOnly(row));
+  const size = (row: T) => JSON.stringify(row.message ?? null).length;
+  return [...real].sort(
+    (a, b) =>
+      Number(isBlankNativeCopy(a)) - Number(isBlankNativeCopy(b)) ||
+      size(b) - size(a) ||
+      a.messageTimestamp - b.messageTimestamp ||
+      a.id.localeCompare(b.id),
+  )[0];
+}
+
 export function predictNativeGap(rows: NativeGapRow[], route: NativeGapRoute): NativeGapPrediction {
   const key = rows[0].key;
   if (ignoresHistoryPeer(route.provider, rows[0], route.groupsIgnore) || scopeIgnored(key.remoteJid))
@@ -116,7 +132,7 @@ export function predictNativeGap(rows: NativeGapRow[], route: NativeGapRoute): N
   if (!content.length) return 'not_a_message';
   const real = content.filter((row) => !isInboundTransportOnly(row));
   if (!real.length) return 'ignore_transport';
-  const payload = real[0];
+  const payload = nativeGapSource(real)!;
   // Before the importer classifier, which refuses most of these shapes outright.
   if (RECOVERY_UNSUPPORTED_TYPES.has(payload.messageType)) return 'likely_unsupported';
   let ordinary = false;
@@ -177,9 +193,7 @@ export async function planNativeGaps(reader: NativeGapReader, filter: NativeGapF
         const key = rows[0].key;
         const prediction = outbound.has(key.id) ? 'chatwoot_outbound' : predictNativeGap(rows, route);
         const source =
-          prediction === 'enqueue_history' || prediction === 'likely_unsupported'
-            ? rows.find((row) => row.messageType !== 'reactionMessage' && !isInboundTransportOnly(row))
-            : undefined;
+          prediction === 'enqueue_history' || prediction === 'likely_unsupported' ? nativeGapSource(rows) : undefined;
         candidates.push({
           route,
           identity,
