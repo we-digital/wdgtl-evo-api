@@ -1,6 +1,7 @@
 // Import this first from sentry instrument!
 import '@utils/instrumentSentry';
 
+import { whatsappIngestRunner } from '@api/integrations/channel/whatsapp/whatsapp-ingest-runner';
 // Now import other modules
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -177,6 +178,12 @@ async function bootstrap() {
       const httpClosed = new Promise<void>((resolve, reject) => {
         server.close((error) => (error ? reject(error) : resolve()));
       });
+      // Finish per-chat ingest of messages already admitted to the inbound ledger
+      // (native rows, media, Chatwoot pointers) before the queues stop. Anything
+      // left after the timeout is redelivered from the durable ledger.
+      const ingestDrained = await whatsappIngestRunner.drain(20_000);
+      if (!ingestDrained)
+        logger.warn(JSON.stringify({ event: 'whatsapp_ingest_drain_timeout', pending: whatsappIngestRunner.size }));
       const drains = await Promise.allSettled([
         httpClosed,
         chatwootService.stopOutboundWorker(),

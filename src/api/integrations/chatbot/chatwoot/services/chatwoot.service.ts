@@ -316,6 +316,13 @@ export class ChatwootService {
   private readonly inboundCanonicalContexts = new WeakMap<object, InboundCanonicalContext>();
   private readonly inboundDeliveryFence = new ChatwootIngressDeliveryFence();
   private readonly receiverIdempotencyChecks = new Map<string, { at: number; value: Promise<boolean> }>();
+  private readonly providerConversationCapabilities = new Map<string, { at: number; value: Promise<boolean> }>();
+  // Chatwoot contact found for a WhatsApp peer (provider path only). Two filter
+  // calls per message dominated Chatwoot load; ids are stable, so a found contact
+  // is reused for a few minutes and dropped on any error of the conversation step.
+  private readonly providerContacts = new Map<string, { at: number; contact: any }>();
+  private static readonly PROVIDER_CONTACT_TTL_MS = 10 * 60_000;
+  private static readonly PROVIDER_CONTACT_CACHE_MAX = 20_000;
   // Request-local: a durable delivery may fall back to a media-unavailable text.
   private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
 
@@ -630,12 +637,24 @@ export class ChatwootService {
 
   private async providerConversationsEnabled(provider: ChatwootModel, inboxId: number): Promise<boolean> {
     if (!this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS) return false;
-    const capability = await this.providerConversationRequest(provider, 'GET', { inbox_id: inboxId });
-    if (capability.enabled === false) return false;
-    if (capability.enabled !== true || capability.provider !== 'whatsapp') {
-      throw new Error('Chatwoot provider conversation contract does not match WhatsApp');
-    }
-    return true;
+    // Same capability endpoint as receiverIdempotent; asked once a minute per inbox
+    // instead of on every message. A failed check is not cached.
+    const key = `${provider.id}:${provider.accountId}:${inboxId}`;
+    const cached = this.providerConversationCapabilities.get(key);
+    if (cached && Date.now() - cached.at < 60_000) return cached.value;
+    const value = this.providerConversationRequest(provider, 'GET', { inbox_id: inboxId }).then((capability) => {
+      if (capability.enabled === false) return false;
+      if (capability.enabled !== true || capability.provider !== 'whatsapp') {
+        throw new Error('Chatwoot provider conversation contract does not match WhatsApp');
+      }
+      return true;
+    });
+    this.providerConversationCapabilities.set(key, { at: Date.now(), value });
+    value.catch(() => {
+      if (this.providerConversationCapabilities.get(key)?.value === value)
+        this.providerConversationCapabilities.delete(key);
+    });
+    return value;
   }
 
   private async canonicalProviderConversation(
@@ -943,9 +962,48 @@ export class ChatwootService {
       throw new Error('Group participant contact creation could not be verified');
   }
 
+  private providerContactKey(provider: ChatwootModel, peer: string) {
+    return `${provider.id}:${provider.accountId}:${peer}`;
+  }
+
+  private rememberProviderContact(provider: ChatwootModel, peer: string, contact: any) {
+    if (!contact || !peer) return;
+    if (this.providerContacts.size >= ChatwootService.PROVIDER_CONTACT_CACHE_MAX) {
+      // Map keeps insertion order: drop the oldest tenth.
+      let drop = Math.ceil(ChatwootService.PROVIDER_CONTACT_CACHE_MAX / 10);
+      for (const key of this.providerContacts.keys()) {
+        this.providerContacts.delete(key);
+        if (--drop <= 0) break;
+      }
+    }
+    this.providerContacts.set(this.providerContactKey(provider, peer), { at: Date.now(), contact });
+  }
+
+  private forgetProviderContact(provider: ChatwootModel, peer?: string | null) {
+    if (!peer) return;
+    this.providerContacts.delete(this.providerContactKey(provider, peer));
+    this.providerContacts.delete(this.providerContactKey(provider, toCanonicalHistoryJid(peer)));
+  }
+
+  /** Drops every cached peer that points at this Chatwoot contact (after an update). */
+  private forgetProviderContactId(contactId: number) {
+    for (const [key, entry] of this.providerContacts)
+      if (entry.contact?.id === contactId) this.providerContacts.delete(key);
+  }
+
   private async findProviderContact(instance: InstanceDto, peer: string) {
     const context = await this.clientCw(instance);
     if (!context) throw new Error('Provider contact lookup context is unavailable');
+    const cacheKey = this.providerContactKey(context.provider, peer);
+    const cached = this.providerContacts.get(cacheKey);
+    if (cached && Date.now() - cached.at < ChatwootService.PROVIDER_CONTACT_TTL_MS) return cached.contact;
+    const found = await this.lookupProviderContact(context, peer);
+    if (found) this.rememberProviderContact(context.provider, peer, found);
+    else this.providerContacts.delete(cacheKey);
+    return found;
+  }
+
+  private async lookupProviderContact(context: any, peer: string) {
     const lookup = async (attribute: 'identifier' | 'phone_number', value: string) => {
       const response: any = await context.client.contacts.filter({
         accountId: Number(context.provider.accountId),
@@ -1379,6 +1437,9 @@ export class ChatwootService {
     }
 
     try {
+      // The cached provider contact carries the old name/identifier. Optional call:
+      // contact-boundary tests evaluate this method on a bare object.
+      this.forgetProviderContactId?.(Number(id));
       const contact = await client.contacts.update({
         accountId: Number(provider.accountId),
         id,
@@ -1668,13 +1729,22 @@ export class ChatwootService {
       if (!providerInbox) return null;
       if (await this.providerConversationsEnabled(provider, Number(providerInbox.id))) {
         // A legacy cache entry must not bypass the shared database binding.
-        return await this.canonicalProviderConversation(
-          instance,
-          provider,
-          Number(providerInbox.id),
-          toCanonicalHistoryJid(phoneNumber),
-          body,
-        );
+        const canonicalPeer = toCanonicalHistoryJid(phoneNumber);
+        try {
+          return await this.canonicalProviderConversation(
+            instance,
+            provider,
+            Number(providerInbox.id),
+            canonicalPeer,
+            body,
+          );
+        } catch (error) {
+          // A cached contact may have been merged or deleted in Chatwoot: look it up again.
+          this.forgetProviderContact(provider, canonicalPeer);
+          this.forgetProviderContact(provider, body?.key?.participantAlt);
+          this.forgetProviderContact(provider, body?.key?.participant);
+          throw error;
+        }
       }
 
       // Processa atualização de contatos já criados @lid (only when we have a real PN)
@@ -1933,7 +2003,35 @@ export class ChatwootService {
     }
   }
 
-  private async syncWhatsappGroupParticipants(
+  // One live groupMetadata + custom_attributes write per group conversation per
+  // minute. A mention message used to run it twice (delivery and render) and every
+  // mention in a busy group ran it again.
+  private readonly groupParticipantSyncs = new Map<
+    string,
+    { at: number; value: Promise<ReturnType<typeof buildWhatsappGroupParticipantSnapshots>> }
+  >();
+
+  private syncWhatsappGroupParticipants(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    conversationId: number,
+    groupJid: string,
+  ): Promise<ReturnType<typeof buildWhatsappGroupParticipantSnapshots>> {
+    const key = `${instance.instanceName}|${provider.id}|${conversationId}|${groupJid}`;
+    const cached = this.groupParticipantSyncs.get(key);
+    if (cached && Date.now() - cached.at < 60_000) return cached.value;
+    if (this.groupParticipantSyncs.size > 5_000) this.groupParticipantSyncs.clear();
+    const value = this.runWhatsappGroupParticipantSync(instance, provider, conversationId, groupJid);
+    this.groupParticipantSyncs.set(key, { at: Date.now(), value });
+    // A failed sync (empty result) is retried on the next message.
+    void value.then((snapshots) => {
+      if (!snapshots.length && this.groupParticipantSyncs.get(key)?.value === value)
+        this.groupParticipantSyncs.delete(key);
+    });
+    return value;
+  }
+
+  private async runWhatsappGroupParticipantSync(
     instance: InstanceDto,
     provider: ChatwootModel,
     conversationId: number,
@@ -2853,10 +2951,20 @@ export class ChatwootService {
     provenance?: OutboundMessageProvenance,
   ) {
     try {
+      // Only the content type is needed here; the send below downloads the file once.
+      // HEAD first, then a one-byte range read for servers that refuse HEAD.
       const metadata = await resolveChatwootAttachmentMetadata(media, async () => {
+        try {
+          const head = await axios.head(media, { signal: options?.signal, timeout: 15_000 });
+          if (head.headers['content-type']) return head.headers['content-type'];
+        } catch (error) {
+          if (options?.signal?.aborted) throw error;
+        }
         const response = await axios.get(media, {
           responseType: 'arraybuffer',
+          headers: { Range: 'bytes=0-0' },
           signal: options?.signal,
+          timeout: 30_000,
         });
         return response.headers['content-type'];
       });
@@ -5229,6 +5337,39 @@ export class ChatwootService {
     const messageContent = this.getMessageContent(types);
 
     return messageContent;
+  }
+
+  /**
+   * Same routing as eventWhatsapp, split in two: the awaited part only commits a
+   * durable message to the inbound ledger (a few ms), and `delivery` carries the
+   * Chatwoot write. The WhatsApp ingest loop awaits the admission and hands the
+   * delivery to its per-chat runner, so one slow chat no longer holds every other
+   * message of the batch.
+   */
+  public async admitWhatsappEvent(
+    event: string,
+    instance: InstanceDto,
+    body: any,
+  ): Promise<{ delivery: Promise<any> }> {
+    const deliveryKey = chatwootIngressDeliveryKey({
+      event,
+      instanceId: instance.instanceId,
+      whatsappMessageId: body?.key?.id,
+      remoteJid: body?.key?.remoteJid,
+      fromMe: body?.key?.fromMe,
+    });
+    if (!deliveryKey || !this.isDurableInboundBody(body) || isInboundTransportOnly(body))
+      return { delivery: this.eventWhatsapp(event, instance, body) };
+    const provider = await this.getProvider(instance);
+    if (!provider?.enabled) return { delivery: Promise.resolve(null) };
+    if (
+      await isChatwootOutboundEcho(body, (id) =>
+        isRetainedChatwootOutboundMessageId(this.prismaRepository, instance.instanceId, id),
+      )
+    )
+      return { delivery: Promise.resolve(null) };
+    const stored = await this.inboundQueue.admit(this.inboundRecord(instance, provider, body, 'pending'));
+    return { delivery: this.inboundQueue.deliverAdmitted(stored) };
   }
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {

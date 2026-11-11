@@ -55,6 +55,7 @@ import {
   StatusMessage,
   TypeButton,
 } from '@api/dto/sendMessage.dto';
+import { whatsappIngestRunner } from '@api/integrations/channel/whatsapp/whatsapp-ingest-runner';
 import {
   assertWhatsappMentionParticipants,
   normalizeWhatsappJid,
@@ -1377,7 +1378,14 @@ export class BaileysStartupService extends ChannelStartupService {
               ].some((err) => param?.includes?.(err)),
             )
           ) {
-            this.logger.warn(`Message ignored with messageStubParameters: ${JSON.stringify(received, null, 2)}`);
+            // Never dump the payload: it carries message content and key material.
+            this.logger.warn(
+              JSON.stringify({
+                event: 'whatsapp_undecryptable_ignored',
+                instanceId: this.instanceId,
+                stub: received.messageStubParameters?.find((param) => typeof param === 'string')?.slice(0, 80) ?? null,
+              }),
+            );
             continue;
           }
           if (received.message?.conversation || received.message?.extendedTextMessage?.text) {
@@ -1388,7 +1396,7 @@ export class BaileysStartupService extends ChannelStartupService {
 
               console.log('requested placeholder resync, id=', messageId);
             } else if (requestId) {
-              console.log('Message received from phone, id=', requestId, received);
+              this.logger.info(JSON.stringify({ event: 'whatsapp_placeholder_resend_received', requestId }));
             }
 
             if (text == 'onDemandHistSync') {
@@ -1615,221 +1623,247 @@ export class BaileysStartupService extends ChannelStartupService {
             await this.client.readMessages([received.key]);
           }
 
+          let chatwootDelivery: Promise<any> | null = null;
+          let deliveryStartedAt = 0;
+          const logForwardFailure = (error: any) =>
+            this.logger.error(
+              JSON.stringify({
+                event: 'chatwoot_ingress_forward_failed',
+                instanceId: this.instanceId,
+                errorClass: /^Inbound[A-Za-z]+$/.test(error?.message || '') ? error.message : error?.name || 'Error',
+              }),
+            );
           if (
             shouldForwardChatwootMessageUpsert(type) &&
             this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
             this.localChatwoot?.enabled &&
             !received.key.id.includes('@broadcast')
           ) {
-            const deliveryStartedAt = Date.now();
-            // A Chatwoot failure must not skip persisting the native Message row
-            // below: the durable inbound ledger retries from that row.
-            const chatwootSentMessage = await this.chatwootService
-              .eventWhatsapp(
+            deliveryStartedAt = Date.now();
+            // Only the durable ledger commit is awaited here. The Chatwoot write runs in
+            // this chat's ingest lane below, so other chats of the batch do not wait.
+            const admitted = await this.chatwootService
+              .admitWhatsappEvent(
                 Events.MESSAGES_UPSERT,
                 { instanceName: this.instance.name, instanceId: this.instanceId },
                 messageRaw,
               )
               .catch((error) => {
-                this.logger.error(
-                  JSON.stringify({
-                    event: 'chatwoot_ingress_forward_failed',
-                    instanceId: this.instanceId,
-                    errorClass: /^Inbound[A-Za-z]+$/.test(error?.message || '')
-                      ? error.message
-                      : error?.name || 'Error',
-                  }),
-                );
+                logForwardFailure(error);
                 return null;
               });
-
-            if (chatwootSentMessage?.id) {
-              messageRaw.chatwootMessageId = chatwootSentMessage.id;
-              messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
-              messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
-              const providerTimestamp = Number(received.messageTimestamp);
-              this.logger.info(
-                JSON.stringify({
-                  event: 'chatwoot_ingress_timing',
-                  instanceId: this.instanceId,
-                  inboxId: chatwootSentMessage.inbox_id,
-                  destinationId: chatwootSentMessage.id,
-                  upsertType: type,
-                  providerAgeAtReceiptSeconds: Number.isFinite(providerTimestamp)
-                    ? (ingressReceivedAt - providerTimestamp * 1000) / 1000
-                    : null,
-                  beforeDeliveryMs: deliveryStartedAt - ingressReceivedAt,
-                  destinationDeliveryMs: Date.now() - deliveryStartedAt,
-                }),
-              );
-            }
+            chatwootDelivery = admitted?.delivery ?? null;
           }
 
-          if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
-            const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
-              where: { instanceId: this.instanceId },
-              include: { OpenaiCreds: true },
-            });
-
-            if (openAiDefaultSettings && openAiDefaultSettings.openaiCredsId && openAiDefaultSettings.speechToText) {
-              messageRaw.message.speechToText = `[audio] ${await this.openaiService.speechToText(received, this)}`;
-            }
-          }
-
-          if (
-            this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE &&
-            (await this.isStoredRetransmission(type, messageRaw))
-          ) {
-            this.logger.info(
-              JSON.stringify({
-                event: 'native_retransmission_not_stored',
-                instanceId: this.instanceId,
-                messageType: messageRaw.messageType,
-              }),
-            );
-          } else if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
-            // eslint-disable-next-line @typescript-eslint/no-unused-vars
-            const { pollUpdates, ...messageData } = messageRaw;
-            const msg = await this.prismaRepository.message.create({ data: messageData });
-
-            const { remoteJid } = received.key;
-            const timestamp = msg.messageTimestamp;
-            const fromMe = received.key.fromMe.toString();
-            const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
-
-            const cachedTimestamp = await this.baileysCache.get(messageKey);
-
-            if (!cachedTimestamp) {
-              if (!received.key.fromMe) {
-                if (msg.status === status[3]) {
-                  this.logger.log(`Update not read messages ${remoteJid}`);
-                  await this.updateChatUnreadMessages(remoteJid);
-                } else if (msg.status === status[4]) {
-                  this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-                  await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
-                }
-              } else {
-                // is send message by me
-                this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
-                await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+          const ingestKey = `${received.key.remoteJid}`;
+          void whatsappIngestRunner.run(`${this.instanceId}|${ingestKey}`, async () => {
+            try {
+              const chatwootSentMessage = chatwootDelivery
+                ? await chatwootDelivery.catch((error) => {
+                    logForwardFailure(error);
+                    return null;
+                  })
+                : null;
+              if (chatwootSentMessage?.id) {
+                messageRaw.chatwootMessageId = chatwootSentMessage.id;
+                messageRaw.chatwootInboxId = chatwootSentMessage.inbox_id;
+                messageRaw.chatwootConversationId = chatwootSentMessage.conversation_id;
+                const providerTimestamp = Number(received.messageTimestamp);
+                this.logger.info(
+                  JSON.stringify({
+                    event: 'chatwoot_ingress_timing',
+                    instanceId: this.instanceId,
+                    inboxId: chatwootSentMessage.inbox_id,
+                    destinationId: chatwootSentMessage.id,
+                    upsertType: type,
+                    providerAgeAtReceiptSeconds: Number.isFinite(providerTimestamp)
+                      ? (ingressReceivedAt - providerTimestamp * 1000) / 1000
+                      : null,
+                    beforeDeliveryMs: deliveryStartedAt - ingressReceivedAt,
+                    destinationDeliveryMs: Date.now() - deliveryStartedAt,
+                  }),
+                );
               }
 
-              await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
-            } else {
-              this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
-            }
+              if (this.configService.get<Openai>('OPENAI').ENABLED && received?.message?.audioMessage) {
+                const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
+                  where: { instanceId: this.instanceId },
+                  include: { OpenaiCreds: true },
+                });
 
-            await this.retainNativeMessageMedia(received, messageRaw, msg);
-          }
+                if (
+                  openAiDefaultSettings &&
+                  openAiDefaultSettings.openaiCredsId &&
+                  openAiDefaultSettings.speechToText
+                ) {
+                  messageRaw.message.speechToText = `[audio] ${await this.openaiService.speechToText(received, this)}`;
+                }
+              }
 
-          if (this.localWebhook.enabled) {
-            if (isMedia && this.localWebhook.webhookBase64) {
-              try {
-                const buffer = await downloadMediaMessage(
-                  { key: received.key, message: received?.message },
-                  'buffer',
-                  {},
-                  { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+              if (
+                this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE &&
+                (await this.isStoredRetransmission(type, messageRaw))
+              ) {
+                this.logger.info(
+                  JSON.stringify({
+                    event: 'native_retransmission_not_stored',
+                    instanceId: this.instanceId,
+                    messageType: messageRaw.messageType,
+                  }),
                 );
+              } else if (this.configService.get<Database>('DATABASE').SAVE_DATA.NEW_MESSAGE) {
+                // eslint-disable-next-line @typescript-eslint/no-unused-vars
+                const { pollUpdates, ...messageData } = messageRaw;
+                const msg = await this.prismaRepository.message.create({ data: messageData });
 
-                if (buffer) {
-                  messageRaw.message.base64 = buffer.toString('base64');
+                const { remoteJid } = received.key;
+                const timestamp = msg.messageTimestamp;
+                const fromMe = received.key.fromMe.toString();
+                const messageKey = `${remoteJid}_${timestamp}_${fromMe}`;
+
+                const cachedTimestamp = await this.baileysCache.get(messageKey);
+
+                if (!cachedTimestamp) {
+                  if (!received.key.fromMe) {
+                    if (msg.status === status[3]) {
+                      this.logger.log(`Update not read messages ${remoteJid}`);
+                      await this.updateChatUnreadMessages(remoteJid);
+                    } else if (msg.status === status[4]) {
+                      this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
+                      await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+                    }
+                  } else {
+                    // is send message by me
+                    this.logger.log(`Update readed messages ${remoteJid} - ${timestamp}`);
+                    await this.updateMessagesReadedByTimestamp(remoteJid, timestamp);
+                  }
+
+                  await this.baileysCache.set(messageKey, true, this.MESSAGE_CACHE_TTL_SECONDS);
                 } else {
-                  // retry to download media
-                  const buffer = await downloadMediaMessage(
-                    { key: received.key, message: received?.message },
-                    'buffer',
-                    {},
-                    { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
-                  );
+                  this.logger.info(`Update readed messages duplicated ignored [avoid deadlock]: ${messageKey}`);
+                }
 
-                  if (buffer) {
-                    messageRaw.message.base64 = buffer.toString('base64');
+                await this.retainNativeMessageMedia(received, messageRaw, msg);
+              }
+
+              if (this.localWebhook.enabled) {
+                if (isMedia && this.localWebhook.webhookBase64) {
+                  try {
+                    const buffer = await downloadMediaMessage(
+                      { key: received.key, message: received?.message },
+                      'buffer',
+                      {},
+                      { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                    );
+
+                    if (buffer) {
+                      messageRaw.message.base64 = buffer.toString('base64');
+                    } else {
+                      // retry to download media
+                      const buffer = await downloadMediaMessage(
+                        { key: received.key, message: received?.message },
+                        'buffer',
+                        {},
+                        { logger: P({ level: 'error' }) as any, reuploadRequest: this.client.updateMediaMessage },
+                      );
+
+                      if (buffer) {
+                        messageRaw.message.base64 = buffer.toString('base64');
+                      }
+                    }
+                  } catch (error) {
+                    this.logger.error(['Error converting media to base64', error?.message]);
                   }
                 }
-              } catch (error) {
-                this.logger.error(['Error converting media to base64', error?.message]);
               }
-            }
-          }
 
-          this.logger.verbose(messageRaw);
+              this.logger.verbose(messageRaw);
 
-          sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
-          if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
-            messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
-          }
-          console.log(messageRaw);
+              sendTelemetry(`received.message.${messageRaw.messageType ?? 'unknown'}`);
+              if (messageRaw.key.remoteJid?.includes('@lid') && messageRaw.key.remoteJidAlt) {
+                messageRaw.key.remoteJid = messageRaw.key.remoteJidAlt;
+              }
+              this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
 
-          this.sendDataWebhook(Events.MESSAGES_UPSERT, messageRaw);
-
-          await chatbotController.emit({
-            instance: { instanceName: this.instance.name, instanceId: this.instanceId },
-            remoteJid: messageRaw.key.remoteJid,
-            msg: messageRaw,
-            pushName: messageRaw.pushName,
-          });
-
-          const contact = await this.prismaRepository.contact.findFirst({
-            where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
-          });
-
-          const contactRaw: {
-            remoteJid: string;
-            pushName: string;
-            profilePicUrl?: string;
-            instanceId: string;
-          } = {
-            remoteJid: received.key.remoteJid,
-            pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-            profilePicUrl: (await this.profilePicture(received.key.remoteJid)).profilePictureUrl,
-            instanceId: this.instanceId,
-          };
-
-          if (contactRaw.remoteJid === 'status@broadcast') {
-            continue;
-          }
-
-          if (contactRaw.remoteJid.includes('@s.whatsapp') || contactRaw.remoteJid.includes('@lid')) {
-            await saveOnWhatsappCache([
-              {
-                remoteJid:
-                  messageRaw.key.addressingMode === 'lid' ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid,
-                remoteJidAlt: messageRaw.key.remoteJidAlt,
-                lid: messageRaw.key.addressingMode === 'lid' ? 'lid' : null,
-              },
-            ]);
-          }
-
-          if (contact) {
-            this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
-
-            if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-              await this.chatwootService.eventWhatsapp(
-                Events.CONTACTS_UPDATE,
-                { instanceName: this.instance.name, instanceId: this.instanceId },
-                contactRaw,
-              );
-            }
-
-            if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-              await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
+              await chatbotController.emit({
+                instance: { instanceName: this.instance.name, instanceId: this.instanceId },
+                remoteJid: messageRaw.key.remoteJid,
+                msg: messageRaw,
+                pushName: messageRaw.pushName,
               });
 
-            continue;
-          }
+              if (received.key.remoteJid === 'status@broadcast') return;
 
-          this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
+              const contact = await this.prismaRepository.contact.findFirst({
+                where: { remoteJid: received.key.remoteJid, instanceId: this.instanceId },
+              });
 
-          if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
-            await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
-            });
+              const contactRaw: {
+                remoteJid: string;
+                pushName: string;
+                profilePicUrl?: string;
+                instanceId: string;
+              } = {
+                remoteJid: received.key.remoteJid,
+                pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
+                profilePicUrl: await this.cachedProfilePictureUrl(received.key.remoteJid),
+                instanceId: this.instanceId,
+              };
+
+              if (contactRaw.remoteJid.includes('@s.whatsapp') || contactRaw.remoteJid.includes('@lid')) {
+                await saveOnWhatsappCache([
+                  {
+                    remoteJid:
+                      messageRaw.key.addressingMode === 'lid' ? messageRaw.key.remoteJidAlt : messageRaw.key.remoteJid,
+                    remoteJidAlt: messageRaw.key.remoteJidAlt,
+                    lid: messageRaw.key.addressingMode === 'lid' ? 'lid' : null,
+                  },
+                ]);
+              }
+
+              if (contact) {
+                // Most messages come from a known, unchanged contact: no event, no write.
+                if (
+                  contact.pushName === (contactRaw.pushName ?? null) &&
+                  contact.profilePicUrl === (contactRaw.profilePicUrl ?? null)
+                )
+                  return;
+                this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+
+                if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+                  await this.chatwootService.eventWhatsapp(
+                    Events.CONTACTS_UPDATE,
+                    { instanceName: this.instance.name, instanceId: this.instanceId },
+                    contactRaw,
+                  );
+                }
+
+                if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+                  await this.prismaRepository.contact.upsert({
+                    where: {
+                      remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId },
+                    },
+                    create: contactRaw,
+                    update: contactRaw,
+                  });
+
+                return;
+              }
+
+              this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
+
+              if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
+                await this.prismaRepository.contact.upsert({
+                  where: {
+                    remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId },
+                  },
+                  update: contactRaw,
+                  create: contactRaw,
+                });
+            } catch (error) {
+              this.logger.error(error);
+            }
+          });
         } catch (error) {
           this.logger.error(error);
         }
@@ -2383,6 +2417,30 @@ export class BaileysStartupService extends ChannelStartupService {
       (this.historySyncFullRequestedForSocket && msg?.syncType === 2) ||
       (!this.historySyncFullRequestedForSocket && msg?.syncType === 3)
     );
+  }
+
+  private static readonly PROFILE_PICTURE_TTL_SECONDS = 6 * 60 * 60;
+
+  /**
+   * Avatar URL for message ingest. Asking WhatsApp on every message cost one IQ
+   * round trip per message and adds rate-limit pressure; avatars change rarely.
+   * A missing avatar is cached too (as an empty string).
+   */
+  private async cachedProfilePictureUrl(jid: string): Promise<string | null> {
+    const key = `profile_picture_url:${jid}`;
+    try {
+      const cached = await this.baileysCache.get(key);
+      if (typeof cached === 'string') return cached || null;
+    } catch {
+      // A cache outage only costs the WhatsApp lookup below.
+    }
+    const url = (await this.profilePicture(jid)).profilePictureUrl ?? null;
+    try {
+      await this.baileysCache.set(key, url ?? '', BaileysStartupService.PROFILE_PICTURE_TTL_SECONDS);
+    } catch {
+      // Best effort.
+    }
+    return url;
   }
 
   public async profilePicture(number: string) {
@@ -3204,7 +3262,11 @@ export class BaileysStartupService extends ChannelStartupService {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
         }
 
-        mediaInput = await sharp(imageBuffer).jpeg().toBuffer();
+        // A JPEG goes as is: re-encoding cost CPU on the send path, lost quality and
+        // dropped the EXIF orientation. Other formats are still converted for WhatsApp.
+        const isJpeg =
+          imageBuffer.length > 3 && imageBuffer[0] === 0xff && imageBuffer[1] === 0xd8 && imageBuffer[2] === 0xff;
+        mediaInput = isJpeg ? imageBuffer : await sharp(imageBuffer).jpeg().toBuffer();
         this.throwIfOutboundAborted(mediaMessage.signal);
         mediaMessage.fileName ??= 'image.jpg';
         mediaMessage.mimetype = 'image/jpeg';

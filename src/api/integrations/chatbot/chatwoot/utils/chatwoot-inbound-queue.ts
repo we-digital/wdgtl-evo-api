@@ -210,10 +210,51 @@ export class ChatwootInboundQueue {
 
   async submit(item: InboundDelivery): Promise<InboundAck | undefined> {
     // The database commit precedes all receiver reads/writes; no in-memory retry receipt substitutes for it.
-    const stored = await this.store.enqueue(item);
+    const stored = await this.admit(item);
     if (stored.state === 'confirmed') return stored.result ?? undefined;
     if (stored.state === 'failed' || stored.state === 'ignored' || stored.state === 'already_present') return undefined;
     return this.attempt(stored) ?? Promise.resolve(undefined);
+  }
+  /** Commits the row to the ledger only. Once this resolves the message survives a crash. */
+  admit(item: InboundDelivery): Promise<InboundDelivery> {
+    return this.store.enqueue(item);
+  }
+  /**
+   * Delivers an admitted row now, waiting up to `waitMs` for a free slot of this chat
+   * instead of leaving it to the 1 s poller. A row the poller already started resolves
+   * with that same delivery. Resolves undefined when it could not start in time; the
+   * row stays durable and the poller delivers it.
+   */
+  async deliverAdmitted(stored: InboundDelivery, waitMs = 30_000): Promise<InboundAck | undefined> {
+    if (stored.state === 'confirmed') return stored.result ?? undefined;
+    if (stored.state !== 'pending' && stored.state !== 'history_pending') return undefined;
+    const deadline = Date.now() + Math.max(0, waitMs);
+    for (;;) {
+      const work = this.attempt(stored);
+      if (work) return work;
+      const left = deadline - Date.now();
+      if (this.stopped || left <= 0) return undefined;
+      await this.slotReleased(left);
+    }
+  }
+  private slotWaiters: (() => void)[] = [];
+  private slotReleased(timeoutMs: number): Promise<void> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(done, timeoutMs);
+      timer.unref?.();
+      const waiters = this.slotWaiters;
+      function done() {
+        clearTimeout(timer);
+        const index = waiters.indexOf(done);
+        if (index >= 0) waiters.splice(index, 1);
+        resolve();
+      }
+      waiters.push(done);
+    });
+  }
+  private releaseSlotWaiters() {
+    const waiters = this.slotWaiters.splice(0);
+    for (const wake of waiters) wake();
   }
   start() {
     this.stopped = false;
@@ -230,6 +271,7 @@ export class ChatwootInboundQueue {
     if (this.reportTimer) clearInterval(this.reportTimer);
     this.timer = null;
     this.reportTimer = null;
+    this.releaseSlotWaiters();
     await Promise.allSettled([...this.active.values()]);
   }
   // Drains what is due now: fills free slots, waits, and repeats while work was
@@ -289,6 +331,7 @@ export class ChatwootInboundQueue {
       this.active.delete(item.id);
       for (const key of keys) this.activeChats.delete(key);
       if (history) this.activeHistory--;
+      this.releaseSlotWaiters();
       if (this.timer && !this.stopped) this.kick();
     });
     this.active.set(item.id, work);
