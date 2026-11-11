@@ -97,6 +97,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  canonicalInboundBody,
   inboundAcceptedSourceHashes,
   inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
@@ -296,6 +297,9 @@ const groupSyncWaiters: Array<() => void> = [];
 const scheduledGroupSyncs = new Set<string>();
 const pendingGroupSyncs = new Map<string, string[] | undefined>();
 const groupSyncs = new Map<string, Promise<any>>();
+
+// Wrapper types whose durable admission validates the persisted byte encoding.
+const durableWrappedMediaTypes = ['associatedChildMessage'];
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
@@ -5315,11 +5319,15 @@ export class ChatwootService {
 
   private isDurableInboundBody(body: any): boolean {
     try {
+      // Wrapped media is validated in its persisted (base64) byte encoding; the live
+      // upsert carries Uint8Arrays, which made every album child photo non-durable
+      // and the non-durable path dropped it ("no body message found").
+      const record = durableWrappedMediaTypes.includes(body?.messageType) ? canonicalInboundBody(body) : body;
       return (
         typeof body?.key?.fromMe === 'boolean' &&
         typeof body.key.remoteJid === 'string' &&
         !body.key.remoteJid.endsWith('@broadcast') &&
-        classifyCachedHistoryRecord(body, body.status === 'EDITED') === 'ordinary'
+        classifyCachedHistoryRecord(record, body.status === 'EDITED') === 'ordinary'
       );
     } catch {
       return false;
@@ -5600,6 +5608,13 @@ export class ChatwootService {
     if (!this.isDurableInboundBody(body)) throw new Error('InboundNativePayloadUnavailable');
     const nativeHash = inboundPayloadHash(body);
     if (body.message?.ephemeralMessage?.message) body.message = body.message.ephemeralMessage.message;
+    // An album child photo/video is delivered as its own media message, as the
+    // stored-history importer already does (retainedHistoryDisplayBody).
+    if (body.messageType === 'associatedChildMessage') {
+      const display = retainedHistoryDisplayBody(body);
+      body.messageType = retainedHistoryMedia(body).type;
+      body.message = display;
+    }
     const inbox = await this.getInbox(instance);
     const expected = inbox ? this.buildEvoRouteBinding(instance, provider, Number(inbox.id)) : null;
     if (

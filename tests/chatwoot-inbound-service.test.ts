@@ -6,12 +6,17 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 import vm from 'node:vm';
 import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import {
+  retainedHistoryDisplayBody,
+  retainedHistoryMedia,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import {
   normalizeStoredHistoryMessages,
   toChatwootSourceId,
@@ -83,6 +88,15 @@ function literalService() {
     module: { exports: undefined as any },
     historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,
+    JSON,
+    structuredClone,
+    Readable,
+    path,
+    mimeTypes: { extension: () => 'jpg' },
+    canonicalInboundBody,
+    durableWrappedMediaTypes: ['associatedChildMessage'],
+    retainedHistoryDisplayBody,
+    retainedHistoryMedia,
     persistHistoryIngress, ignoresHistoryPeer, normalizeStoredHistoryMessages, toChatwootSourceId,
     cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT, retainedVideoProxyUrl, URL,
     chatwootImport:{getHistoryContentMessage:(service:any,body:any)=>service.getConversationMessage(body.message)},
@@ -1501,4 +1515,89 @@ test('an owner already present but unverifiable is reported as present, without 
   const g = fixture();
   g.rows = [{ ...g.owner(), private: true }];
   await assert.rejects(g.service.deliverQueuedInbound(g.item), /IdentityMismatch/);
+});
+
+// Prod 2026-11-02..11: album child photos arrive as associatedChildMessage with
+// Uint8Array byte fields. They failed durable admission (persisted-shape validator),
+// went to the non-durable path, which saw no media and dropped them: none of ~250
+// reached Chatwoot.
+function albumChild(bytes: Buffer) {
+  const jpegThumbnail = Buffer.from([0xff, 0xd8, 0xff, 1, 2, 0xff, 0xd9]).toString('base64');
+  const image = {
+    url: 'https://mmg.whatsapp.net/synthetic',
+    mimetype: 'image/jpeg',
+    fileSha256: createHash('sha256').update(bytes).digest('base64'),
+    fileLength: { low: bytes.length, high: 0, unsigned: true },
+    height: 10,
+    width: 10,
+    mediaKey: Buffer.alloc(32, 1).toString('base64'),
+    fileEncSha256: Buffer.alloc(32, 2).toString('base64'),
+    directPath: '/v/synthetic',
+    mediaKeyTimestamp: { low: 1794355300, high: 0, unsigned: false },
+    jpegThumbnail,
+    caption: 'album caption',
+    contextInfo: { pairedMediaType: 1 },
+    annotations: [],
+    scanLengths: [],
+  };
+  return {
+    associatedChildMessage: { message: { imageMessage: image } },
+    messageContextInfo: {
+      messageAssociation: { associationType: 1, parentMessageKey: { id: 'P', remoteJid: 'x@g.us', fromMe: false } },
+    },
+  };
+}
+
+test('a live album child photo (Uint8Array bytes) is durable', () => {
+  const service = literalService();
+  const persisted: any = {
+    key: { id: 'A', remoteJid: '120363000000000000@g.us', fromMe: false },
+    messageType: 'associatedChildMessage',
+    messageTimestamp: 1794355300,
+    status: 'READ',
+    message: albumChild(Buffer.from('album-bytes')),
+  };
+  const live = structuredClone(persisted);
+  const image = live.message.associatedChildMessage.message.imageMessage;
+  for (const field of ['fileSha256', 'mediaKey', 'fileEncSha256', 'jpegThumbnail'])
+    image[field] = new Uint8Array(Buffer.from(image[field], 'base64'));
+  assert.throws(() => classifyCachedHistoryRecord(live, false));
+  assert.equal(service.isDurableInboundBody(persisted), true);
+  assert.equal(service.isDurableInboundBody(live), true);
+});
+
+test('a queued album child is delivered as its own image with caption and confirmed', async () => {
+  const bytes = Buffer.from('album-bytes');
+  const f = fixture();
+  f.native.messageType = 'associatedChildMessage';
+  f.native.message = albumChild(bytes);
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.processWhatsappEvent = f.literalProcess;
+  f.service.clientCw = async () => ({ client: {}, provider: f.provider });
+  f.service.isMediaMessage = (msg: any) => Boolean(msg?.imageMessage || msg?.documentMessage);
+  f.service.getConversationMessage = (msg: any) => msg?.imageMessage?.caption ?? msg?.conversation;
+  let delivered: any = null;
+  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = async ({ message }: any) => {
+    assert.ok(message.message.imageMessage);
+    return { base64: bytes.toString('base64'), mimetype: 'image/jpeg' };
+  };
+  f.service.sendData = async (...args: any[]) => {
+    delivered = { content: args[4], body: args[6] };
+    f.rows = [
+      {
+        ...f.owner(),
+        content: args[4],
+        attachments: 1,
+        content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(args[6]) } },
+      },
+    ];
+    return { id: 9 };
+  };
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(delivered.content, 'album caption');
+  assert.equal(delivered.body.messageType, 'imageMessage');
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.updates[0].where.messageType, 'associatedChildMessage');
 });
