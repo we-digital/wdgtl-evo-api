@@ -88,11 +88,11 @@ function literalService() {
     module: { exports: undefined as any },
     historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,
-    JSON,
     structuredClone,
     Readable,
     path,
     mimeTypes: { extension: () => 'jpg' },
+    JSON,
     canonicalInboundBody,
     durableWrappedMediaTypes: ['associatedChildMessage'],
     retainedHistoryDisplayBody,
@@ -1545,6 +1545,66 @@ test('an owner already present but unverifiable is reported as present, never PO
   await assert.rejects(g.service.deliverQueuedInbound(g.item), /IdentityMismatch/);
 });
 
+// Prod 2026-11-11: the media download turned mediaKey/fileSha256/fileEncSha256 of the
+// delivered body into Buffers before the receiver stamp was hashed, so every inbound
+// media message failed its stamp check and closed unlinked as already_present.
+test('a media download cannot change the delivered body, so the receiver stamp confirms', async () => {
+  const bytes = Buffer.from('jpeg-bytes');
+  const { f, calls } = mediaFixture(async () => ({ base64: bytes.toString('base64'), mimetype: 'image/jpeg' }));
+  f.native.message.imageMessage.fileSha256 = createHash('sha256').update(bytes).digest('base64');
+  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 2).toString('base64');
+  f.native.message.imageMessage.fileLength = bytes.length;
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = async ({ message }: any) => {
+    // What the Baileys download does to the object it is given.
+    for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
+      message.message.imageMessage[field] = Buffer.from(message.message.imageMessage[field], 'base64');
+    return { base64: bytes.toString('base64'), mimetype: 'image/jpeg' };
+  };
+  f.service.sendData = async (...args: any[]) => {
+    calls.files++;
+    const body = args[6];
+    f.rows = [
+      {
+        ...f.owner(),
+        content: '',
+        attachments: 1,
+        content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(body) } },
+      },
+    ];
+    return { id: 9 };
+  };
+  f.item.attempts = 0;
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(calls.files, 1);
+  assert.equal(f.updates.length, 1);
+});
+
+test('media rows stamped by the old in-place download confirm on a retry (recovery of already_present rows)', async () => {
+  const { f } = mediaFixture(async () => assert.fail('an existing owner is never downloaded again'));
+  f.native.message.imageMessage.fileSha256 = Buffer.alloc(32, 3).toString('base64');
+  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 4).toString('base64');
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  const legacy = structuredClone(f.native);
+  for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
+    legacy.message.imageMessage[field] = Buffer.from(legacy.message.imageMessage[field], 'base64');
+  f.rows = [
+    {
+      ...f.owner(),
+      content: '',
+      attachments: 1,
+      content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(legacy) } },
+    },
+  ];
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(f.creates, 0);
+  assert.equal(f.updates.length, 1);
+});
+
 // Prod 2026-11-02..11: album child photos arrive as associatedChildMessage with
 // Uint8Array byte fields. They failed durable admission (persisted-shape validator),
 // went to the non-durable path, which saw no media and dropped them: none of ~250
@@ -1618,32 +1678,6 @@ test('a queued album child is delivered as its own image with caption and confir
         content: args[4],
         attachments: 1,
         content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(args[6]) } },
-// Prod 2026-11-11: the media download turned mediaKey/fileSha256/fileEncSha256 of the
-// delivered body into Buffers before the receiver stamp was hashed, so every inbound
-// media message failed its stamp check and closed unlinked as already_present.
-test('a media download cannot change the delivered body, so the receiver stamp confirms', async () => {
-  const bytes = Buffer.from('jpeg-bytes');
-  const { f, calls } = mediaFixture(async () => ({ base64: bytes.toString('base64'), mimetype: 'image/jpeg' }));
-  f.native.message.imageMessage.fileSha256 = createHash('sha256').update(bytes).digest('base64');
-  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 2).toString('base64');
-  f.native.message.imageMessage.fileLength = bytes.length;
-  f.item.payload = structuredClone(f.native);
-  f.item.payloadHash = inboundPayloadHash(f.item.payload);
-  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = async ({ message }: any) => {
-    // What the Baileys download does to the object it is given.
-    for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
-      message.message.imageMessage[field] = Buffer.from(message.message.imageMessage[field], 'base64');
-    return { base64: bytes.toString('base64'), mimetype: 'image/jpeg' };
-  };
-  f.service.sendData = async (...args: any[]) => {
-    calls.files++;
-    const body = args[6];
-    f.rows = [
-      {
-        ...f.owner(),
-        content: '',
-        attachments: 1,
-        content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(body) } },
       },
     ];
     return { id: 9 };
@@ -1654,32 +1688,4 @@ test('a media download cannot change the delivered body, so the receiver stamp c
   assert.equal(delivered.body.messageType, 'imageMessage');
   assert.equal(f.updates.length, 1);
   assert.equal(f.updates[0].where.messageType, 'associatedChildMessage');
-  f.item.attempts = 0;
-  const ack = await f.service.deliverQueuedInbound(f.item);
-  assert.equal(ack.id, 9);
-  assert.equal(calls.files, 1);
-  assert.equal(f.updates.length, 1);
-});
-
-test('media rows stamped by the old in-place download confirm on a retry (recovery of already_present rows)', async () => {
-  const { f } = mediaFixture(async () => assert.fail('an existing owner is never downloaded again'));
-  f.native.message.imageMessage.fileSha256 = Buffer.alloc(32, 3).toString('base64');
-  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 4).toString('base64');
-  f.item.payload = structuredClone(f.native);
-  f.item.payloadHash = inboundPayloadHash(f.item.payload);
-  const legacy = structuredClone(f.native);
-  for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
-    legacy.message.imageMessage[field] = Buffer.from(legacy.message.imageMessage[field], 'base64');
-  f.rows = [
-    {
-      ...f.owner(),
-      content: '',
-      attachments: 1,
-      content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(legacy) } },
-    },
-  ];
-  const ack = await f.service.deliverQueuedInbound(f.item);
-  assert.equal(ack.id, 9);
-  assert.equal(f.creates, 0);
-  assert.equal(f.updates.length, 1);
 });
