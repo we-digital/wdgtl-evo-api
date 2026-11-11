@@ -58,13 +58,67 @@ export function inboundAcceptedSourceHashes(...bodies: InboundPayload[]): Set<st
     if (!body) continue;
     hashes.add(inboundPayloadHash(body));
     hashes.add(inboundPayloadHash(canonicalInboundBody(body)));
+    const legacy = legacyDownloadStampBody(body);
+    if (legacy) hashes.add(inboundPayloadHash(legacy));
   }
   return hashes;
+}
+
+// Same lists as TypeMediaMessage / MessageSubtype in wa.types (kept local: utils stay alias-free).
+const downloadMediaTypes = [
+  'imageMessage',
+  'documentMessage',
+  'audioMessage',
+  'videoMessage',
+  'stickerMessage',
+  'ptvMessage',
+];
+const downloadWrappers = ['ephemeralMessage', 'documentWithCaptionMessage', 'viewOnceMessage', 'viewOnceMessageV2'];
+const downloadKeyFields = ['mediaKey', 'fileSha256', 'fileEncSha256'];
+
+// Until 2026-11-11 the media download turned these three fields of the delivered
+// body into Buffers in place, before the receiver stamp was hashed. Every inbound
+// media row delivered then carries this stamp; accepting it lets those rows confirm.
+export function legacyDownloadStampBody(body: InboundPayload): InboundPayload | null {
+  const legacy = canonicalInboundBody(body);
+  let node = legacy.message;
+  for (const wrapper of downloadWrappers) if (node?.[wrapper]?.message) node = node[wrapper].message;
+  const type = downloadMediaTypes.find((name) => node?.[name] && typeof node[name] === 'object');
+  if (!type) return null;
+  const media = node[type];
+  let changed = false;
+  for (const field of downloadKeyFields)
+    if (typeof media[field] === 'string') {
+      media[field] = Buffer.from(media[field], 'base64');
+      changed = true;
+    }
+  return changed ? legacy : null;
 }
 // A blank-text sender-key distribution copy carries no user content. WhatsApp
 // sends it to (re)distribute group keys; Chatwoot can never render it.
 export function isInboundTransportOnly(body: InboundPayload): boolean {
   return plainTransportBody(body) && body.message.conversation === '' && !!body.message.senderKeyDistributionMessage;
+}
+const retransmittedMediaTypes = new Set([
+  'imageMessage',
+  'documentMessage',
+  'videoMessage',
+  'audioMessage',
+  'stickerMessage',
+  'ptvMessage',
+]);
+// A notify upsert under a key that already has a native row is a WhatsApp
+// retransmission (edits arrive as protocol messages, history as append), not
+// new content. Storing it again made every later lookup of the key ambiguous.
+export function isNativeRetransmission(existing: InboundPayload[], incoming: InboundPayload): boolean {
+  if (isInboundTransportOnly(incoming)) return true;
+  return existing.some(
+    (row) =>
+      row.messageType === incoming.messageType &&
+      row.messageType !== 'reactionMessage' &&
+      row.status !== 'EDITED' &&
+      incoming.status !== 'EDITED',
+  );
 }
 // Rows that can never be the content source of a message under the same key.
 export function inboundSourceCandidates<T extends InboundPayload>(sources: T[], stored: InboundPayload): T[] {
@@ -117,34 +171,37 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
     });
     if (anchor && sameEntity) return normalizedStored;
   }
-  // Sender-key retransmissions can retain the exact image with a newer transport timestamp.
+  // Sender-key retransmissions keep the exact media under the same key with a
+  // newer transport timestamp, a different sender-key/context envelope or a
+  // retained mediaUrl, or come as a blank sender-key-only copy (prod 2026-11-11:
+  // image+blank and document+document pairs on every instance of a group).
   if (
     stored.key?.fromMe === false &&
-    stored.messageType === 'imageMessage' &&
+    retransmittedMediaTypes.has(stored.messageType) &&
     stored.status !== 'EDITED' &&
-    stored.message?.imageMessage &&
-    sources.length
+    stored.message?.[stored.messageType] &&
+    sources.length > 1
   ) {
-    const normalized = canonicalInboundBody(stored);
-    const anchor = sources.some(
-      (source) => inboundPayloadHash(canonicalInboundBody(source)) === inboundPayloadHash(normalized),
-    );
+    // The provider-original row must still exist; S3 retention may have added a mediaUrl to it.
+    const anchor = sources.find((source) => inboundSourceIdentityHash(source) === inboundSourceIdentityHash(stored));
     const semantic = (source: InboundPayload) => {
       const projected = canonicalInboundBody(source);
-      const message = { ...projected.message };
+      const message = withoutLocators(projected.message, true);
       delete message.senderKeyDistributionMessage;
+      delete message.messageContextInfo;
       return { ...projected, message, messageTimestamp: stored.messageTimestamp };
     };
     if (
       anchor &&
       sources.every(
         (source) =>
-          source.messageType === 'imageMessage' &&
-          source.status !== 'EDITED' &&
-          inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored)),
+          (isInboundTransportOnly(source) && source.key?.fromMe === false) ||
+          (source.messageType === stored.messageType &&
+            source.status !== 'EDITED' &&
+            inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored))),
       )
     )
-      return normalized;
+      return canonicalInboundBody(anchor);
   }
   if (sources.length > 1 && new Set(sources.map((source) => inboundSourceIdentityHash(source))).size !== 1)
     throw new Error('InboundNativeSourceAmbiguous');

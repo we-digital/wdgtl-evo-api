@@ -97,6 +97,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ignored-history-edit';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import {
+  canonicalInboundBody,
   inboundAcceptedSourceHashes,
   inboundHistoryDocumentProjection,
   inboundNativeSnapshot,
@@ -296,6 +297,9 @@ const groupSyncWaiters: Array<() => void> = [];
 const scheduledGroupSyncs = new Set<string>();
 const pendingGroupSyncs = new Map<string, string[] | undefined>();
 const groupSyncs = new Map<string, Promise<any>>();
+
+// Wrapper types whose durable admission validates the persisted byte encoding.
+const durableWrappedMediaTypes = ['associatedChildMessage'];
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
@@ -5315,11 +5319,15 @@ export class ChatwootService {
 
   private isDurableInboundBody(body: any): boolean {
     try {
+      // Wrapped media is validated in its persisted (base64) byte encoding; the live
+      // upsert carries Uint8Arrays, which made every album child photo non-durable
+      // and the non-durable path dropped it ("no body message found").
+      const record = durableWrappedMediaTypes.includes(body?.messageType) ? canonicalInboundBody(body) : body;
       return (
         typeof body?.key?.fromMe === 'boolean' &&
         typeof body.key.remoteJid === 'string' &&
         !body.key.remoteJid.endsWith('@broadcast') &&
-        classifyCachedHistoryRecord(body, body.status === 'EDITED') === 'ordinary'
+        classifyCachedHistoryRecord(record, body.status === 'EDITED') === 'ordinary'
       );
     } catch {
       return false;
@@ -5600,6 +5608,13 @@ export class ChatwootService {
     if (!this.isDurableInboundBody(body)) throw new Error('InboundNativePayloadUnavailable');
     const nativeHash = inboundPayloadHash(body);
     if (body.message?.ephemeralMessage?.message) body.message = body.message.ephemeralMessage.message;
+    // An album child photo/video is delivered as its own media message, as the
+    // stored-history importer already does (retainedHistoryDisplayBody).
+    if (body.messageType === 'associatedChildMessage') {
+      const display = retainedHistoryDisplayBody(body);
+      body.messageType = retainedHistoryMedia(body).type;
+      body.message = display;
+    }
     const inbox = await this.getInbox(instance);
     const expected = inbox ? this.buildEvoRouteBinding(instance, provider, Number(inbox.id)) : null;
     if (
@@ -5655,7 +5670,12 @@ export class ChatwootService {
         rendered = formatIncomingWhatsappMentions(rendered, mentions, participants);
       }
     }
+    // Set once the receiver row is proven to be this source in this route
+    // (account, inbox, conversation, direction, peer). Content proof may still fail.
+    type ReceiverLink = { id: number; inbox_id: number; conversation_id: number; contact_inbox_source_id: any };
+    let identified = null as ReceiverLink | null;
     const confirm = async (rows: any[]) => {
+      identified = null;
       if (rows.length !== 1) throw new Error('InboundReceiverSourceAmbiguous');
       const row = rows[0];
       let attributes = row.content_attributes;
@@ -5680,6 +5700,12 @@ export class ChatwootService {
         (peer.endsWith('@g.us') && row.identifier !== peer)
       )
         throw new Error('InboundReceiverIdentityMismatch');
+      identified = {
+        id: Number(row.id),
+        inbox_id: Number(row.inbox_id),
+        conversation_id: Number(row.conversation_id),
+        contact_inbox_source_id: row.contact_inbox_source_id,
+      };
       const isMedia = this.isMediaMessage(body.message);
       if (attributes?.deleted === true || attributes?.message_deleted === true)
         throw new Error('InboundReceiverDeleted');
@@ -5746,57 +5772,8 @@ export class ChatwootService {
         ...(mediaUnavailable ? { media_unavailable: true } : {}),
       };
     };
-    // Fast path: the receiver itself returns the existing message for a replayed
-    // (inbox_id, source_id), so the pre-POST owner read is skipped. Any earlier
-    // receiver-side refusal or unconfirmed outcome goes back to the verified path.
-    // Only a first attempt takes it: every retry reads receiver owners first,
-    // so an existing message is confirmed instead of being POSTed again.
-    const idempotent =
-      item.attempts === 0 && !item.lastErrorClass && (await this.receiverIdempotent(provider, Number(inbox.id)));
-    return (async () => {
-      const before = idempotent ? [] : await owners();
-      let ack;
-      if (before.length) {
-        try {
-          ack = await confirm(before);
-        } catch (error) {
-          // The same inbox already owns exactly this source with the right identity
-          // (account, inbox, routed conversation, direction, peer), but its content
-          // or payload stamp cannot be proven. Never POST again; close it visibly.
-          if (error instanceof Error && inboundPresentUnverifiedClasses.has(error.message))
-            throw new Error('InboundReceiverPresentUnverified');
-          throw error;
-        }
-      } else {
-        this.durableInboundBodies.add(body);
-        if (!item.fromMe)
-          this.inboundCanonicalContexts.set(body, {
-            instanceId: item.instanceId,
-            instanceName: item.instanceName,
-            providerFingerprint: item.providerFingerprint,
-            accountId: item.accountId,
-            inboxId: Number(inbox.id),
-            peer,
-            sourceId: item.sourceId,
-            sourceHash,
-            conversationId,
-            routeBinding: expected,
-          });
-        let sent;
-        this.inboundMediaFallbacks.set(body, { attempts: item.attempts, used: false });
-        try {
-          sent = await this.processWhatsappEvent('messages.upsert', instance, body);
-        } catch (error) {
-          throw inboundReceiverHttpError(error) ?? error;
-        } finally {
-          this.inboundCanonicalContexts.delete(body);
-          this.durableInboundBodies.delete(body);
-          this.inboundMediaFallbacks.delete(body);
-        }
-        if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
-        ack = await confirm(await owners());
-        if (Number(sent.id) !== ack.id) throw new Error('InboundReceiverAckMismatch');
-      }
+    // Writes the Chatwoot pointers onto the native rows of this exact source (CAS per row).
+    const link = async (ack: ReceiverLink) => {
       const after = inboundSourceCandidates(
         await this.prismaRepository.message.findMany({
           where: {
@@ -5845,6 +5822,64 @@ export class ChatwootService {
         });
         if (updated.count !== 1) throw new Error('InboundNativeVersionChanged');
       }
+    };
+    // Fast path: the receiver itself returns the existing message for a replayed
+    // (inbox_id, source_id), so the pre-POST owner read is skipped. Any earlier
+    // receiver-side refusal or unconfirmed outcome goes back to the verified path.
+    // Only a first attempt takes it: every retry reads receiver owners first,
+    // so an existing message is confirmed instead of being POSTed again.
+    const idempotent =
+      item.attempts === 0 && !item.lastErrorClass && (await this.receiverIdempotent(provider, Number(inbox.id)));
+    return (async () => {
+      const before = idempotent ? [] : await owners();
+      let ack;
+      if (before.length) {
+        try {
+          ack = await confirm(before);
+        } catch (error) {
+          // The same inbox already owns exactly this source with the right identity
+          // (account, inbox, routed conversation, direction, peer), but its content
+          // or payload stamp cannot be proven. Never POST again; close it visibly.
+          if (error instanceof Error && inboundPresentUnverifiedClasses.has(error.message)) {
+            // Still never POSTed again, but the found message is linked: quotes,
+            // edits, deletes and reactions resolve it by its Chatwoot id.
+            const found = identified as ReceiverLink | null;
+            if (found) await link(found).catch(() => undefined);
+            throw new Error('InboundReceiverPresentUnverified');
+          }
+          throw error;
+        }
+      } else {
+        this.durableInboundBodies.add(body);
+        if (!item.fromMe)
+          this.inboundCanonicalContexts.set(body, {
+            instanceId: item.instanceId,
+            instanceName: item.instanceName,
+            providerFingerprint: item.providerFingerprint,
+            accountId: item.accountId,
+            inboxId: Number(inbox.id),
+            peer,
+            sourceId: item.sourceId,
+            sourceHash,
+            conversationId,
+            routeBinding: expected,
+          });
+        let sent;
+        this.inboundMediaFallbacks.set(body, { attempts: item.attempts, used: false });
+        try {
+          sent = await this.processWhatsappEvent('messages.upsert', instance, body);
+        } catch (error) {
+          throw inboundReceiverHttpError(error) ?? error;
+        } finally {
+          this.inboundCanonicalContexts.delete(body);
+          this.durableInboundBodies.delete(body);
+          this.inboundMediaFallbacks.delete(body);
+        }
+        if (!sent?.id) throw new Error('InboundReceiverOutcomeUnconfirmed');
+        ack = await confirm(await owners());
+        if (Number(sent.id) !== ack.id) throw new Error('InboundReceiverAckMismatch');
+      }
+      await link(ack);
       return { ...ack, native_source_hash: nativeHash, receiver_path: idempotent ? 'idempotent' : 'verified' };
     })();
   }
@@ -6039,10 +6074,10 @@ export class ChatwootService {
         if (isMedia) {
           let downloadBase64: any;
           try {
+            // The download normalizes media key fields in place; it must never
+            // touch the delivered body, whose hash is the receiver stamp.
             downloadBase64 = await waInstance?.getBase64FromMediaMessage({
-              message: {
-                ...body,
-              },
+              message: structuredClone(body),
             });
             if (!downloadBase64?.base64) throw new Error('InboundNativeMediaUnavailable');
             if (this.durableInboundBodies.has(body)) {

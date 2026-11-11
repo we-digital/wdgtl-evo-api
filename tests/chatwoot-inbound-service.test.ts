@@ -6,12 +6,17 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
+import { Readable } from 'node:stream';
 import test from 'node:test';
 import vm from 'node:vm';
 import { isDeepStrictEqual } from 'node:util';
 import ts from 'typescript';
 
 import { classifyCachedHistoryRecord } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
+import {
+  retainedHistoryDisplayBody,
+  retainedHistoryMedia,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-history-formats';
 import {
   normalizeStoredHistoryMessages,
   toChatwootSourceId,
@@ -83,6 +88,15 @@ function literalService() {
     module: { exports: undefined as any },
     historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,
+    structuredClone,
+    Readable,
+    path,
+    mimeTypes: { extension: () => 'jpg' },
+    JSON,
+    canonicalInboundBody,
+    durableWrappedMediaTypes: ['associatedChildMessage'],
+    retainedHistoryDisplayBody,
+    retainedHistoryMedia,
     persistHistoryIngress, ignoresHistoryPeer, normalizeStoredHistoryMessages, toChatwootSourceId,
     cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT, retainedVideoProxyUrl, URL,
     chatwootImport:{getHistoryContentMessage:(service:any,body:any)=>service.getConversationMessage(body.message)},
@@ -358,7 +372,8 @@ for (const [label, change] of [
     f.rows = [{ ...f.owner(), ...(change as object) }];
     await assert.rejects(f.service.deliverQueuedInbound(f.item));
     assert.equal(f.creates, 0);
-    assert.equal(f.updates.length, 0);
+    // Same identity, other text: present but unverified, and linked to that message.
+    assert.equal(f.updates.length, label === 'differentbody' ? 1 : 0);
   });
 test('ambiguous two owners refuses instead of choosing a winner', async () => {
   const f = fixture();
@@ -952,13 +967,25 @@ test('cached document fallback rejects semantic changes, malformed bytes, foreig
     f.item.payloadHash = inboundPayloadHash(f.item.payload);
     await assert.rejects(f.service.deliverQueuedInbound(f.item));
     assert.equal(f.creates, 0);
-    assert.equal(f.updates.length, 0);
+    // Never confirmed; at most the identity-proven owner is linked (present but unverified).
+    assert.ok(f.updates.every((update: any) => update.data.chatwootMessageId === 9));
   }
+  // Identity mismatches never link; a proven identity with unprovable metadata links only.
   for (const mutate of [
     (r: any) => (r.inbox_id = 43),
     (r: any) => (r.message_type = 1),
     (r: any) => (r.private = true),
     (r: any) => (r.peer = 'foreign@g.us'),
+  ]) {
+    const f = await recoveredDocumentFixture();
+    const rows = f.rows;
+    mutate(rows[0]);
+    f.rows = rows;
+    await assert.rejects(f.service.deliverQueuedInbound(f.item));
+    assert.equal(f.creates, 0);
+    assert.equal(f.updates.length, 0);
+  }
+  for (const mutate of [
     (r: any) => r.created_at_epoch++,
     (r: any) => r.content_attributes.external_created_at++,
     (r: any) => (r.content_attributes.provider_history_native.message_id = 'foreign'),
@@ -970,9 +997,9 @@ test('cached document fallback rejects semantic changes, malformed bytes, foreig
     const rows = f.rows;
     mutate(rows[0]);
     f.rows = rows;
-    await assert.rejects(f.service.deliverQueuedInbound(f.item));
+    await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverPresentUnverified/);
     assert.equal(f.creates, 0);
-    assert.equal(f.updates.length, 0);
+    assert.ok(f.updates.length <= 1 && f.updates.every((update: any) => update.data.chatwootMessageId === 9));
   }
   const f = await recoveredDocumentFixture();
   f.service.assertTaggedHistoryMediaStored = async () => {
@@ -1490,15 +1517,175 @@ test('receiver POST failures become ledger classes with status-specific retry se
   assert.equal(inboundReceiverHttpError(new Error('plain')), null);
 });
 
-test('an owner already present but unverifiable is reported as present, without POST or pointer writes', async () => {
+// Prod 2026-11-11: ~2,600 present-but-unverified rows never got their Chatwoot id,
+// so replies, edits and reactions on them could not find the message.
+test('an owner already present but unverifiable is reported as present, never POSTed, and linked', async () => {
   const f = fixture();
   f.rows = [{ ...f.owner(), content: 'edited later in Chatwoot' }];
   await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundReceiverPresentUnverified/);
   assert.equal(f.creates, 0);
-  assert.equal(f.updates.length, 0);
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.updates[0].where.id, 'native-A');
+  assert.deepEqual(JSON.parse(JSON.stringify(f.updates[0].data)), {
+    chatwootMessageId: 9,
+    chatwootInboxId: 42,
+    chatwootConversationId: 77,
+    chatwootContactInboxSourceId: 'source-ci',
+  });
+  // A native row already pointing elsewhere is never overwritten; the row still closes as present.
+  const c = fixture();
+  c.native.chatwootMessageId = 555;
+  c.rows = [{ ...c.owner(), content: 'edited later in Chatwoot' }];
+  await assert.rejects(c.service.deliverQueuedInbound(c.item), /InboundReceiverPresentUnverified/);
+  assert.equal(c.updates.length, 0);
   assert.ok(inboundPresentUnverifiedClasses.has('InboundReceiverContentChanged'));
   // Identity mismatches are not "present": they still refuse as before.
   const g = fixture();
   g.rows = [{ ...g.owner(), private: true }];
   await assert.rejects(g.service.deliverQueuedInbound(g.item), /IdentityMismatch/);
+});
+
+// Prod 2026-11-11: the media download turned mediaKey/fileSha256/fileEncSha256 of the
+// delivered body into Buffers before the receiver stamp was hashed, so every inbound
+// media message failed its stamp check and closed unlinked as already_present.
+test('a media download cannot change the delivered body, so the receiver stamp confirms', async () => {
+  const bytes = Buffer.from('jpeg-bytes');
+  const { f, calls } = mediaFixture(async () => ({ base64: bytes.toString('base64'), mimetype: 'image/jpeg' }));
+  f.native.message.imageMessage.fileSha256 = createHash('sha256').update(bytes).digest('base64');
+  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 2).toString('base64');
+  f.native.message.imageMessage.fileLength = bytes.length;
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = async ({ message }: any) => {
+    // What the Baileys download does to the object it is given.
+    for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
+      message.message.imageMessage[field] = Buffer.from(message.message.imageMessage[field], 'base64');
+    return { base64: bytes.toString('base64'), mimetype: 'image/jpeg' };
+  };
+  f.service.sendData = async (...args: any[]) => {
+    calls.files++;
+    const body = args[6];
+    f.rows = [
+      {
+        ...f.owner(),
+        content: '',
+        attachments: 1,
+        content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(body) } },
+      },
+    ];
+    return { id: 9 };
+  };
+  f.item.attempts = 0;
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(calls.files, 1);
+  assert.equal(f.updates.length, 1);
+});
+
+test('media rows stamped by the old in-place download confirm on a retry (recovery of already_present rows)', async () => {
+  const { f } = mediaFixture(async () => assert.fail('an existing owner is never downloaded again'));
+  f.native.message.imageMessage.fileSha256 = Buffer.alloc(32, 3).toString('base64');
+  f.native.message.imageMessage.fileEncSha256 = Buffer.alloc(32, 4).toString('base64');
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  const legacy = structuredClone(f.native);
+  for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
+    legacy.message.imageMessage[field] = Buffer.from(legacy.message.imageMessage[field], 'base64');
+  f.rows = [
+    {
+      ...f.owner(),
+      content: '',
+      attachments: 1,
+      content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(legacy) } },
+    },
+  ];
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(f.creates, 0);
+  assert.equal(f.updates.length, 1);
+});
+
+// Prod 2026-11-02..11: album child photos arrive as associatedChildMessage with
+// Uint8Array byte fields. They failed durable admission (persisted-shape validator),
+// went to the non-durable path, which saw no media and dropped them: none of ~250
+// reached Chatwoot.
+function albumChild(bytes: Buffer) {
+  const jpegThumbnail = Buffer.from([0xff, 0xd8, 0xff, 1, 2, 0xff, 0xd9]).toString('base64');
+  const image = {
+    url: 'https://mmg.whatsapp.net/synthetic',
+    mimetype: 'image/jpeg',
+    fileSha256: createHash('sha256').update(bytes).digest('base64'),
+    fileLength: { low: bytes.length, high: 0, unsigned: true },
+    height: 10,
+    width: 10,
+    mediaKey: Buffer.alloc(32, 1).toString('base64'),
+    fileEncSha256: Buffer.alloc(32, 2).toString('base64'),
+    directPath: '/v/synthetic',
+    mediaKeyTimestamp: { low: 1794355300, high: 0, unsigned: false },
+    jpegThumbnail,
+    caption: 'album caption',
+    contextInfo: { pairedMediaType: 1 },
+    annotations: [],
+    scanLengths: [],
+  };
+  return {
+    associatedChildMessage: { message: { imageMessage: image } },
+    messageContextInfo: {
+      messageAssociation: { associationType: 1, parentMessageKey: { id: 'P', remoteJid: 'x@g.us', fromMe: false } },
+    },
+  };
+}
+
+test('a live album child photo (Uint8Array bytes) is durable', () => {
+  const service = literalService();
+  const persisted: any = {
+    key: { id: 'A', remoteJid: '120363000000000000@g.us', fromMe: false },
+    messageType: 'associatedChildMessage',
+    messageTimestamp: 1794355300,
+    status: 'READ',
+    message: albumChild(Buffer.from('album-bytes')),
+  };
+  const live = structuredClone(persisted);
+  const image = live.message.associatedChildMessage.message.imageMessage;
+  for (const field of ['fileSha256', 'mediaKey', 'fileEncSha256', 'jpegThumbnail'])
+    image[field] = new Uint8Array(Buffer.from(image[field], 'base64'));
+  assert.throws(() => classifyCachedHistoryRecord(live, false));
+  assert.equal(service.isDurableInboundBody(persisted), true);
+  assert.equal(service.isDurableInboundBody(live), true);
+});
+
+test('a queued album child is delivered as its own image with caption and confirmed', async () => {
+  const bytes = Buffer.from('album-bytes');
+  const f = fixture();
+  f.native.messageType = 'associatedChildMessage';
+  f.native.message = albumChild(bytes);
+  f.item.payload = structuredClone(f.native);
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.service.processWhatsappEvent = f.literalProcess;
+  f.service.clientCw = async () => ({ client: {}, provider: f.provider });
+  f.service.isMediaMessage = (msg: any) => Boolean(msg?.imageMessage || msg?.documentMessage);
+  f.service.getConversationMessage = (msg: any) => msg?.imageMessage?.caption ?? msg?.conversation;
+  let delivered: any = null;
+  f.service.waMonitor.waInstances.one.getBase64FromMediaMessage = async ({ message }: any) => {
+    assert.ok(message.message.imageMessage);
+    return { base64: bytes.toString('base64'), mimetype: 'image/jpeg' };
+  };
+  f.service.sendData = async (...args: any[]) => {
+    delivered = { content: args[4], body: args[6] };
+    f.rows = [
+      {
+        ...f.owner(),
+        content: args[4],
+        attachments: 1,
+        content_attributes: { we_digital_ingress: { source_payload_sha256: inboundPayloadHash(args[6]) } },
+      },
+    ];
+    return { id: 9 };
+  };
+  const ack = await f.service.deliverQueuedInbound(f.item);
+  assert.equal(ack.id, 9);
+  assert.equal(delivered.content, 'album caption');
+  assert.equal(delivered.body.messageType, 'imageMessage');
+  assert.equal(f.updates.length, 1);
+  assert.equal(f.updates[0].where.messageType, 'associatedChildMessage');
 });

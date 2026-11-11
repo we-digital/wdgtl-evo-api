@@ -390,6 +390,27 @@ test('accepted receiver stamps cover both encodings of the same source and nothi
   assert.equal(accepted.has(inboundPayloadHash(changed)), false);
 });
 
+test('the old in-place download stamp of a media source is accepted; other media is not', () => {
+  const key = (n: number) => Buffer.alloc(32, n).toString('base64');
+  const media = (sha: string): any => ({
+    key: { id: 'M', remoteJid: '1203@g.us', fromMe: false },
+    messageType: 'imageMessage',
+    messageTimestamp: 1794380977,
+    message: { imageMessage: { mimetype: 'image/jpeg', mediaKey: key(1), fileSha256: sha, fileEncSha256: key(3) } },
+  });
+  const stored = media(key(2));
+  const stamped = structuredClone(stored);
+  for (const field of ['mediaKey', 'fileSha256', 'fileEncSha256'])
+    stamped.message.imageMessage[field] = Buffer.from(stamped.message.imageMessage[field], 'base64');
+  assert.notEqual(inboundPayloadHash(stamped), inboundPayloadHash(stored));
+  assert.ok(inboundAcceptedSourceHashes(stored).has(inboundPayloadHash(stamped)));
+  const other = structuredClone(stamped);
+  other.message.imageMessage.fileSha256 = Buffer.from(key(9), 'base64');
+  assert.equal(inboundAcceptedSourceHashes(stored).has(inboundPayloadHash(other)), false);
+  // A text source has no download variant: only its own (already canonical) hash.
+  assert.equal(inboundAcceptedSourceHashes(native()).size, 1);
+});
+
 test('sender-key-only blank copies are transport; text with sender keys is not', () => {
   const skd = { groupId: '120363000000000000@g.us', axolotlSenderKeyDistributionMessage: b64(1, 8) };
   assert.equal(isInboundTransportOnly({ ...native(), message: { conversation: '', senderKeyDistributionMessage: skd } }), true);
