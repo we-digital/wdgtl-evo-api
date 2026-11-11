@@ -4,10 +4,12 @@
 //
 // Ledger rows:  node dist/chatwoot-inbound-recovery.js [--states=failed,pending] [--instances=a,b]
 //   [--exclude-instances=t-test] [--errors=InboundX,...] [--history-older-than-hours=2]
-//   [--apply --confirm=<planHash>]
+//   [--skip-unsupported] [--apply --confirm=<planHash>]
 // Native gaps (stored in EVO, no ledger row, not linked to Chatwoot):
 //   node dist/chatwoot-inbound-recovery.js --native-since=2026-11-02T00:00:00Z [--native-until=ISO]
-//   --instances=a [--apply --confirm=<planHash>]
+//   --instances=a [--skip-unsupported] [--apply --confirm=<planHash>]
+// --skip-unsupported closes types Chatwoot cannot render (stickers, templates,
+// buttons, polls, product/order) as ignored ledger rows: terminal, never delivered.
 // Run native gaps one instance at a time: the window index is read into memory.
 import { PrismaClient } from '@prisma/client';
 
@@ -51,6 +53,7 @@ async function nativeGaps(prisma: PrismaClient, now: Date) {
     until,
     instanceNames: option('instances'),
     excludeInstanceNames: option('exclude-instances'),
+    skipUnsupported: process.argv.includes('--skip-unsupported'),
   };
   const plan = await planNativeGaps(prismaNativeGapReader(prisma), filter);
   const report = nativeGapReport(plan, now);
@@ -80,6 +83,7 @@ async function main() {
       instanceNames: option('instances'),
       excludeInstanceNames: option('exclude-instances'),
       errorClasses: option('errors'),
+      skipUnsupported: process.argv.includes('--skip-unsupported'),
       ...(Number.isFinite(hours) && hours > 0 ? { historyOlderThanMs: hours * 3_600_000 } : {}),
     };
     const plan = await planRecovery(prismaRecoveryReader(prisma), filter, now);

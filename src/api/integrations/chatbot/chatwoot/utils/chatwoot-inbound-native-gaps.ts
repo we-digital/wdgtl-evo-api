@@ -4,6 +4,7 @@ import { classifyCachedHistoryRecord } from './chatwoot-cached-history-record';
 import { ignoresHistoryPeer } from './chatwoot-history-ingress';
 import { isInboundTransportOnly, resolveInboundNativeBody } from './chatwoot-inbound-native-source';
 import {
+  INBOUND_UNSUPPORTED_SKIPPED,
   InboundDelivery,
   inboundDeliveryId,
   inboundPayloadHash,
@@ -83,6 +84,9 @@ export interface NativeGapFilter {
   until: Date;
   instanceNames?: string[];
   excludeInstanceNames?: string[];
+  // Record likely_unsupported gaps as ignored ledger rows (terminal, never
+  // delivered) so they stop showing up as gaps (owner decision 2026-11-11).
+  skipUnsupported?: boolean;
 }
 
 const scopeIgnored = (jid: string) =>
@@ -110,10 +114,11 @@ export function predictNativeGap(rows: NativeGapRow[], route: NativeGapRoute): N
     return 'ignored_peer';
   const content = rows.filter((row) => row.messageType !== 'reactionMessage');
   if (!content.length) return 'not_a_message';
-  if (content.length >= 3) return 'blocked_ambiguous';
   const real = content.filter((row) => !isInboundTransportOnly(row));
   if (!real.length) return 'ignore_transport';
   const payload = real[0];
+  // Before the importer classifier, which refuses most of these shapes outright.
+  if (RECOVERY_UNSUPPORTED_TYPES.has(payload.messageType)) return 'likely_unsupported';
   let ordinary = false;
   try {
     ordinary = classifyCachedHistoryRecord(payload, payload.status === 'EDITED') === 'ordinary';
@@ -126,7 +131,6 @@ export function predictNativeGap(rows: NativeGapRow[], route: NativeGapRoute): N
   } catch {
     return 'blocked_ambiguous';
   }
-  if (RECOVERY_UNSUPPORTED_TYPES.has(payload.messageType)) return 'likely_unsupported';
   return 'enqueue_history';
 }
 
@@ -173,7 +177,7 @@ export async function planNativeGaps(reader: NativeGapReader, filter: NativeGapF
         const key = rows[0].key;
         const prediction = outbound.has(key.id) ? 'chatwoot_outbound' : predictNativeGap(rows, route);
         const source =
-          prediction === 'enqueue_history'
+          prediction === 'enqueue_history' || prediction === 'likely_unsupported'
             ? rows.find((row) => row.messageType !== 'reactionMessage' && !isInboundTransportOnly(row))
             : undefined;
         candidates.push({
@@ -194,14 +198,18 @@ export async function planNativeGaps(reader: NativeGapReader, filter: NativeGapF
     (a, b) => a.timestampMs - b.timestampMs || a.peer.localeCompare(b.peer) || a.identity.localeCompare(b.identity),
   );
   const selected = candidates.filter((candidate) => candidate.prediction === 'enqueue_history');
+  const skip = filter.skipUnsupported
+    ? candidates.filter((candidate) => candidate.prediction === 'likely_unsupported' && candidate.source)
+    : [];
   const planHash = createHash('sha256')
     .update(
-      JSON.stringify(
-        selected.map(({ identity, source }) => [identity, source.id, inboundPayloadHash(ledgerPayload(source))]),
-      ),
+      JSON.stringify([
+        ...selected.map(({ identity, source }) => [identity, source.id, inboundPayloadHash(ledgerPayload(source))]),
+        ...skip.map(({ identity, source }) => [identity, source.id, 'skip']),
+      ]),
     )
     .digest('hex');
-  return { candidates, selected, alreadyInLedger, planHash };
+  return { candidates, selected, skip, alreadyInLedger, planHash };
 }
 
 const mask = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 8);
@@ -222,6 +230,7 @@ export function nativeGapReport(plan: Awaited<ReturnType<typeof planNativeGaps>>
     toEnqueue: plan.selected.length,
     chatsToEnqueue: new Set(plan.selected.map((candidate) => candidate.route.instanceId + '|' + candidate.peer)).size,
     oldestToEnqueue: plan.selected[0] ? new Date(plan.selected[0].timestampMs).toISOString() : null,
+    toSkipUnsupported: plan.skip.length,
     byPrediction: count(plan.candidates, (candidate) => candidate.prediction),
     byPredictionAndType: count(plan.candidates, (candidate) => `${candidate.prediction}|${candidate.messageType}`),
     toEnqueueByScopeDirection: count(plan.selected, (candidate) => `${scope(candidate)}|${direction(candidate)}`),
@@ -236,7 +245,12 @@ export async function applyNativeGaps(
   now: Date,
   spacingMs = 10,
 ) {
-  const items: InboundDelivery[] = plan.selected.map(({ route, identity, source }, index) => {
+  const row = (
+    { route, identity, source }: NativeGapCandidate,
+    state: 'history_pending' | 'ignored',
+    lastErrorClass: string,
+    nextAttemptAt: Date,
+  ): InboundDelivery => {
     const payload = ledgerPayload(source);
     if (inboundDeliveryId(route.instanceId, payload) !== identity) throw new Error('NativeGapIdentityChanged');
     return {
@@ -252,18 +266,25 @@ export async function applyNativeGaps(
       fromMe: source.key.fromMe,
       payload,
       payloadHash: inboundPayloadHash(payload),
-      state: 'history_pending',
+      state,
       attempts: 0,
-      nextAttemptAt: new Date(now.getTime() + index * spacingMs),
+      nextAttemptAt,
       leaseOwner: null,
       leaseExpiresAt: null,
       result: null,
-      lastErrorClass: RECOVERY_MARKER,
+      lastErrorClass,
     };
-  });
+  };
+  const items = plan.selected.map((candidate, index) =>
+    row(candidate, 'history_pending', RECOVERY_MARKER, new Date(now.getTime() + index * spacingMs)),
+  );
+  const ignored = plan.skip.map((candidate) => row(candidate, 'ignored', INBOUND_UNSUPPORTED_SKIPPED, now));
   let enqueued = 0;
   for (let i = 0; i < items.length; i += BATCH) enqueued += await writer.enqueue(items.slice(i, i + BATCH));
-  return { enqueued, skipped: items.length - enqueued };
+  let skippedUnsupported = 0;
+  for (let i = 0; i < ignored.length; i += BATCH)
+    skippedUnsupported += await writer.enqueue(ignored.slice(i, i + BATCH));
+  return { enqueued, skipped: items.length - enqueued, skippedUnsupported };
 }
 
 export function prismaNativeGapReader(prisma: any): NativeGapReader {

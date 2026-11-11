@@ -3,6 +3,8 @@ import test from 'node:test';
 
 import {
   ChatwootInboundQueue,
+  INBOUND_UNSUPPORTED_SKIPPED,
+  INBOUND_UNSUPPORTED_TYPES,
   InboundAck,
   InboundDelivery,
   InboundStore,
@@ -363,4 +365,33 @@ test('installed SDK Buffer JSON serialization does not rotate frozen native sour
   assert.equal(JSON.stringify(original), before);
   persisted.message.imageMessage.fileSha256.data[0] = 8;
   assert.notEqual(inboundPayloadHash(original), inboundPayloadHash(persisted));
+});
+
+test('unsupported types close at once as ignored, without a delivery attempt or retry', async () => {
+  class Terminal extends Ledger {
+    async fail(id: string, owner: string, state: any, errorClass: string) {
+      const r = this.rows.get(id)!;
+      if (r.leaseOwner !== owner) return false;
+      Object.assign(r, { state, lastErrorClass: errorClass, leaseOwner: null, leaseExpiresAt: null });
+      this.events.push(state);
+      return true;
+    }
+  }
+  for (const type of ['lottieStickerMessage', 'templateMessage', 'buttonsMessage', 'pollCreationMessageV3']) {
+    assert.equal(INBOUND_UNSUPPORTED_TYPES.has(type), true, type);
+    const store = new Terminal();
+    let delivered = 0;
+    const q = new ChatwootInboundQueue(store, async () => (delivered++, ack()));
+    const sticker = item();
+    sticker.payload = { ...sticker.payload, messageType: type, message: { [type]: {} } } as any;
+    sticker.payloadHash = inboundPayloadHash(sticker.payload);
+    await q.submit(sticker);
+    assert.equal(delivered, 0);
+    assert.equal(store.rows.get(sticker.id)?.state, 'ignored');
+    assert.equal(store.rows.get(sticker.id)?.lastErrorClass, INBOUND_UNSUPPORTED_SKIPPED);
+    await q.stop();
+  }
+  // Supported types, album child photos included, still deliver.
+  assert.equal(INBOUND_UNSUPPORTED_TYPES.has('associatedChildMessage'), false);
+  assert.equal(INBOUND_UNSUPPORTED_TYPES.has('stickerMessage'), false);
 });

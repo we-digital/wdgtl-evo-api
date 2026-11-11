@@ -16,6 +16,7 @@ import {
   inboundProviderFingerprint,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 import { RECOVERY_MARKER } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-recovery';
+import { INBOUND_UNSUPPORTED_SKIPPED } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-queue';
 
 const GROUP = '120363000000000077@g.us';
 const PEER = '62800000000001@s.whatsapp.net';
@@ -107,8 +108,8 @@ test('only unlinked, unledgered, ordinary messages are planned into the history 
   const predictions = Object.fromEntries(plan.candidates.map((c) => [c.messageType + ':' + c.prediction, true]));
   assert.ok(predictions['conversation:ignore_transport']);
   assert.ok(predictions['conversation:chatwoot_outbound']);
-  // A malformed lottie wrapper is not an ordinary record; a valid one is likely_unsupported. Neither is enqueued.
-  assert.equal(plan.candidates.find((c) => c.messageType === 'lottieStickerMessage')!.prediction, 'not_a_message');
+  // Unsupported types are predicted before the importer classifier and never enqueued.
+  assert.equal(plan.candidates.find((c) => c.messageType === 'lottieStickerMessage')!.prediction, 'likely_unsupported');
   assert.equal(plan.alreadyInLedger, 1);
   // Linked keys (even through a duplicate row), reactions alone and rows outside the window are not gaps.
   assert.equal(plan.candidates.length, 5);
@@ -117,7 +118,7 @@ test('only unlinked, unledgered, ordinary messages are planned into the history 
   assert.equal(again.planHash, plan.planHash);
 });
 
-test('ignored peers, broadcast scopes and triple-stored keys are refused', () => {
+test('ignored peers, broadcast scopes and over-stored keys are refused', () => {
   const ignored = { ...route, provider: { ...route.provider, ignoreJids: ['@g.us'] } };
   assert.equal(predictNativeGap([native('A')], ignored), 'ignored_peer');
   assert.equal(predictNativeGap([native('A')], { ...route, groupsIgnore: true }), 'ignored_peer');
@@ -125,7 +126,12 @@ test('ignored peers, broadcast scopes and triple-stored keys are refused', () =>
     predictNativeGap([native('S', { key: { id: 'S', remoteJid: 'status@broadcast', fromMe: false } })], route),
     'ignored_peer',
   );
-  assert.equal(predictNativeGap([native('T'), native('T'), native('T')], route), 'blocked_ambiguous');
+  // The copy limit is the delivery resolver's own (a key stored more often than it accepts).
+  const copies = [1, 2, 3, 4, 5].map(() => native('T'));
+  assert.equal(predictNativeGap(copies, route), 'blocked_ambiguous');
+  // Identical triple-stored copies resolve to one message (owner decision 11-11, resolver from #184).
+  const twin = native('W');
+  assert.equal(predictNativeGap([twin, { ...twin, id: 'w2' }, { ...twin, id: 'w3' }], route), 'enqueue_history');
   assert.equal(predictNativeGap([native('U')], route), 'enqueue_history');
 });
 
@@ -148,7 +154,7 @@ test('apply writes history_pending ledger rows the history lane accepts, ordered
     { enqueue: async (items) => (written.push(...items), items.length - 1) },
     now,
   );
-  assert.deepEqual(result, { enqueued: 1, skipped: 1 });
+  assert.deepEqual(result, { enqueued: 1, skipped: 1, skippedUnsupported: 0 });
   assert.deepEqual(
     written.map((item) => item.sourceId),
     ['WAID:B', 'WAID:A'],
@@ -167,4 +173,29 @@ test('apply writes history_pending ledger rows the history lane accepts, ordered
   }
   // Same hash as the native row itself: the history lane resolves the native source by it.
   assert.equal(written[0].payloadHash, inboundPayloadHash(b));
+});
+
+test('with --skip-unsupported, unsupported gaps are recorded as ignored ledger rows and never delivered', async () => {
+  const template = native('M', {
+    messageType: 'templateMessage',
+    message: { templateMessage: { hydratedTemplate: { hydratedContentText: 'secret text M' } } },
+  });
+  const plain = native('N');
+  const off = await planNativeGaps(reader([template, plain]).source, window);
+  assert.equal(off.skip.length, 0);
+  assert.equal(off.candidates.find((c) => c.messageType === 'templateMessage')!.prediction, 'likely_unsupported');
+  const plan = await planNativeGaps(reader([template, plain]).source, { ...window, skipUnsupported: true });
+  assert.notEqual(plan.planHash, off.planHash);
+  assert.equal(nativeGapReport(plan, new Date(1_800_000_000_000)).toSkipUnsupported, 1);
+  const written: any[] = [];
+  const result = await applyNativeGaps(
+    plan,
+    { enqueue: async (items) => (written.push(...items), items.length) },
+    new Date(1_800_000_000_000),
+  );
+  assert.deepEqual(result, { enqueued: 1, skipped: 0, skippedUnsupported: 1 });
+  const ignored = written.find((item) => item.sourceId === 'WAID:M');
+  assert.equal(ignored.state, 'ignored');
+  assert.equal(ignored.lastErrorClass, INBOUND_UNSUPPORTED_SKIPPED);
+  assert.equal(written.find((item) => item.sourceId === 'WAID:N').state, 'history_pending');
 });

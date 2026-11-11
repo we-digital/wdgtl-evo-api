@@ -4,11 +4,17 @@ import { Prisma } from '@prisma/client';
 
 import {
   inboundSourceCandidates,
-  MAX_NATIVE_COPIES,
   isInboundTransportOnly,
+  MAX_NATIVE_COPIES,
   resolveInboundNativeBody,
 } from './chatwoot-inbound-native-source';
-import { inboundDeliveryId, InboundLane, inboundPayloadHash } from './chatwoot-inbound-queue';
+import {
+  INBOUND_UNSUPPORTED_SKIPPED,
+  INBOUND_UNSUPPORTED_TYPES,
+  inboundDeliveryId,
+  InboundLane,
+  inboundPayloadHash,
+} from './chatwoot-inbound-queue';
 
 // Recovery for ledger rows that never reached Chatwoot. It only moves rows back
 // into their own lane with an ordered nextAttemptAt; delivery itself stays the
@@ -18,14 +24,9 @@ import { inboundDeliveryId, InboundLane, inboundPayloadHash } from './chatwoot-i
 export const RECOVERY_MARKER = 'InboundReceiverRecoveryRequeued';
 export const RECOVERY_STATES = ['pending', 'history_pending', 'failed'] as const;
 // Album child photos are delivered since #181 (live unwrap; the history importer
-// already unwrapped them), so they are no longer predicted unsupported.
-export const RECOVERY_UNSUPPORTED_TYPES = new Set([
-  'lottieStickerMessage',
-  'buttonsMessage',
-  'templateMessage',
-  'interactiveMessage',
-  'listMessage',
-]);
+// already unwrapped them), so they are no longer predicted unsupported. The
+// queue closes the remaining unsupported types as ignored (owner decision 11-11).
+export const RECOVERY_UNSUPPORTED_TYPES = INBOUND_UNSUPPORTED_TYPES;
 
 export type RecoveryPrediction =
   | 'deliver'
@@ -128,6 +129,8 @@ export interface RecoveryFilter {
   // history lane even when they were live: an old message replayed through the
   // live API would notify staff, run automations and reopen conversations.
   historyOlderThanMs?: number;
+  // Close likely_unsupported rows as ignored (terminal, never retried) on apply.
+  skipUnsupported?: boolean;
   instanceNames?: string[];
   errorClasses?: string[];
   excludeInstanceNames?: string[];
@@ -139,6 +142,7 @@ export interface RecoveryReader {
 }
 export interface RecoveryWriter {
   requeue(row: RecoveryRow, state: 'pending' | 'history_pending', nextAttemptAt: Date, now: Date): Promise<boolean>;
+  skip?(row: RecoveryRow, now: Date): Promise<boolean>;
 }
 
 export async function planRecovery(reader: RecoveryReader, filter: RecoveryFilter, now: Date) {
@@ -167,16 +171,37 @@ export async function planRecovery(reader: RecoveryReader, filter: RecoveryFilte
       });
     }
   }
+  // Old live rows go through the silent history lane: an old message replayed
+  // through the live API would notify staff, run automations and reopen
+  // conversations. Only a row with its native source can move lanes, because
+  // the history lane re-reads it.
+  if (filter.historyOlderThanMs !== undefined)
+    for (const candidate of candidates)
+      if (
+        candidate.lane === 'live' &&
+        (candidate.prediction === 'deliver' || candidate.prediction === 'confirm_existing') &&
+        candidate.timestampMs > 0 &&
+        now.getTime() - candidate.timestampMs > filter.historyOlderThanMs
+      )
+        candidate.lane = 'history';
   // Oldest WhatsApp message first: the queue delivers in nextAttemptAt order,
   // one in-flight delivery per chat, so each chat replays in original order.
   candidates.sort(
     (a, b) => a.timestampMs - b.timestampMs || a.row.peer.localeCompare(b.row.peer) || a.row.id.localeCompare(b.row.id),
   );
   const selected = candidates.filter((candidate) => requeuable.has(candidate.prediction));
+  const skip = filter.skipUnsupported
+    ? candidates.filter((candidate) => candidate.prediction === 'likely_unsupported')
+    : [];
   const planHash = createHash('sha256')
-    .update(JSON.stringify(selected.map(({ row, lane }) => [row.id, row.state, row.attempts, lane])))
+    .update(
+      JSON.stringify([
+        ...selected.map(({ row, lane }) => [row.id, row.state, row.attempts, lane]),
+        ...skip.map(({ row }) => [row.id, row.state, row.attempts, 'skip']),
+      ]),
+    )
     .digest('hex');
-  return { candidates, selected, planHash };
+  return { candidates, selected, skip, planHash };
 }
 
 const mask = (value: string) => createHash('sha256').update(value).digest('hex').slice(0, 8);
@@ -201,6 +226,7 @@ export function recoveryReport(plan: Awaited<ReturnType<typeof planRecovery>>, n
     groupsToRequeue: plan.selected.filter((candidate) => scope(candidate) === 'group').length,
     chatsToRequeue: new Set(plan.selected.map(({ row }) => row.instanceId + '|' + row.peer)).size,
     oldestToRequeue: oldest ? new Date(oldest).toISOString() : null,
+    toSkipUnsupported: plan.skip.length,
     byPrediction: count((candidate) => candidate.prediction),
     byStateAndPrediction: count(
       (candidate) => `${candidate.row.state}|${candidate.row.lastErrorClass ?? '-'}|${candidate.prediction}`,
@@ -231,7 +257,9 @@ export async function applyRecovery(
     if (ok) requeued++;
     else skipped++;
   }
-  return { requeued, skipped };
+  let skippedUnsupported = 0;
+  for (const { row } of plan.skip) if (await writer.skip!(row, now)) skippedUnsupported++;
+  return { requeued, skipped, skippedUnsupported, skipUnsupportedChanged: plan.skip.length - skippedUnsupported };
 }
 
 export function prismaRecoveryReader(prisma: any): RecoveryReader {
@@ -283,6 +311,19 @@ export function prismaRecoveryWriter(prisma: any): RecoveryWriter {
           leaseExpiresAt: null,
           ...(row.state === 'failed' ? { result: Prisma.DbNull } : {}),
         },
+      });
+      return updated.count === 1;
+    },
+    async skip(row, now) {
+      // Terminal and visible: the type is not delivered (owner decision 2026-11-11).
+      const updated = await prisma.chatwootInboundDelivery.updateMany({
+        where: {
+          id: row.id,
+          state: row.state,
+          attempts: row.attempts,
+          OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
+        },
+        data: { state: 'ignored', lastErrorClass: INBOUND_UNSUPPORTED_SKIPPED, leaseOwner: null, leaseExpiresAt: null },
       });
       return updated.count === 1;
     },

@@ -162,7 +162,12 @@ test('apply requeues into the original lane with ordered attempts and the verifi
       },
     },
   };
-  assert.deepEqual(await applyRecovery(plan, prismaRecoveryWriter(prisma), now), { requeued: 1, skipped: 1 });
+  assert.deepEqual(await applyRecovery(plan, prismaRecoveryWriter(prisma), now), {
+    requeued: 1,
+    skipped: 1,
+    skippedUnsupported: 0,
+    skipUnsupportedChanged: 0,
+  });
   assert.equal(calls[0].where.state, 'history_pending');
   assert.equal(calls[0].where.attempts, 40);
   assert.ok(calls[0].where.OR);
@@ -228,4 +233,35 @@ test('old live rows with a native source move to the silent history lane when as
   const states: string[] = [];
   await applyRecovery(plan, { requeue: async (r, state) => (states.push(r.sourceId + '|' + state), true) }, now);
   assert.ok(states.includes('WAID:O|history_pending'));
+});
+
+test('with skipUnsupported, likely_unsupported rows are closed as ignored, bound to the plan hash', async () => {
+  const now = new Date(1_700_000_000_000 + 10 * 3_600_000);
+  const sticker = native('S', { messageType: 'lottieStickerMessage', message: { lottieStickerMessage: { message: {} } } });
+  const text = native('T');
+  const rows = [row(sticker, { state: 'failed' }), row(text, { state: 'failed' })];
+  const off = await planRecovery(reader(rows, [sticker, text]), {}, now);
+  assert.equal(off.skip.length, 0);
+  const plan = await planRecovery(reader(rows, [sticker, text]), { skipUnsupported: true }, now);
+  assert.equal(plan.skip.length, 1);
+  assert.notEqual(plan.planHash, off.planHash);
+  assert.equal(recoveryReport(plan, now).toSkipUnsupported, 1);
+  const calls: string[] = [];
+  const result = await applyRecovery(
+    plan,
+    {
+      requeue: async (r, state) => (calls.push(r.sourceId + '|' + state), true),
+      skip: async (r) => (calls.push(r.sourceId + '|skip'), true),
+    },
+    now,
+  );
+  assert.deepEqual(calls, ['WAID:T|history_pending', 'WAID:S|skip']);
+  assert.equal(result.skippedUnsupported, 1);
+  // The writer closes it as terminal ignored with the skip reason, under the same CAS as a requeue.
+  const updates: any[] = [];
+  const writer = prismaRecoveryWriter({ chatwootInboundDelivery: { updateMany: async (q: any) => (updates.push(q), { count: 1 }) } });
+  assert.equal(await writer.skip!(rows[0], now), true);
+  assert.equal(updates[0].data.state, 'ignored');
+  assert.equal(updates[0].data.lastErrorClass, 'InboundUnsupportedTypeSkipped');
+  assert.equal(updates[0].where.attempts, rows[0].attempts);
 });
