@@ -395,3 +395,80 @@ test('unsupported types close at once as ignored, without a delivery attempt or 
   assert.equal(INBOUND_UNSUPPORTED_TYPES.has('associatedChildMessage'), false);
   assert.equal(INBOUND_UNSUPPORTED_TYPES.has('stickerMessage'), false);
 });
+
+test('admit only commits the ledger row; deliverAdmitted then delivers it once', async () => {
+  const store = new Ledger();
+  const delivered: string[] = [];
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    delivered.push(row.id);
+    return ack();
+  });
+  const row = item('admit-only');
+  const stored = await queue.admit(row);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.equal(store.rows.get(row.id)!.state, 'pending');
+  assert.deepEqual(delivered, []);
+  assert.deepEqual(await queue.deliverAdmitted(stored), ack());
+  assert.deepEqual(delivered, [row.id]);
+  // A confirmed row is answered from the ledger without another delivery.
+  assert.deepEqual(await queue.deliverAdmitted(await queue.admit(row)), ack());
+  assert.deepEqual(delivered, [row.id]);
+  await queue.stop();
+});
+
+test('deliverAdmitted waits for a busy chat instead of falling back to the poller', async () => {
+  const store = new Ledger();
+  let releaseFirst!: () => void;
+  const firstGate = new Promise<void>((resolve) => (releaseFirst = resolve));
+  const order: string[] = [];
+  const queue = new ChatwootInboundQueue(store, async (row) => {
+    order.push(row.payload.key.id);
+    if (row.payload.key.id === 'first') await firstGate;
+    return ack();
+  });
+  const make = (id: string): InboundDelivery => {
+    const base = item('same-chat');
+    const payload = { ...base.payload, key: { ...base.payload.key, id } };
+    return {
+      ...base,
+      id: inboundDeliveryId('same-chat', payload),
+      sourceId: `WAID:${id}`,
+      payload,
+      payloadHash: inboundPayloadHash(payload),
+    };
+  };
+  const first = await queue.admit(make('first'));
+  const second = await queue.admit(make('second'));
+  const firstDelivery = queue.deliverAdmitted(first);
+  const secondDelivery = queue.deliverAdmitted(second, 5_000);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(order, ['first']);
+  releaseFirst();
+  assert.deepEqual(await firstDelivery, ack());
+  assert.deepEqual(await secondDelivery, ack());
+  assert.deepEqual(order, ['first', 'second']);
+  await queue.stop();
+});
+
+test('deliverAdmitted gives up after its wait and leaves the row to the poller', async () => {
+  const store = new Ledger();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const queue = new ChatwootInboundQueue(store, async () => {
+    await gate;
+    return ack();
+  });
+  const busy = await queue.admit(item('busy-a'));
+  const waiting = await queue.admit(item('busy-b'));
+  const third = await queue.admit(item('busy-c'));
+  const running = [queue.deliverAdmitted(busy), queue.deliverAdmitted(waiting)];
+  // Two slots are taken (default concurrency 2): the third times out quickly.
+  assert.equal(await queue.deliverAdmitted(third, 20), undefined);
+  assert.equal(store.rows.get(third.id)!.state, 'pending');
+  assert.equal(store.rows.get(third.id)!.leaseOwner ?? null, null);
+  release();
+  await Promise.all(running);
+  await queue.poll();
+  assert.equal(store.rows.get(third.id)!.state, 'confirmed');
+  await queue.stop();
+});
