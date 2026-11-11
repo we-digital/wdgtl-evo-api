@@ -99,12 +99,12 @@ export function selectUniqueNativeKeyMessage(rows: Message[]): Message | null {
   );
 }
 
-export async function findNativeMessageByKey(
+async function findNativeKeyRows(
   prisma: PrismaClient,
   instanceId: string,
   keyId: string,
   scope?: NativeMessageKeyScope,
-): Promise<Message | null> {
+): Promise<Message[]> {
   if (
     !instanceId ||
     typeof keyId !== 'string' ||
@@ -113,11 +113,80 @@ export async function findNativeMessageByKey(
     (scope?.remoteJid !== undefined && (typeof scope.remoteJid !== 'string' || !scope.remoteJid.length)) ||
     (scope?.fromMe !== undefined && typeof scope.fromMe !== 'boolean')
   )
-    return null;
-  const rows = await prisma.$queryRaw<Message[]>(Prisma.sql`
+    return [];
+  return prisma.$queryRaw<Message[]>(Prisma.sql`
     SELECT * FROM "Message" WHERE "instanceId"=${instanceId} AND key->>'id'=${keyId}
       ${scope?.remoteJid !== undefined ? Prisma.sql`AND key->>'remoteJid'=${scope.remoteJid}` : Prisma.empty}
       ${scope?.fromMe !== undefined ? Prisma.sql`AND key->>'fromMe'=${String(scope.fromMe)}` : Prisma.empty}
       ORDER BY id LIMIT 33`);
-  return selectUniqueNativeKeyMessage(rows);
+}
+
+export async function findNativeMessageByKey(
+  prisma: PrismaClient,
+  instanceId: string,
+  keyId: string,
+  scope?: NativeMessageKeyScope,
+): Promise<Message | null> {
+  return selectUniqueNativeKeyMessage(await findNativeKeyRows(prisma, instanceId, keyId, scope));
+}
+
+/** Read-only lookup for building a WhatsApp quote; never used for native writes. */
+export async function findQuotableNativeMessageByKey(
+  prisma: PrismaClient,
+  instanceId: string,
+  keyId: string,
+  scope?: NativeMessageKeyScope,
+): Promise<Message | null> {
+  return selectQuotableNativeKeyMessage(await findNativeKeyRows(prisma, instanceId, keyId, scope));
+}
+
+// Fields that carry no visible content: EVO's stored media URL, group sender
+// keys and per-message context. A row with only these (or an empty text) is a
+// stub left by a repeated group receive, not something to quote.
+const NON_CONTENT_FIELDS = new Set(['mediaUrl', 'senderKeyDistributionMessage', 'messageContextInfo', 'conversation']);
+
+function hasQuotableContent(message: Message['message']): boolean {
+  if (!message || typeof message !== 'object' || Array.isArray(message)) return false;
+  const content = message as Record<string, unknown>;
+  if (typeof content.conversation === 'string' && content.conversation.length > 0) return true;
+  return Object.entries(content).some(
+    ([field, value]) => !NON_CONTENT_FIELDS.has(field) && value !== null && value !== undefined,
+  );
+}
+
+/**
+ * A quote only needs the WhatsApp key (id, chat, direction, group participant)
+ * plus some content for the preview. Group messages sent by one of our own
+ * instances reach every other instance in the group, and the receiving
+ * instance may store the same key twice (the media receive and a later empty
+ * text stub) without Chatwoot pointers, which `selectUniqueNativeKeyMessage`
+ * rightly refuses for native writes. For a quote any copy with the same key
+ * identity is the same WhatsApp message, so prefer the bound copy, then the
+ * earliest copy with visible content.
+ */
+export function selectQuotableNativeKeyMessage(rows: Message[]): Message | null {
+  const unique = selectUniqueNativeKeyMessage(rows);
+  if (unique) return unique;
+  if (!rows.length || rows.length > 32) return null;
+  const first = rows[0];
+  const key = first.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown };
+  if (!key?.id || typeof key.remoteJid !== 'string' || !key.remoteJid || typeof key.fromMe !== 'boolean') return null;
+  const participants = new Set<unknown>();
+  for (const row of rows) {
+    const current = row.key as { id?: unknown; remoteJid?: unknown; fromMe?: unknown; participant?: unknown };
+    if (
+      row.instanceId !== first.instanceId ||
+      current?.id !== key.id ||
+      current.remoteJid !== key.remoteJid ||
+      current.fromMe !== key.fromMe
+    )
+      return null;
+    if (current.participant !== undefined && current.participant !== null) participants.add(current.participant);
+  }
+  // Two different senders behind one key id is not the same message.
+  if (participants.size > 1) return null;
+  const quotable = rows.filter((row) => hasQuotableContent(row.message));
+  if (!quotable.length) return null;
+  const bound = quotable.filter(completePointers);
+  return bound.length === 1 ? bound[0] : quotable[0];
 }

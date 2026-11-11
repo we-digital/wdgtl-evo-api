@@ -481,7 +481,38 @@ export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
 const errorClass = (error: unknown): string => {
   if (error && typeof error === 'object' && 'name' in error && typeof error.name === 'string')
     return error.name.slice(0, 100);
+  // HTTP exceptions (BadRequestException and friends) throw plain objects
+  // `{ status, error: 'Bad Request', message }` without a name.
+  if (error && typeof error === 'object' && 'error' in error && typeof error.error === 'string') {
+    const name = error.error.replace(/[^A-Za-z0-9]/g, '');
+    if (name) return `Http${name}`.slice(0, 100);
+  }
   return 'Error';
+};
+
+/**
+ * A short, log-safe description of a failure: URLs (presigned media links),
+ * emails / WhatsApp JIDs and long digit runs (phone numbers) are masked.
+ */
+export const sanitizedOutboundErrorMessage = (error: unknown): string | null => {
+  let raw: unknown =
+    error && typeof error === 'object' && 'message' in error ? (error as { message?: unknown }).message : error;
+  if (Array.isArray(raw)) raw = raw.map((item) => (typeof item === 'string' ? item : JSON.stringify(item))).join('; ');
+  else if (raw && typeof raw === 'object') {
+    try {
+      raw = JSON.stringify(raw);
+    } catch {
+      raw = null;
+    }
+  }
+  if (typeof raw !== 'string' || !raw.trim()) return null;
+  return raw
+    .replace(/[a-z][a-z0-9+.-]*:\/\/\S+/gi, '<url>')
+    .replace(/[^\s@"']+@[^\s@"']+/g, '<address>')
+    .replace(/\d{6,}/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 200);
 };
 
 export class ChatwootOutboundQueue {
@@ -715,7 +746,7 @@ export class ChatwootOutboundQueue {
         await this.store.requestDeletion(operation);
         return true;
       }
-      await this.retryPreparation(operation, errorClass(error));
+      await this.retryPreparation(operation, errorClass(error), error);
       return true;
     }
     if (validation === 'mismatch') {
@@ -863,7 +894,7 @@ export class ChatwootOutboundQueue {
       } else if (classified === 'WhatsappNotReady') {
         await this.deferUntilWhatsappReady(operation);
       } else {
-        await this.retryPreparation(operation, classified);
+        await this.retryPreparation(operation, classified, error);
       }
     }
     return true;
@@ -886,7 +917,18 @@ export class ChatwootOutboundQueue {
     );
   }
 
-  private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string) {
+  private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string, error?: unknown) {
+    // lastErrorClass keeps only the class; the sanitized message goes to the
+    // log with the operation id so a terminal failure stays diagnosable.
+    this.handler.observe?.('chatwoot_outbound_preparation_failed', {
+      operationId: operation.id,
+      chatwootMessageId: operation.chatwootMessageId,
+      partIndex: operation.partIndex,
+      attempt: operation.preparationAttempts + 1,
+      maxAttempts: MAX_OUTBOUND_PREPARATION_ATTEMPTS,
+      errorClass: classified,
+      errorMessage: sanitizedOutboundErrorMessage(error),
+    });
     if (operation.preparationAttempts + 1 >= MAX_OUTBOUND_PREPARATION_ATTEMPTS) {
       await this.store.markFailureCallbackPending(operation, this.workerId, classified, new Date());
       this.wake();

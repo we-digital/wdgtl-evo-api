@@ -144,6 +144,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
 import {
   findNativeMessageByKey,
+  findQuotableNativeMessageByKey,
   NativeMessageKeyScope,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-message-key';
 import {
@@ -359,9 +360,11 @@ export class ChatwootService {
         fail: (operation, signal) => this.failQueuedOutbound(operation, signal),
         delete: (operation, signal) => this.deleteQueuedOutbound(operation, signal),
         observe: (event, metrics) =>
-          event === 'chatwoot_outbound_latency'
-            ? this.logger.info(JSON.stringify({ event, ...metrics }))
-            : this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
+          event === 'chatwoot_outbound_preparation_failed'
+            ? this.logger.warn(JSON.stringify({ event, ...metrics }))
+            : event === 'chatwoot_outbound_latency'
+              ? this.logger.info(JSON.stringify({ event, ...metrics }))
+              : this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
       },
       1_000,
       600_000,
@@ -3214,6 +3217,7 @@ export class ChatwootService {
         },
       },
       instance,
+      { operationId: operation.id, chatwootMessageId: operation.chatwootMessageId, partIndex: operation.partIndex },
     );
     const provenance: OutboundMessageProvenance = {
       version: 1,
@@ -4494,11 +4498,19 @@ export class ChatwootService {
     });
   }
 
-  private async getQuotedMessage(msg: any, instance: InstanceDto): Promise<Quoted> {
+  /**
+   * Resolve a Chatwoot reply to a WhatsApp quote. An unresolvable quote never
+   * fails the message: it is sent without the quote and the reason is logged.
+   * Database errors still propagate so the caller retries.
+   */
+  private async getQuotedMessage(
+    msg: any,
+    instance: InstanceDto,
+    context?: { operationId?: string; chatwootMessageId?: number; partIndex?: number },
+  ): Promise<Quoted> {
     const references = chatwootReplyReferences(msg?.content_attributes);
-    let message: MessageModel | null = null;
     if (references.chatwootMessageId) {
-      message = await this.prismaRepository.message.findFirst({
+      const message = await this.prismaRepository.message.findFirst({
         where: {
           chatwootMessageId: references.chatwootMessageId,
           instanceId: instance.instanceId,
@@ -4510,13 +4522,31 @@ export class ChatwootService {
     }
 
     if (references.whatsappMessageId) {
-      message = await this.getMessageByKeyId(instance, references.whatsappMessageId);
+      // The stored key carries remoteJid, fromMe and the group participant,
+      // which is exactly what WhatsApp needs to render the quote.
+      const message = await findQuotableNativeMessageByKey(
+        this.prismaRepository,
+        instance.instanceId,
+        references.whatsappMessageId,
+      );
       const quoted = this.quotedMessage(message, references.quoteText);
       if (quoted) return quoted;
     }
 
     if (references.chatwootMessageId || references.whatsappMessageId) {
-      throw new BadRequestException('Quoted WhatsApp message not found');
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_outbound_quote_unresolved',
+          reason: 'QuotedMessageNotFound',
+          action: 'sent_without_quote',
+          instanceId: instance.instanceId,
+          operationId: context?.operationId ?? null,
+          chatwootMessageId: context?.chatwootMessageId ?? msg?.id ?? null,
+          partIndex: context?.partIndex ?? null,
+          quotedChatwootMessageId: references.chatwootMessageId ?? null,
+          quotedWhatsappMessageId: references.whatsappMessageId?.slice(0, 64) ?? null,
+        }),
+      );
     }
 
     return null;
