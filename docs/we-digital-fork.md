@@ -1420,3 +1420,18 @@ values only) and a network code; never response bodies. An owner already in
 the same inbox with the right identity whose content or payload stamp cannot
 be proven closes as `already_present` (`InboundReceiverPresentUnverified`)
 instead of retrying; identity mismatches still refuse.
+
+## Inbound recovery: native-store gaps and the history-lane override (2026-11-11)
+
+`dist/chatwoot-inbound-recovery.js` has a second mode, `--native-since=<ISO> [--native-until=<ISO>] --instances=<name>`.
+It finds native `Message` rows in the window that are not linked to Chatwoot and have no ledger row (album photos
+dropped before #181, messages lost around restarts), and plans one `history_pending` ledger row per WhatsApp key.
+The silent history lane then delivers each one: it reads the Chatwoot owner first (an existing message is only linked),
+keeps the WhatsApp timestamp and sends no notification or webhook. Messages younger than 15 minutes, Chatwoot-sent
+outbound keys, ignored peers, transport stubs, controls, triple-stored keys and the unsupported types are reported but
+never planned. Dry run by default; `--apply --confirm=<planHash>` writes exactly the plan with `createMany
+skipDuplicates`.
+
+The ledger mode takes `--history-older-than-hours=<n>`: a live row whose WhatsApp message is older than that and that
+still has its native source is requeued into the history lane, so an old message is not replayed through the live API
+(notifications, automations, reopened conversations). `associatedChildMessage` is no longer predicted unsupported.

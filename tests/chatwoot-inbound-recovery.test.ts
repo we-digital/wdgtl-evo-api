@@ -9,6 +9,7 @@ import {
   predictRecovery,
   prismaRecoveryWriter,
   RECOVERY_MARKER,
+  RECOVERY_UNSUPPORTED_TYPES,
   RecoveryNativeRow,
   recoveryLane,
   recoveryReport,
@@ -187,4 +188,44 @@ test('terminal failures keep their lane for recovery', async () => {
   assert.equal(await store.fail('id', 'owner', 'failed', 'InboundReceiverContentChanged', 'history'), true);
   assert.deepEqual(calls[0].data.result, { terminal: 'failed', lane: 'history' });
   assert.equal(calls[0].data.state, 'failed');
+});
+
+test('album child photos are no longer predicted unsupported; the other unsupported types still are', () => {
+  assert.equal(RECOVERY_UNSUPPORTED_TYPES.has('associatedChildMessage'), false);
+  for (const type of ['lottieStickerMessage', 'buttonsMessage', 'templateMessage'])
+    assert.equal(RECOVERY_UNSUPPORTED_TYPES.has(type), true);
+});
+
+test('old live rows with a native source move to the silent history lane when asked', async () => {
+  const now = new Date(1_700_000_000_000 + 10 * 3_600_000);
+  const old = native('O', { messageTimestamp: 1_700_000_000 });
+  const fresh = native('F', { messageTimestamp: Math.floor(now.getTime() / 1000) - 60 });
+  const orphan = native('P', { messageTimestamp: 1_700_000_000 });
+  const rows = [
+    row(old, { state: 'failed', result: { terminal: 'failed', lane: 'live' } }),
+    row(fresh, { state: 'failed', result: { terminal: 'failed', lane: 'live' } }),
+    row(orphan, { state: 'pending', attempts: 0 }),
+  ];
+  const lanes = async (filter: any) =>
+    Object.fromEntries(
+      (await planRecovery(reader(rows, [old, fresh]), filter, now)).candidates.map(({ row, lane, prediction }) => [
+        row.sourceId,
+        lane + '|' + prediction,
+      ]),
+    );
+  assert.deepEqual(await lanes({}), {
+    'WAID:O': 'live|deliver',
+    'WAID:F': 'live|deliver',
+    'WAID:P': 'live|deliver_from_payload',
+  });
+  // The orphan has no native row: only the live lane can deliver it from its payload.
+  assert.deepEqual(await lanes({ historyOlderThanMs: 2 * 3_600_000 }), {
+    'WAID:O': 'history|deliver',
+    'WAID:F': 'live|deliver',
+    'WAID:P': 'live|deliver_from_payload',
+  });
+  const plan = await planRecovery(reader(rows, [old, fresh]), { historyOlderThanMs: 2 * 3_600_000 }, now);
+  const states: string[] = [];
+  await applyRecovery(plan, { requeue: async (r, state) => (states.push(r.sourceId + '|' + state), true) }, now);
+  assert.ok(states.includes('WAID:O|history_pending'));
 });

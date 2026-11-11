@@ -17,9 +17,10 @@ import { inboundDeliveryId, InboundLane, inboundPayloadHash } from './chatwoot-i
 // error class keeps the stage-3 idempotent fast path off for these rows.
 export const RECOVERY_MARKER = 'InboundReceiverRecoveryRequeued';
 export const RECOVERY_STATES = ['pending', 'history_pending', 'failed'] as const;
-const unsupportedTypes = new Set([
+// Album child photos are delivered since #181 (live unwrap; the history importer
+// already unwrapped them), so they are no longer predicted unsupported.
+export const RECOVERY_UNSUPPORTED_TYPES = new Set([
   'lottieStickerMessage',
-  'associatedChildMessage',
   'buttonsMessage',
   'templateMessage',
   'interactiveMessage',
@@ -116,13 +117,17 @@ export function predictRecovery(
     return 'blocked_ambiguous';
   }
   if (isInboundTransportOnly(resolved)) return 'ignore_transport';
-  if (unsupportedTypes.has(resolved.messageType)) return 'likely_unsupported';
+  if (RECOVERY_UNSUPPORTED_TYPES.has(resolved.messageType)) return 'likely_unsupported';
   if (candidates.some((native) => native.chatwootMessageId !== null)) return 'confirm_existing';
   return 'deliver';
 }
 
 export interface RecoveryFilter {
   states?: string[];
+  // Rows whose WhatsApp timestamp is older than this go through the silent
+  // history lane even when they were live: an old message replayed through the
+  // live API would notify staff, run automations and reopen conversations.
+  historyOlderThanMs?: number;
   instanceNames?: string[];
   errorClasses?: string[];
   excludeInstanceNames?: string[];

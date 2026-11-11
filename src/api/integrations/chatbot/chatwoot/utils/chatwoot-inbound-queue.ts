@@ -117,6 +117,31 @@ export function inboundPayloadHash(body: InboundPayload): string {
     .update(JSON.stringify(stable(JSON.parse(JSON.stringify(source)))))
     .digest('hex');
 }
+// Binds a ledger row to the exact Chatwoot provider configuration it was admitted under.
+// Must stay identical to ChatwootService.inboundProviderFingerprint (pinned by a test).
+export function inboundProviderFingerprint(provider: {
+  id: string;
+  instanceId: string;
+  accountId: unknown;
+  url: unknown;
+  nameInbox: unknown;
+  number: unknown;
+  ignoreJids: unknown;
+}): string {
+  return createHash('sha256')
+    .update(
+      JSON.stringify([
+        provider.id,
+        provider.instanceId,
+        provider.accountId,
+        provider.url,
+        provider.nameInbox,
+        provider.number,
+        provider.ignoreJids,
+      ]),
+    )
+    .digest('hex');
+}
 export function inboundDeliveryId(instanceId: string, body: InboundPayload): string {
   const { id, remoteJid, fromMe } = body.key ?? {};
   if (
