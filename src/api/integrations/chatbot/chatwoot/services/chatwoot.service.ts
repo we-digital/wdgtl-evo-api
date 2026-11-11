@@ -104,6 +104,8 @@ import {
   inboundSourceCandidates,
   inboundSourceIdentityHash,
   isInboundTransportOnly,
+  MAX_NATIVE_COPIES,
+  NATIVE_COPY_QUERY_LIMIT,
   resolveInboundNativeBody,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
 import { ChatwootInboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
@@ -5472,7 +5474,7 @@ export class ChatwootService {
             { key: { path: ['fromMe'], equals: item.fromMe } },
           ],
         },
-        take: 3,
+        take: NATIVE_COPY_QUERY_LIMIT,
       }),
       item.payload,
     );
@@ -5587,7 +5589,7 @@ export class ChatwootService {
             { key: { path: ['fromMe'], equals: item.fromMe } },
           ],
         },
-        take: 3,
+        take: NATIVE_COPY_QUERY_LIMIT,
       }),
       item.payload,
     );
@@ -5784,11 +5786,11 @@ export class ChatwootService {
               { key: { path: ['fromMe'], equals: item.fromMe } },
             ],
           },
-          take: 3,
+          take: NATIVE_COPY_QUERY_LIMIT,
         }),
         item.payload,
       );
-      if (after.length >= 3 || inboundNativeSnapshot(after) !== nativeSnapshot)
+      if (after.length > MAX_NATIVE_COPIES || inboundNativeSnapshot(after) !== nativeSnapshot)
         throw new Error('InboundNativeSourceChangedDuringDelivery');
       for (const source of after) {
         if (

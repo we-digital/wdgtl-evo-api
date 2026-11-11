@@ -73,6 +73,8 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       'midQualityFileSha256',
       'interactiveAnnotations',
       'imageSourceType',
+      'firstScanLength',
+      'firstScanSidecar',
       'jpegThumbnail',
       'thumbnailSha256',
       'thumbnailEncSha256',
@@ -102,6 +104,10 @@ export function retainedNativeJPEGDescriptor(value: any): boolean {
       (name) => value[name] === undefined || Array.isArray(value[name]),
     ) &&
     (value.scansSidecar === undefined || typeof value.scansSidecar === 'string') &&
+    // Progressive-JPEG first-scan sidecar (direct-chat album photos, prod 2026-11-11).
+    (value.firstScanSidecar === undefined || typeof value.firstScanSidecar === 'string') &&
+    (value.firstScanLength === undefined ||
+      (Number.isSafeInteger(value.firstScanLength) && value.firstScanLength >= 0)) &&
     (value.midQualityFileSha256 === undefined || bytes32(value.midQualityFileSha256)) &&
     (value.jpegThumbnail === undefined ||
       (typeof value.jpegThumbnail === 'string' &&

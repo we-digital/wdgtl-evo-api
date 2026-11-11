@@ -107,11 +107,83 @@ const retransmittedMediaTypes = new Set([
   'stickerMessage',
   'ptvMessage',
 ]);
+// Copies of one WhatsApp key that delivery may reconcile. Queries read one more
+// than this so an overflow is seen and refused instead of silently truncated.
+export const MAX_NATIVE_COPIES = 4;
+export const NATIVE_COPY_QUERY_LIMIT = MAX_NATIVE_COPIES + 1;
+
+// An empty plain text copy under a key carries no content at all (with or
+// without a sender-key sidecar). Edits/deletes arrive as protocol messages.
+export function isBlankNativeCopy(body: InboundPayload): boolean {
+  return plainTransportBody(body) && body.message.conversation === '';
+}
+
+const bareJid = (jid: string) => jid.replace(/:\d+@/, '@');
+// Every sender identity a copy carries about itself: the key participant and its
+// LID/PN alternate (participantAlt, participantPn, participantLid) and the
+// stored participant column. A copy with none of them asserts no sender.
+export function nativeSenderIdentities(body: InboundPayload): Set<string> {
+  const key = body?.key ?? {};
+  return new Set(
+    [key.participant, key.participantAlt, key.participantPn, key.participantLid, body?.participant]
+      .filter((value) => typeof value === 'string' && value.length > 0)
+      .map(bareJid),
+  );
+}
+const sameIdentities = (a: Set<string>, b: Set<string>) => a.size === b.size && [...a].every((v) => b.has(v));
+
+// Same sender, proven only from what the copies say about themselves: one copy
+// names the other's LID or phone-number form (WhatsApp sends both on a LID-addressed
+// copy), or one copy names nobody. Disjoint identities are different people.
+function provenSameSender(a: InboundPayload, b: InboundPayload): boolean {
+  const left = nativeSenderIdentities(a);
+  const right = nativeSenderIdentities(b);
+  if (left.size && right.size && ![...left].some((value) => right.has(value))) return false;
+  // Identical addressing: nothing explains a different display name.
+  if (sameIdentities(left, right) && (a.pushName ?? null) !== (b.pushName ?? null)) return false;
+  return true;
+}
+
+const mediaCopyKeys = new Set(['senderKeyDistributionMessage', 'messageContextInfo', 'mediaUrl', 'base64']);
+// Same content, proven by text equality or by the sender's per-message media
+// secret and file hashes (a forward would carry another key id).
+function provenSameContent(a: InboundPayload, b: InboundPayload): boolean {
+  if (a.messageType !== b.messageType || a.status === 'EDITED' || b.status === 'EDITED') return false;
+  if ((a.contextInfo?.stanzaId ?? null) !== (b.contextInfo?.stanzaId ?? null)) return false;
+  if (a.messageType === 'conversation')
+    return (
+      plainTransportBody(a) &&
+      plainTransportBody(b) &&
+      a.message.conversation.length > 0 &&
+      a.message.conversation === b.message.conversation
+    );
+  if (!retransmittedMediaTypes.has(a.messageType)) return false;
+  const [left, right] = [canonicalInboundBody(a).message, canonicalInboundBody(b).message];
+  const type = a.messageType;
+  if (![left, right].every((m) => m?.[type] && Object.keys(m).every((k) => k === type || mediaCopyKeys.has(k))))
+    return false;
+  return (
+    ['mediaKey', 'fileSha256', 'fileEncSha256'].every(
+      (field) => typeof left[type][field] === 'string' && left[type][field] === right[type][field],
+    ) && ['caption', 'fileName', 'mimetype'].every((field) => (left[type][field] ?? '') === (right[type][field] ?? ''))
+  );
+}
+
 // A notify upsert under a key that already has a native row is a WhatsApp
 // retransmission (edits arrive as protocol messages, history as append), not
 // new content. Storing it again made every later lookup of the key ambiguous.
 export function isNativeRetransmission(existing: InboundPayload[], incoming: InboundPayload): boolean {
   if (isInboundTransportOnly(incoming)) return true;
+  if (existing.length && isBlankNativeCopy(incoming)) return true;
+  // Keep the copy that names its group sender when every stored row names nobody
+  // (history-synced copies lose the key participant): delivery reconciles both.
+  if (
+    incoming.key?.remoteJid?.endsWith('@g.us') &&
+    nativeSenderIdentities(incoming).size &&
+    existing.length &&
+    existing.every((row) => !nativeSenderIdentities(row).size)
+  )
+    return false;
   return existing.some(
     (row) =>
       row.messageType === incoming.messageType &&
@@ -139,7 +211,7 @@ function plainTransportBody(body: InboundPayload): boolean {
 }
 
 export function resolveInboundNativeBody(sources: InboundPayload[], stored: InboundPayload): InboundPayload {
-  if (sources.length >= 3) throw new Error('InboundNativeSourceAmbiguous');
+  if (sources.length > MAX_NATIVE_COPIES) throw new Error('InboundNativeSourceAmbiguous');
   if (
     stored.key?.fromMe === false &&
     plainTransportBody(stored) &&
@@ -199,6 +271,34 @@ export function resolveInboundNativeBody(sources: InboundPayload[], stored: Inbo
           (source.messageType === stored.messageType &&
             source.status !== 'EDITED' &&
             inboundPayloadHash(semantic(source)) === inboundPayloadHash(semantic(stored))),
+      )
+    )
+      return canonicalInboundBody(anchor);
+  }
+  // Copies that differ in sender addressing (prod 2026-11-11): a LID-addressed copy
+  // with its phone-number alternate, and a copy that names no sender at all
+  // (history sync), each with its own pushName, thumbnail and context envelope.
+  if (stored.status !== 'EDITED' && sources.length > 1) {
+    const anchor = sources.find((source) => inboundSourceIdentityHash(source) === inboundSourceIdentityHash(stored));
+    const same = (source: InboundPayload) =>
+      source.key?.id === anchor!.key?.id &&
+      source.key?.remoteJid === anchor!.key?.remoteJid &&
+      source.key?.fromMe === anchor!.key?.fromMe &&
+      provenSameSender(anchor!, source) &&
+      provenSameContent(anchor!, source);
+    const addressingDiffers =
+      !!anchor &&
+      sources.some((source) => !sameIdentities(nativeSenderIdentities(source), nativeSenderIdentities(anchor)));
+    if (
+      anchor &&
+      // Outgoing copies reconcile only on an addressing difference, never on a
+      // repeated identical outgoing row.
+      (anchor.key?.fromMe === false || addressingDiffers) &&
+      sources.every(
+        (source) =>
+          source === anchor ||
+          (isBlankNativeCopy(source) && source.key?.fromMe === anchor.key?.fromMe && source.key?.fromMe === false) ||
+          same(source),
       )
     )
       return canonicalInboundBody(anchor);
