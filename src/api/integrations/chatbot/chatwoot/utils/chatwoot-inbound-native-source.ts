@@ -58,8 +58,41 @@ export function inboundAcceptedSourceHashes(...bodies: InboundPayload[]): Set<st
     if (!body) continue;
     hashes.add(inboundPayloadHash(body));
     hashes.add(inboundPayloadHash(canonicalInboundBody(body)));
+    const legacy = legacyDownloadStampBody(body);
+    if (legacy) hashes.add(inboundPayloadHash(legacy));
   }
   return hashes;
+}
+
+// Same lists as TypeMediaMessage / MessageSubtype in wa.types (kept local: utils stay alias-free).
+const downloadMediaTypes = [
+  'imageMessage',
+  'documentMessage',
+  'audioMessage',
+  'videoMessage',
+  'stickerMessage',
+  'ptvMessage',
+];
+const downloadWrappers = ['ephemeralMessage', 'documentWithCaptionMessage', 'viewOnceMessage', 'viewOnceMessageV2'];
+const downloadKeyFields = ['mediaKey', 'fileSha256', 'fileEncSha256'];
+
+// Until 2026-11-11 the media download turned these three fields of the delivered
+// body into Buffers in place, before the receiver stamp was hashed. Every inbound
+// media row delivered then carries this stamp; accepting it lets those rows confirm.
+export function legacyDownloadStampBody(body: InboundPayload): InboundPayload | null {
+  const legacy = canonicalInboundBody(body);
+  let node = legacy.message;
+  for (const wrapper of downloadWrappers) if (node?.[wrapper]?.message) node = node[wrapper].message;
+  const type = downloadMediaTypes.find((name) => node?.[name] && typeof node[name] === 'object');
+  if (!type) return null;
+  const media = node[type];
+  let changed = false;
+  for (const field of downloadKeyFields)
+    if (typeof media[field] === 'string') {
+      media[field] = Buffer.from(media[field], 'base64');
+      changed = true;
+    }
+  return changed ? legacy : null;
 }
 // A blank-text sender-key distribution copy carries no user content. WhatsApp
 // sends it to (re)distribute group keys; Chatwoot can never render it.
