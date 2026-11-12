@@ -96,3 +96,39 @@ test('backfill can keep only recently active conversations, most recent first', 
   await service.avatarBackfill({ instanceName: 'recent-avatar-test' }, {});
   assert.equal(queries[1].params[5], null, 'no filter by default');
 });
+
+test('Chatwoot avatar requests need a signed webhook and land on their lane', async () => {
+  const enqueued: any[] = [];
+  const service = new ChatwootService(
+    { waInstances: {} } as any,
+    { get: () => ({}) } as any,
+    {} as any,
+    {} as any,
+  ) as any;
+  service.enqueueAvatarSync = (_instance: unknown, job: any) => (enqueued.push(job), true);
+  const instance = { instanceName: 'requests-test' };
+  const body = {
+    event: 'contact_avatar_request',
+    priority: 'open',
+    contacts: [
+      { id: 11, identifier: '628111@s.whatsapp.net', has_avatar: false },
+      { id: 12, identifier: '120363000000000002@g.us', has_avatar: true },
+      { id: 13, identifier: 'telegram:42', has_avatar: false },
+    ],
+  };
+  await assert.rejects(service.receiveWebhook(instance, body, undefined), { status: 401 });
+  const admission = { deliveryId: 'd', timestampSeconds: 1, receivedAt: new Date() };
+  const result = await service.receiveWebhook(instance, body, admission);
+  assert.deepEqual(result, { message: 'avatar_requested', queued: 2 });
+  assert.deepEqual(
+    enqueued.map((j) => [j.jid, j.lane, j.contactId, j.hasAvatar, j.viewed]),
+    [
+      ['628111@s.whatsapp.net', 'open', 11, false, true],
+      ['120363000000000002@g.us', 'open', 12, true, false],
+    ],
+  );
+  assert.deepEqual(await service.receiveWebhook(instance, { ...body, priority: 'all' }, admission), {
+    message: 'avatar_request_ignored',
+    queued: 0,
+  });
+});

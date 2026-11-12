@@ -42,6 +42,7 @@ const harness = (
     fetch?: (jid: string) => AvatarPicture;
     markers?: [string, AvatarMarker][];
     rateLimitPauseMs?: number;
+    onSleep?: (ms: number, queue: AvatarSyncQueue) => void;
     maxRateLimitStrikes?: number;
   } = {},
 ): Harness => {
@@ -70,6 +71,7 @@ const harness = (
     sleep: async (ms) => {
       sleeps.push(ms);
       clock.now += ms;
+      options.onSleep?.(ms, queue);
     },
   };
   const queue = new AvatarSyncQueue('t-test', deps, {
@@ -126,7 +128,14 @@ test('paces WhatsApp fetches per instance and stores markers', async () => {
   await h.queue.idle();
   assert.equal(h.fetches.length, 3);
   // First fetch goes at once, the next ones 5 s apart (12 per minute).
-  assert.deepEqual(h.sleeps, [5_000, 5_000]);
+  assert.equal(
+    h.sleeps.reduce((sum, ms) => sum + ms, 0),
+    10_000,
+  );
+  assert.ok(
+    h.sleeps.every((ms) => ms <= 250),
+    'waits in short slices so an opened dialog can cut in',
+  );
   assert.equal(h.applied.length, 3);
   assert.equal(h.markers.get('628111@s.whatsapp.net')?.pictureId, '628111@s.whatsapp.net.jpg');
   assert.equal(h.queue.stats.applied, 3);
@@ -293,4 +302,74 @@ test('durable inbound messages trigger the avatar sync without awaiting it', () 
     admit,
     /\n {4}this\.enqueueInboundAvatars\(instance, body\);\n {4}const stored = await this\.inboundQueue\.admit/,
   );
+});
+
+test('an opened dialog cuts in: express slot, the waiting job keeps its place', async () => {
+  let injected = false;
+  const fetchedAt: [string, number][] = [];
+  const h = harness({
+    perMinute: 12,
+    onSleep: (_ms, queue) => {
+      if (!injected) {
+        injected = true;
+        queue.enqueue(job('opened@s.whatsapp.net', { lane: 'open', contactId: 9, hasAvatar: false, viewed: true }));
+      }
+    },
+    fetch: (jid) => {
+      fetchedAt.push([jid, h.clock.now]);
+      return { kind: 'picture', url: cdn(`${jid}.jpg`, h.clock.now + 10 * DAY), source: 'whatsapp' };
+    },
+  });
+  h.queue.enqueue(job('a@s.whatsapp.net'));
+  h.queue.enqueue(job('b@s.whatsapp.net'));
+  await h.queue.idle();
+  assert.deepEqual(
+    fetchedAt.map(([jid]) => jid),
+    ['a@s.whatsapp.net', 'opened@s.whatsapp.net', 'b@s.whatsapp.net'],
+  );
+  assert.ok(fetchedAt[1][1] - fetchedAt[0][1] <= 1_000, 'opened dialog waits at most the express gap');
+  assert.ok(fetchedAt[2][1] - fetchedAt[1][1] >= 5_000, 'normal pace resumes after it');
+  assert.equal(h.queue.stats.preempted, 1);
+  assert.equal(h.queue.stats.expressFetches, 1);
+  assert.equal(h.queue.stats.processed, 3);
+});
+
+test('express slots are limited: burst, then the normal pace', async () => {
+  const h = harness({ perMinute: 12 });
+  for (const n of ['1', '2', '3', '4', '5'])
+    h.queue.enqueue(job(`o${n}@s.whatsapp.net`, { lane: 'open', viewed: true, hasAvatar: false, contactId: 1 }));
+  await h.queue.idle();
+  assert.equal(h.queue.stats.expressFetches, 3);
+  // 3 express gaps of 1 s (the first one needs none), then normal 5 s gaps.
+  assert.equal(
+    h.sleeps.reduce((sum, ms) => sum + ms, 0),
+    2 * 1_000 + 2 * 5_000,
+  );
+});
+
+test('a viewed contact without avatar gets the known picture again; a hidden one waits', async () => {
+  const url = cdn('seen.jpg', T0 + 5 * DAY);
+  const h = harness({
+    peek: (jid) => (jid === 'seen@s.whatsapp.net' ? { kind: 'picture', url, source: 'cache' } : null),
+    markers: [
+      ['seen@s.whatsapp.net', { pictureId: 'seen.jpg', checkedAt: T0 - DAY }],
+      ['hidden@s.whatsapp.net', { pictureId: '', checkedAt: T0 - 2 * DAY }],
+      ['hidden-new@s.whatsapp.net', { pictureId: '', checkedAt: T0 - 60_000 }],
+    ],
+    fetch: () => ({ kind: 'none', source: 'whatsapp' }),
+  });
+  h.queue.enqueue(job('seen@s.whatsapp.net', { lane: 'list', viewed: true, hasAvatar: false, contactId: 1 }));
+  h.queue.enqueue(job('hidden@s.whatsapp.net', { lane: 'list', viewed: true, hasAvatar: false, contactId: 2 }));
+  h.queue.enqueue(job('hidden-new@s.whatsapp.net', { lane: 'open', viewed: true, hasAvatar: false, contactId: 3 }));
+  await h.queue.idle();
+  assert.deepEqual(
+    h.applied.map((a) => [a.jid, a.url]),
+    [['seen@s.whatsapp.net', url]],
+  );
+  assert.deepEqual(h.fetches, [], 'hidden pictures checked within a day are not asked again');
+
+  // Opened a day later: WhatsApp is asked once more.
+  h.queue.enqueue(job('hidden@s.whatsapp.net', { lane: 'open', viewed: true, hasAvatar: false, contactId: 2 }));
+  await h.queue.idle();
+  assert.deepEqual(h.fetches, ['hidden@s.whatsapp.net']);
 });

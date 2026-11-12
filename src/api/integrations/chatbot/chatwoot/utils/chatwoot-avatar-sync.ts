@@ -9,7 +9,12 @@
  * own storage, so nothing hotlinks the expiring WhatsApp CDN URL.
  */
 
-export type AvatarLane = 'live' | 'backfill';
+/**
+ * Lanes, highest priority first: a dialog someone opened in Chatwoot, WhatsApp
+ * activity and picture events, a conversation list someone loaded, backfill.
+ */
+export type AvatarLane = 'open' | 'live' | 'list' | 'backfill';
+export const AVATAR_LANES: readonly AvatarLane[] = ['open', 'live', 'list', 'backfill'];
 
 export type AvatarSyncJob = {
   jid: string;
@@ -20,6 +25,11 @@ export type AvatarSyncJob = {
   contactId?: number;
   /** Whether the Chatwoot contact already shows an avatar, when known. */
   hasAvatar?: boolean;
+  /**
+   * Chatwoot asked because someone looks at this contact and it shows no avatar:
+   * a fresh marker with a picture id does not skip it (the picture never landed).
+   */
+  viewed?: boolean;
   reason: string;
 };
 
@@ -58,6 +68,16 @@ export type AvatarSyncOptions = {
   refreshMs: number;
   maxLive: number;
   maxBackfill: number;
+  maxOpen: number;
+  maxList: number;
+  /** Opened dialogs may skip the pacing gap: at most this many in a row ... */
+  expressBurst: number;
+  /** ... refilled at this many per minute, on top of perMinute. */
+  expressPerMinute: number;
+  /** Minimum gap between two WhatsApp queries, even for express ones. */
+  expressGapMs: number;
+  /** An opened dialog asks again about a hidden picture after this long. */
+  openNoneRecheckMs: number;
   rateLimitPauseMs: number;
   /** Consecutive rate limits after which the backfill lane is dropped. */
   maxRateLimitStrikes: number;
@@ -68,13 +88,24 @@ export const DEFAULT_AVATAR_SYNC_OPTIONS: AvatarSyncOptions = {
   refreshMs: 7 * 24 * 60 * 60 * 1000,
   maxLive: 2_000,
   maxBackfill: 20_000,
+  maxOpen: 200,
+  maxList: 2_000,
+  expressBurst: 3,
+  expressPerMinute: 6,
+  expressGapMs: 1_000,
+  openNoneRecheckMs: 24 * 60 * 60 * 1000,
   rateLimitPauseMs: 15 * 60 * 1000,
   maxRateLimitStrikes: 3,
 };
 
 export type AvatarSyncStats = {
+  queuedOpen: number;
   queuedLive: number;
+  queuedList: number;
   queuedBackfill: number;
+  /** Jobs that waited for a slot and gave way to an opened dialog. */
+  preempted: number;
+  expressFetches: number;
   processed: number;
   applied: number;
   cleared: number;
@@ -166,8 +197,9 @@ export const markerIsFresh = (marker: AvatarMarker | null, now: number, refreshM
  * `perMinute` pictures per minute; markers and stored URLs are free.
  */
 export class AvatarSyncQueue {
-  private readonly live: AvatarSyncJob[] = [];
-  private readonly backfill: AvatarSyncJob[] = [];
+  private readonly lanes: Record<AvatarLane, AvatarSyncJob[]> = { open: [], live: [], list: [], backfill: [] };
+  private expressTokens: number;
+  private expressRefilledAt = 0;
   private readonly pending = new Map<string, AvatarSyncJob>();
   /** In-memory copy of fresh markers so repeated activity costs no cache reads. */
   private readonly recentlyChecked = new Map<string, number>();
@@ -179,8 +211,12 @@ export class AvatarSyncQueue {
   private readonly now: () => number;
   private readonly sleep: (ms: number) => Promise<void>;
   readonly stats: AvatarSyncStats = {
+    queuedOpen: 0,
     queuedLive: 0,
+    queuedList: 0,
     queuedBackfill: 0,
+    preempted: 0,
+    expressFetches: 0,
     processed: 0,
     applied: 0,
     cleared: 0,
@@ -209,6 +245,16 @@ export class AvatarSyncQueue {
     this.options.perMinute = Math.max(1, Math.min(60, this.options.perMinute));
     this.now = deps.now ?? (() => Date.now());
     this.sleep = deps.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
+    this.expressTokens = this.options.expressBurst;
+  }
+
+  private laneMax(lane: AvatarLane) {
+    return {
+      open: this.options.maxOpen,
+      live: this.options.maxLive,
+      list: this.options.maxList,
+      backfill: this.options.maxBackfill,
+    }[lane];
   }
 
   get perMinute() {
@@ -222,29 +268,31 @@ export class AvatarSyncQueue {
 
   /** Synchronous and cheap: safe to call from the message path. */
   enqueue(job: AvatarSyncJob): boolean {
-    if (this.stopped || !isSyncableAvatarJid(job.jid)) return false;
+    if (this.stopped || !isSyncableAvatarJid(job.jid) || !AVATAR_LANES.includes(job.lane)) return false;
     const existing = this.pending.get(job.jid);
     if (existing) {
-      // Upgrade in place: a forced or live request must not wait behind backfill.
+      // Merge, and move up when the new request has a higher priority.
       existing.force = existing.force || job.force;
+      existing.viewed = existing.viewed || job.viewed;
       existing.contactId = existing.contactId ?? job.contactId;
       existing.hasAvatar = existing.hasAvatar ?? job.hasAvatar;
-      if (existing.lane === 'backfill' && job.lane === 'live') {
-        const index = this.backfill.indexOf(existing);
-        if (index >= 0) this.backfill.splice(index, 1);
-        existing.lane = 'live';
-        this.live.push(existing);
+      if (AVATAR_LANES.indexOf(job.lane) < AVATAR_LANES.indexOf(existing.lane)) {
+        const from = this.lanes[existing.lane];
+        const index = from.indexOf(existing);
+        if (index >= 0) from.splice(index, 1);
+        existing.lane = job.lane;
+        this.lanes[job.lane].push(existing);
       }
       this.syncCounts();
       return true;
     }
-    if (!job.force) {
+    // Viewed contacts are judged by their marker in the worker; activity is not.
+    if (!job.force && !job.viewed) {
       const checkedUntil = this.recentlyChecked.get(job.jid);
       if (checkedUntil && checkedUntil > this.now()) return false;
     }
-    const lane = job.lane === 'live' ? this.live : this.backfill;
-    const max = job.lane === 'live' ? this.options.maxLive : this.options.maxBackfill;
-    if (lane.length >= max) {
+    const lane = this.lanes[job.lane];
+    if (lane.length >= this.laneMax(job.lane)) {
       this.stats.droppedFull++;
       return false;
     }
@@ -258,8 +306,7 @@ export class AvatarSyncQueue {
 
   stop() {
     this.stopped = true;
-    this.live.length = 0;
-    this.backfill.length = 0;
+    for (const lane of AVATAR_LANES) this.lanes[lane].length = 0;
     this.pending.clear();
     this.syncCounts();
   }
@@ -270,8 +317,14 @@ export class AvatarSyncQueue {
   }
 
   private syncCounts() {
-    this.stats.queuedLive = this.live.length;
-    this.stats.queuedBackfill = this.backfill.length;
+    this.stats.queuedOpen = this.lanes.open.length;
+    this.stats.queuedLive = this.lanes.live.length;
+    this.stats.queuedList = this.lanes.list.length;
+    this.stats.queuedBackfill = this.lanes.backfill.length;
+  }
+
+  private queuedTotal() {
+    return AVATAR_LANES.reduce((sum, lane) => sum + this.lanes[lane].length, 0);
   }
 
   private kick() {
@@ -280,12 +333,13 @@ export class AvatarSyncQueue {
     this.stats.startedAt ??= this.now();
     void this.drain().finally(() => {
       this.running = false;
-      if (!this.stopped && (this.live.length || this.backfill.length)) this.kick();
+      if (!this.stopped && this.queuedTotal()) this.kick();
     });
   }
 
   private next(): AvatarSyncJob | undefined {
-    const job = this.live.shift() ?? this.backfill.shift();
+    let job: AvatarSyncJob | undefined;
+    for (const lane of AVATAR_LANES) if ((job = this.lanes[lane].shift())) break;
     if (job) this.pending.delete(job.jid);
     this.syncCounts();
     return job;
@@ -294,7 +348,7 @@ export class AvatarSyncQueue {
   private async drain() {
     for (let job = this.next(); job; job = this.next()) {
       try {
-        await this.process(job);
+        if ((await this.process(job)) === 'requeued') continue;
       } catch (error) {
         this.stats.errors++;
         this.deps.log('chatwoot_avatar_sync_error', { queue: this.name, jid: job.jid, error: String(error) });
@@ -315,22 +369,56 @@ export class AvatarSyncQueue {
     this.recentlyChecked.set(jid, checkedAt + this.options.refreshMs);
   }
 
-  private async waitForSlot() {
+  private refillExpress() {
+    const now = this.now();
+    const every = 60_000 / this.options.expressPerMinute;
+    if (!this.expressRefilledAt) this.expressRefilledAt = now;
+    const earned = Math.floor((now - this.expressRefilledAt) / every);
+    if (earned > 0) {
+      this.expressTokens = Math.min(this.options.expressBurst, this.expressTokens + earned);
+      this.expressRefilledAt += earned * every;
+    }
+  }
+
+  /**
+   * Waits for the next WhatsApp query slot. An opened dialog may use an express
+   * token (short gap). Any other job gives way when an opened dialog arrives
+   * meanwhile: returns false and the caller puts it back.
+   */
+  private async waitForSlot(job: AvatarSyncJob): Promise<boolean> {
     const pausedUntil = this.stats.pausedUntil;
     if (pausedUntil && pausedUntil > this.now()) await this.sleep(pausedUntil - this.now());
     this.stats.pausedUntil = null;
-    const gap = 60_000 / this.options.perMinute;
-    const wait = this.lastFetchAt + gap - this.now();
-    if (wait > 0) await this.sleep(wait);
+    let gap = 60_000 / this.options.perMinute;
+    if (job.lane === 'open') {
+      this.refillExpress();
+      if (this.expressTokens >= 1) {
+        this.expressTokens--;
+        this.stats.expressFetches++;
+        gap = Math.min(gap, this.options.expressGapMs);
+      }
+    }
+    for (let wait = this.lastFetchAt + gap - this.now(); wait > 0; wait = this.lastFetchAt + gap - this.now()) {
+      if (job.lane !== 'open' && this.lanes.open.length) return false;
+      await this.sleep(Math.min(wait, 250));
+    }
+    return !(job.lane !== 'open' && this.lanes.open.length);
   }
 
-  private async process(job: AvatarSyncJob) {
+  private async process(job: AvatarSyncJob): Promise<'requeued' | void> {
     const previous = await this.deps.readMarker(job.jid);
     const now = this.now();
     if (!job.force && markerIsFresh(previous, now, this.options.refreshMs)) {
-      this.stats.fresh++;
-      this.remember(job.jid, previous.checkedAt);
-      return;
+      // A viewed contact without an avatar whose picture we did see: re-apply it.
+      // A hidden picture: an opened dialog asks WhatsApp again after a day.
+      const reapply = job.viewed && job.hasAvatar === false && !!previous.pictureId;
+      const recheckHidden =
+        job.lane === 'open' && !previous.pictureId && now - previous.checkedAt > this.options.openNoneRecheckMs;
+      if (!reapply && !recheckHidden) {
+        this.stats.fresh++;
+        if (!job.viewed) this.remember(job.jid, previous.checkedAt);
+        return;
+      }
     }
 
     if (!job.contactId && this.deps.resolveTarget) {
@@ -350,7 +438,14 @@ export class AvatarSyncQueue {
     let picture: AvatarPicture | null = job.force ? null : await this.deps.peekPicture(job.jid);
     if (picture?.kind === 'picture') this.stats.reusedUrls++;
     if (!picture) {
-      await this.waitForSlot();
+      if (!(await this.waitForSlot(job))) {
+        // An opened dialog goes first; this job keeps its place at the head of its lane.
+        this.stats.preempted++;
+        this.lanes[job.lane].unshift(job);
+        this.pending.set(job.jid, job);
+        this.syncCounts();
+        return 'requeued';
+      }
       if (this.stopped) return;
       picture = await this.deps.fetchPicture(job.jid);
       this.lastFetchAt = this.now();
@@ -367,14 +462,17 @@ export class AvatarSyncQueue {
         pauseMs: this.options.rateLimitPauseMs,
       });
       if (this.strikes >= this.options.maxRateLimitStrikes) {
-        this.stats.backfillDropped += this.backfill.length;
-        for (const dropped of this.backfill) this.pending.delete(dropped.jid);
-        this.backfill.length = 0;
+        for (const lane of ['list', 'backfill'] as const) {
+          this.stats.backfillDropped += this.lanes[lane].length;
+          for (const dropped of this.lanes[lane]) this.pending.delete(dropped.jid);
+          this.lanes[lane].length = 0;
+        }
         this.syncCounts();
       }
-      // Try once more after the pause, ahead of everything else.
-      if (job.lane === 'live' || this.strikes < this.options.maxRateLimitStrikes) {
-        this.live.unshift(job);
+      // Try once more after the pause, at the head of its lane.
+      const keep = job.lane === 'open' || job.lane === 'live';
+      if (keep || this.strikes < this.options.maxRateLimitStrikes) {
+        this.lanes[job.lane].unshift(job);
         this.pending.set(job.jid, job);
         this.syncCounts();
       }
