@@ -337,7 +337,9 @@ export class ChatwootService {
   // Request-local: a durable delivery may fall back to a media-unavailable text.
   private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
 
-  private readonly avatarQueues = new Map<string, AvatarSyncQueue>();
+  // One queue per WhatsApp number per process: every channel builds its own ChatwootService,
+  // and the API controller has another one; separate maps would pace one number twice.
+  private static readonly avatarQueues = new Map<string, AvatarSyncQueue>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -6847,7 +6849,7 @@ export class ChatwootService {
 
   private avatarQueue(instance: InstanceDto): AvatarSyncQueue | null {
     if (!ChatwootService.avatarSyncEnabled() || !instance?.instanceName) return null;
-    const existing = this.avatarQueues.get(instance.instanceName);
+    const existing = ChatwootService.avatarQueues.get(instance.instanceName);
     if (existing) return existing;
     const perMinute = Number.parseInt(process.env.CHATWOOT_AVATAR_SYNC_PER_MINUTE ?? '', 10);
     const queue = new AvatarSyncQueue(
@@ -6887,7 +6889,7 @@ export class ChatwootService {
         ...(Number.isFinite(perMinute) && perMinute > 0 && { perMinute }),
       },
     );
-    this.avatarQueues.set(instance.instanceName, queue);
+    ChatwootService.avatarQueues.set(instance.instanceName, queue);
     return queue;
   }
 
@@ -7064,7 +7066,9 @@ export class ChatwootService {
   }
 
   public avatarSyncStatus(instance: InstanceDto) {
-    return this.avatarQueues.get(instance.instanceName)?.report() ?? { queue: instance.instanceName, idle: true };
+    return (
+      ChatwootService.avatarQueues.get(instance.instanceName)?.report() ?? { queue: instance.instanceName, idle: true }
+    );
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {
