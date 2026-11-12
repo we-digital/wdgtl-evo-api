@@ -31,6 +31,9 @@ export interface InboundStore {
   renew(id: string, owner: string, until: Date): Promise<boolean>;
   finish(id: string, owner: string, ack: InboundAck): Promise<boolean>;
   defer(id: string, owner: string, errorClass: string, until: Date): Promise<void>;
+  // Bring deferred rows whose last error is one of `errorClasses` forward to `now`.
+  // One bounded UPDATE, used once when the receiver answers again after an outage.
+  advance?(errorClasses: string[], now: Date): Promise<number>;
   // Terminal, visible end state: the row leaves the retry lanes with its reason kept.
   // The lane is kept so recovery can requeue a closed row into its original lane.
   fail(
@@ -51,6 +54,10 @@ export const INBOUND_ACTIVE_STATES = ['pending', 'history_pending'] as const;
 export const INBOUND_RETRY_SCHEDULE_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 export const INBOUND_RETRY_STEADY_MS = 300_000;
 export const INBOUND_FAIL_AFTER_MS = 24 * 60 * 60 * 1000;
+// Transport failures of the receiver itself (Chatwoot 5xx/unreachable while it
+// deploys). After the first confirmed delivery that follows one, rows deferred
+// for this reason are retried at once instead of waiting their 5-minute step.
+export const INBOUND_RECEIVER_OUTAGE_ERRORS = ['AxiosError'];
 export function inboundRetryDelayMs(attempts: number): number {
   const index = Math.max(0, Math.trunc(attempts) - 1);
   return INBOUND_RETRY_SCHEDULE_MS[index] ?? INBOUND_RETRY_STEADY_MS;
@@ -204,6 +211,7 @@ export class ChatwootInboundQueue {
   private refill = false;
   private readonly concurrency: number;
   private readonly failAfterMs: number;
+  private receiverOutageSeen = false;
   private readonly latencyReportMs: number;
   private latencies: Record<string, { provider: number[]; queue: number[]; failed: number }> = {};
   constructor(
@@ -295,6 +303,18 @@ export class ChatwootInboundQueue {
       if (!started.length) return;
       await Promise.allSettled(started);
     }
+  }
+  private resumeAfterReceiverOutage() {
+    this.receiverOutageSeen = false;
+    if (!this.store.advance) return;
+    void this.store
+      .advance(INBOUND_RECEIVER_OUTAGE_ERRORS, this.now())
+      .then((advanced) => {
+        if (!advanced) return;
+        this.observe('chatwoot_inbound_resumed', { advanced });
+        if (!this.stopped) this.kick();
+      })
+      .catch((e) => this.observe('chatwoot_inbound_resume_failed', { errorClass: e?.name || 'Error' }));
   }
   private kick() {
     void this.fill().catch((e) => this.observe('chatwoot_inbound_poll_failed', { errorClass: e?.name || 'Error' }));
@@ -414,6 +434,7 @@ export class ChatwootInboundQueue {
       )
         throw new Error('InboundReceiverOutcomeUnconfirmed');
       if (!(await this.store.finish(item.id, this.owner, ack))) throw new Error('InboundReceiptLeaseLost');
+      if (this.receiverOutageSeen) this.resumeAfterReceiverOutage();
       const done = this.now().getTime();
       const provider = providerTimestampMs(item.payload);
       const providerMs = provider === null ? null : Math.max(0, done - provider);
@@ -442,6 +463,7 @@ export class ChatwootInboundQueue {
       const errorDetail = error instanceof Error && errorClass === error.name ? inboundErrorDetail(error) : undefined;
       // Unknown HTTP outcomes remain retryable. The next attempt MUST read exact receiver owners before POST.
       // Only the failure cap or a deterministic source error closes the row, with its reason kept.
+      if (INBOUND_RECEIVER_OUTAGE_ERRORS.includes(errorClass)) this.receiverOutageSeen = true;
       const at = this.now().getTime();
       const age = at - new Date(item.createdAt ?? at).getTime();
       const terminal: InboundTerminalState | undefined =
