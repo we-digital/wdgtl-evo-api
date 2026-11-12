@@ -472,3 +472,81 @@ test('deliverAdmitted gives up after its wait and leaves the row to the poller',
   assert.equal(store.rows.get(third.id)!.state, 'confirmed');
   await queue.stop();
 });
+
+class OutageLedger extends Ledger {
+  advances: string[][] = [];
+  async defer(id: string, owner: string, error: string, until: Date) {
+    const r = this.rows.get(id)!;
+    if (r.leaseOwner !== owner) return;
+    Object.assign(r, { nextAttemptAt: until, lastErrorClass: error, leaseOwner: null, leaseExpiresAt: null });
+  }
+  async advance(errorClasses: string[], now: Date) {
+    this.advances.push(errorClasses);
+    let count = 0;
+    for (const r of this.rows.values())
+      if (r.state === 'pending' && errorClasses.includes(r.lastErrorClass ?? '') && r.nextAttemptAt > now && !r.leaseOwner) {
+        r.nextAttemptAt = now;
+        count++;
+      }
+    return count;
+  }
+}
+
+test('the first confirmed delivery after a receiver outage brings outage-deferred rows forward once', async () => {
+  const store = new OutageLedger();
+  let down = true;
+  const events: [string, Record<string, unknown>][] = [];
+  const axiosError = () => Object.assign(new Error('Request failed with status code 502'), { name: 'AxiosError' });
+  const queue = new ChatwootInboundQueue(
+    store,
+    async (row) => {
+      if (down) throw axiosError();
+      return ack(row.inboxId ?? 42);
+    },
+    (event, fields) => events.push([event, fields]),
+    60 * 60 * 1000, // a deferred row would wait an hour without the wake
+  );
+  const rows = [item('a'), item('b'), item('c')];
+  for (const row of rows) await queue.submit(row).catch(() => undefined);
+  await queue.poll();
+  assert.ok([...store.rows.values()].every((r) => r.state === 'pending' && r.lastErrorClass === 'AxiosError'));
+  // Chatwoot is back: a new message confirms and wakes the deferred ones.
+  down = false;
+  const fresh = item('d');
+  await queue.submit(fresh);
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  await queue.poll();
+  assert.equal([...store.rows.values()].filter((r) => r.state === 'confirmed').length, 4);
+  assert.deepEqual(store.advances, [['AxiosError']]);
+  assert.deepEqual(
+    events.filter(([event]) => event === 'chatwoot_inbound_resumed').map(([, fields]) => fields.advanced),
+    [3],
+  );
+  // No outage since: later confirmations do not touch the store again.
+  await queue.submit(item('e'));
+  await queue.poll();
+  assert.equal(store.advances.length, 1);
+  await queue.stop();
+});
+
+test('non-transport failures never trigger the outage wake', async () => {
+  const store = new OutageLedger();
+  let fail = true;
+  const queue = new ChatwootInboundQueue(
+    store,
+    async (row) => {
+      if (fail) throw new Error('InboundReceiverMediaUnconfirmed');
+      return ack(row.inboxId ?? 42);
+    },
+    () => {},
+    60 * 60 * 1000,
+  );
+  await queue.submit(item('a')).catch(() => undefined);
+  await queue.poll();
+  fail = false;
+  await queue.submit(item('b'));
+  await queue.poll();
+  assert.equal(store.advances.length, 0);
+  assert.equal(store.rows.get(item('a').id)!.state, 'pending');
+  await queue.stop();
+});

@@ -87,3 +87,32 @@ test(
     }
   },
 );
+
+test('advance moves only unleased active rows deferred for the given errors, in one update', async () => {
+  const calls: any[] = [];
+  const store = new ChatwootInboundPrismaStore({
+    chatwootInboundDelivery: {
+      upsert: async () => ({}),
+      findMany: async () => [],
+      updateMany: async (args: any) => {
+        calls.push(args);
+        return { count: 7 };
+      },
+    },
+  } as any);
+  const now = new Date('2026-11-12T05:00:00Z');
+  assert.equal(await store.advance(['AxiosError'], now), 7);
+  assert.deepEqual(calls, [
+    {
+      where: {
+        state: { in: ['pending', 'history_pending'] },
+        lastErrorClass: { in: ['AxiosError'] },
+        nextAttemptAt: { gt: now },
+        leaseOwner: null,
+      },
+      data: { nextAttemptAt: now },
+    },
+  ]);
+  assert.equal(await store.advance([], now), 0);
+  assert.equal(calls.length, 1);
+});

@@ -130,6 +130,20 @@ export class ChatwootInboundPrismaStore implements InboundStore {
       ).count === 1
     );
   }
+  async advance(errorClasses: string[], now: Date) {
+    if (!errorClasses.length) return 0;
+    return (
+      await this.rows.updateMany({
+        where: {
+          state: { in: ['pending', 'history_pending'] },
+          lastErrorClass: { in: errorClasses },
+          nextAttemptAt: { gt: now },
+          leaseOwner: null,
+        },
+        data: { nextAttemptAt: now },
+      })
+    ).count;
+  }
   async defer(id: string, owner: string, errorClass: string, until: Date) {
     await this.rows.updateMany({
       where: { id, state: { in: ['pending', 'history_pending'] }, leaseOwner: owner },
