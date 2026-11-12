@@ -7,6 +7,7 @@ import {
   inboundHistoryDocumentProjection,
   inboundSourceCandidates,
   inboundSourceIdentityHash,
+  isBlankReactionTwin,
   isInboundTransportOnly,
   resolveInboundNativeBody,
 } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
@@ -15,6 +16,7 @@ import {
   InboundAck,
   InboundDelivery,
   inboundDeliveryId,
+  inboundErrorDetail,
   inboundPayloadHash,
   inboundRetryDelayMs,
   InboundStore,
@@ -418,6 +420,17 @@ test('sender-key-only blank copies are transport; text with sender keys is not',
   assert.equal(isInboundTransportOnly({ ...native(), message: { conversation: '' } }), false);
 });
 
+test('a blank text copy is a reaction twin only when every row under its key is a reaction', () => {
+  const reaction = { messageType: 'reactionMessage', message: { reactionMessage: { text: '' } } };
+  const blank = { ...native(), messageType: 'conversation', message: { conversation: '' } };
+  assert.equal(isBlankReactionTwin(blank, [reaction]), true);
+  assert.equal(isBlankReactionTwin(blank, [reaction, reaction]), true);
+  assert.equal(isBlankReactionTwin(blank, []), false);
+  assert.equal(isBlankReactionTwin(blank, [reaction, native()]), false);
+  assert.equal(isBlankReactionTwin({ ...blank, message: { conversation: 'hi' } }, [reaction]), false);
+  assert.equal(isBlankReactionTwin({ ...blank, status: 'EDITED' }, [reaction]), false);
+});
+
 test('reaction rows under the same key are excluded unless the queued source is itself a reaction', () => {
   const content = native();
   const reaction = { ...native(), id: 'r', messageType: 'reactionMessage', message: { reactionMessage: { text: 'x' } } };
@@ -488,4 +501,15 @@ test('a present-but-unverifiable receiver owner closes as already_present and is
   assert.equal(await queue.submit(item), undefined);
   assert.equal(store.rows.get(item.id)!.attempts, 1);
   await queue.stop();
+});
+
+test('retry error detail masks numbers and URLs and is capped', () => {
+  assert.equal(inboundErrorDetail(new Error('Request failed with status code 502')), 'Request failed with status code 502');
+  assert.equal(
+    inboundErrorDetail(new Error('peer 628111234567@s.whatsapp.net at https://cw.example/api/v1/x?a=1 failed')),
+    'peer <n>@s.whatsapp.net at <url> failed',
+  );
+  assert.equal(inboundErrorDetail(new Error('x'.repeat(500)))!.length, 160);
+  assert.equal(inboundErrorDetail(new Error('')), undefined);
+  assert.equal(inboundErrorDetail({}), undefined);
 });
