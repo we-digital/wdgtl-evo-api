@@ -389,3 +389,12 @@ test('native generic Word MIME can reuse exact OOXML stored bytes without weaken
     /digest_authority/,
   );
 });
+
+test('a document stored by Chatwoot as file verifies only when the caller expects file', () => {
+  const asFile = [{ ...payload[0], attachments: [{ ...payload[0].attachments[0], file_type: 'file' }] }];
+  // Derived from the content type (video/mp4) the file row refuses.
+  assert.throws(() => retainedVideoProxyUrl(copy, asFile, 'https://cw.example'), /retained_cw_video_api_unconfirmed/);
+  assert.match(retainedVideoProxyUrl(copy, asFile, 'https://cw.example', { fileType: 'file' }), /\/blobs\/proxy\//);
+  // The override never widens: a video row no longer matches an expected file.
+  assert.throws(() => retainedVideoProxyUrl(copy, payload, 'https://cw.example', { fileType: 'file' }));
+});

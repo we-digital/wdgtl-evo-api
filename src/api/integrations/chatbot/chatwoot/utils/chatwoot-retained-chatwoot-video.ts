@@ -114,7 +114,14 @@ export async function readRetainedChatwootGroupVideo(
     : null;
 }
 
-export function retainedVideoProxyUrl(copy: RetainedChatwootVideo, payload: any, trustedOrigin: string): string {
+// `fileType` overrides the type derived from the content type: a WhatsApp
+// document is stored by Chatwoot as `file` even when it is a JPEG or MP4.
+export function retainedVideoProxyUrl(
+  copy: RetainedChatwootVideo,
+  payload: any,
+  trustedOrigin: string,
+  options: { fileType?: 'image' | 'audio' | 'video' | 'file' } = {},
+): string {
   if (!Array.isArray(payload) || payload.length > 17) throw new Error('retained_cw_video_api_unconfirmed');
   const matches = payload.filter((row) => row.id === copy.id);
   const row = matches[0];
@@ -135,13 +142,14 @@ export function retainedVideoProxyUrl(copy: RetainedChatwootVideo, payload: any,
     attachment.message_id !== copy.id ||
     attachment.account_id !== copy.account_id ||
     attachment.file_type !==
-      (copy.content_type.startsWith('image/')
-        ? 'image'
-        : copy.content_type.startsWith('audio/')
-          ? 'audio'
-          : copy.content_type.startsWith('video/')
-            ? 'video'
-            : 'file') ||
+      (options.fileType ??
+        (copy.content_type.startsWith('image/')
+          ? 'image'
+          : copy.content_type.startsWith('audio/')
+            ? 'audio'
+            : copy.content_type.startsWith('video/')
+              ? 'video'
+              : 'file')) ||
     attachment.content_type !== copy.content_type ||
     attachment.file_size !== Number(copy.byte_size) ||
     typeof attachment.download_url !== 'string'
