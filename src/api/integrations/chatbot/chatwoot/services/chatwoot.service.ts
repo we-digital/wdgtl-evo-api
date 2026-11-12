@@ -4253,8 +4253,9 @@ export class ChatwootService {
 
         for (const message of body.conversation.messages) {
           if (message.attachments && message.attachments.length > 0) {
-            for (const attachment of message.attachments) {
-              if (!messageReceived) {
+            for (const [attachmentIndex, attachment] of message.attachments.entries()) {
+              // Caption only on the first attachment; the rest go without text.
+              if (!messageReceived || attachmentIndex > 0) {
                 formatText = null;
               }
 
