@@ -259,7 +259,7 @@ test('looks up the Chatwoot contact before asking WhatsApp; unknown contacts cos
   const lookups: string[] = [];
   (h.queue as any).deps.resolveTarget = async (jid: string) => {
     lookups.push(jid);
-    return jid.startsWith('known') ? { contactId: 42, hasAvatar: false } : null;
+    return jid.startsWith('known') ? { contactId: 42, hasAvatar: false } : { missing: 'not-found:@s.whatsapp.net' };
   };
   h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' }));
   h.queue.enqueue(job('known@s.whatsapp.net', { lane: 'live' }));
@@ -267,6 +267,7 @@ test('looks up the Chatwoot contact before asking WhatsApp; unknown contacts cos
   assert.deepEqual(lookups, ['unknown@s.whatsapp.net', 'known@s.whatsapp.net']);
   assert.deepEqual(h.fetches, ['known@s.whatsapp.net']);
   assert.equal(h.queue.stats.noContact, 1);
+  assert.deepEqual(h.queue.stats.noContactReasons, { 'not-found:@s.whatsapp.net': 1 });
   assert.equal(h.markers.has('unknown@s.whatsapp.net'), false, 'no marker: a later Chatwoot contact is not blocked');
   // Repeated activity of the unknown peer stays in memory until the window ends.
   assert.equal(h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' })), false);

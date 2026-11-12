@@ -6877,7 +6877,7 @@ export class ChatwootService {
         apply: (job, url, previous) => this.applyAvatar(instance, job, url, previous),
         resolveTarget: async (jid) => {
           const found = await this.findAvatarContact(instance, jid);
-          return found ? { contactId: found.id, hasAvatar: found.hasAvatar } : null;
+          return 'id' in found ? { contactId: found.id, hasAvatar: found.hasAvatar } : found;
         },
         log: (event, fields) =>
           event.endsWith('_error') || event.endsWith('_rate_limited')
@@ -6908,10 +6908,11 @@ export class ChatwootService {
   private async findAvatarContact(
     instance: InstanceDto,
     jid: string,
-  ): Promise<{ id: number; hasAvatar: boolean } | null> {
+  ): Promise<{ id: number; hasAvatar: boolean } | { missing: string }> {
     const provider = await this.getProvider(instance);
     const accountId = Number(provider?.accountId);
-    if (!this.isImportHistoryAvailable() || !this.pgClient || !accountId) return null;
+    if (!accountId) return { missing: 'no-provider' };
+    if (!this.isImportHistoryAvailable() || !this.pgClient) return { missing: 'no-database' };
     const phone = jid.endsWith('@s.whatsapp.net') ? `+${jid.split('@')[0]}` : null;
     const lookup = async (column: 'identifier' | 'phone_number', value: string) =>
       (
@@ -6927,7 +6928,9 @@ export class ChatwootService {
         )
       )?.rows?.[0];
     const row = (await lookup('identifier', jid)) ?? (phone ? await lookup('phone_number', phone) : undefined);
-    return row ? { id: Number(row.id), hasAvatar: !!row.has_avatar } : null;
+    return row
+      ? { id: Number(row.id), hasAvatar: !!row.has_avatar }
+      : { missing: `not-found:${jid.slice(jid.indexOf('@')) || 'no-domain'}` };
   }
 
   private async applyAvatar(
@@ -6940,9 +6943,10 @@ export class ChatwootService {
     let hasAvatar = job.hasAvatar;
     if (!contactId || hasAvatar === undefined) {
       const found = await this.findAvatarContact(instance, job.jid);
-      if (!found && !contactId) return 'no-contact';
-      contactId ??= found?.id;
-      hasAvatar ??= found?.hasAvatar ?? false;
+      const known = 'id' in found ? found : null;
+      if (!known && !contactId) return 'no-contact';
+      contactId ??= known?.id;
+      hasAvatar ??= known?.hasAvatar ?? false;
     }
     if (url) {
       if (hasAvatar && previous?.pictureId && previous.pictureId === whatsappPictureId(url)) return 'unchanged';
