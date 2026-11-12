@@ -20,6 +20,11 @@ test('pinned Baileys is the we:Digital fork with group sender-key repair', () =>
   assert.match(lib('Socket/messages-send.js'), /repairGroupSenderKeyDistribution/);
 });
 
+test('pinned Baileys sends group phash and recovers only on a real mismatch', () => {
+  assert.match(lib('Socket/messages-send.js'), /groupParticipantHash\(/);
+  assert.match(lib('Socket/messages-recv.js'), /participantHashAckAction\(/);
+});
+
 test('pinned Baileys drops spoofed self-only protocol messages (GHSA-qvv5-jq5g-4cgg)', () => {
   assert.match(lib('Utils/process-message.js'), /dropping spoofed self-only protocolMessage/);
 });
