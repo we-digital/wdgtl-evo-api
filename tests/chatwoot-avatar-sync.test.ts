@@ -278,8 +278,12 @@ test('looks up the Chatwoot contact before asking WhatsApp; unknown contacts cos
   assert.equal(h.queue.stats.noContact, 1);
   assert.deepEqual(h.queue.stats.noContactReasons, { 'not-found:@s.whatsapp.net': 1 });
   assert.equal(h.markers.has('unknown@s.whatsapp.net'), false, 'no marker: a later Chatwoot contact is not blocked');
-  // Repeated activity of the unknown peer stays in memory until the window ends.
+  // Repeated activity of the unknown peer is skipped in memory for two minutes ...
   assert.equal(h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' })), false);
+  // ... not for the whole refresh window: a new conversation's contact appears in Chatwoot moments later.
+  h.clock.now += 2 * 60 * 1000 + 1;
+  assert.equal(h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' })), true);
+  h.queue.stop();
 });
 
 test('durable inbound messages trigger the avatar sync without awaiting it', () => {

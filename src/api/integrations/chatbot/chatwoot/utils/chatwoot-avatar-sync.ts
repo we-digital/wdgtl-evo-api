@@ -78,6 +78,11 @@ export type AvatarSyncOptions = {
   expressGapMs: number;
   /** An opened dialog asks again about a hidden picture after this long. */
   openNoneRecheckMs: number;
+  /**
+   * A contact Chatwoot does not have yet (the first message of a new
+   * conversation races its creation) is looked up again after this long.
+   */
+  noContactRetryMs: number;
   rateLimitPauseMs: number;
   /** Consecutive rate limits after which the backfill lane is dropped. */
   maxRateLimitStrikes: number;
@@ -94,6 +99,7 @@ export const DEFAULT_AVATAR_SYNC_OPTIONS: AvatarSyncOptions = {
   expressPerMinute: 6,
   expressGapMs: 1_000,
   openNoneRecheckMs: 24 * 60 * 60 * 1000,
+  noContactRetryMs: 2 * 60 * 1000,
   rateLimitPauseMs: 15 * 60 * 1000,
   maxRateLimitStrikes: 3,
 };
@@ -364,9 +370,9 @@ export class AvatarSyncQueue {
     return { queue: this.name, ...this.stats };
   }
 
-  private remember(jid: string, checkedAt: number) {
+  private remember(jid: string, checkedAt: number, forMs = this.options.refreshMs) {
     if (this.recentlyChecked.size > 50_000) this.recentlyChecked.clear();
-    this.recentlyChecked.set(jid, checkedAt + this.options.refreshMs);
+    this.recentlyChecked.set(jid, checkedAt + forMs);
   }
 
   private refillExpress() {
@@ -427,7 +433,7 @@ export class AvatarSyncQueue {
         this.stats.noContact++;
         const reason = (target as { missing?: string } | null)?.missing ?? 'not-found';
         this.stats.noContactReasons[reason] = (this.stats.noContactReasons[reason] ?? 0) + 1;
-        this.remember(job.jid, now);
+        this.remember(job.jid, now, this.options.noContactRetryMs);
         return;
       }
       const found = target as { contactId: number; hasAvatar: boolean };
