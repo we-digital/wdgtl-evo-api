@@ -197,6 +197,7 @@ import {
   qualifyNativeWhatsappEditKey,
 } from './normalized-whatsapp-edit';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
+import { RecentOutboundMessages } from './recent-outbound-messages';
 import { SendRecipientCache } from './send-recipient-cache';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 import {
@@ -277,6 +278,7 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
 export class BaileysStartupService extends ChannelStartupService {
   private readonly nativeEditQueue = new NativeWhatsappEditQueue();
   private messageProcessor = new BaileysMessageProcessor();
+  private readonly recentOutboundMessages = new RecentOutboundMessages();
   private readonly groupSenderKeyRepairs = new WeakMap<
     WASocket,
     Map<string, Promise<{ groupJid: string; participantCount: number; deviceCount: number; sessionCount: number }>>
@@ -729,6 +731,12 @@ export class BaileysStartupService extends ChannelStartupService {
   }
 
   private async getMessage(key: proto.IMessageKey, full = false) {
+    if (!full) {
+      // Baileys resends from here (participant-hash recovery, retry receipts).
+      // A message sent moments ago may not be in the database yet.
+      const recent = this.recentOutboundMessages?.get(key?.id);
+      if (recent) return recent;
+    }
     try {
       // Use raw SQL to avoid JSON path issues
       const webMessageInfo = (await this.prismaRepository.$queryRaw`
@@ -740,6 +748,10 @@ export class BaileysStartupService extends ChannelStartupService {
       if (full) {
         return webMessageInfo[0];
       }
+      // Never answer with placeholder content: Baileys would resend it under the
+      // original id, and WhatsApp shows that as an empty bubble (for a reaction,
+      // whose id is not a chat message, the phone keeps it as a new message).
+      if (!webMessageInfo[0]?.message) return undefined;
       if (webMessageInfo[0].message?.pollCreationMessage) {
         const messageSecretBase64 = webMessageInfo[0].message?.messageContextInfo?.messageSecret;
 
@@ -756,8 +768,9 @@ export class BaileysStartupService extends ChannelStartupService {
       }
 
       return webMessageInfo[0].message;
-    } catch {
-      return { conversation: '' };
+    } catch (error) {
+      this.logger.warn(`getMessage failed for ${key?.id}: ${(error as Error)?.message}`);
+      return undefined;
     }
   }
 
@@ -2889,6 +2902,8 @@ export class BaileysStartupService extends ChannelStartupService {
         );
       }
 
+      this.recentOutboundMessages?.remember(messageSent);
+
       // Commit API delivery proof before optional history, media and webhook work.
       await options?.afterTransport?.(messageSent);
 
@@ -4069,6 +4084,7 @@ export class BaileysStartupService extends ChannelStartupService {
     if (!messageSent?.key?.id) {
       throw new BadRequestException('Native forward returned empty message key');
     }
+    this.recentOutboundMessages?.remember(messageSent);
     if (Long.isLong(messageSent.messageTimestamp)) {
       messageSent.messageTimestamp = messageSent.messageTimestamp.toNumber();
     }
