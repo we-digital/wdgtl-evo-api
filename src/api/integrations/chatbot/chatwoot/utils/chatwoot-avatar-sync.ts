@@ -43,6 +43,11 @@ export type AvatarSyncDeps = {
   fetchPicture(jid: string): Promise<AvatarPicture>;
   /** Pushes the result to Chatwoot. `url` null means WhatsApp shows no picture. */
   apply(job: AvatarSyncJob, url: string | null, previous: AvatarMarker | null): Promise<AvatarApplyResult>;
+  /**
+   * Chatwoot contact for a job without a known contactId, looked up before any
+   * WhatsApp query; null = not in Chatwoot (no fetch, checked again after the window).
+   */
+  resolveTarget?(jid: string): Promise<{ contactId: number; hasAvatar: boolean } | null>;
   log(event: string, fields: Record<string, unknown>): void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -323,6 +328,17 @@ export class AvatarSyncQueue {
       this.stats.fresh++;
       this.remember(job.jid, previous.checkedAt);
       return;
+    }
+
+    if (!job.contactId && this.deps.resolveTarget) {
+      const target = await this.deps.resolveTarget(job.jid);
+      if (!target) {
+        this.stats.noContact++;
+        this.remember(job.jid, now);
+        return;
+      }
+      job.contactId = target.contactId;
+      job.hasAvatar ??= target.hasAvatar;
     }
 
     let picture: AvatarPicture | null = job.force ? null : await this.deps.peekPicture(job.jid);
