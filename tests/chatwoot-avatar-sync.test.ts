@@ -284,4 +284,13 @@ test('durable inbound messages trigger the avatar sync without awaiting it', () 
     /\n {4}this\.enqueueInboundAvatars\(instance, body\);\n {4}return this\.inboundQueue\.submit/,
   );
   assert.doesNotMatch(eventWhatsapp, /await this\.enqueueInboundAvatars/);
+  // The live Baileys path admits durable messages here, not through eventWhatsapp.
+  const admit = chatwoot.slice(
+    chatwoot.indexOf('public async admitWhatsappEvent('),
+    chatwoot.indexOf('public async eventWhatsapp('),
+  );
+  assert.match(
+    admit,
+    /\n {4}this\.enqueueInboundAvatars\(instance, body\);\n {4}const stored = await this\.inboundQueue\.admit/,
+  );
 });
