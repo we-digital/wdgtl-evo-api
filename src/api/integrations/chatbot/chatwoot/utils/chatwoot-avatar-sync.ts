@@ -47,7 +47,7 @@ export type AvatarSyncDeps = {
    * Chatwoot contact for a job without a known contactId, looked up before any
    * WhatsApp query; null = not in Chatwoot (no fetch, checked again after the window).
    */
-  resolveTarget?(jid: string): Promise<{ contactId: number; hasAvatar: boolean } | null>;
+  resolveTarget?(jid: string): Promise<{ contactId: number; hasAvatar: boolean } | { missing: string } | null>;
   log(event: string, fields: Record<string, unknown>): void;
   now?: () => number;
   sleep?: (ms: number) => Promise<void>;
@@ -82,6 +82,8 @@ export type AvatarSyncStats = {
   none: number;
   fresh: number;
   noContact: number;
+  /** Why the Chatwoot contact lookup missed, e.g. not-found:@lid. */
+  noContactReasons: Record<string, number>;
   whatsappFetches: number;
   reusedUrls: number;
   rateLimited: number;
@@ -186,6 +188,7 @@ export class AvatarSyncQueue {
     none: 0,
     fresh: 0,
     noContact: 0,
+    noContactReasons: {},
     whatsappFetches: 0,
     reusedUrls: 0,
     rateLimited: 0,
@@ -332,13 +335,16 @@ export class AvatarSyncQueue {
 
     if (!job.contactId && this.deps.resolveTarget) {
       const target = await this.deps.resolveTarget(job.jid);
-      if (!target) {
+      if (!target || 'missing' in target) {
         this.stats.noContact++;
+        const reason = (target as { missing?: string } | null)?.missing ?? 'not-found';
+        this.stats.noContactReasons[reason] = (this.stats.noContactReasons[reason] ?? 0) + 1;
         this.remember(job.jid, now);
         return;
       }
-      job.contactId = target.contactId;
-      job.hasAvatar ??= target.hasAvatar;
+      const found = target as { contactId: number; hasAvatar: boolean };
+      job.contactId = found.contactId;
+      job.hasAvatar ??= found.hasAvatar;
     }
 
     let picture: AvatarPicture | null = job.force ? null : await this.deps.peekPicture(job.jid);
