@@ -52,6 +52,29 @@ export class ChatwootRouter extends RouterBroker {
         });
         res.status(HttpStatus.OK).json(response);
       })
+      .post(this.routerPath('avatarBackfill'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<{
+          dryRun?: boolean;
+          includeStale?: boolean;
+          limit?: number;
+          perMinute?: number;
+        }>({
+          request: req,
+          schema: instanceSchema,
+          ClassRef: InstanceDto,
+          execute: (instance, data) => chatwootController.avatarBackfill(instance, data),
+        });
+        res.status(HttpStatus.OK).json(response);
+      })
+      .get(this.routerPath('avatarBackfill'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<InstanceDto>({
+          request: req,
+          schema: instanceSchema,
+          ClassRef: InstanceDto,
+          execute: (instance) => chatwootController.avatarSyncStatus(instance),
+        });
+        res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('historySync'), ...guards, async (req, res) => {
         const response = await this.dataValidate<ChatwootHistorySyncDto>({
           request: req,

@@ -1,3 +1,5 @@
+process.env.CHATWOOT_AVATAR_SYNC = 'off';
+
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
@@ -27,6 +29,7 @@ const instance = {
 const serviceFixture = (resolvePhoneJidForLid: (lid: string) => Promise<string | null>) => {
   const cache = new Map<string, unknown>();
   const profilePictureLookups: string[] = [];
+  const whatsappPictureQueries: string[] = [];
   const client = {
     contacts: {
       filter: async (_params: unknown): Promise<any> => ({ payload: [], meta: { count: 0 } }),
@@ -56,9 +59,18 @@ const serviceFixture = (resolvePhoneJidForLid: (lid: string) => Promise<string |
           client: {
             groupMetadata: async (jid: string) => ({ JID: jid, subject: 'Test group' }),
           },
+          // Delivery may only peek at cached avatars; WhatsApp queries belong to the avatar sync.
           profilePicture: async (jid: string) => {
-            profilePictureLookups.push(jid);
+            whatsappPictureQueries.push(jid);
             return { profilePictureUrl: null };
+          },
+          peekProfilePictureForSync: async (jid: string) => {
+            profilePictureLookups.push(jid);
+            return null;
+          },
+          fetchProfilePictureForSync: async (jid: string) => {
+            whatsappPictureQueries.push(jid);
+            return { kind: 'none', source: 'whatsapp' };
           },
         },
       },
@@ -76,7 +88,7 @@ const serviceFixture = (resolvePhoneJidForLid: (lid: string) => Promise<string |
   service.clientCw = async () => ({ provider, client });
   service.getInbox = async () => ({ id: 58 });
 
-  return { service, client, profilePictureLookups };
+  return { service, client, profilePictureLookups, whatsappPictureQueries };
 };
 
 test('canonical provider resolution ignores a stale conversation cache and reuses the inbox-scoped binding', async () => {
@@ -135,7 +147,7 @@ test('preserves canonical LID namespaces for ancillary Baileys lookups', () => {
 });
 
 test('canonical group reuse preserves a confirmed participant identity without downloading avatars', async () => {
-  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  const { service, profilePictureLookups, whatsappPictureQueries } = serviceFixture(async () => null);
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
   const peer = '120363000000001@g.us';
   const participant = '628100000001@s.whatsapp.net';
@@ -162,7 +174,7 @@ test('canonical group reuse preserves a confirmed participant identity without d
 });
 
 test('canonical group reuse creates a missing provisional participant with its LID and no invented phone', async () => {
-  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  const { service, profilePictureLookups, whatsappPictureQueries } = serviceFixture(async () => null);
   service.configService = { get: () => ({ PROVIDER_CONVERSATION_BINDINGS: true }) };
   const peer = '120363000000001@g.us';
   service.findProviderContact = async (_instance: unknown, identifier: string) =>
@@ -190,7 +202,7 @@ test('canonical group reuse creates a missing provisional participant with its L
 });
 
 test('creates a provisional LID contact when no phone mapping exists', async () => {
-  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  const { service, profilePictureLookups, whatsappPictureQueries } = serviceFixture(async () => null);
   const identifierLookups: string[] = [];
   const createdContacts: unknown[][] = [];
   service.findContact = async () => {
@@ -221,6 +233,7 @@ test('creates a provisional LID contact when no phone mapping exists', async () 
   assert.equal(createdContacts[0][6], '222@lid');
   assert.equal(body.key.remoteJidAlt, undefined);
   assert.deepEqual(profilePictureLookups, ['222@lid']);
+  assert.deepEqual(whatsappPictureQueries, []);
 });
 
 test('reuses a provisional LID contact by its exact identifier', async () => {
@@ -305,7 +318,7 @@ test('does not synthesize a phone number for a provisional LID contact', async (
 });
 
 test('uses a confirmed participantAlt phone JID for an incoming LID-addressed group', async () => {
-  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  const { service, profilePictureLookups, whatsappPictureQueries } = serviceFixture(async () => null);
   const phoneLookups: string[] = [];
   const identifierLookups: string[] = [];
   service.findContact = async (_instance: unknown, query: string) => {
@@ -341,7 +354,7 @@ test('uses a confirmed participantAlt phone JID for an incoming LID-addressed gr
 });
 
 test('preserves a provisional participant LID when a group has no confirmed participantAlt', async () => {
-  const { service, profilePictureLookups } = serviceFixture(async () => null);
+  const { service, profilePictureLookups, whatsappPictureQueries } = serviceFixture(async () => null);
   const phoneLookups: string[] = [];
   const identifierLookups: string[] = [];
   service.findContact = async (_instance: unknown, query: string) => {

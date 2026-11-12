@@ -17,6 +17,16 @@ import {
   buildChatwootOutboundProvenance,
   validateChatwootAutoReplyBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-auto-reply-binding';
+import {
+  AvatarMarker,
+  AvatarSyncJob,
+  AvatarSyncQueue,
+  chatwootContactJid,
+  DEFAULT_AVATAR_SYNC_OPTIONS,
+  markerIsFresh,
+  reusableWhatsappUrl,
+  whatsappPictureId,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-avatar-sync';
 import { classifyCachedHistoryRecord } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-cached-history-record';
 import {
   CACHED_MEDIA_FILE_LIMIT,
@@ -326,6 +336,8 @@ export class ChatwootService {
   private static readonly PROVIDER_CONTACT_CACHE_MAX = 20_000;
   // Request-local: a durable delivery may fall back to a media-unavailable text.
   private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
+
+  private readonly avatarQueues = new Map<string, AvatarSyncQueue>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -1847,8 +1859,7 @@ export class ChatwootService {
           const isProvisionalParticipantLid = isLidJid(participantJid);
           nameContact = `${group.subject} (GROUP)`;
 
-          const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(participantJid);
-          this.logger.verbose(() => `Participant profile picture URL: ${JSON.stringify(picture_url)}`);
+          const picture_url = { profilePictureUrl: await this.cachedAvatarUrl(instance, participantJid) };
 
           const findParticipant = isProvisionalParticipantLid
             ? await this.findContactByIdentifier(instance, participantJid)
@@ -1859,11 +1870,15 @@ export class ChatwootService {
               `Found participant: ID:${findParticipant.id} - Name: ${findParticipant.name} - identifier: ${findParticipant.identifier}`,
             );
             if (!findParticipant.name || findParticipant.name === chatId) {
-              await this.updateContact(instance, findParticipant.id, {
-                name: body.pushName,
-                avatar_url: picture_url.profilePictureUrl || null,
-              });
+              await this.updateContact(instance, findParticipant.id, { name: body.pushName });
             }
+            this.enqueueAvatarSync(instance, {
+              jid: participantJid,
+              lane: 'live',
+              contactId: Number(findParticipant.id) || undefined,
+              hasAvatar: !!findParticipant.thumbnail,
+              reason: 'group-activity',
+            });
           } else {
             await this.createContact(
               instance,
@@ -1874,12 +1889,14 @@ export class ChatwootService {
               picture_url.profilePictureUrl || null,
               participantJid,
             );
+            this.enqueueAvatarSync(instance, { jid: participantJid, lane: 'live', reason: 'group-activity' });
           }
         }
 
+        // Avatars come from the throttled avatar sync, never from a WhatsApp query here.
         const pictureLookupId = isProvisionalLid ? phoneNumber : chatId;
-        const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(pictureLookupId);
-        this.logger.verbose(() => `Contact profile picture URL: ${JSON.stringify(picture_url)}`);
+        const avatarJid = isGroup || isProvisionalLid ? pictureLookupId : `${chatId}@s.whatsapp.net`;
+        const picture_url = { profilePictureUrl: await this.cachedAvatarUrl(instance, avatarJid) };
 
         this.logger.verbose(`Searching contact for: ${chatId}`);
         let contact = isProvisionalLid
@@ -1888,21 +1905,17 @@ export class ChatwootService {
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
-          if (!body.key.fromMe) {
-            const waProfilePictureFile =
-              picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
-            const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
-            const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = replaceableWhatsappName(contact.name, chatId);
-            this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
-            this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
-            if (pictureNeedsUpdate || nameNeedsUpdate) {
-              contact = await this.updateContact(instance, contact.id, {
-                ...(nameNeedsUpdate && { name: nameContact }),
-                ...(waProfilePictureFile === '' && { avatar: null }),
-                ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
-              });
-            }
+          // The old file-name comparison against Chatwoot's blob thumbnail never matched,
+          // so every 30-minute cache miss re-sent avatar_url. The avatar sync decides now.
+          this.enqueueAvatarSync(instance, {
+            jid: avatarJid,
+            lane: 'live',
+            contactId: Number(contact.id) || undefined,
+            hasAvatar: !!contact.thumbnail,
+            reason: 'conversation-activity',
+          });
+          if (!body.key.fromMe && replaceableWhatsappName(contact.name, chatId)) {
+            contact = await this.updateContact(instance, contact.id, { name: nameContact });
           }
         } else {
           contact = await this.createContact(
@@ -1914,6 +1927,16 @@ export class ChatwootService {
             picture_url.profilePictureUrl || null,
             phoneNumber,
           );
+          if (!picture_url.profilePictureUrl) {
+            const createdId = contact?.payload?.id || contact?.payload?.contact?.id || contact?.id;
+            this.enqueueAvatarSync(instance, {
+              jid: avatarJid,
+              lane: 'live',
+              contactId: Number(createdId) || undefined,
+              hasAvatar: false,
+              reason: 'new-contact',
+            });
+          }
         }
 
         if (!contact) {
@@ -6764,6 +6787,251 @@ export class ChatwootService {
       releaseWriter();
       releaseCapacity();
     }
+  }
+
+  private static avatarSyncEnabled() {
+    return !['0', 'false', 'off'].includes(String(process.env.CHATWOOT_AVATAR_SYNC ?? 'on').toLowerCase());
+  }
+
+  private static avatarRefreshMs() {
+    const days = Number.parseFloat(process.env.CHATWOOT_AVATAR_REFRESH_DAYS ?? '');
+    return Number.isFinite(days) && days > 0 ? days * 86_400_000 : DEFAULT_AVATAR_SYNC_OPTIONS.refreshMs;
+  }
+
+  private static avatarMarkerKey(jid: string) {
+    return `chatwoot_avatar:${jid}`;
+  }
+
+  private syncableWaInstance(instance: InstanceDto): any | null {
+    const waInstance = this.waMonitor.waInstances[instance.instanceName] as any;
+    return typeof waInstance?.fetchProfilePictureForSync === 'function' ? waInstance : null;
+  }
+
+  /** Cached avatar URL for a new Chatwoot contact; never queries WhatsApp. */
+  private async cachedAvatarUrl(instance: InstanceDto, jid: string): Promise<string | null> {
+    try {
+      const picture = await this.syncableWaInstance(instance)?.peekProfilePictureForSync(jid);
+      return picture?.kind === 'picture' ? picture.url : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private avatarQueue(instance: InstanceDto): AvatarSyncQueue | null {
+    if (!ChatwootService.avatarSyncEnabled() || !instance?.instanceName) return null;
+    const existing = this.avatarQueues.get(instance.instanceName);
+    if (existing) return existing;
+    const perMinute = Number.parseInt(process.env.CHATWOOT_AVATAR_SYNC_PER_MINUTE ?? '', 10);
+    const queue = new AvatarSyncQueue(
+      instance.instanceName,
+      {
+        readMarker: async (jid) => {
+          try {
+            const value = await this.cache.get(ChatwootService.avatarMarkerKey(jid));
+            const marker = typeof value === 'string' ? JSON.parse(value) : value;
+            return marker && typeof marker.checkedAt === 'number' ? (marker as AvatarMarker) : null;
+          } catch {
+            return null;
+          }
+        },
+        writeMarker: async (jid, marker) => {
+          const ttlSeconds = Math.ceil((ChatwootService.avatarRefreshMs() * 2) / 1000);
+          await this.cache.set(ChatwootService.avatarMarkerKey(jid), JSON.stringify(marker), ttlSeconds);
+        },
+        peekPicture: async (jid) => (await this.syncableWaInstance(instance)?.peekProfilePictureForSync(jid)) ?? null,
+        fetchPicture: async (jid) => {
+          const waInstance = this.syncableWaInstance(instance);
+          if (!waInstance) return { kind: 'error', message: 'instance-unavailable' };
+          return waInstance.fetchProfilePictureForSync(jid);
+        },
+        apply: (job, url, previous) => this.applyAvatar(instance, job, url, previous),
+        log: (event, fields) =>
+          event.endsWith('_error') || event.endsWith('_rate_limited')
+            ? this.logger.warn(JSON.stringify({ event, ...fields }))
+            : this.logger.info(JSON.stringify({ event, ...fields })),
+      },
+      {
+        refreshMs: ChatwootService.avatarRefreshMs(),
+        ...(Number.isFinite(perMinute) && perMinute > 0 && { perMinute }),
+      },
+    );
+    this.avatarQueues.set(instance.instanceName, queue);
+    return queue;
+  }
+
+  /** Non-blocking: queues an avatar check; safe on the message path. */
+  public enqueueAvatarSync(instance: InstanceDto, job: AvatarSyncJob): boolean {
+    try {
+      if (!this.syncableWaInstance(instance)) return false;
+      return this.avatarQueue(instance)?.enqueue(job) ?? false;
+    } catch (error) {
+      this.logger.warn(`Avatar sync enqueue failed: ${error}`);
+      return false;
+    }
+  }
+
+  private async findAvatarContact(
+    instance: InstanceDto,
+    jid: string,
+  ): Promise<{ id: number; hasAvatar: boolean } | null> {
+    const provider = await this.getProvider(instance);
+    const accountId = Number(provider?.accountId);
+    if (!this.isImportHistoryAvailable() || !this.pgClient || !accountId) return null;
+    const phone = jid.endsWith('@s.whatsapp.net') ? `+${jid.split('@')[0]}` : null;
+    const lookup = async (column: 'identifier' | 'phone_number', value: string) =>
+      (
+        await this.pgClient.query(
+          `SELECT ct.id, EXISTS (
+              SELECT 1 FROM active_storage_attachments a
+               WHERE a.record_type = 'Contact' AND a.record_id = ct.id AND a.name = 'avatar'
+            ) AS has_avatar
+             FROM contacts ct
+            WHERE ct.account_id = $1 AND ct.${column} = $2
+            ORDER BY ct.id LIMIT 1`,
+          [accountId, value],
+        )
+      )?.rows?.[0];
+    const row = (await lookup('identifier', jid)) ?? (phone ? await lookup('phone_number', phone) : undefined);
+    return row ? { id: Number(row.id), hasAvatar: !!row.has_avatar } : null;
+  }
+
+  private async applyAvatar(
+    instance: InstanceDto,
+    job: AvatarSyncJob,
+    url: string | null,
+    previous: AvatarMarker | null,
+  ): Promise<'applied' | 'cleared' | 'unchanged' | 'no-contact'> {
+    let contactId = job.contactId;
+    let hasAvatar = job.hasAvatar;
+    if (!contactId || hasAvatar === undefined) {
+      const found = await this.findAvatarContact(instance, job.jid);
+      if (!found && !contactId) return 'no-contact';
+      contactId ??= found?.id;
+      hasAvatar ??= found?.hasAvatar ?? false;
+    }
+    if (url) {
+      if (hasAvatar && previous?.pictureId && previous.pictureId === whatsappPictureId(url)) return 'unchanged';
+      // Chatwoot downloads the file into its own storage (Avatar::AvatarFromUrlJob).
+      const updated: unknown = await this.updateContact(instance, contactId, { avatar_url: url });
+      if (updated === null) throw new Error('chatwoot-contact-update-failed');
+      return 'applied';
+    }
+    // No visible picture: clear only when WhatsApp told us it was removed.
+    if (job.force && hasAvatar) {
+      const updated: unknown = await this.updateContact(instance, contactId, { avatar: null });
+      if (updated === null) throw new Error('chatwoot-contact-update-failed');
+      return 'cleared';
+    }
+    return 'unchanged';
+  }
+
+  /**
+   * Avatar backfill for one instance's inbox: Chatwoot contacts and groups without
+   * an avatar (and, with includeStale, ones not refreshed within the window).
+   * Dry run (default) only reads; apply queues them on the throttled backfill
+   * lane. Resumable: checked contacts leave markers and are skipped on a rerun.
+   */
+  public async avatarBackfill(
+    instance: InstanceDto,
+    data: { dryRun?: boolean; includeStale?: boolean; limit?: number; perMinute?: number } = {},
+  ) {
+    const dryRun = data.dryRun !== false;
+    if (!ChatwootService.avatarSyncEnabled()) return { enabled: false };
+    const waInstance = this.syncableWaInstance(instance);
+    if (!waInstance) throw new Error('Avatar backfill needs a connected Baileys instance');
+    const provider = await this.getProvider(instance);
+    const inbox = await this.getInbox(instance);
+    if (!provider || !inbox || !this.isImportHistoryAvailable() || !this.pgClient)
+      throw new Error('Chatwoot inbox or database is unavailable');
+    const refreshMs = ChatwootService.avatarRefreshMs();
+    const limit = Math.max(1, Math.min(20_000, Number(data.limit) || 20_000));
+    const { rows } = await this.pgClient.query(
+      `SELECT ct.id, ct.identifier, ct.phone_number, (a.id IS NOT NULL) AS has_avatar
+         FROM contact_inboxes ci
+         JOIN contacts ct ON ct.id = ci.contact_id AND ct.account_id = $1
+         LEFT JOIN active_storage_attachments a
+           ON a.record_type = 'Contact' AND a.record_id = ct.id AND a.name = 'avatar'
+        WHERE ci.inbox_id = $2
+          AND (a.id IS NULL OR ($3::boolean AND COALESCE(
+                (ct.additional_attributes->>'last_avatar_sync_at')::timestamptz, a.created_at)
+                < now() - ($4::bigint * interval '1 millisecond')))
+        GROUP BY ct.id, a.id
+        ORDER BY ct.id
+        LIMIT $5`,
+      [Number(provider.accountId), inbox.id, !!data.includeStale, refreshMs, limit],
+    );
+    const now = Date.now();
+    const candidates = rows
+      .map((row: any) => ({
+        contactId: Number(row.id),
+        hasAvatar: !!row.has_avatar,
+        jid: chatwootContactJid(row.identifier, row.phone_number),
+      }))
+      .filter((row: any) => row.jid);
+    const jids = candidates.map((row: any) => row.jid as string);
+    const stored = new Map<string, string | null>(
+      (
+        await this.prismaRepository.contact.findMany({
+          where: { instanceId: instance.instanceId ?? waInstance.instanceId, remoteJid: { in: jids } },
+          select: { remoteJid: true, profilePicUrl: true },
+        })
+      ).map((row) => [row.remoteJid, row.profilePicUrl]),
+    );
+    const summary = {
+      instance: instance.instanceName,
+      inboxId: inbox.id,
+      dryRun,
+      contacts: rows.length,
+      notWhatsapp: rows.length - candidates.length,
+      people: candidates.filter((row: any) => !row.jid.endsWith('@g.us') && !row.hasAvatar).length,
+      groups: candidates.filter((row: any) => row.jid.endsWith('@g.us') && !row.hasAvatar).length,
+      stale: candidates.filter((row: any) => row.hasAvatar).length,
+      checkedRecently: 0,
+      knownNoPicture: 0,
+      reusableStoredUrl: 0,
+      needWhatsappFetch: 0,
+      queued: 0,
+      perMinute: 0,
+      estimatedMinutes: 0,
+    };
+    const queue = this.avatarQueue(instance);
+    if (!queue) return { ...summary, enabled: false };
+    if (data.perMinute && !dryRun) queue.setPerMinute(Number(data.perMinute));
+    summary.perMinute = queue.perMinute;
+    const pending: AvatarSyncJob[] = [];
+    for (const row of candidates) {
+      let marker: AvatarMarker | null = null;
+      try {
+        const value = await this.cache.get(ChatwootService.avatarMarkerKey(row.jid));
+        marker = typeof value === 'string' ? JSON.parse(value) : value;
+      } catch {
+        marker = null;
+      }
+      if (markerIsFresh(marker, now, refreshMs)) {
+        summary.checkedRecently++;
+        if (!marker.pictureId) summary.knownNoPicture++;
+        continue;
+      }
+      if (reusableWhatsappUrl(stored.get(row.jid), now)) summary.reusableStoredUrl++;
+      else summary.needWhatsappFetch++;
+      pending.push({
+        jid: row.jid,
+        lane: 'backfill',
+        contactId: row.contactId,
+        hasAvatar: row.hasAvatar,
+        reason: 'backfill',
+      });
+    }
+    summary.estimatedMinutes = Math.ceil(summary.needWhatsappFetch / summary.perMinute);
+    if (!dryRun) {
+      for (const job of pending) if (queue.enqueue(job)) summary.queued++;
+      this.logger.info(JSON.stringify({ event: 'chatwoot_avatar_backfill_started', ...summary }));
+    }
+    return { ...summary, progress: queue.report() };
+  }
+
+  public avatarSyncStatus(instance: InstanceDto) {
+    return this.avatarQueues.get(instance.instanceName)?.report() ?? { queue: instance.instanceName, idle: true };
   }
 
   public async updateContactAvatarInRecentConversations(instance: InstanceDto, limitContacts = 100) {

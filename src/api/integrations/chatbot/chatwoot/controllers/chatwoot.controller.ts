@@ -104,6 +104,29 @@ export class ChatwootController {
     return this.chatwootService.syncParticipatingGroups(instance, data.dryRun !== false);
   }
 
+  public async avatarBackfill(
+    instance: InstanceDto,
+    data: { dryRun?: boolean; includeStale?: boolean; limit?: number; perMinute?: number },
+  ) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
+    for (const flag of ['dryRun', 'includeStale'] as const)
+      if (data?.[flag] !== undefined && typeof data[flag] !== 'boolean')
+        throw new BadRequestException(`${flag} must be boolean`);
+    for (const field of ['limit', 'perMinute'] as const)
+      if (data?.[field] !== undefined && (!Number.isInteger(data[field]) || data[field] <= 0))
+        throw new BadRequestException(`${field} must be a positive integer`);
+    try {
+      return await this.chatwootService.avatarBackfill(instance, data ?? {});
+    } catch (error) {
+      throw new BadRequestException(error?.message ?? String(error));
+    }
+  }
+
+  public async avatarSyncStatus(instance: InstanceDto) {
+    if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
+    return this.chatwootService.avatarSyncStatus(instance);
+  }
+
   public async syncHistory(instance: InstanceDto, data: ChatwootHistorySyncDto) {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
 
