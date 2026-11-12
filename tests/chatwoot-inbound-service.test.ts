@@ -44,6 +44,7 @@ import {
   inboundNativeSnapshot,
   inboundSourceCandidates,
   inboundSourceIdentityHash,
+  isBlankReactionTwin,
   isInboundTransportOnly,
   MAX_NATIVE_COPIES,
   NATIVE_COPY_QUERY_LIMIT,
@@ -117,6 +118,7 @@ function literalService() {
     inboundAcceptedSourceHashes,
     inboundSourceCandidates,
     inboundSourceIdentityHash,
+    isBlankReactionTwin,
     isInboundTransportOnly,
     chatwootErrorFields,
     inboundPresentUnverifiedClasses,
@@ -1301,8 +1303,26 @@ test('a native row never written after the ledger commit delivers from the froze
   assert.equal((await f.service.deliverQueuedInbound(f.item)).id, 9);
   assert.equal(f.creates, 1);
   const g = fixture();
-  g.service.prismaRepository.message.findMany = async () => [];
-  g.service.prismaRepository.message.count = async () => 1;
+  // The candidate query finds nothing; the by-id lookup (with `select`) finds another row.
+  g.service.prismaRepository.message.findMany = async (args: any) =>
+    args?.select ? [{ messageType: 'conversation', message: { conversation: 'other' } }] : [];
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundNativeSourceUnavailable/);
+  assert.equal(g.creates, 0);
+});
+
+test('a blank text copy whose key holds only a reaction is transport-only, not a retry', async () => {
+  const reactionRow = { messageType: 'reactionMessage', message: { reactionMessage: { text: '' } } };
+  const f = fixture();
+  f.item.payload = { ...f.item.payload, messageType: 'conversation', message: { conversation: '' } };
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.item.id = inboundDeliveryId(f.item.instanceId, f.item.payload);
+  f.service.prismaRepository.message.findMany = async (args: any) => (args?.select ? [reactionRow] : []);
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundTransportOnly/);
+  assert.equal(f.creates, 0);
+  // Text under that key, or a non-reaction row, keeps the old behaviour.
+  const g = fixture();
+  g.item.attempts = 1;
+  g.service.prismaRepository.message.findMany = async (args: any) => (args?.select ? [reactionRow] : []);
   await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundNativeSourceUnavailable/);
   assert.equal(g.creates, 0);
 });

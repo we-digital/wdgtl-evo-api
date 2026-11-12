@@ -103,6 +103,7 @@ import {
   inboundNativeSnapshot,
   inboundSourceCandidates,
   inboundSourceIdentityHash,
+  isBlankReactionTwin,
   isInboundTransportOnly,
   MAX_NATIVE_COPIES,
   NATIVE_COPY_QUERY_LIMIT,
@@ -5738,14 +5739,15 @@ export class ChatwootService {
     // A native row that was never written (the upsert handler failed after the
     // ledger commit) leaves the frozen payload as the only source. A row that
     // exists under another peer/direction, or was removed, still refuses.
-    if (
-      sources.length === 0 &&
-      item.attempts > 0 &&
-      (await this.prismaRepository.message.count({
+    if (sources.length === 0) {
+      const underKey = (await this.prismaRepository.message.findMany({
         where: { instanceId: item.instanceId, key: { path: ['id'], equals: item.sourceId.slice(5) } },
-      })) !== 0
-    )
-      throw new Error('InboundNativeSourceUnavailable');
+        select: { messageType: true, message: true },
+        take: NATIVE_COPY_QUERY_LIMIT,
+      })) as unknown as Record<string, any>[];
+      if (isBlankReactionTwin(item.payload, underKey)) throw new Error('InboundTransportOnly');
+      if (item.attempts > 0 && underKey.length !== 0) throw new Error('InboundNativeSourceUnavailable');
+    }
     const nativeSnapshot = inboundNativeSnapshot(sources);
     const body = JSON.parse(JSON.stringify(resolveInboundNativeBody(sources, item.payload)));
     if (isInboundTransportOnly(body)) throw new Error('InboundTransportOnly');

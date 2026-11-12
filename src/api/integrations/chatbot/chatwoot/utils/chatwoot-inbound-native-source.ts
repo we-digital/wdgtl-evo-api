@@ -118,6 +118,19 @@ export function isBlankNativeCopy(body: InboundPayload): boolean {
   return plainTransportBody(body) && body.message.conversation === '';
 }
 
+// WhatsApp can deliver a blank plain-text copy under the key of a reaction
+// (seen on group reaction removals: the empty reaction, then ~10 s later a
+// bare `conversation: ''` with the same id). The native store keeps only the
+// reaction, so the copy never has a source and carries no content to render.
+export function isBlankReactionTwin(body: InboundPayload, rowsUnderKey: InboundPayload[]): boolean {
+  return (
+    isBlankNativeCopy(body) &&
+    !body.message.senderKeyDistributionMessage &&
+    rowsUnderKey.length > 0 &&
+    rowsUnderKey.every((row) => row?.messageType === 'reactionMessage' && !!row?.message?.reactionMessage)
+  );
+}
+
 const bareJid = (jid: string) => jid.replace(/:\d+@/, '@');
 // Every sender identity a copy carries about itself: the key participant and its
 // LID/PN alternate (participantAlt, participantPn, participantLid) and the

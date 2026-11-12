@@ -86,6 +86,19 @@ const terminalErrors: Record<string, InboundTerminalState> = {
   InboundIdentityUnavailable: 'failed',
 };
 
+// Error text for operators: long digit runs (phones, ids, timestamps) masked,
+// URLs reduced to their path shape, capped. Never the payload.
+export function inboundErrorDetail(error: unknown): string | undefined {
+  const text = error instanceof Error ? error.message : typeof error === 'string' ? error : '';
+  if (!text) return undefined;
+  return text
+    .replace(/https?:\/\/\S+/g, '<url>')
+    .replace(/\d{5,}/g, '<n>')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 160);
+}
+
 export function inboundChatKey(item: Pick<InboundDelivery, 'instanceId' | 'peer'>): string {
   return item.instanceId + '|' + item.peer;
 }
@@ -424,6 +437,9 @@ export class ChatwootInboundQueue {
           : error instanceof Error
             ? error.name
             : 'Error';
+      // A bare `Error`/`TypeError` says nothing; keep a short, number-masked detail
+      // in the event (not in the row) so a stuck item can be diagnosed.
+      const errorDetail = error instanceof Error && errorClass === error.name ? inboundErrorDetail(error) : undefined;
       // Unknown HTTP outcomes remain retryable. The next attempt MUST read exact receiver owners before POST.
       // Only the failure cap or a deterministic source error closes the row, with its reason kept.
       const at = this.now().getTime();
@@ -436,6 +452,7 @@ export class ChatwootInboundQueue {
           instanceId: item.instanceId,
           lane,
           errorClass,
+          ...(errorDetail ? { errorDetail } : {}),
           attempts,
           ageMs: age,
         });
@@ -447,6 +464,7 @@ export class ChatwootInboundQueue {
         instanceId: item.instanceId,
         lane,
         errorClass,
+        ...(errorDetail ? { errorDetail } : {}),
         attempts,
         retryInMs: delay,
       });
