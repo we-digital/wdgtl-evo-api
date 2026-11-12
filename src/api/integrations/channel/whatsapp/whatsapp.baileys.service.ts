@@ -57,6 +57,11 @@ import {
 } from '@api/dto/sendMessage.dto';
 import { whatsappIngestRunner } from '@api/integrations/channel/whatsapp/whatsapp-ingest-runner';
 import {
+  AvatarPicture,
+  classifyProfilePictureError,
+  reusableWhatsappUrl,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-avatar-sync';
+import {
   assertWhatsappMentionParticipants,
   normalizeWhatsappJid,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
@@ -1214,14 +1219,25 @@ export class BaileysStartupService extends ChannelStartupService {
 
     'contacts.update': async (contacts: Partial<Contact>[]) => {
       const contactsRaw: { remoteJid: string; pushName?: string; profilePicUrl?: string; instanceId: string }[] = [];
-      for await (const contact of contacts) {
+      for (const contact of contacts) {
         this.logger.debug(() => `Updating contact: ${JSON.stringify(contact, null, 2)}`);
+        // No WhatsApp query here: app-state syncs deliver contacts.update in bursts of
+        // hundreds. Only a picture notification (imgUrl) means the avatar changed; the
+        // throttled Chatwoot avatar sync fetches it and updates the stored URL.
         contactsRaw.push({
           remoteJid: contact.id,
           pushName: whatsappProfileName(contact),
-          profilePicUrl: (await this.profilePicture(contact.id)).profilePictureUrl,
           instanceId: this.instanceId,
         });
+        if (contact.id && contact.imgUrl !== undefined) {
+          void this.forgetCachedProfilePictureUrl(contact.id);
+          if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+            this.chatwootService.enqueueAvatarSync(
+              { instanceName: this.instance.name, instanceId: this.instanceId },
+              { jid: contact.id, lane: 'live', force: true, reason: `picture-${contact.imgUrl || 'changed'}` },
+            );
+          }
+        }
       }
 
       this.sendDataWebhook(Events.CONTACTS_UPDATE, contactsRaw);
@@ -1819,7 +1835,8 @@ export class BaileysStartupService extends ChannelStartupService {
               } = {
                 remoteJid: received.key.remoteJid,
                 pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
-                profilePicUrl: await this.cachedProfilePictureUrl(received.key.remoteJid),
+                // Never ask WhatsApp on the message path: cached or stored URL only.
+                profilePicUrl: await this.peekCachedProfilePictureUrl(received.key.remoteJid, contact?.profilePicUrl),
                 instanceId: this.instanceId,
               };
 
@@ -2435,25 +2452,78 @@ export class BaileysStartupService extends ChannelStartupService {
   private static readonly PROFILE_PICTURE_TTL_SECONDS = 6 * 60 * 60;
 
   /**
-   * Avatar URL for message ingest. Asking WhatsApp on every message cost one IQ
-   * round trip per message and adds rate-limit pressure; avatars change rarely.
-   * A missing avatar is cached too (as an empty string).
+   * Avatar URL for message ingest without a WhatsApp query: the cached URL
+   * (an empty string caches "no picture"), else the stored one. Fresh values come
+   * from the throttled Chatwoot avatar sync (fetchProfilePictureForSync).
    */
-  private async cachedProfilePictureUrl(jid: string): Promise<string | null> {
-    const key = `profile_picture_url:${jid}`;
+  private async peekCachedProfilePictureUrl(jid: string, stored?: string | null): Promise<string | null> {
     try {
-      const cached = await this.baileysCache.get(key);
+      const cached = await this.baileysCache.get(`profile_picture_url:${jid}`);
       if (typeof cached === 'string') return cached || null;
     } catch {
-      // A cache outage only costs the WhatsApp lookup below.
+      // A cache outage falls back to the stored URL.
     }
-    const url = (await this.profilePicture(jid)).profilePictureUrl ?? null;
+    return stored ?? null;
+  }
+
+  private async forgetCachedProfilePictureUrl(jid: string) {
     try {
-      await this.baileysCache.set(key, url ?? '', BaileysStartupService.PROFILE_PICTURE_TTL_SECONDS);
+      await this.baileysCache.delete(`profile_picture_url:${jid}`);
     } catch {
       // Best effort.
     }
-    return url;
+  }
+
+  /** Free avatar lookup for the sync queue: cached or stored URL that has not expired. */
+  public async peekProfilePictureForSync(jid: string): Promise<AvatarPicture | null> {
+    try {
+      const cached = await this.baileysCache.get(`profile_picture_url:${jid}`);
+      if (cached === '') return { kind: 'none', source: 'cache' };
+      if (typeof cached === 'string' && reusableWhatsappUrl(cached, Date.now()))
+        return { kind: 'picture', url: cached, source: 'cache' };
+    } catch {
+      // Fall through to the stored URL.
+    }
+    const stored = await this.prismaRepository.contact
+      .findUnique({
+        where: { remoteJid_instanceId: { remoteJid: jid, instanceId: this.instanceId } },
+        select: { profilePicUrl: true },
+      })
+      .catch((): null => null);
+    if (stored?.profilePicUrl && reusableWhatsappUrl(stored.profilePicUrl, Date.now()))
+      return { kind: 'picture', url: stored.profilePicUrl, source: 'stored' };
+    return null;
+  }
+
+  /**
+   * One WhatsApp profile picture query for the avatar sync queue (which paces
+   * it). The result refreshes the ingest cache and the stored contact URL.
+   */
+  public async fetchProfilePictureForSync(jid: string): Promise<AvatarPicture> {
+    if (!this.client || this.stateConnection?.state !== 'open') return { kind: 'error', message: 'not-connected' };
+    let url: string | null = null;
+    try {
+      url = (await this.client.profilePictureUrl(jid, 'image', 15_000)) || null;
+    } catch (error) {
+      const kind = classifyProfilePictureError(error);
+      if (kind === 'rate-limited') return { kind };
+      if (kind === 'error') return { kind, message: String(error?.message ?? error) };
+    }
+    try {
+      await this.baileysCache.set(
+        `profile_picture_url:${jid}`,
+        url ?? '',
+        BaileysStartupService.PROFILE_PICTURE_TTL_SECONDS,
+      );
+    } catch {
+      // Best effort.
+    }
+    if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS) {
+      await this.prismaRepository.contact
+        .updateMany({ where: { remoteJid: jid, instanceId: this.instanceId }, data: { profilePicUrl: url } })
+        .catch(() => undefined);
+    }
+    return url ? { kind: 'picture', url, source: 'whatsapp' } : { kind: 'none', source: 'whatsapp' };
   }
 
   public async profilePicture(number: string) {
