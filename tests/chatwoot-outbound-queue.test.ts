@@ -120,6 +120,21 @@ test('uses only the exact top-level message and creates attachment identities in
   assert.ok(first.every((part) => part.payload.quotedChatwootMessageId === 99));
 });
 
+test('puts the text as caption on the first attachment only', () => {
+  const parts = buildParts();
+  assert.deepEqual(
+    parts.map((part) => part.payload.text),
+    ['caption', null],
+  );
+  const single = buildParts({ ...webhook, attachments: [webhook.attachments[1]] });
+  assert.deepEqual(
+    single.map((part) => part.payload.text),
+    ['caption'],
+  );
+  const textOnly = buildParts({ ...webhook, attachments: [] });
+  assert.equal(textOnly[0].payload.text, 'caption');
+});
+
 test('freezes the external WhatsApp quote identity for provider-cache fallback', () => {
   const parts = buildParts({
     ...webhook,

@@ -414,7 +414,12 @@ export function buildChatwootOutboundParts(params: {
       laneKey: hash(`${instanceId}:${chatId}`),
       payload: {
         chatId,
-        text: nativeForward ? null : 'attachmentUrl' in part && !params.formattedText ? null : params.formattedText,
+        // One Chatwoot message with N attachments becomes N WhatsApp messages;
+        // the text rides as the caption of the first one only, like a native album.
+        text:
+          nativeForward || ('attachmentUrl' in part && (partIndex > 0 || !params.formattedText))
+            ? null
+            : params.formattedText,
         attachmentId: 'attachmentId' in part ? part.attachmentId : undefined,
         attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : undefined,
         nativeForward,
