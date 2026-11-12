@@ -5568,7 +5568,9 @@ export class ChatwootService {
         params: { source_ids: [row.source_id] },
         headers: { 'api-access-token': provider.token, 'X-Chatwoot-Native-Bridge-Token': trusted.NATIVE_BRIDGE_TOKEN },
       });
-      const url = retainedVideoProxyUrl(row, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin);
+      const url = retainedVideoProxyUrl(row, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin, {
+        fileType: cachedHistoryMediaType(message) === 'document' ? 'file' : undefined,
+      });
       const stored = await axios.request({
         method: 'GET',
         url,
