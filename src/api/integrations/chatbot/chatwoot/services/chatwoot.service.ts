@@ -5419,7 +5419,35 @@ export class ChatwootService {
       )
     )
       return null;
+    this.enqueueInboundAvatars(instance, body);
     return this.inboundQueue.submit(this.inboundRecord(instance, provider, body, 'pending'));
+  }
+
+  /**
+   * Live avatar trigger for durable inbound messages (their conversation comes
+   * from the native bridge, not createConversation). In-memory and synchronous;
+   * the queue checks markers and Chatwoot later, at its own pace.
+   */
+  private enqueueInboundAvatars(instance: InstanceDto, body: any) {
+    try {
+      const key = body?.key ?? {};
+      const pick = (jid: unknown, alt: unknown) => (isLidJid(jid as string) && isPhoneJid(alt as string) ? alt : jid);
+      const chat = pick(key.remoteJid, key.remoteJidAlt);
+      if (typeof chat === 'string') {
+        this.enqueueAvatarSync(instance, { jid: toCanonicalHistoryJid(chat), lane: 'live', reason: 'inbound' });
+      }
+      if (isGroupJid(key.remoteJid)) {
+        const participant = pick(key.participant, key.participantAlt);
+        if (typeof participant === 'string')
+          this.enqueueAvatarSync(instance, {
+            jid: toCanonicalHistoryJid(participant),
+            lane: 'live',
+            reason: 'inbound-participant',
+          });
+      }
+    } catch {
+      // Avatars must never break message delivery.
+    }
   }
 
   public async persistReceivedHistory(instance: InstanceDto, messages: any[]) {
@@ -6845,6 +6873,10 @@ export class ChatwootService {
           return waInstance.fetchProfilePictureForSync(jid);
         },
         apply: (job, url, previous) => this.applyAvatar(instance, job, url, previous),
+        resolveTarget: async (jid) => {
+          const found = await this.findAvatarContact(instance, jid);
+          return found ? { contactId: found.id, hasAvatar: found.hasAvatar } : null;
+        },
         log: (event, fields) =>
           event.endsWith('_error') || event.endsWith('_rate_limited')
             ? this.logger.warn(JSON.stringify({ event, ...fields }))
@@ -6865,7 +6897,8 @@ export class ChatwootService {
       if (!this.syncableWaInstance(instance)) return false;
       return this.avatarQueue(instance)?.enqueue(job) ?? false;
     } catch (error) {
-      this.logger.warn(`Avatar sync enqueue failed: ${error}`);
+      // Avatars must never break message delivery.
+      this.logger?.warn?.(`Avatar sync enqueue failed: ${error}`);
       return false;
     }
   }

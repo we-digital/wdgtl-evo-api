@@ -253,3 +253,34 @@ test('no WhatsApp picture query on the inbound delivery and ingest paths', () =>
   assert.doesNotMatch(contactsUpdate, /profilePicture\(/);
   assert.match(contactsUpdate, /enqueueAvatarSync\(/);
 });
+
+test('looks up the Chatwoot contact before asking WhatsApp; unknown contacts cost no fetch', async () => {
+  const h = harness();
+  const lookups: string[] = [];
+  (h.queue as any).deps.resolveTarget = async (jid: string) => {
+    lookups.push(jid);
+    return jid.startsWith('known') ? { contactId: 42, hasAvatar: false } : null;
+  };
+  h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' }));
+  h.queue.enqueue(job('known@s.whatsapp.net', { lane: 'live' }));
+  await h.queue.idle();
+  assert.deepEqual(lookups, ['unknown@s.whatsapp.net', 'known@s.whatsapp.net']);
+  assert.deepEqual(h.fetches, ['known@s.whatsapp.net']);
+  assert.equal(h.queue.stats.noContact, 1);
+  assert.equal(h.markers.has('unknown@s.whatsapp.net'), false, 'no marker: a later Chatwoot contact is not blocked');
+  // Repeated activity of the unknown peer stays in memory until the window ends.
+  assert.equal(h.queue.enqueue(job('unknown@s.whatsapp.net', { lane: 'live' })), false);
+});
+
+test('durable inbound messages trigger the avatar sync without awaiting it', () => {
+  const chatwoot = fs.readFileSync('src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts', 'utf8');
+  const eventWhatsapp = chatwoot.slice(
+    chatwoot.indexOf('public async eventWhatsapp('),
+    chatwoot.indexOf('private enqueueInboundAvatars('),
+  );
+  assert.match(
+    eventWhatsapp,
+    /\n {4}this\.enqueueInboundAvatars\(instance, body\);\n {4}return this\.inboundQueue\.submit/,
+  );
+  assert.doesNotMatch(eventWhatsapp, /await this\.enqueueInboundAvatars/);
+});
