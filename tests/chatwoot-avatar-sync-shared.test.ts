@@ -54,3 +54,45 @@ test('every ChatwootService shares one avatar queue per WhatsApp number', async 
   assert.equal(channel.avatarSyncStatus(instance).fresh, 1);
   queue.stop();
 });
+
+test('backfill can keep only recently active conversations, most recent first', async () => {
+  const queries: { sql: string; params: unknown[] }[] = [];
+  const service = new ChatwootService(
+    {
+      waInstances: {
+        'recent-avatar-test': {
+          instanceId: 'i-2',
+          peekProfilePictureForSync: async () => null,
+          fetchProfilePictureForSync: async () => ({ kind: 'none', source: 'whatsapp' }),
+        },
+      },
+    } as any,
+    { get: () => ({ IMPORT: { DATABASE: { CONNECTION: { URI: 'postgres://chatwoot' } } } }) } as any,
+    { contact: { findMany: async () => [] } } as any,
+    {
+      get: async () => undefined,
+      set: async () => undefined,
+      has: async () => false,
+      delete: async () => undefined,
+    } as any,
+  ) as any;
+  service.logger = { info: () => undefined, warn: () => undefined, error: () => undefined, verbose: () => undefined };
+  service.getProvider = async () => ({ accountId: '1' });
+  service.getInbox = async () => ({ id: 58 });
+  service.pgClient = {
+    query: async (sql: string, params: unknown[]) => {
+      queries.push({ sql, params });
+      return { rows: [{ id: 5, identifier: '120363000000000001@g.us', phone_number: null, has_avatar: false }] };
+    },
+  };
+  const result = await service.avatarBackfill({ instanceName: 'recent-avatar-test' }, { activeWithinDays: 3 });
+  assert.equal(result.dryRun, true);
+  assert.equal(result.activeWithinDays, 3);
+  assert.equal(result.groups, 1);
+  assert.equal(queries[0].params[5], 3);
+  assert.match(queries[0].sql, /act\.last_activity_at > now\(\) - \(\$6::int \* interval '1 day'\)/);
+  assert.match(queries[0].sql, /ORDER BY act\.last_activity_at DESC NULLS LAST/);
+
+  await service.avatarBackfill({ instanceName: 'recent-avatar-test' }, {});
+  assert.equal(queries[1].params[5], null, 'no filter by default');
+});

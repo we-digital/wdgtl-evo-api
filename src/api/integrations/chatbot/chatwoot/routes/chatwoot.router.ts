@@ -58,6 +58,7 @@ export class ChatwootRouter extends RouterBroker {
           includeStale?: boolean;
           limit?: number;
           perMinute?: number;
+          activeWithinDays?: number;
         }>({
           request: req,
           schema: instanceSchema,
