@@ -106,13 +106,13 @@ export class ChatwootController {
 
   public async avatarBackfill(
     instance: InstanceDto,
-    data: { dryRun?: boolean; includeStale?: boolean; limit?: number; perMinute?: number },
+    data: { dryRun?: boolean; includeStale?: boolean; limit?: number; perMinute?: number; activeWithinDays?: number },
   ) {
     if (!this.configService.get<Chatwoot>('CHATWOOT').ENABLED) throw new BadRequestException('Chatwoot is disabled');
     for (const flag of ['dryRun', 'includeStale'] as const)
       if (data?.[flag] !== undefined && typeof data[flag] !== 'boolean')
         throw new BadRequestException(`${flag} must be boolean`);
-    for (const field of ['limit', 'perMinute'] as const)
+    for (const field of ['limit', 'perMinute', 'activeWithinDays'] as const)
       if (data?.[field] !== undefined && (!Number.isInteger(data[field]) || data[field] <= 0))
         throw new BadRequestException(`${field} must be a positive integer`);
     try {

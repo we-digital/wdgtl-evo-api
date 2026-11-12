@@ -6981,9 +6981,16 @@ export class ChatwootService {
    */
   public async avatarBackfill(
     instance: InstanceDto,
-    data: { dryRun?: boolean; includeStale?: boolean; limit?: number; perMinute?: number } = {},
+    data: {
+      dryRun?: boolean;
+      includeStale?: boolean;
+      limit?: number;
+      perMinute?: number;
+      activeWithinDays?: number;
+    } = {},
   ) {
     const dryRun = data.dryRun !== false;
+    const activeWithinDays = Number(data.activeWithinDays) > 0 ? Math.floor(Number(data.activeWithinDays)) : null;
     if (!ChatwootService.avatarSyncEnabled()) return { enabled: false };
     const waInstance = this.syncableWaInstance(instance);
     if (!waInstance) throw new Error('Avatar backfill needs a connected Baileys instance');
@@ -6994,19 +7001,26 @@ export class ChatwootService {
     const refreshMs = ChatwootService.avatarRefreshMs();
     const limit = Math.max(1, Math.min(20_000, Number(data.limit) || 20_000));
     const { rows } = await this.pgClient.query(
+      // Most recently active conversations first; activeWithinDays keeps only those.
       `SELECT ct.id, ct.identifier, ct.phone_number, (a.id IS NOT NULL) AS has_avatar
          FROM contact_inboxes ci
          JOIN contacts ct ON ct.id = ci.contact_id AND ct.account_id = $1
          LEFT JOIN active_storage_attachments a
            ON a.record_type = 'Contact' AND a.record_id = ct.id AND a.name = 'avatar'
+         LEFT JOIN LATERAL (
+           SELECT max(cv.last_activity_at) AS last_activity_at
+             FROM conversations cv
+            WHERE cv.contact_id = ct.id AND cv.inbox_id = $2
+         ) act ON true
         WHERE ci.inbox_id = $2
           AND (a.id IS NULL OR ($3::boolean AND COALESCE(
                 (ct.additional_attributes->>'last_avatar_sync_at')::timestamptz, a.created_at)
                 < now() - ($4::bigint * interval '1 millisecond')))
-        GROUP BY ct.id, a.id
-        ORDER BY ct.id
+          AND ($6::int IS NULL OR act.last_activity_at > now() - ($6::int * interval '1 day'))
+        GROUP BY ct.id, a.id, act.last_activity_at
+        ORDER BY act.last_activity_at DESC NULLS LAST, ct.id
         LIMIT $5`,
-      [Number(provider.accountId), inbox.id, !!data.includeStale, refreshMs, limit],
+      [Number(provider.accountId), inbox.id, !!data.includeStale, refreshMs, limit, activeWithinDays],
     );
     const now = Date.now();
     const candidates = rows
@@ -7029,6 +7043,7 @@ export class ChatwootService {
       instance: instance.instanceName,
       inboxId: inbox.id,
       dryRun,
+      activeWithinDays,
       contacts: rows.length,
       notWhatsapp: rows.length - candidates.length,
       people: candidates.filter((row: any) => !row.jid.endsWith('@g.us') && !row.hasAvatar).length,
