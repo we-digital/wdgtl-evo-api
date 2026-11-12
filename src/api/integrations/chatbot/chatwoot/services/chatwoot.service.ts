@@ -5395,6 +5395,7 @@ export class ChatwootService {
       )
     )
       return { delivery: Promise.resolve(null) };
+    this.enqueueInboundAvatars(instance, body);
     const stored = await this.inboundQueue.admit(this.inboundRecord(instance, provider, body, 'pending'));
     return { delivery: this.inboundQueue.deliverAdmitted(stored) };
   }
@@ -6927,7 +6928,15 @@ export class ChatwootService {
           [accountId, value],
         )
       )?.rows?.[0];
-    const row = (await lookup('identifier', jid)) ?? (phone ? await lookup('phone_number', phone) : undefined);
+    let row = (await lookup('identifier', jid)) ?? (phone ? await lookup('phone_number', phone) : undefined);
+    // Chatwoot keys most direct contacts by phone JID; inbound often carries only the LID.
+    if (!row && isLidJid(jid)) {
+      const resolved = await this.resolvePhoneJidForLid(instance, jid).catch((): null => null);
+      if (resolved) {
+        const pn = toCanonicalHistoryJid(resolved);
+        row = (await lookup('identifier', pn)) ?? (await lookup('phone_number', `+${pn.split('@')[0]}`));
+      }
+    }
     return row
       ? { id: Number(row.id), hasAvatar: !!row.has_avatar }
       : { missing: `not-found:${jid.slice(jid.indexOf('@')) || 'no-domain'}` };
