@@ -3765,6 +3765,9 @@ export class ChatwootService {
     body: any,
     authenticatedAdmission?: ChatwootOutboundWebhookHeaders,
   ) {
+    // Answered before any outbound work: in-memory enqueue only.
+    if (body?.event === 'contact_avatar_request')
+      return this.receiveAvatarRequest(instance, body, authenticatedAdmission);
     let outboundEnqueueAttempted = false;
     try {
       const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
@@ -7091,6 +7094,45 @@ export class ChatwootService {
       this.logger.info(JSON.stringify({ event: 'chatwoot_avatar_backfill_started', ...summary }));
     }
     return { ...summary, progress: queue.report() };
+  }
+
+  /**
+   * Chatwoot asks for avatars of contacts people are looking at: 'open' for a
+   * dialog someone opened (front of the queue), 'list' for a loaded conversation
+   * list. Signed like every Chatwoot webhook; no Chatwoot or WhatsApp call here.
+   */
+  private receiveAvatarRequest(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
+    if (!admission) {
+      throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
+        name: 'ChatwootWebhookAuthenticationError',
+        status: 401,
+      });
+    }
+    const lane = body?.priority === 'open' ? 'open' : body?.priority === 'list' ? 'list' : null;
+    const contacts = Array.isArray(body?.contacts) ? body.contacts.slice(0, 50) : [];
+    if (!lane) return { message: 'avatar_request_ignored', queued: 0 };
+    let queued = 0;
+    for (const contact of contacts) {
+      const jid = chatwootContactJid(
+        typeof contact?.identifier === 'string' ? contact.identifier : null,
+        typeof contact?.phone_number === 'string' ? contact.phone_number : null,
+      );
+      const contactId = Number(contact?.id);
+      if (!jid || !Number.isSafeInteger(contactId) || contactId <= 0) continue;
+      const hasAvatar = contact?.has_avatar === true;
+      if (
+        this.enqueueAvatarSync(instance, {
+          jid,
+          lane,
+          contactId,
+          hasAvatar,
+          viewed: !hasAvatar,
+          reason: `chatwoot-${lane}`,
+        })
+      )
+        queued++;
+    }
+    return { message: 'avatar_requested', queued };
   }
 
   public avatarSyncStatus(instance: InstanceDto) {
