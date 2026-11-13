@@ -40,6 +40,7 @@ import {
   KeyType,
   MediaMessage,
   Options,
+  SendAlbumDto,
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
@@ -2672,8 +2673,17 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     sender = sender.toLowerCase();
 
-    const { mentions, linkPreview, quoted, messageId, ephemeralExpiration, contextInfo, beforeTransport, signal } =
-      transport;
+    const {
+      mentions,
+      linkPreview,
+      quoted,
+      messageId,
+      ephemeralExpiration,
+      contextInfo,
+      beforeTransport,
+      signal,
+      albumParentKey,
+    } = transport;
 
     const option: any = { quoted, ...(await this.groupTransportOptions(sender)) };
 
@@ -2733,6 +2743,15 @@ export class BaileysStartupService extends ChannelStartupService {
       message['contextInfo'] = contextInfo;
     }
 
+    // Album container: Baileys builds albumMessage{expectedImageCount, expectedVideoCount}.
+    if (message['album']) {
+      return await this.client.sendMessage(
+        sender,
+        { album: message['album'] } as unknown as AnyMessageContent,
+        option as unknown as MiscMessageGenerationOptions,
+      );
+    }
+
     if (message['conversation']) {
       return await this.client.sendMessage(
         sender,
@@ -2753,6 +2772,7 @@ export class BaileysStartupService extends ChannelStartupService {
           forward: { key: { remoteJid: this.instance.wuid, fromMe: true }, message },
           mentions,
           contextInfo: message['contextInfo'],
+          ...(albumParentKey ? { albumParentKey } : {}),
         },
         option as unknown as MiscMessageGenerationOptions,
       );
@@ -2942,6 +2962,7 @@ export class BaileysStartupService extends ChannelStartupService {
             ephemeralExpiration: group?.ephemeralDuration,
             beforeTransport: options?.beforeTransport,
             signal: options?.signal,
+            albumParentKey: options?.albumParentKey,
           }),
         );
       } else {
@@ -2968,6 +2989,7 @@ export class BaileysStartupService extends ChannelStartupService {
             contextInfo,
             beforeTransport: options?.beforeTransport,
             signal: options?.signal,
+            albumParentKey: options?.albumParentKey,
           }),
         );
       }
@@ -3576,6 +3598,57 @@ export class BaileysStartupService extends ChannelStartupService {
     );
 
     return mediaSent;
+  }
+
+  // A WhatsApp album: one albumMessage container, then every item as a normal media
+  // message tied to it by messageContextInfo.messageAssociation (MEDIA_ALBUM).
+  // Captions stay per item; the quote goes on the first item.
+  public async albumMessage(data: SendAlbumDto, isIntegration = false, provenance?: OutboundMessageProvenance) {
+    const items = data.items || [];
+    const prepared = [];
+    for (const item of items) {
+      prepared.push(
+        await this.prepareMediaMessage({
+          number: data.number,
+          mediatype: item.mediatype,
+          mimetype: item.mimetype,
+          media: item.media,
+          caption: item.caption,
+          fileName: item.fileName,
+        } as SendMediaDto),
+      );
+    }
+
+    const expectedImageCount = items.filter((item) => item.mediatype === 'image').length;
+    const expectedVideoCount = items.filter((item) => item.mediatype === 'video').length;
+    const album = await this.sendMessageWithTyping(
+      data.number,
+      { album: { expectedImageCount, expectedVideoCount } } as any,
+      { delay: data?.delay, presence: 'composing' },
+      isIntegration,
+      provenance,
+    );
+    const albumParentKey = { remoteJid: album.key.remoteJid, fromMe: true, id: album.key.id };
+
+    const sent = [];
+    for (const [index, generate] of prepared.entries()) {
+      sent.push(
+        await this.sendMessageWithTyping(
+          data.number,
+          { ...generate.message },
+          {
+            quoted: index === 0 ? data?.quoted : undefined,
+            mentionsEveryOne: index === 0 ? data?.mentionsEveryOne : undefined,
+            mentioned: index === 0 ? data?.mentioned : undefined,
+            albumParentKey,
+          },
+          isIntegration,
+          provenance,
+        ),
+      );
+    }
+
+    return { album, items: sent };
   }
 
   public async ptvMessage(data: SendPtvDto, file?: any, isIntegration = false) {

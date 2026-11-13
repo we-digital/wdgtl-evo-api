@@ -1,5 +1,6 @@
 import { InstanceDto } from '@api/dto/instance.dto';
 import {
+  SendAlbumDto,
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
@@ -49,6 +50,14 @@ export class SendMessageController {
       return await this.waMonitor.waInstances[instanceName].mediaMessage(data, file);
     }
     throw new BadRequestException('Owned media must be a url or base64');
+  }
+
+  public async sendAlbum({ instanceName }: InstanceDto, data: SendAlbumDto) {
+    const items = Array.isArray(data?.items) ? data.items : [];
+    if (items.length < 2) throw new BadRequestException('An album needs at least two items.');
+    if (items.some((item) => !isURL(item?.media) && !isBase64(item?.media)))
+      throw new BadRequestException('Owned media must be a url or base64');
+    return await this.waMonitor.waInstances[instanceName].albumMessage(data);
   }
 
   public async sendPtv({ instanceName }: InstanceDto, data: SendPtvDto, file?: any) {

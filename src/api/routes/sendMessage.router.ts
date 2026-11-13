@@ -1,5 +1,6 @@
 import { RouterBroker } from '@api/abstract/abstract.router';
 import {
+  SendAlbumDto,
   SendAudioDto,
   SendButtonsDto,
   SendContactDto,
@@ -18,6 +19,7 @@ import { apiOutboundOperations, prismaRepository, sendMessageController } from '
 import { isApiOperationId } from '@api/services/api-outbound-operation';
 import { resolveOutboundRequestId } from '@api/types/outbound-provenance';
 import {
+  albumMessageSchema,
   audioMessageSchema,
   buttonsMessageSchema,
   contactMessageSchema,
@@ -123,6 +125,17 @@ export class MessageRouter extends RouterBroker {
         return res
           .status(response?.operation && response.operation.state !== 'sent' ? HttpStatus.ACCEPTED : HttpStatus.CREATED)
           .json(response);
+      })
+      .post(this.routerPath('sendAlbum'), ...guards, async (req, res) => {
+        if (req.get('idempotency-key')) return res.status(400).json({ error: 'API_OPERATION_UNSUPPORTED_FOR_ALBUM' });
+        const response = await this.dataValidate<SendAlbumDto>({
+          request: req,
+          schema: albumMessageSchema,
+          ClassRef: SendAlbumDto,
+          execute: (instance) => sendMessageController.sendAlbum(instance, req.body),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
       })
       .post(this.routerPath('sendPtv'), ...guards, upload.single('file'), async (req, res) => {
         const bodyData = req.body;

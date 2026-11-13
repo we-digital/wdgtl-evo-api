@@ -122,6 +122,47 @@ export const mediaMessageSchema: JSONSchema7 = {
   required: ['number', 'mediatype'],
 };
 
+export const albumMessageSchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    number: { ...numberDefinition },
+    items: {
+      type: 'array',
+      minItems: 2,
+      maxItems: 30,
+      items: {
+        type: 'object',
+        properties: {
+          mediatype: { type: 'string', enum: ['image', 'video'] },
+          mimetype: { type: 'string' },
+          media: { type: 'string' },
+          fileName: { type: 'string' },
+          caption: { type: 'string' },
+        },
+        required: ['mediatype', 'media'],
+      },
+    },
+    delay: {
+      type: 'integer',
+      description: 'Enter a value in milliseconds',
+    },
+    quoted: { ...quotedOptionsSchema },
+    everyOne: { type: 'boolean', enum: [true, false] },
+    mentioned: {
+      type: 'array',
+      minItems: 1,
+      uniqueItems: true,
+      items: {
+        type: 'string',
+        pattern: '^\\d+',
+        description: '"mentioned" must be an array of numeric strings',
+      },
+    },
+  },
+  required: ['number', 'items'],
+};
+
 export const ptvMessageSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',
