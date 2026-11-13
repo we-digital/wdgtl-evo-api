@@ -6,6 +6,7 @@ import { test } from 'node:test';
 import '@api/server.module';
 import { chatwootIgnoresJid } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
 import {
+  busCreds,
   busInstanceEnabled,
   busOutboundPeerAllowed,
   busPartition,
@@ -57,4 +58,11 @@ test('ignored chats are refused before the ledger with the processWhatsappEvent 
   assert.equal(chatwootIgnoresJid(['120@g.us'], '121@g.us'), false);
   assert.equal(chatwootIgnoresJid([], '120@g.us'), false);
   assert.equal(chatwootIgnoresJid(null, '120@g.us'), false);
+});
+
+test('bus creds come from base64 content when no file is configured', () => {
+  const creds = '-----BEGIN NATS USER JWT-----\nabc\n------END NATS USER JWT------\n';
+  const decoded = busCreds({ CHATWOOT_BUS_CREDS_B64: Buffer.from(creds).toString('base64') } as any);
+  assert.equal(Buffer.from(decoded!).toString(), creds);
+  assert.equal(busCreds({} as any), null);
 });
