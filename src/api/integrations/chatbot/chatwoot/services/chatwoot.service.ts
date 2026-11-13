@@ -2179,7 +2179,8 @@ export class ChatwootService {
     const storedBinding = inboxRecord ? this.inboxRouteBinding(inboxRecord) : null;
     const route = chatwootEvoRouteBindingsEqual(storedBinding, expectedBinding) ? expectedBinding : null;
 
-    const attributes = buildChatwootIngressAttributes(messageBody, route, clientSent);
+    const user = this.waMonitor.waInstances[instance.instanceName]?.client?.user;
+    const attributes = buildChatwootIngressAttributes(messageBody, route, clientSent, [user?.id, user?.lid]);
     return {
       ...attributes,
       we_digital_ingress: {
@@ -3084,6 +3085,16 @@ export class ChatwootService {
     return url.replace(/\/+$/, '');
   }
 
+  // Chatwoot deletes fail-closed (since 2026-09-18): it asks EVO first with a
+  // native_delete_probe and marks the message deleted only after EVO answers
+  // "deleted", so the current message is normally not deleted yet, and an
+  // agent edit may have changed its content since the send. The deletion read
+  // therefore accepts either deleted state and any content, while provider,
+  // origin, route, destination and contact still have to match.
+  private currentDeletionContext(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
+    return this.currentOutboundContext(operation, signal, false, false, true);
+  }
+
   private outboundBindingMismatch() {
     const error = new Error('Chatwoot outbound origin or route binding changed');
     error.name = 'OutboundBindingMismatch';
@@ -3146,6 +3157,7 @@ export class ChatwootService {
     signal: AbortSignal,
     expectedDeleted = false,
     allowAuthoritativeDeletion = false,
+    forDeletion = false,
   ) {
     const [instance, provider] = await Promise.all([
       this.outboundInstance(operation),
@@ -3208,7 +3220,7 @@ export class ChatwootService {
       expectedRoute,
       currentRoute: currentMessage?.route?.binding,
     };
-    const exact = validatesCurrentChatwootOutboundSnapshot({ ...snapshot, expectedDeleted });
+    const exact = validatesCurrentChatwootOutboundSnapshot({ ...snapshot, expectedDeleted, forDeletion });
     const authoritativelyDeleted =
       !expectedDeleted &&
       allowAuthoritativeDeletion &&
@@ -3610,7 +3622,7 @@ export class ChatwootService {
     operation: StoredChatwootOutboundOperation,
     signal: AbortSignal,
   ): Promise<'deleted' | 'waiting'> {
-    const context = await this.currentOutboundContext(operation, signal, true);
+    const context = await this.currentDeletionContext(operation, signal);
     if (!context) throw this.outboundBindingMismatch();
     const sourceId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
     if (!sourceId) return operation.sendAttempts === 0 ? 'deleted' : 'waiting';
@@ -3920,7 +3932,7 @@ export class ChatwootService {
           const deletionTimer = setTimeout(() => deletionController.abort(), 20_000);
           let deletionContext;
           try {
-            deletionContext = await this.currentOutboundContext(retained[0], deletionController.signal, true);
+            deletionContext = await this.currentDeletionContext(retained[0], deletionController.signal);
           } finally {
             clearTimeout(deletionTimer);
           }
@@ -3945,7 +3957,17 @@ export class ChatwootService {
             throw new BadRequestException('WhatsApp instance unavailable for native delete');
           }
           if (!mapped) {
-            throw new BadRequestException('WhatsApp message mapping missing for native delete');
+            // Deleted right after the send: the echo that links the native row
+            // to Chatwoot may not have arrived yet. The operations already know
+            // the exact WhatsApp ids they sent (planned before transport).
+            const sentKeys: WAMessageKey[] = [];
+            for (const operation of retained) {
+              const sentId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
+              if (sentId) sentKeys.push({ remoteJid: operation.payload.chatId, fromMe: true, id: sentId });
+            }
+            if (!sentKeys.length) throw new BadRequestException('WhatsApp message mapping missing for native delete');
+            for (const key of sentKeys) await waInstance.client.sendMessage(key.remoteJid, { delete: key });
+            return { message: 'deleted' };
           }
 
           const retainedKey = mapped.key as WAMessageKey;
@@ -4012,7 +4034,7 @@ export class ChatwootService {
         const deletionTimer = setTimeout(() => deletionController.abort(), 20_000);
         let deletionContext;
         try {
-          deletionContext = await this.currentOutboundContext(syntheticDeletion, deletionController.signal, true);
+          deletionContext = await this.currentDeletionContext(syntheticDeletion, deletionController.signal);
         } finally {
           clearTimeout(deletionTimer);
         }

@@ -56,20 +56,18 @@ export const matchesLegacyOpaqueChatwootDestination = (
   );
 };
 
-export const validatesCurrentChatwootOutboundSnapshot = (params: {
+// The checks EVO can make from its own rows: the queued operation still names
+// this provider, inbox and instance binding. A fresh bus send relies on these
+// alone; every other send also re-reads the message from Chatwoot.
+export const validatesLocalChatwootOutboundBinding = (params: {
   operation: StoredChatwootOutboundOperation;
   provider: ChatwootModel;
-  currentInbox: any;
-  conversation: any;
-  currentMessage?: any;
-  currentConversation?: any;
   expectedRoute: unknown;
-  currentRoute: unknown;
-  expectedDeleted?: boolean;
+  currentRoute?: unknown;
 }): boolean => {
   const { operation, provider } = params;
   const { origin } = operation.payload;
-  if (
+  return !(
     provider.enabled !== true ||
     provider.id !== origin.providerId ||
     provider.url?.replace(/\/+$/, '') !== origin.baseUrl ||
@@ -81,9 +79,27 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
     origin.routeBinding.instance_id !== operation.instanceId ||
     origin.routeBinding.inbox_id !== origin.inboxId ||
     !chatwootEvoRouteBindingsEqual(params.expectedRoute as any, origin.routeBinding) ||
-    !chatwootEvoRouteBindingsEqual(params.currentRoute as any, origin.routeBinding)
-  )
-    return false;
+    ('currentRoute' in params && !chatwootEvoRouteBindingsEqual(params.currentRoute as any, origin.routeBinding))
+  );
+};
+
+export const validatesCurrentChatwootOutboundSnapshot = (params: {
+  operation: StoredChatwootOutboundOperation;
+  provider: ChatwootModel;
+  currentInbox: any;
+  conversation: any;
+  currentMessage?: any;
+  currentConversation?: any;
+  expectedRoute: unknown;
+  currentRoute: unknown;
+  expectedDeleted?: boolean;
+  // A native delete probe: the message may be deleted or not yet, and its
+  // content may have been edited since the send; identity and route still bind.
+  forDeletion?: boolean;
+}): boolean => {
+  const { operation } = params;
+  const { origin } = operation.payload;
+  if (!validatesLocalChatwootOutboundBinding(params)) return false;
 
   const currentMessage = params.currentMessage;
   return Boolean(
@@ -94,7 +110,9 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       Number(currentMessage.conversation_id) === origin.conversationId &&
       Number(currentMessage.message_id) === origin.messageId &&
       isChatwootOutgoingMessageType(currentMessage.message_type_name ?? currentMessage.message_type) &&
-      currentMessage.deleted === (params.expectedDeleted ?? false) &&
+      (params.forDeletion
+        ? typeof currentMessage.deleted === 'boolean'
+        : currentMessage.deleted === (params.expectedDeleted ?? false)) &&
       (currentMessage.destination === operation.payload.chatId ||
         matchesLegacyOpaqueChatwootDestination(params.currentConversation, currentMessage, operation)) &&
       (!origin.contactInboxSourceId || currentMessage.contact_inbox_source_id === origin.contactInboxSourceId) &&
@@ -107,6 +125,7 @@ export const validatesCurrentChatwootOutboundSnapshot = (params: {
       /^[a-f0-9]{64}$/.test(String(origin.snapshotFingerprint || '')) &&
       /^[a-f0-9]{64}$/.test(String(currentMessage.outbound_snapshot?.fingerprint || '')) &&
       ((params.expectedDeleted ?? false) ||
+        params.forDeletion === true ||
         currentMessage.outbound_snapshot.fingerprint === origin.snapshotFingerprint),
   );
 };

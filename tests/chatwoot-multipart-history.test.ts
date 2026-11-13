@@ -31,13 +31,14 @@ for (const serialized of [false, true]) {
         connect: async () => ({
           query: async (sql: string, params: unknown[] = []) => {
             queries.push({ sql, params });
-            if (sql.trim().startsWith('SELECT id, inbox_id'))
+            if (sql.trim().startsWith('SELECT m.id, m.inbox_id'))
               return {
                 rows: [
                   {
                     id: 123,
                     inbox_id: 7,
-                    conversation_id: 9,
+                    conversation_id: 509,
+                    conversation_display_id: 9,
                     message_type: 1,
                     source_id: 'WAID:A',
                     additional_attributes: serialized ? JSON.stringify(attrs) : attrs,
@@ -84,13 +85,14 @@ test('actual multipart history still rejects an independent owner of any acknowl
       connect: async () => ({
         query: async (sql: string) => {
           statements.push(sql);
-          if (sql.trim().startsWith('SELECT id, inbox_id'))
+          if (sql.trim().startsWith('SELECT m.id, m.inbox_id'))
             return {
               rows: [
                 {
                   id: 123,
                   inbox_id: 7,
-                  conversation_id: 9,
+                  conversation_id: 509,
+                    conversation_display_id: 9,
                   message_type: 1,
                   source_id: 'WAID:A',
                   additional_attributes: receipt(),

@@ -206,6 +206,56 @@ export const classifyChatwootIngressScope = (
   return 'unknown';
 };
 
+const normalizeAccountJid = (value: unknown): string => {
+  const jid = readNonEmptyString(value).toLowerCase();
+  const match = /^([0-9a-z._-]+?)(?::\d+)?@(s\.whatsapp\.net|lid|hosted\.lid)$/.exec(jid);
+  return match ? `${match[1]}@${match[2]}` : '';
+};
+
+// The authors of messages this one quotes (contextInfo.participant next to a stanzaId).
+export const extractChatwootIngressQuotedParticipants = (messageBody: unknown): string[] => {
+  const participants = new Set<string>();
+  const addContext = (value: unknown): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+    const record = value as Record<string, unknown>;
+    if (!readNonEmptyString(record.stanzaId ?? record.stanzaid)) return;
+    const participant = normalizeAccountJid(record.participant);
+    if (participant) participants.add(participant);
+  };
+  const visit = (value: unknown, depth = 0): void => {
+    if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 5) return;
+    const record = value as Record<string, unknown>;
+    const message =
+      record.message && typeof record.message === 'object' && !Array.isArray(record.message)
+        ? (record.message as Record<string, unknown>)
+        : record;
+    for (const [contentType, content] of Object.entries(message)) {
+      if (!content || typeof content !== 'object' || Array.isArray(content)) continue;
+      const contentRecord = content as Record<string, unknown>;
+      addContext(contentRecord.contextInfo);
+      if (CURRENT_MESSAGE_WRAPPERS.has(contentType)) visit(contentRecord.message, depth + 1);
+    }
+  };
+  if (messageBody && typeof messageBody === 'object' && !Array.isArray(messageBody)) {
+    addContext((messageBody as Record<string, unknown>).contextInfo);
+  }
+  visit(messageBody);
+  return [...participants].sort();
+};
+
+// Whether a group message addresses the linked account: an @mention of its
+// number or LID, or a reply quoting one of its messages. @all does not count.
+export const chatwootIngressLinkedAccountAddressing = (messageBody: unknown, accountJids: unknown[]) => {
+  const own = new Set(accountJids.map(normalizeAccountJid).filter(Boolean));
+  if (own.size === 0) return null;
+  return {
+    mentions_linked_account: extractChatwootIngressMentionJids(messageBody).some((jid) =>
+      own.has(normalizeAccountJid(jid)),
+    ),
+    replies_to_linked_account: extractChatwootIngressQuotedParticipants(messageBody).some((jid) => own.has(jid)),
+  };
+};
+
 export const isChatwootLinkedClientSentEvent = (event: unknown, messageBody: { key?: MessageKey } | null | undefined) =>
   event === 'messages.upsert' && messageBody?.key?.fromMe === true;
 
@@ -213,6 +263,7 @@ export const buildChatwootIngressAttributes = (
   messageBody: { key?: MessageKey } | null | undefined,
   route: ChatwootEvoRouteBinding | null,
   clientSent = false,
+  accountJids: unknown[] = [],
 ) => {
   const fromMe = messageBody?.key?.fromMe;
   const mentionedJids = extractChatwootIngressMentionJids(messageBody);
@@ -229,6 +280,10 @@ export const buildChatwootIngressAttributes = (
       : null;
   const direction =
     fromMe === false ? ('inbound' as const) : fromMe === true ? ('outbound' as const) : ('unknown' as const);
+  const addressing =
+    classifyChatwootIngressScope(messageBody) === 'group' && fromMe === false
+      ? chatwootIngressLinkedAccountAddressing(messageBody, accountJids)
+      : null;
 
   return {
     we_digital_ingress: {
@@ -240,6 +295,7 @@ export const buildChatwootIngressAttributes = (
       ...(clientSent === true ? { client_sent: true as const } : {}),
       ...(mentionedJids.length > 0 ? { mentioned_jids: mentionedJids } : {}),
       ...(groupParticipant ? { participant_jid: groupParticipant } : {}),
+      ...(addressing ?? {}),
       route,
     },
   };
