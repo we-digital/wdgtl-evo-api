@@ -95,6 +95,31 @@ test('treats exact raw and canonical Chatwoot source ids as the same retained hi
   }
 });
 
+test('scopes retained source ids to the conversation display id, not the database id', async () => {
+  const originalGetConnection = postgresClient.getChatwootConnection;
+  const queries: Array<{ sql: string; params: unknown[] }> = [];
+
+  try {
+    postgresClient.getChatwootConnection = (() => ({
+      query: async (sql: string, params: unknown[]) => {
+        queries.push({ sql, params });
+        return { rows: [{ source_id: 'WAID:ABC' }] };
+      },
+    })) as any;
+
+    const existing = await chatwootImport.getExistingSourceIds(['ABC'], 9);
+
+    assert.deepEqual(existing, new Set(['WAID:ABC']));
+    assert.deepEqual(queries[0].params, [['WAID:ABC', 'ABC'], 9]);
+    assert.match(
+      queries[0].sql,
+      /conversation_id = \(SELECT c\.id FROM conversations c WHERE c\.display_id = \$2 AND c\.inbox_id = messages\.inbox_id\)/,
+    );
+  } finally {
+    postgresClient.getChatwootConnection = originalGetConnection;
+  }
+});
+
 test('fails closed when retained Chatwoot source ids cannot be read', async () => {
   const originalGetConnection = postgresClient.getChatwootConnection;
 
@@ -126,9 +151,9 @@ test('heals an authoritative outbound bridge under the serialized message lock',
       connect: async () => ({
         query: async (sql: string, params: unknown[] = []) => {
           queries.push({ sql, params });
-          if (/^SELECT id, inbox_id/.test(sql.trim())) {
+          if (/^SELECT m\.id, m\.inbox_id/.test(sql.trim())) {
             return {
-              rows: [{ id: 123, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: null }],
+              rows: [{ id: 123, inbox_id: 7, conversation_id: 509, conversation_display_id: 9, message_type: 1, source_id: null }],
             };
           }
           return { rows: [], rowCount: 1 };
@@ -142,7 +167,7 @@ test('heals an authoritative outbound bridge under the serialized message lock',
     assert.deepEqual(reconciled, new Set(['WAID:outbound-bridge']));
     assert.deepEqual(
       queries.map(({ sql }) => sql.trim().split(/\s+/).slice(0, 3).join(' ')),
-      ['BEGIN', 'LOCK TABLE messages', 'SELECT id, inbox_id,', 'UPDATE messages SET', 'COMMIT'],
+      ['BEGIN', 'LOCK TABLE messages', 'SELECT m.id, m.inbox_id,', 'UPDATE messages SET', 'COMMIT'],
     );
     assert.deepEqual(queries[3].params, ['WAID:outbound-bridge', 123]);
   } finally {
@@ -165,11 +190,11 @@ test('fails closed when an outbound bridge would duplicate a Chatwoot source id'
       connect: async () => ({
         query: async (sql: string) => {
           queries.push(sql.trim());
-          if (/^SELECT id, inbox_id/.test(sql.trim())) {
+          if (/^SELECT m\.id, m\.inbox_id/.test(sql.trim())) {
             return {
               rows: [
-                { id: 123, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: null },
-                { id: 124, inbox_id: 7, conversation_id: 9, message_type: 1, source_id: 'WAID:outbound-conflict' },
+                { id: 123, inbox_id: 7, conversation_id: 509, conversation_display_id: 9, message_type: 1, source_id: null },
+                { id: 124, inbox_id: 7, conversation_id: 509, conversation_display_id: 9, message_type: 1, source_id: 'WAID:outbound-conflict' },
               ],
             };
           }
@@ -215,12 +240,13 @@ for (const scenario of [
           query: async (sql: string) => {
             queries.push(sql.trim());
             return {
-              rows: /^SELECT id, inbox_id/.test(sql.trim())
+              rows: /^SELECT m\.id, m\.inbox_id/.test(sql.trim())
                 ? [
                     {
                       id: 123,
                       inbox_id: scenario.inboxId ?? 7,
-                      conversation_id: scenario.conversationId ?? 9,
+                      conversation_id: 500 + (scenario.conversationId ?? 9),
+                      conversation_display_id: scenario.conversationId ?? 9,
                       message_type: scenario.messageType ?? 1,
                       source_id: scenario.sourceId,
                     },

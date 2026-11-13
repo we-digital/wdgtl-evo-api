@@ -69,6 +69,8 @@ type HistoryBridgeRow = {
   id: string | number;
   inbox_id: string | number;
   conversation_id: string | number;
+  // EVO stores the conversation display id, not the database id.
+  conversation_display_id: string | number;
   message_type: string | number;
   source_id: string | null;
   additional_attributes?: unknown;
@@ -262,8 +264,12 @@ class ChatwootImport {
       const params: Array<string[] | number> = [sourceIdAliases];
       const filters = ['source_id = ANY($1)'];
       if (conversationId) {
+        // Callers pass the conversation display id (what EVO stores and the API
+        // routes use). Display ids are unique per inbox, database ids are not them.
         params.push(conversationId);
-        filters.push(`conversation_id = $${params.length}`);
+        filters.push(
+          `conversation_id = (SELECT c.id FROM conversations c WHERE c.display_id = $${params.length} AND c.inbox_id = messages.inbox_id)`,
+        );
       }
       if (inboxId) {
         params.push(inboxId);
@@ -355,11 +361,12 @@ class ChatwootImport {
       const sourceIds = candidates.map((message) => toChatwootSourceId((message.key as { id: string }).id));
       const sourceIdAliases = [...new Set(sourceIds.flatMap((sourceId) => [sourceId, sourceId.slice('WAID:'.length)]))];
       const result = await client.query(
-        `SELECT id, inbox_id, conversation_id, message_type, source_id, additional_attributes
-         FROM messages
-         WHERE id = ANY($1::bigint[])
-            OR (inbox_id = $2 AND source_id = ANY($3::text[]))
-         FOR UPDATE`,
+        `SELECT m.id, m.inbox_id, m.conversation_id, c.display_id AS conversation_display_id, m.message_type,
+                m.source_id, m.additional_attributes
+         FROM messages m JOIN conversations c ON c.id = m.conversation_id
+         WHERE m.id = ANY($1::bigint[])
+            OR (m.inbox_id = $2 AND m.source_id = ANY($3::text[]))
+         FOR UPDATE OF m`,
         [messageIds, inboxId, sourceIdAliases],
       );
       const rows = result.rows as HistoryBridgeRow[];
@@ -372,7 +379,7 @@ class ChatwootImport {
         if (
           !bridge ||
           Number(bridge.inbox_id) !== inboxId ||
-          Number(bridge.conversation_id) !== message.chatwootConversationId ||
+          Number(bridge.conversation_display_id) !== message.chatwootConversationId ||
           Number(bridge.message_type) !== 1
         ) {
           throw new Error('Outbound history binding does not match an outgoing Chatwoot message');
