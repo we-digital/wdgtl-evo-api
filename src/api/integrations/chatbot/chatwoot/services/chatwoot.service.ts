@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { isDeepStrictEqual } from 'node:util';
 
 import { InstanceDto } from '@api/dto/instance.dto';
@@ -165,6 +165,7 @@ import {
   chatwootOutboundContactIdentity,
   chatwootOutboundDestination,
   validatesCurrentChatwootOutboundSnapshot,
+  validatesLocalChatwootOutboundBinding,
   validatesLocalChatwootDeletionBinding,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import {
@@ -267,6 +268,22 @@ import FormData from 'form-data';
 import { Jimp, JimpMime } from 'jimp';
 import Long from 'long';
 import mimeTypes from 'mime-types';
+
+import {
+  BUS_ENVELOPE_VERSION,
+  BUS_REPUBLISH_AFTER_MS,
+  BusEnvelope,
+  BusMediaRef,
+  BusOutcome,
+  busInstanceEnabled,
+  BUS_FRESH_SEND_MAX_AGE_MS,
+  busFreshSendEnabled,
+  busOutboundPeerAllowed,
+  busSubject,
+  BUS_OUTBOUND_CONSUMER,
+  ChatwootBus,
+  INBOUND_BUS_PUBLISHED,
+} from '../utils/chatwoot-bus';
 import path from 'path';
 import { Readable } from 'stream';
 
@@ -314,6 +331,25 @@ const groupSyncs = new Map<string, Promise<any>>();
 // Wrapper types whose durable admission validates the persisted byte encoding.
 const durableWrappedMediaTypes = ['associatedChildMessage'];
 
+// Conversation id handed to processWhatsappEvent in bus capture mode: Chatwoot
+// resolves the real conversation itself when it applies the envelope.
+const BUS_CAPTURE_CONVERSATION = -1;
+const BUS_ROSTER_RESEND_MS = 30 * 60_000;
+
+interface BusCapture {
+  message?: { content: string | null; message_type: string; content_attributes: Record<string, unknown> };
+  file?: { bytes: Buffer; fileName: string };
+}
+
+// The same rules processWhatsappEvent applies with provider.ignoreJids.
+export function chatwootIgnoresJid(ignoreJids: unknown, remoteJid: unknown): boolean {
+  if (!Array.isArray(ignoreJids) || typeof remoteJid !== 'string' || !ignoreJids.length) return false;
+  const jids = ignoreJids.filter((jid): jid is string => typeof jid === 'string');
+  if (jids.includes('@g.us') && remoteJid.endsWith('@g.us')) return true;
+  if (jids.includes('@s.whatsapp.net') && remoteJid.endsWith('@s.whatsapp.net')) return true;
+  return jids.includes(remoteJid);
+}
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
@@ -336,6 +372,15 @@ export class ChatwootService {
   private static readonly PROVIDER_CONTACT_CACHE_MAX = 20_000;
   // Request-local: a durable delivery may fall back to a media-unavailable text.
   private readonly inboundMediaFallbacks = new WeakMap<object, { attempts: number; used: boolean }>();
+  // Bus delivery: processWhatsappEvent runs unchanged and records what it would
+  // have sent to Chatwoot instead of calling it (see publishInboundToBus).
+  private readonly busCaptures = new WeakMap<object, BusCapture>();
+  // Deliveries admitted from the bus in this process: delivery id -> receive time.
+  // Process memory on purpose: after a restart every send re-reads Chatwoot.
+  private readonly busFreshDeliveries = new Map<string, number>();
+  private static bus: ChatwootBus | null = null;
+  private static busOutcomesStarted = false;
+  private static readonly busRosterSentAt = new Map<string, number>();
 
   // One queue per WhatsApp number per process: every channel builds its own ChatwootService,
   // and the API controller has another one; separate maps would pace one number twice.
@@ -406,6 +451,7 @@ export class ChatwootService {
 
   public async startOutboundWorker() {
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) this.inboundQueue.start();
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && process.env.CHATWOOT_BUS_URL) this.startBusOutcomes();
     if (!this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) return;
     await this.bootstrapOutboundWebhookSecrets();
     await this.outboundQueue.start();
@@ -447,6 +493,8 @@ export class ChatwootService {
 
   public async stopOutboundWorker() {
     await Promise.all([this.outboundQueue.stop(), this.inboundQueue.stop()]);
+    // Drain after the queues: in-flight publishes and acks complete first.
+    await ChatwootService.bus?.stop();
   }
 
   public async authenticateOutboundWebhook(
@@ -1697,6 +1745,7 @@ export class ChatwootService {
   }
 
   public async createConversation(instance: InstanceDto, body: any) {
+    if (body && this.busCaptures?.has(body)) return BUS_CAPTURE_CONVERSATION;
     const remoteJid = typeof body?.key?.remoteJid === 'string' ? body.key.remoteJid : '';
     if (!remoteJid) {
       this.logger.warn('createConversation: missing remoteJid');
@@ -2043,6 +2092,7 @@ export class ChatwootService {
     conversationId: number,
     groupJid: string,
   ): Promise<ReturnType<typeof buildWhatsappGroupParticipantSnapshots>> {
+    if (conversationId === BUS_CAPTURE_CONVERSATION) return this.localGroupParticipants(instance, groupJid);
     const key = `${instance.instanceName}|${provider.id}|${conversationId}|${groupJid}`;
     const cached = this.groupParticipantSyncs.get(key);
     if (cached && Date.now() - cached.at < 60_000) return cached.value;
@@ -2279,6 +2329,15 @@ export class ChatwootService {
         source_reply_id: sourceReplyId ? sourceReplyId.toString() : null,
       },
     };
+    const capture = messageBody && this.busCaptures?.get(messageBody);
+    if (capture) {
+      capture.message = {
+        content: content ?? null,
+        message_type: messageType,
+        content_attributes: request.data.content_attributes,
+      };
+      return { id: BUS_CAPTURE_CONVERSATION } as any;
+    }
     const queued = messageBody && this.durableInboundBodies.has(messageBody);
     const message = queued
       ? (
@@ -2418,7 +2477,8 @@ export class ChatwootService {
       nativeSource?: { message_type: string; sha256: string };
     },
   ) {
-    if (sourceId && this.isImportHistoryAvailable()) {
+    const busCapture = !recovery && messageBody ? this.busCaptures?.get(messageBody) : undefined;
+    if (sourceId && !busCapture && this.isImportHistoryAvailable()) {
       const messageAlreadySaved = await chatwootImport.getExistingSourceIds([sourceId], conversationId);
       if (messageAlreadySaved) {
         if (messageAlreadySaved.size > 0) {
@@ -2474,6 +2534,18 @@ export class ChatwootService {
       });
       expectedContentAttributes = JSON.parse(contentAttributes);
       data.append('content_attributes', contentAttributes);
+    }
+
+    if (busCapture) {
+      const chunks: Buffer[] = [];
+      for await (const chunk of fileStream) chunks.push(Buffer.from(chunk));
+      busCapture.message = {
+        content: content || null,
+        message_type: messageType,
+        content_attributes: expectedContentAttributes,
+      };
+      busCapture.file = { bytes: Buffer.concat(chunks), fileName };
+      return { id: BUS_CAPTURE_CONVERSATION } as any;
     }
 
     if (sourceReplyId) {
@@ -3184,16 +3256,26 @@ export class ChatwootService {
 
     const client = new ChatwootClient({ config: this.getClientCwConfig(provider) });
     const snapshotStartedAt = Date.now();
-    const exactMessageResponse = await this.awaitCancelable(
-      getExactChatwootMessage(
-        this.getClientCwConfig(provider),
-        origin.accountId,
-        origin.inboxId,
-        origin.conversationId,
-        origin.messageId,
-      ) as any,
+    const exactViaBus: any = await this.awaitCancelable(
+      (this.chatwootApiViaBus?.(
+        provider,
+        'GET',
+        `/api/v1/accounts/${origin.accountId}/inboxes/${origin.inboxId}/conversations/${origin.conversationId}/messages/${origin.messageId}`,
+      ) ?? Promise.resolve(undefined)) as any,
       signal,
     );
+    const exactMessageResponse = exactViaBus?.handled
+      ? exactViaBus.data
+      : await this.awaitCancelable(
+          getExactChatwootMessage(
+            this.getClientCwConfig(provider),
+            origin.accountId,
+            origin.inboxId,
+            origin.conversationId,
+            origin.messageId,
+          ) as any,
+          signal,
+        );
     const currentMessage = unwrapChatwootPayload(exactMessageResponse);
     // Only a destination mismatch needs the compatibility read. The prior
     // Chatwoot image fingerprints raw opaque labels; the fresh conversation
@@ -3245,8 +3327,72 @@ export class ChatwootService {
     };
   }
 
+  private rememberBusFreshDelivery(deliveryId: string) {
+    const now = Date.now();
+    if (this.busFreshDeliveries.size > 1000) {
+      for (const [id, at] of this.busFreshDeliveries) if (now - at > BUS_FRESH_SEND_MAX_AGE_MS) this.busFreshDeliveries.delete(id);
+    }
+    this.busFreshDeliveries.set(deliveryId, now);
+  }
+
+  /**
+   * A first attempt of a send that arrived over the bus seconds ago skips the
+   * exact Chatwoot message read. The bus authenticates the publisher (NKey),
+   * and a delete issued before the send cancels the queued operation, so the
+   * read only matters once a send has waited or failed: retries, deferrals and
+   * anything older than BUS_FRESH_SEND_MAX_AGE_MS still re-read Chatwoot.
+   */
+  private async freshBusOutboundContext(operation: StoredChatwootOutboundOperation) {
+    const deliveryId = operation.webhookDeliveryId;
+    const receivedAt = deliveryId ? this.busFreshDeliveries.get(deliveryId) : undefined;
+    if (receivedAt === undefined) return null;
+    this.busFreshDeliveries.delete(deliveryId!);
+    if (
+      operation.preparationAttempts !== 0 ||
+      operation.sendAttempts !== 0 ||
+      operation.transportOutcomeUnresolved ||
+      Date.now() - receivedAt > BUS_FRESH_SEND_MAX_AGE_MS
+    )
+      return null;
+    const origin = operation.payload.origin;
+    if (!/^[a-f0-9]{64}$/.test(String(origin.snapshotFingerprint || ''))) return null;
+    const [instance, provider] = await Promise.all([
+      this.outboundInstance(operation),
+      this.prismaRepository.chatwoot.findUnique({ where: { instanceId: operation.instanceId } }),
+    ]);
+    if (!instance || !provider?.id || !provider.url || !provider.token || !provider.accountId || !provider.nameInbox)
+      return null;
+    if (origin.routeBinding.instance_name !== instance.instanceName) return null;
+    const expectedRoute = this.buildEvoRouteBinding(instance, provider, origin.inboxId);
+    if (!validatesLocalChatwootOutboundBinding({ operation, provider, expectedRoute })) return null;
+    const localWaInstance = this.waMonitor.waInstances[instance.instanceName];
+    const waInstance = localWaInstance?.instanceId === operation.instanceId ? localWaInstance : null;
+    this.busObserve('chatwoot_bus_outbound_fresh_send', {
+      instanceId: operation.instanceId,
+      deliveryId,
+      ageMs: Date.now() - receivedAt,
+    });
+    return {
+      instance,
+      waInstance,
+      provider,
+      client: new ChatwootClient({ config: this.getClientCwConfig(provider) }),
+      currentMessage: null,
+      authoritativelyDeleted: false,
+      snapshotStartedAt: Date.now(),
+      fenceBinding: this.outboundFenceBinding(instance, provider, origin.inboxId, waInstance),
+      providerContext: {
+        snapshot_version: 1,
+        snapshot_fingerprint: String(origin.snapshotFingerprint),
+        binding: origin.routeBinding,
+      },
+    };
+  }
+
   private async prepareQueuedOutbound(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
-    const context = await this.currentOutboundContext(operation, signal, false, true);
+    const context =
+      (await this.freshBusOutboundContext(operation)) ??
+      (await this.currentOutboundContext(operation, signal, false, true));
     if (!context) return { validation: 'mismatch' as const };
     return {
       validation: context.authoritativelyDeleted ? ('deleted' as const) : ('valid' as const),
@@ -3559,11 +3705,55 @@ export class ChatwootService {
     );
   }
 
+  // Chatwoot API calls on the outbound hot path (status PATCH, pre-send
+  // read) with CHATWOOT_BUS_API_RPC: Chatwoot runs the same route in-process
+  // behind its NATS service (no Puma, proxy or TLS). A missing responder keeps
+  // the HTTP request; an error reply is thrown with the HTTP status and body.
+  private async chatwootApiViaBus(
+    provider: any,
+    method: 'GET' | 'PATCH',
+    path: string,
+    body?: Record<string, unknown>,
+  ): Promise<{ handled: boolean; data?: unknown }> {
+    if (!process.env.CHATWOOT_BUS_URL || process.env.CHATWOOT_BUS_API_RPC !== 'true') return { handled: false };
+    const reply = await ChatwootService.busClient(this.busObserve).request(
+      'rpc.cw.api',
+      {
+        method,
+        path,
+        headers: {
+          api_access_token: provider.token,
+          'X-Chatwoot-Native-Bridge-Token': this.configService.get<Chatwoot>('CHATWOOT').NATIVE_BRIDGE_TOKEN,
+        },
+        ...(body ? { body } : {}),
+      },
+      20_000,
+    );
+    if (!reply) return { handled: false };
+    if (reply.status >= 400)
+      throw Object.assign(new Error(`Chatwoot ${method} ${reply.status}`), { status: reply.status, body: reply.data });
+    return { handled: true, data: reply.data };
+  }
+
+  private patchChatwootMessageViaBus(
+    provider: any,
+    update: { accountId: number; conversationId: number; messageId: number; data: Record<string, unknown> },
+  ) {
+    return this.chatwootApiViaBus(
+      provider,
+      'PATCH',
+      `/api/v1/accounts/${update.accountId}/conversations/${update.conversationId}/messages/${update.messageId}`,
+      update.data,
+    );
+  }
+
   private async updateQueuedOutboundMessage(
     provider: any,
     update: ReturnType<typeof buildChatwootDeliverySuccessUpdate>,
     signal: AbortSignal,
   ): Promise<unknown> {
+    const viaBus = await this.awaitCancelable((this.patchChatwootMessageViaBus?.(provider, update) ?? Promise.resolve(undefined)) as any, signal);
+    if ((viaBus as any)?.handled) return (viaBus as any).data;
     return this.awaitCancelable(
       updateChatwootMessageJson(
         this.getClientCwConfig(provider),
@@ -3603,12 +3793,11 @@ export class ChatwootService {
     if (!context) throw this.outboundBindingMismatch();
     if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { origin } = operation.payload;
-    const response: any = await this.awaitCancelable(
-      context.client.messages.update(
-        buildChatwootDeliveryFailureUpdate(origin.accountId, origin.conversationId, origin.messageId) as any,
-      ) as any,
-      signal,
-    );
+    const failure = buildChatwootDeliveryFailureUpdate(origin.accountId, origin.conversationId, origin.messageId);
+    const viaBus: any = await this.awaitCancelable((this.patchChatwootMessageViaBus?.(context.provider, failure) ?? Promise.resolve(undefined)) as any, signal);
+    const response: any = viaBus?.handled
+      ? viaBus.data
+      : await this.awaitCancelable(context.client.messages.update(failure as any) as any, signal);
     if (!isChatwootDeliveryFailureAcknowledged(response, origin.messageId)) {
       throw new Error('ChatwootFailureCallbackNotAcknowledged');
     }
@@ -5414,6 +5603,10 @@ export class ChatwootService {
       return { delivery: this.eventWhatsapp(event, instance, body) };
     const provider = await this.getProvider(instance);
     if (!provider?.enabled) return { delivery: Promise.resolve(null) };
+    // Ignored chats never enter the ledger: delivering them would still create
+    // the Chatwoot contact/conversation (and fetch group metadata) before
+    // processWhatsappEvent drops the message.
+    if (chatwootIgnoresJid(provider.ignoreJids, body?.key?.remoteJid)) return { delivery: Promise.resolve(null) };
     if (
       await isChatwootOutboundEcho(body, (id) =>
         isRetainedChatwootOutboundMessageId(this.prismaRepository, instance.instanceId, id),
@@ -5852,6 +6045,8 @@ export class ChatwootService {
       !(await this.inboundStore.bindInbox(item.id, item.leaseOwner, Number(inbox.id)))
     )
       throw new Error('InboundDestinationChanged');
+    if (busInstanceEnabled(instance.instanceName))
+      return (await this.publishInboundToBus(item, body, provider, Number(inbox.id), expected, nativeHash)) as any;
     const conversationId = Number(await this.createConversation(instance, body));
     if (!Number.isSafeInteger(conversationId) || conversationId <= 0) throw new Error('InboundCanonicalUnavailable');
     const peer = toCanonicalHistoryJid(
@@ -6111,7 +6306,405 @@ export class ChatwootService {
     })();
   }
 
+  private static busClient(observe: (event: string, fields: Record<string, unknown>) => void): ChatwootBus {
+    ChatwootService.bus ??= new ChatwootBus(process.env.CHATWOOT_BUS_URL, observe);
+    return ChatwootService.bus;
+  }
+
+  private busObserve = (event: string, fields: Record<string, unknown>) =>
+    this.logger.info(JSON.stringify({ event, ...fields }));
+
+  // One outcome consumer per process (every channel builds its own service).
+  private startBusOutcomes() {
+    if (ChatwootService.busOutcomesStarted) return;
+    ChatwootService.busOutcomesStarted = true;
+    const bus = ChatwootService.busClient(this.busObserve);
+    const forever = (name: string, run: () => Promise<void>) =>
+      void (async () => {
+        for (;;) {
+          try {
+            await run();
+            return;
+          } catch (error) {
+            this.busObserve('chatwoot_bus_consumer_restart', { name, errorClass: (error as Error)?.name || 'Error' });
+            await new Promise((resolve) => setTimeout(resolve, 1_000));
+          }
+        }
+      })();
+    forever('outcomes', () => bus.consumeOutcomes((status, outcome) => this.applyBusOutcome(status, outcome)));
+    void bus
+      .serve(
+        { name: 'evo-provider', version: '1.0.0', description: 'EVO WhatsApp provider calls', queue: 'evo-provider' },
+        'webhook',
+        'rpc.evo.*.webhook',
+        (subject, body, headers) => this.receiveBusRpc(subject, body, headers),
+      )
+      .then(() => this.busObserve('chatwoot_bus_rpc_serving', { subject: 'rpc.evo.*.webhook' }))
+      .catch((error) => this.busObserve('chatwoot_bus_rpc_failed', { errorClass: (error as Error)?.name || 'Error' }));
+    if (this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED)
+      forever('outbound', () =>
+        bus.consume('CW_OUT', BUS_OUTBOUND_CONSUMER, ['cw.out.evo.>'], (subject, body) =>
+          this.receiveBusOutbound(subject, body),
+        ),
+      );
+  }
+
+  // Chatwoot -> EVO synchronous call (edit/delete/reaction/mute/pin/archive
+  // probe, avatar request): the same body the signed HTTP webhook carries,
+  // answered with the same response object.
+  private async receiveBusRpc(subject: string, body: any, headers: { get(key: string): string } | undefined) {
+    const instanceId = subject.split('.')[2];
+    const instance = await this.prismaRepository.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true } });
+    const provider = instance ? await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: instance.id } }) : null;
+    if (!instance || !provider?.enabled)
+      throw Object.assign(new Error('Chatwoot route is unavailable'), { status: 404, body: { error: 'route_unavailable' } });
+    // The same peer allowlist as outbound sends (canary / lab guard): a probe
+    // acts on the chat of its conversation. Avatar requests carry no chat.
+    if (body?.conversation && !busOutboundPeerAllowed(chatwootOutboundDestination(body.conversation)))
+      throw Object.assign(new Error('Chat is outside the bus allowlist'), { status: 403, body: { error: 'peer_not_allowed' } });
+    const started = Date.now();
+    const result = await this.receiveWebhook({ instanceName: instance.name, instanceId: instance.id } as InstanceDto, body, {
+      deliveryId: headers?.get('Chatwoot-Delivery') || randomUUID(),
+      timestampSeconds: Math.floor(Date.now() / 1000),
+      receivedAt: new Date(),
+      routeInstanceId: instance.id,
+      routeProviderId: provider.id,
+    });
+    this.busObserve('chatwoot_bus_rpc_answered', { instanceId, webhookEvent: body?.event, ms: Date.now() - started });
+    return result;
+  }
+
+  // Chatwoot -> WhatsApp over the bus: the frozen outbox payload enters the
+  // same receiveWebhook path as the signed HTTP webhook. NATS credentials and
+  // subject permissions replace the HMAC; the route comes from the subject.
+  private async receiveBusOutbound(subject: string, body: any) {
+    const instanceId = subject.split('.')[3];
+    const deliveryId = typeof body?.delivery_id === 'string' ? body.delivery_id : '';
+    if (!instanceId || !deliveryId || !body?.payload) throw new Error('ChatwootBusOutboundInvalid');
+    const instance = await this.prismaRepository.instance.findUnique({ where: { id: instanceId }, select: { id: true, name: true } });
+    const provider = instance ? await this.prismaRepository.chatwoot.findUnique({ where: { instanceId: instance.id } }) : null;
+    if (!instance || !provider?.enabled) {
+      this.busObserve('chatwoot_bus_outbound_unroutable', { instanceId, deliveryId });
+      return;
+    }
+    const peer = chatwootOutboundDestination(body.payload?.conversation);
+    if (!busOutboundPeerAllowed(peer)) {
+      this.busObserve('chatwoot_bus_outbound_peer_blocked', { instanceId, deliveryId });
+      return;
+    }
+    const started = Date.now();
+    if (busFreshSendEnabled()) this.rememberBusFreshDelivery(deliveryId);
+    const result = await this.receiveWebhook({ instanceName: instance.name, instanceId: instance.id } as InstanceDto, body.payload, {
+      deliveryId,
+      timestampSeconds: Math.floor(Date.now() / 1000),
+      receivedAt: new Date(),
+      routeInstanceId: instance.id,
+      routeProviderId: provider.id,
+    });
+    this.busObserve('chatwoot_bus_outbound_admitted', {
+      instanceId,
+      deliveryId,
+      accepted: Boolean((result as any)?.accepted),
+      admitMs: Date.now() - started,
+      busLatencyMs: body.published_at ? Math.round(Date.now() - body.published_at * 1000) : null,
+    });
+  }
+
+  // Bus delivery of one ledger row: processWhatsappEvent renders it exactly as
+  // the HTTP path would (text, mentions, reply ids, ingress stamp, media and
+  // its unavailable fallback); the capture replaces its Chatwoot calls. The
+  // envelope then carries everything Chatwoot needs to resolve the contact,
+  // conversation and message in one transaction.
+  private async publishInboundToBus(
+    item: InboundDelivery,
+    body: any,
+    provider: ChatwootModel,
+    inboxId: number,
+    binding: ChatwootEvoRouteBinding,
+    nativeHash: string,
+  ): Promise<typeof INBOUND_BUS_PUBLISHED> {
+    const started = Date.now();
+    const instance: InstanceDto = { instanceId: item.instanceId, instanceName: item.instanceName };
+    const remoteJid: string = body.key.remoteJid;
+    const isGroup = isGroupJid(remoteJid);
+    const { peer, aliases } = await this.busPeer(instance, body.key);
+
+    const capture: BusCapture = {};
+    this.busCaptures.set(body, capture);
+    this.durableInboundBodies.add(body);
+    this.inboundMediaFallbacks.set(body, { attempts: item.attempts, used: false });
+    try {
+      await this.processWhatsappEvent('messages.upsert', instance, body);
+    } finally {
+      this.busCaptures.delete(body);
+      this.durableInboundBodies.delete(body);
+      this.inboundMediaFallbacks.delete(body);
+    }
+    if (!capture.message) throw new Error('InboundReceiverOutcomeUnconfirmed');
+    const rendered = Date.now();
+
+    let attachments: BusMediaRef[] = [];
+    let mediaUnavailableText: string | null = null;
+    if (capture.file) {
+      const contentType = mimeTypes.lookup(capture.file.fileName) || 'application/octet-stream';
+      attachments = [
+        await ChatwootService.busClient(this.busObserve).putMedia(
+          `${item.instanceId}/${body.key.id}`,
+          capture.file.bytes,
+          capture.file.fileName,
+          contentType,
+        ),
+      ];
+      mediaUnavailableText = mediaUnavailableContent(capture.message.content, body.message);
+    }
+
+    let peerName = incomingWhatsappName(body) ?? null;
+    if (!isGroup && !peerName) {
+      const stored = await this.prismaRepository.contact.findFirst({
+        where: { instanceId: provider.instanceId, remoteJid: peer },
+        select: { pushName: true },
+      });
+      peerName = whatsappContactName(stored?.pushName) ?? null;
+    }
+    const participantJid: string | undefined = body.key.participant;
+    const participant =
+      isGroup && !body.key.fromMe && participantJid
+        ? {
+            jid:
+              isLidJid(participantJid) && isPhoneJid(body.key.participantAlt) ? body.key.participantAlt : participantJid,
+            name: whatsappContactName(body.pushName) ?? null,
+          }
+        : null;
+    let groupParticipants: unknown[] | null = null;
+    if (isGroup) {
+      const rosterKey = `${item.instanceId}|${peer}`;
+      const sentAt = ChatwootService.busRosterSentAt.get(rosterKey) ?? 0;
+      if (Date.now() - sentAt > BUS_ROSTER_RESEND_MS) {
+        groupParticipants = await this.localGroupParticipants(instance, peer);
+        if (groupParticipants.length) ChatwootService.busRosterSentAt.set(rosterKey, Date.now());
+        else groupParticipants = null;
+      }
+    }
+
+    const envelope: BusEnvelope = {
+      v: BUS_ENVELOPE_VERSION,
+      event_id: item.id,
+      provider: 'evo_whatsapp',
+      kind: 'message',
+      occurred_at: Number(body.messageTimestamp) || Date.now() / 1000,
+      route: {
+        account_id: Number(provider.accountId),
+        inbox_id: inboxId,
+        instance_id: item.instanceId,
+        instance_name: item.instanceName,
+        binding,
+      },
+      payload: {
+        source_id: item.sourceId,
+        from_me: item.fromMe,
+        peer,
+        aliases,
+        peer_name: peerName,
+        group_subject: isGroup ? await this.busGroupSubject(instance, peer) : null,
+        participant,
+        conversation_pending: Boolean(provider.conversationPending),
+        label: provider.nameInbox || null,
+        content: capture.message.content,
+        content_attributes: capture.message.content_attributes,
+        attachments,
+        media_unavailable_content: mediaUnavailableText,
+        group_participants: groupParticipants,
+        native_source_hash: nativeHash,
+      },
+    };
+    const published = await ChatwootService.busClient(this.busObserve).publish(busSubject(item.instanceId, peer), envelope);
+    this.busObserve('chatwoot_inbound_published', {
+      instanceId: item.instanceId,
+      seq: published.seq,
+      duplicate: published.duplicate,
+      attempts: item.attempts + 1,
+      renderMs: rendered - started,
+      publishMs: Date.now() - rendered,
+      media: attachments.length > 0,
+    });
+    return INBOUND_BUS_PUBLISHED;
+  }
+
+  // The canonical chat peer, exactly as createConversation resolves it (LID ->
+  // phone JID when known; may set key.remoteJidAlt). Every event of one chat
+  // uses it, so messages, reactions and edits share one ordered partition.
+  private async busPeer(instance: InstanceDto, key: any): Promise<{ peer: string; aliases: string[] }> {
+    const remoteJid: string = key.remoteJid;
+    const isGroup = isGroupJid(remoteJid);
+    const isDirectLid = !isGroup && (key.addressingMode === 'lid' || isLidJid(remoteJid));
+    let phoneJid: string | undefined = isDirectLid
+      ? typeof key.remoteJidAlt === 'string'
+        ? key.remoteJidAlt
+        : undefined
+      : remoteJid;
+    if (isDirectLid && !isPhoneJid(phoneJid)) {
+      const lid = isLidJid(remoteJid) ? remoteJid : phoneJid;
+      const wa = this.waMonitor.waInstances[instance.instanceName];
+      const resolved = lid && wa?.resolvePhoneJidForLid ? await wa.resolvePhoneJidForLid(lid) : null;
+      if (isPhoneJid(resolved)) {
+        phoneJid = resolved;
+        key.remoteJidAlt = resolved;
+      } else if (isLidJid(lid)) phoneJid = toCanonicalHistoryJid(lid);
+      else throw new Error('InboundCanonicalUnavailable');
+    }
+    const peer = toCanonicalHistoryJid(phoneJid);
+    const remoteLid = isLidJid(remoteJid) ? toCanonicalHistoryJid(remoteJid) : null;
+    return { peer, aliases: remoteLid && remoteLid !== peer && isPhoneJid(peer) ? [remoteLid] : [] };
+  }
+
+  // Reactions and edits on the bus (no ledger row): a failed publish returns
+  // false and the caller keeps the HTTP path, so nothing is lost when NATS is down.
+  private async publishProviderEventToBus(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    key: any,
+    kind: 'reaction' | 'edit',
+    eventId: string,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> {
+    try {
+      const inbox = await this.getInbox(instance);
+      if (!inbox) return false;
+      const { peer } = await this.busPeer(instance, key);
+      const envelope: BusEnvelope = {
+        v: BUS_ENVELOPE_VERSION,
+        event_id: eventId,
+        provider: 'evo_whatsapp',
+        kind,
+        occurred_at: Date.now() / 1000,
+        route: {
+          account_id: Number(provider.accountId),
+          inbox_id: Number(inbox.id),
+          instance_id: instance.instanceId,
+          instance_name: instance.instanceName,
+          binding: this.buildEvoRouteBinding(instance, provider, Number(inbox.id)),
+        },
+        payload: { peer, ...payload },
+      };
+      const published = await ChatwootService.busClient(this.busObserve).publish(
+        busSubject(instance.instanceId, peer),
+        envelope,
+      );
+      this.busObserve('chatwoot_bus_event_published', { kind, instanceId: instance.instanceId, seq: published.seq });
+      return true;
+    } catch (error) {
+      this.busObserve('chatwoot_bus_publish_failed', { kind, errorClass: (error as Error)?.name || 'Error' });
+      return false;
+    }
+  }
+
+  // Participant snapshot from the local WhatsApp store, never written to Chatwoot here.
+  private async localGroupParticipants(instance: InstanceDto, groupJid: string) {
+    try {
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      if (!waInstance?.findParticipants) return [];
+      const groupParticipants = await waInstance.findParticipants({ groupJid });
+      return buildWhatsappGroupParticipantSnapshots(groupParticipants?.participants || []);
+    } catch {
+      return [];
+    }
+  }
+
+  private static readonly busGroupSubjects = new Map<string, { at: number; subject: string | null }>();
+  private async busGroupSubject(instance: InstanceDto, groupJid: string): Promise<string | null> {
+    const key = `${instance.instanceName}|${groupJid}`;
+    const cached = ChatwootService.busGroupSubjects.get(key);
+    if (cached && Date.now() - cached.at < 6 * 3_600_000) return cached.subject;
+    let subject: string | null = null;
+    try {
+      subject = (await this.waMonitor.waInstances[instance.instanceName]?.client?.groupMetadata(groupJid))?.subject ?? null;
+    } catch {
+      subject = null;
+    }
+    if (ChatwootService.busGroupSubjects.size > 5_000) ChatwootService.busGroupSubjects.clear();
+    ChatwootService.busGroupSubjects.set(key, { at: Date.now(), subject });
+    return subject;
+  }
+
+  // Chatwoot's outcome for a published ledger row: link the native rows to the
+  // Chatwoot message (quotes, edits, deletes and reactions resolve through it)
+  // and close the row.
+  private async applyBusOutcome(status: 'ingested' | 'failed', outcome: BusOutcome) {
+    if (outcome.kind !== 'message') {
+      if (status === 'failed')
+        this.logger.warn(JSON.stringify({ event: 'chatwoot_bus_event_failed', kind: outcome.kind, errorCode: outcome.error_code }));
+      return;
+    }
+    const row = (await (this.prismaRepository as any).chatwootInboundDelivery.findUnique({
+      where: { id: outcome.event_id },
+    })) as InboundDelivery | null;
+    if (!row) return;
+    if (status === 'failed') {
+      await this.inboundStore.failPublished(row.id, 'failed', `Bus:${outcome.error_code ?? 'unknown'}`);
+      this.logger.error(JSON.stringify({ event: 'chatwoot_inbound_failed', instanceId: row.instanceId, errorClass: outcome.error_code, lane: 'bus' }));
+      return;
+    }
+    const ack = {
+      id: Number(outcome.message_id),
+      inbox_id: Number(outcome.inbox_id),
+      conversation_id: Number(outcome.conversation_id),
+      contact_inbox_source_id: outcome.contact_inbox_source_id ?? null,
+    };
+    if (![ack.id, ack.inbox_id, ack.conversation_id].every((v) => Number.isSafeInteger(v) && v > 0)) {
+      // Never loop on it: the ledger row stays pending and its republish
+      // returns a complete already_present outcome.
+      this.logger.warn(JSON.stringify({ event: 'chatwoot_bus_outcome_incomplete', eventId: row.id, outcome: outcome.outcome }));
+      return;
+    }
+    const keyId = row.sourceId.slice(5);
+    const natives = await this.prismaRepository.message.findMany({
+      where: {
+        instanceId: row.instanceId,
+        AND: [
+          { key: { path: ['id'], equals: keyId } },
+          { key: { path: ['remoteJid'], equals: row.peer } },
+          { key: { path: ['fromMe'], equals: row.fromMe } },
+        ],
+      },
+      select: { id: true, chatwootMessageId: true },
+      take: 8,
+    });
+    for (const native of natives) {
+      if (native.chatwootMessageId !== null && native.chatwootMessageId !== ack.id) continue;
+      await this.prismaRepository.message.updateMany({
+        where: { id: native.id, OR: [{ chatwootMessageId: null }, { chatwootMessageId: ack.id }] },
+        data: {
+          chatwootMessageId: ack.id,
+          chatwootInboxId: ack.inbox_id,
+          chatwootConversationId: ack.conversation_id,
+          chatwootContactInboxSourceId: ack.contact_inbox_source_id,
+        },
+      });
+    }
+    const confirmed = await this.inboundStore.confirmPublished(row.id, {
+      ...ack,
+      receiver_path: 'bus',
+      outcome: outcome.outcome,
+    } as any);
+    if (!confirmed) return;
+    const done = Date.now();
+    const provider = Number((row.payload as any)?.messageTimestamp) * 1000;
+    this.logger.info(
+      JSON.stringify({
+        event: 'chatwoot_inbound_confirmed',
+        instanceId: row.instanceId,
+        inboxId: ack.inbox_id,
+        destinationId: ack.id,
+        lane: 'bus',
+        outcome: outcome.outcome,
+        providerLatencyMs: provider ? Math.max(0, done - provider) : null,
+        queueLatencyMs: row.createdAt ? Math.max(0, done - new Date(row.createdAt).getTime()) : null,
+      }),
+    );
+  }
+
   private requestInboundConversation(instance: InstanceDto, provider: ChatwootModel, body: any): number | null {
+    if (this.busCaptures?.has(body)) return BUS_CAPTURE_CONVERSATION;
     const context = this.inboundCanonicalContexts?.get(body);
     if (!context) return null;
     const peer = toCanonicalHistoryJid(
@@ -6258,6 +6851,24 @@ export class ChatwootService {
         const adsMessage = this.getAdsMessage(body);
 
         const reactionMessage = this.getReactionMessage(body.message);
+        if (
+          reactionMessage?.key?.id &&
+          body?.key?.id &&
+          busInstanceEnabled(instance.instanceName) &&
+          (await this.publishProviderEventToBus(
+            instance,
+            provider,
+            { ...body.key, remoteJid: reactionMessage.key.remoteJid ?? body.key.remoteJid },
+            'reaction',
+            `WAREACT:${instance.instanceId}:${body.key.id}`,
+            {
+              target_key_id: reactionMessage.key.id,
+              emoji: reactionMessage.text || '',
+              ...buildWhatsappReactionActor(body),
+            },
+          ))
+        )
+          return { message: 'reaction_published' };
         const isInteractiveButtonMessage = this.isInteractiveButtonMessage(body.messageType, body.message);
 
         if (!bodyMessage && !isMedia && !reactionMessage && !isInteractiveButtonMessage) {
@@ -6617,6 +7228,24 @@ export class ChatwootService {
           (typeof body?.text === 'string' ? body.text : undefined);
 
         if (typeof editedMessageContentRaw !== 'string') return;
+
+        if (
+          body?.key?.id &&
+          busInstanceEnabled(instance.instanceName) &&
+          (await this.publishProviderEventToBus(
+            instance,
+            provider,
+            body.key,
+            'edit',
+            `WAEDIT:${instance.instanceId}:${body.key.id}:${createHash('sha256').update(editedMessageContentRaw).digest('hex').slice(0, 16)}`,
+            {
+              target_key_id: body.key.id,
+              content: editedMessageContentRaw,
+              message_type: body.key.fromMe ? 'outgoing' : 'incoming',
+            },
+          ))
+        )
+          return { providerEditApplied: true };
 
         const message = await this.getNativeEventTarget(instance, body?.key?.id, body?.key);
         if (!message?.chatwootConversationId || !message?.chatwootMessageId) {

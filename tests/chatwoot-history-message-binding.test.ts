@@ -203,6 +203,9 @@ function publicConsumer(options: { changed?: any; edited?: boolean; busy?: boole
   const calls: any[] = [];
   let releases = 0;
   const context = {
+    // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
+    busInstanceEnabled: () => false,
+    BUS_CAPTURE_CONVERSATION: -1,
     module: { exports: undefined as any },
     BadRequestException: Error,
     tryAcquireHistoryWriter: () => options.busy ? null : () => releases++,

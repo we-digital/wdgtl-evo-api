@@ -22,7 +22,10 @@ function fenceConsumer() {
   const javascript = ts.transpileModule(`module.exports=class Consumer {${methods.join('\n')}}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
-  const context = { module: { exports: undefined as any }, canReusePreparedOutboundSnapshot, Date };
+  const context = {
+    // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
+    busInstanceEnabled: () => false,
+    BUS_CAPTURE_CONVERSATION: -1, module: { exports: undefined as any }, canReusePreparedOutboundSnapshot, Date };
   vm.runInNewContext(javascript, context);
   return new context.module.exports();
 }

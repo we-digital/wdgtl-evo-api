@@ -130,6 +130,34 @@ export class ChatwootInboundPrismaStore implements InboundStore {
       ).count === 1
     );
   }
+  // Bus outcomes arrive without a lease: the row was published and released.
+  async confirmPublished(id: string, ack: InboundAck) {
+    return (
+      (
+        await this.rows.updateMany({
+          where: { id, state: { in: ['pending', 'history_pending'] } },
+          data: {
+            state: 'confirmed',
+            result: ack,
+            confirmedAt: new Date(),
+            leaseOwner: null,
+            leaseExpiresAt: null,
+            lastErrorClass: null,
+          },
+        })
+      ).count === 1
+    );
+  }
+  async failPublished(id: string, state: InboundTerminalState, errorClass: string) {
+    return (
+      (
+        await this.rows.updateMany({
+          where: { id, state: { in: ['pending', 'history_pending'] } },
+          data: { state, lastErrorClass: errorClass.slice(0, 100), leaseOwner: null, leaseExpiresAt: null },
+        })
+      ).count === 1
+    );
+  }
   async advance(errorClasses: string[], now: Date) {
     if (!errorClasses.length) return 0;
     return (

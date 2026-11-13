@@ -1,5 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
 
+import { BUS_REPUBLISH_AFTER_MS, INBOUND_BUS_PUBLISHED } from './chatwoot-bus';
+
 export type InboundPayload = Record<string, any>;
 export type InboundAck = { id: number; inbox_id: number; conversation_id: number };
 export interface InboundDelivery {
@@ -423,6 +425,17 @@ export class ChatwootInboundQueue {
     try {
       if (INBOUND_UNSUPPORTED_TYPES.has(item.payload?.messageType)) throw new Error(INBOUND_UNSUPPORTED_SKIPPED);
       const ack = await this.deliver({ ...item, leaseOwner: this.owner });
+      if ((ack as unknown) === INBOUND_BUS_PUBLISHED) {
+        // Handed to the bus: Chatwoot's outcome confirms the row; the poller
+        // republishes it only if no outcome arrives in time.
+        await this.store.defer(
+          item.id,
+          this.owner,
+          'InboundBusPublished',
+          new Date(this.now().getTime() + BUS_REPUBLISH_AFTER_MS),
+        );
+        return undefined;
+      }
       if (
         lost ||
         !Number.isSafeInteger(ack?.id) ||
