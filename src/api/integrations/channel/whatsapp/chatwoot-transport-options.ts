@@ -7,6 +7,7 @@ export interface BaileysTransportOptions {
   contextInfo?: any;
   beforeTransport?: (destinationJid?: string) => Promise<void>;
   signal?: AbortSignal;
+  albumParentKey?: any;
 }
 
 export const buildBaileysTransportOptions = (options: BaileysTransportOptions): BaileysTransportOptions => ({
@@ -18,4 +19,5 @@ export const buildBaileysTransportOptions = (options: BaileysTransportOptions): 
   contextInfo: options.contextInfo,
   beforeTransport: options.beforeTransport,
   signal: options.signal,
+  albumParentKey: options.albumParentKey,
 });

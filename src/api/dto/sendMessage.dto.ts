@@ -18,6 +18,7 @@ export class Options {
   beforeTransport?: (destinationJid?: string) => Promise<void>;
   afterTransport?: (receipt: any) => Promise<void>;
   signal?: AbortSignal;
+  albumParentKey?: proto.IMessageKey;
 }
 
 export class MediaMessage {
@@ -90,6 +91,19 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+}
+
+export class AlbumItem {
+  mediatype: 'image' | 'video';
+  mimetype?: string;
+  caption?: string;
+  fileName?: string;
+  // url or base64
+  media: string;
+}
+
+export class SendAlbumDto extends Metadata {
+  items: AlbumItem[];
 }
 
 export class SendPtvDto extends Metadata {
