@@ -75,6 +75,14 @@ export function busSubject(instanceId: string, peer: string): string {
   return `wa.in.p${String(busPartition(`${instanceId}|${peer}`)).padStart(2, '0')}.${instanceId}`;
 }
 
+// NATS creds for the bus: a file path (CHATWOOT_BUS_CREDS) or the creds content
+// as base64 (CHATWOOT_BUS_CREDS_B64, how the deploy passes secrets).
+export function busCreds(env = process.env): Uint8Array | null {
+  if (env.CHATWOOT_BUS_CREDS) return readFileSync(env.CHATWOOT_BUS_CREDS);
+  const encoded = env.CHATWOOT_BUS_CREDS_B64?.trim();
+  return encoded ? new Uint8Array(Buffer.from(encoded, 'base64')) : null;
+}
+
 // Optional peer allowlist for outbound sends over the bus (canary / lab guard).
 export function busOutboundPeerAllowed(
   peer: string | null | undefined,
@@ -117,9 +125,7 @@ export class ChatwootBus {
       maxReconnectAttempts: -1,
       reconnectTimeWait: 250,
       waitOnFirstConnect: true,
-      ...(process.env.CHATWOOT_BUS_CREDS
-        ? { authenticator: credsAuthenticator(readFileSync(process.env.CHATWOOT_BUS_CREDS)) }
-        : {}),
+      ...(busCreds() ? { authenticator: credsAuthenticator(busCreds()!) } : {}),
     }).then((nc) => {
       this.js = jetstream(nc);
       void (async () => {
