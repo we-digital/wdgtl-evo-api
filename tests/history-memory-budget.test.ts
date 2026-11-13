@@ -97,6 +97,9 @@ function service(source: string, rows: any[], existing = new Set<string>()) {
   let fail = false;
   let beforeLock: (() => void) | undefined;
   const context = {
+    // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
+    busInstanceEnabled: () => false,
+    BUS_CAPTURE_CONVERSATION: -1,
     module: { exports: undefined as any },
     ...normalization,
     incomingWhatsappName,

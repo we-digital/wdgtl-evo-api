@@ -89,6 +89,9 @@ function literalService() {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },
   }).outputText;
   const context = {
+    // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
+    busInstanceEnabled: () => false,
+    BUS_CAPTURE_CONVERSATION: -1,
     module: { exports: undefined as any },
     historyRecoveryDestination: () => ({ destinationKey: "synthetic-destination" }),
     Buffer,

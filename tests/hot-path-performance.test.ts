@@ -8,7 +8,10 @@ import ts from 'typescript';
 const root = 'src/api/integrations/';
 function load(source: string, imports: Record<string, unknown>, extras: Record<string, unknown> = {}) {
   const exports: Record<string, any> = {};
-  const context = { exports, module: { exports }, require: (name: string) => {
+  const context = {
+    // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
+    busInstanceEnabled: () => false,
+    BUS_CAPTURE_CONVERSATION: -1, exports, module: { exports }, require: (name: string) => {
     assert(name in imports, `Unexpected module ${name}`);
     return imports[name];
   }, ...extras };
