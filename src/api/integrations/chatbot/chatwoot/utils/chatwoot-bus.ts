@@ -11,7 +11,7 @@ import { readFileSync } from 'node:fs';
 
 import { AckPolicy, DeliverPolicy, jetstream, JetStreamClient, jetstreamManager } from '@nats-io/jetstream';
 import { credsAuthenticator, NatsConnection, NoRespondersError } from '@nats-io/nats-core';
-import { Objm, ObjectStore } from '@nats-io/obj';
+import { ObjectStore, Objm } from '@nats-io/obj';
 import { Svcm } from '@nats-io/services';
 import { connect } from '@nats-io/transport-node';
 
@@ -76,7 +76,10 @@ export function busSubject(instanceId: string, peer: string): string {
 }
 
 // Optional peer allowlist for outbound sends over the bus (canary / lab guard).
-export function busOutboundPeerAllowed(peer: string | null | undefined, allowlist = process.env.CHATWOOT_BUS_OUTBOUND_PEERS || '') {
+export function busOutboundPeerAllowed(
+  peer: string | null | undefined,
+  allowlist = process.env.CHATWOOT_BUS_OUTBOUND_PEERS || '',
+) {
   const peers = allowlist
     .split(',')
     .map((value) => value.trim())
@@ -84,7 +87,10 @@ export function busOutboundPeerAllowed(peer: string | null | undefined, allowlis
   return !peers.length || peers.includes('*') || (!!peer && peers.includes(peer));
 }
 
-export function busInstanceEnabled(instanceName: string, allowlist = process.env.CHATWOOT_BUS_INSTANCES || ''): boolean {
+export function busInstanceEnabled(
+  instanceName: string,
+  allowlist = process.env.CHATWOOT_BUS_INSTANCES || '',
+): boolean {
   if (!process.env.CHATWOOT_BUS_URL) return false;
   const names = allowlist
     .split(',')
