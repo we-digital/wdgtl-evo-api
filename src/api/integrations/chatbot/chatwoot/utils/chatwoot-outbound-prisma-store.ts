@@ -1083,6 +1083,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       callbackStartedAt: candidate.callbackStartedAt ?? undefined,
       callbackContext: candidate.callbackContext ?? undefined,
       result: candidate.result ?? undefined,
+      lastErrorClass: candidate.lastErrorClass ?? undefined,
     };
   }
 

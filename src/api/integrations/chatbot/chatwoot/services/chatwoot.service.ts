@@ -3797,7 +3797,12 @@ export class ChatwootService {
     if (!context) throw this.outboundBindingMismatch();
     if (context.authoritativelyDeleted) throw this.outboundMessageDeleted();
     const { origin } = operation.payload;
-    const failure = buildChatwootDeliveryFailureUpdate(origin.accountId, origin.conversationId, origin.messageId);
+    const failure = buildChatwootDeliveryFailureUpdate(
+      origin.accountId,
+      origin.conversationId,
+      origin.messageId,
+      operation.lastErrorClass,
+    );
     const viaBus: any = await this.awaitCancelable(
       (this.patchChatwootMessageViaBus?.(context.provider, failure) ?? Promise.resolve(undefined)) as any,
       signal,

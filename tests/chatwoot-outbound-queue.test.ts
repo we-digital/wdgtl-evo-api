@@ -15,6 +15,7 @@ import {
   ChatwootOutboundState,
   ChatwootOutboundStore,
   isWhatsappConnectionError,
+  isWhatsappRecipientMissing,
   MAX_OUTBOUND_CONNECTION_WAIT_MS,
   MAX_OUTBOUND_PREPARATION_ATTEMPTS,
   StoredChatwootOutboundOperation,
@@ -385,9 +386,10 @@ class MemoryStore implements ChatwootOutboundStore {
   async markFailureCallbackPending(
     _operation: StoredChatwootOutboundOperation,
     _workerId: string,
-    _errorClass: string,
+    errorClass: string,
   ) {
     this.operation.state = 'failure_callback_pending';
+    this.operation.lastErrorClass = errorClass;
   }
 
   async markMessageCompleted() {
@@ -1593,4 +1595,60 @@ test('still counts a genuine bad request as a preparation failure', async () => 
 
   assert.equal(store.operation.state, 'pending');
   assert.equal(store.operation.preparationAttempts, 1);
+});
+
+// Baileys throws BadRequestException(onWhatsApp result) for a number without WhatsApp.
+const notOnWhatsapp = () => ({
+  status: 400,
+  error: 'Bad Request',
+  message: { jid: '6280000000000@s.whatsapp.net', exists: false, number: '6280000000000' },
+});
+
+test('recognises a number without WhatsApp, not groups or other bad requests', () => {
+  assert.equal(isWhatsappRecipientMissing(notOnWhatsapp()), true);
+  assert.equal(isWhatsappRecipientMissing({ ...notOnWhatsapp(), message: [notOnWhatsapp().message] }), true);
+  assert.equal(
+    isWhatsappRecipientMissing({ status: 400, message: { jid: '1203630@g.us', exists: false } }),
+    false,
+  );
+  assert.equal(isWhatsappRecipientMissing(baileysBadRequest('Error: invalid jid')), false);
+  assert.equal(isWhatsappRecipientMissing({ status: 500, message: notOnWhatsapp().message }), false);
+});
+
+test('fails at once without retries when the number is not on WhatsApp during preparation', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const events: string[] = [];
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => Promise.reject(notOnWhatsapp()),
+      observe: (event: string) => {
+        events.push(event);
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(store.operation.lastErrorClass, 'WhatsappRecipientNotFound');
+  assert.equal(store.operation.preparationAttempts, 0);
+  assert.ok(events.includes('chatwoot_outbound_recipient_not_on_whatsapp'));
+  assert.ok(!events.includes('chatwoot_outbound_preparation_failed'));
+});
+
+test('fails at once without retries when the send finds the number is not on WhatsApp', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({ send: async () => Promise.reject(notOnWhatsapp()) }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(store.operation.lastErrorClass, 'WhatsappRecipientNotFound');
+  assert.equal(store.operation.sendAttempts, 0);
 });

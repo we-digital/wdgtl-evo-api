@@ -3,13 +3,25 @@ import {
   unwrapChatwootPayload,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-message-api';
 
-export const buildChatwootDeliveryFailureUpdate = (accountId: number, conversationId: number, messageId: number) => ({
+// Staff read external_error on the failed message, so known terminal causes
+// get a plain sentence; everything else keeps the generic text.
+export const WHATSAPP_RECIPIENT_NOT_FOUND = 'WhatsappRecipientNotFound';
+const DELIVERY_FAILURE_REASONS: Record<string, string> = {
+  [WHATSAPP_RECIPIENT_NOT_FOUND]: 'This number is not on WhatsApp',
+};
+
+export const buildChatwootDeliveryFailureUpdate = (
+  accountId: number,
+  conversationId: number,
+  messageId: number,
+  errorClass?: string | null,
+) => ({
   accountId,
   conversationId,
   messageId,
   data: {
     status: 'failed',
-    external_error: 'EVO WhatsApp delivery failed',
+    external_error: (errorClass && DELIVERY_FAILURE_REASONS[errorClass]) || 'EVO WhatsApp delivery failed',
   },
 });
 

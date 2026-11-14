@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import {
+  ChatwootProviderDeliveryPart,
+  WHATSAPP_RECIPIENT_NOT_FOUND,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { ChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { chatwootReplyReferences } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
@@ -90,6 +93,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   callbackStartedAt?: Date;
   callbackContext?: unknown;
   result?: unknown;
+  lastErrorClass?: string;
 }
 
 export interface ChatwootOutboundAdmission {
@@ -506,6 +510,24 @@ const errorClass = (error: unknown): string => {
 const WHATSAPP_CONNECTION_ERROR =
   /\b(?:Connection (?:Closed|Terminated|Lost|Failure)|connection was lost|socket (?:is )?(?:not (?:open|ready)|closed)|not connected)\b/i;
 
+// Baileys answers a send to a number without a WhatsApp account with
+// BadRequestException(onWhatsApp result): { jid, exists: false, ... }.
+// Retrying cannot help, so the operation fails at once.
+export const isWhatsappRecipientMissing = (error: unknown): boolean => {
+  const candidate = error as { status?: unknown; message?: unknown } | null;
+  if (!candidate || typeof candidate !== 'object' || Number(candidate.status) !== 400) return false;
+  const entries = Array.isArray(candidate.message) ? candidate.message : [candidate.message];
+  if (entries.length !== 1) return false;
+  const item = entries[0] as { exists?: unknown; jid?: unknown } | null;
+  return (
+    !!item &&
+    typeof item === 'object' &&
+    item.exists === false &&
+    typeof item.jid === 'string' &&
+    item.jid.endsWith('@s.whatsapp.net')
+  );
+};
+
 export const isWhatsappConnectionError = (error: unknown): boolean => {
   if (errorClass(error) === 'WhatsappNotReady') return true;
   return WHATSAPP_CONNECTION_ERROR.test(sanitizedOutboundErrorMessage(error) ?? '');
@@ -767,6 +789,10 @@ export class ChatwootOutboundQueue {
         await this.store.requestDeletion(operation);
         return true;
       }
+      if (isWhatsappRecipientMissing(error)) {
+        await this.failRecipientMissing(operation);
+        return true;
+      }
       if (this.waitsForWhatsapp(operation, error)) {
         await this.deferUntilWhatsappReady(operation, error);
         return true;
@@ -916,6 +942,8 @@ export class ChatwootOutboundQueue {
           nextAttemptAt,
           classified,
         );
+      } else if (isWhatsappRecipientMissing(error)) {
+        await this.failRecipientMissing(operation);
       } else if (this.waitsForWhatsapp(operation, error)) {
         await this.deferUntilWhatsappReady(operation, error);
       } else {
@@ -957,6 +985,16 @@ export class ChatwootOutboundQueue {
       new Date(Date.now() + Math.min(OUTBOUND_CONNECTION_POLL_MAX_MS, outboundRetryDelayMs(operation.claimGeneration))),
       'WhatsappNotReady',
     );
+  }
+
+  private async failRecipientMissing(operation: StoredChatwootOutboundOperation) {
+    this.handler.observe?.('chatwoot_outbound_recipient_not_on_whatsapp', {
+      operationId: operation.id,
+      chatwootMessageId: operation.chatwootMessageId,
+      partIndex: operation.partIndex,
+    });
+    await this.store.markFailureCallbackPending(operation, this.workerId, WHATSAPP_RECIPIENT_NOT_FOUND, new Date());
+    this.wake();
   }
 
   private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string, error?: unknown) {
