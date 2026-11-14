@@ -6,6 +6,12 @@ export const LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP = 'weDigitalLastProviderEditT
 type EditKey = { id: string; remoteJid: string; fromMe: boolean; participant?: string };
 export type NativeWhatsappEdit = { key: EditKey; message: Record<string, any>; timestamp: number };
 
+// Decoded WAProto messages carry defaults on the prototype (`conversation` reads null),
+// so only fields the provider actually set count; the copy is a plain object.
+function ownFields(value: object): Record<string, any> {
+  return Object.fromEntries(Object.entries(value).filter(([, field]) => field !== undefined && field !== null));
+}
+
 export function normalizedWhatsappEdit(key: unknown, message: unknown, timestamp: unknown): NativeWhatsappEdit {
   const target = key as EditKey;
   if (
@@ -22,7 +28,7 @@ export function normalizedWhatsappEdit(key: unknown, message: unknown, timestamp
     Array.isArray(message)
   )
     throw new Error('Native normalized edit identity or payload is unavailable');
-  const body = message as Record<string, any>;
+  const body = ownFields(message);
   const supported = [
     'conversation',
     'extendedTextMessage',
@@ -33,6 +39,8 @@ export function normalizedWhatsappEdit(key: unknown, message: unknown, timestamp
   ];
   if (Object.keys(body).some((field) => !supported.includes(field)))
     throw new Error('Native normalized edit content kind is unsupported');
+  for (const field of supported)
+    if (body[field] && typeof body[field] === 'object') body[field] = ownFields(body[field]);
   const values = [
     body.conversation,
     body.extendedTextMessage?.text,
