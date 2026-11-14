@@ -50,6 +50,21 @@ const ACTIVE_STATE_WHERE = {
   OR: [{ state: { in: ACTIVE_STATES } }, { state: 'quarantined', transportOutcomeUnresolved: true }],
 };
 
+const isRedrivableFailure = (operation: {
+  state: string;
+  sendAttempts: number;
+  whatsappMessageId: string | null;
+  sentAt: Date | null;
+  sendStartedAt: Date | null;
+  transportOutcomeUnresolved: boolean;
+}) =>
+  operation.state === 'failed' &&
+  operation.sendAttempts === 0 &&
+  !operation.whatsappMessageId &&
+  !operation.sentAt &&
+  !operation.sendStartedAt &&
+  !operation.transportOutcomeUnresolved;
+
 export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
   constructor(
     private readonly repository: PrismaRepository,
@@ -153,6 +168,40 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
             receivedAt: admission.receivedAt,
           },
         });
+        // A new delivery of a message that failed everywhere before reaching
+        // WhatsApp is a staff Retry: run the same frozen parts again. Anything
+        // that may have reached transport is left alone, so a Retry can never
+        // send twice.
+        if (existing.every((operation) => isRedrivableFailure(operation))) {
+          await transaction.chatwootOutboundOperation.updateMany({
+            where: {
+              instanceId,
+              chatwootMessageId: messageId,
+              state: 'failed',
+              sendAttempts: 0,
+              whatsappMessageId: null,
+              sendStartedAt: null,
+              sentAt: null,
+              transportOutcomeUnresolved: false,
+            },
+            data: {
+              state: 'pending',
+              preparationAttempts: 0,
+              callbackAttempts: 0,
+              nextAttemptAt: admission.receivedAt,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              lastErrorClass: null,
+              laneSequence: lane.nextSequence,
+              webhookReceivedAt: admission.receivedAt,
+              claimedAt: null,
+              validatedAt: null,
+              callbackStartedAt: null,
+              completedAt: null,
+            },
+          });
+          return { recovered: false, rejection: null };
+        }
         return { recovered: true, rejection: null };
       }
       await transaction.chatwootOutboundWebhookDelivery.create({

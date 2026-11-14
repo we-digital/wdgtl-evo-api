@@ -964,8 +964,8 @@ export class ChatwootOutboundQueue {
   // they count as ordinary preparation failures so nothing waits forever.
   private waitsForWhatsapp(operation: StoredChatwootOutboundOperation, error: unknown): boolean {
     if (!isWhatsappConnectionError(error)) return false;
-    const since = operation.createdAt ?? operation.webhookReceivedAt;
-    return !since || Date.now() - since.getTime() < MAX_OUTBOUND_CONNECTION_WAIT_MS;
+    const since = Math.max(operation.webhookReceivedAt?.getTime() ?? 0, operation.createdAt?.getTime() ?? 0);
+    return !since || Date.now() - since < MAX_OUTBOUND_CONNECTION_WAIT_MS;
   }
 
   private async deferUntilWhatsappReady(operation: StoredChatwootOutboundOperation, error?: unknown) {
