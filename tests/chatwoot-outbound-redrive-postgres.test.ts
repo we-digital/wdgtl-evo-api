@@ -89,7 +89,7 @@ test(
         true,
       );
 
-      // 2: failed after transport started -> a new delivery must not re-send it.
+      // 2: failed after transport started -> a new delivery must not re-send it, only report the failure again.
       await store.enqueue(instanceId, 2, 58, 42, makeParts(2), { ...admit, deliveryId: `${instanceId}-2a` });
       await db.chatwootOutboundOperation.updateMany({
         where: { instanceId, chatwootMessageId: 2 },
@@ -101,8 +101,9 @@ test(
         true,
       );
       const kept = await db.chatwootOutboundOperation.findFirst({ where: { instanceId, chatwootMessageId: 2 } });
-      assert.equal(kept?.state, 'failed');
+      assert.equal(kept?.state, 'failure_callback_pending');
       assert.equal(kept?.sendAttempts, 1);
+      assert.equal(kept?.sendStartedAt?.getTime(), future.getTime());
     } finally {
       await db.chatwootOutboundWebhookDelivery.deleteMany({ where: { instanceId } });
       await db.instance.deleteMany({ where: { id: instanceId } });

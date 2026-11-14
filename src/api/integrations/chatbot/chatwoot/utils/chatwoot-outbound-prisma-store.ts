@@ -202,6 +202,23 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
           });
           return { recovered: false, rejection: null };
         }
+        // Retry of a message that may already have reached WhatsApp: do not
+        // send again, report the failure once more so Chatwoot does not keep
+        // showing it as sending.
+        if (existing.every((operation) => operation.state === 'failed')) {
+          await transaction.chatwootOutboundOperation.updateMany({
+            where: { instanceId, chatwootMessageId: messageId, state: 'failed' },
+            data: {
+              state: 'failure_callback_pending',
+              callbackAttempts: 0,
+              nextAttemptAt: admission.receivedAt,
+              leaseOwner: null,
+              leaseExpiresAt: null,
+              callbackStartedAt: null,
+              completedAt: null,
+            },
+          });
+        }
         return { recovered: true, rejection: null };
       }
       await transaction.chatwootOutboundWebhookDelivery.create({
