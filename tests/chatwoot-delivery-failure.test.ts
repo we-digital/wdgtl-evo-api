@@ -23,6 +23,17 @@ test('builds a correlated failed status update for the exact Chatwoot message', 
   });
 });
 
+test('tells staff in plain words when the number is not on WhatsApp', () => {
+  assert.equal(
+    buildChatwootDeliveryFailureUpdate(7, 42, 314, 'WhatsappRecipientNotFound').data.external_error,
+    'This number is not on WhatsApp',
+  );
+  assert.equal(
+    buildChatwootDeliveryFailureUpdate(7, 42, 314, 'HttpBadRequest').data.external_error,
+    'EVO WhatsApp delivery failed',
+  );
+});
+
 test('confirms a live send with the raw WhatsApp message id and clears only the stale transport error', () => {
   assert.deepEqual(buildChatwootDeliverySuccessUpdate(7, 42, 314, '3EB0ABC'), {
     accountId: 7,

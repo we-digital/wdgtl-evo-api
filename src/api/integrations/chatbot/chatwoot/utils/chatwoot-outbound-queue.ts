@@ -1,6 +1,9 @@
 import { createHash, randomUUID } from 'node:crypto';
 
-import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
+import {
+  ChatwootProviderDeliveryPart,
+  WHATSAPP_RECIPIENT_NOT_FOUND,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { ChatwootEvoRouteBinding } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import { chatwootReplyReferences } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 
@@ -90,6 +93,7 @@ export interface StoredChatwootOutboundOperation extends ChatwootOutboundPart {
   callbackStartedAt?: Date;
   callbackContext?: unknown;
   result?: unknown;
+  lastErrorClass?: string;
 }
 
 export interface ChatwootOutboundAdmission {
@@ -456,6 +460,12 @@ export const outboundRetryDelayMs = (attempt: number): number =>
   Math.min(300_000, 5_000 * 2 ** Math.max(0, Math.min(attempt - 1, 6)));
 
 export const MAX_OUTBOUND_PREPARATION_ATTEMPTS = 6;
+// A WhatsApp socket that is restarting or reconnecting (every EVO deploy, a
+// phone that went offline) is not the operation's fault: such sends wait
+// without consuming preparation attempts, up to this long after admission.
+export const MAX_OUTBOUND_CONNECTION_WAIT_MS = 30 * 60_000;
+// The wait is polled at least this often so a send leaves soon after reconnect.
+export const OUTBOUND_CONNECTION_POLL_MAX_MS = 30_000;
 // Expired-lease recovery is a five-statement transaction. Every worker slot
 // used to run it before each claim; one shared pass per interval is enough for
 // ten-minute leases and keeps it off the hot path of a woken send.
@@ -493,6 +503,34 @@ const errorClass = (error: unknown): string => {
     if (name) return `Http${name}`.slice(0, 100);
   }
   return 'Error';
+};
+
+// Baileys rethrows socket failures as BadRequestException(error.toString()),
+// so the class alone ("HttpBadRequest") cannot tell them from a bad payload.
+const WHATSAPP_CONNECTION_ERROR =
+  /\b(?:Connection (?:Closed|Terminated|Lost|Failure)|connection was lost|socket (?:is )?(?:not (?:open|ready)|closed)|not connected)\b/i;
+
+// Baileys answers a send to a number without a WhatsApp account with
+// BadRequestException(onWhatsApp result): { jid, exists: false, ... }.
+// Retrying cannot help, so the operation fails at once.
+export const isWhatsappRecipientMissing = (error: unknown): boolean => {
+  const candidate = error as { status?: unknown; message?: unknown } | null;
+  if (!candidate || typeof candidate !== 'object' || Number(candidate.status) !== 400) return false;
+  const entries = Array.isArray(candidate.message) ? candidate.message : [candidate.message];
+  if (entries.length !== 1) return false;
+  const item = entries[0] as { exists?: unknown; jid?: unknown } | null;
+  return (
+    !!item &&
+    typeof item === 'object' &&
+    item.exists === false &&
+    typeof item.jid === 'string' &&
+    item.jid.endsWith('@s.whatsapp.net')
+  );
+};
+
+export const isWhatsappConnectionError = (error: unknown): boolean => {
+  if (errorClass(error) === 'WhatsappNotReady') return true;
+  return WHATSAPP_CONNECTION_ERROR.test(sanitizedOutboundErrorMessage(error) ?? '');
 };
 
 /**
@@ -751,6 +789,14 @@ export class ChatwootOutboundQueue {
         await this.store.requestDeletion(operation);
         return true;
       }
+      if (isWhatsappRecipientMissing(error)) {
+        await this.failRecipientMissing(operation);
+        return true;
+      }
+      if (this.waitsForWhatsapp(operation, error)) {
+        await this.deferUntilWhatsappReady(operation, error);
+        return true;
+      }
       await this.retryPreparation(operation, errorClass(error), error);
       return true;
     }
@@ -896,8 +942,10 @@ export class ChatwootOutboundQueue {
           nextAttemptAt,
           classified,
         );
-      } else if (classified === 'WhatsappNotReady') {
-        await this.deferUntilWhatsappReady(operation);
+      } else if (isWhatsappRecipientMissing(error)) {
+        await this.failRecipientMissing(operation);
+      } else if (this.waitsForWhatsapp(operation, error)) {
+        await this.deferUntilWhatsappReady(operation, error);
       } else {
         await this.retryPreparation(operation, classified, error);
       }
@@ -912,14 +960,41 @@ export class ChatwootOutboundQueue {
     return outboundRetryDelayMs(Math.max(operation.sendAttempts + 1, operation.claimGeneration));
   }
 
-  private async deferUntilWhatsappReady(operation: StoredChatwootOutboundOperation) {
+  // Connection errors wait for the socket; past MAX_OUTBOUND_CONNECTION_WAIT_MS
+  // they count as ordinary preparation failures so nothing waits forever.
+  private waitsForWhatsapp(operation: StoredChatwootOutboundOperation, error: unknown): boolean {
+    if (!isWhatsappConnectionError(error)) return false;
+    const since = Math.max(operation.webhookReceivedAt?.getTime() ?? 0, operation.createdAt?.getTime() ?? 0);
+    return !since || Date.now() - since < MAX_OUTBOUND_CONNECTION_WAIT_MS;
+  }
+
+  private async deferUntilWhatsappReady(operation: StoredChatwootOutboundOperation, error?: unknown) {
+    if (error !== undefined && errorClass(error) !== 'WhatsappNotReady') {
+      this.handler.observe?.('chatwoot_outbound_waiting_for_whatsapp', {
+        operationId: operation.id,
+        chatwootMessageId: operation.chatwootMessageId,
+        partIndex: operation.partIndex,
+        errorClass: errorClass(error),
+        errorMessage: sanitizedOutboundErrorMessage(error),
+      });
+    }
     await this.store.deferPending(
       operation.id,
       this.workerId,
       operation.claimGeneration,
-      new Date(Date.now() + outboundRetryDelayMs(operation.claimGeneration)),
+      new Date(Date.now() + Math.min(OUTBOUND_CONNECTION_POLL_MAX_MS, outboundRetryDelayMs(operation.claimGeneration))),
       'WhatsappNotReady',
     );
+  }
+
+  private async failRecipientMissing(operation: StoredChatwootOutboundOperation) {
+    this.handler.observe?.('chatwoot_outbound_recipient_not_on_whatsapp', {
+      operationId: operation.id,
+      chatwootMessageId: operation.chatwootMessageId,
+      partIndex: operation.partIndex,
+    });
+    await this.store.markFailureCallbackPending(operation, this.workerId, WHATSAPP_RECIPIENT_NOT_FOUND, new Date());
+    this.wake();
   }
 
   private async retryPreparation(operation: StoredChatwootOutboundOperation, classified: string, error?: unknown) {

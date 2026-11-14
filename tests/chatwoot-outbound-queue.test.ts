@@ -14,6 +14,9 @@ import {
   ChatwootOutboundQueue,
   ChatwootOutboundState,
   ChatwootOutboundStore,
+  isWhatsappConnectionError,
+  isWhatsappRecipientMissing,
+  MAX_OUTBOUND_CONNECTION_WAIT_MS,
   MAX_OUTBOUND_PREPARATION_ATTEMPTS,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
@@ -383,9 +386,10 @@ class MemoryStore implements ChatwootOutboundStore {
   async markFailureCallbackPending(
     _operation: StoredChatwootOutboundOperation,
     _workerId: string,
-    _errorClass: string,
+    errorClass: string,
   ) {
     this.operation.state = 'failure_callback_pending';
+    this.operation.lastErrorClass = errorClass;
   }
 
   async markMessageCompleted() {
@@ -1495,4 +1499,156 @@ test('reads Chatwoot webhook created_at as ISO or epoch seconds', () => {
   assert.equal(chatwootWebhookMessageCreatedAt('2026-11-10T13:00:00Z', receivedAt), undefined);
   assert.equal(chatwootWebhookMessageCreatedAt(null, receivedAt), undefined);
   assert.equal(chatwootWebhookMessageCreatedAt('not a date', receivedAt), undefined);
+});
+
+// Baileys rethrows socket failures as BadRequestException(error.toString()):
+// a plain object with status/error/message and no name.
+const baileysBadRequest = (message: string) => ({ status: 400, error: 'Bad Request', message });
+
+test('classifies socket failures as WhatsApp connection errors, not bad payloads', () => {
+  assert.equal(isWhatsappConnectionError(baileysBadRequest('Error: Connection Closed')), true);
+  assert.equal(isWhatsappConnectionError(baileysBadRequest('Error: Connection Terminated')), true);
+  assert.equal(isWhatsappConnectionError(Object.assign(new Error('x'), { name: 'WhatsappNotReady' })), true);
+  assert.equal(isWhatsappConnectionError(baileysBadRequest('Error: invalid jid')), false);
+  assert.equal(isWhatsappConnectionError(new Error('MediaDownloadFailed')), false);
+});
+
+test('waits for a closed WhatsApp connection during preparation without consuming attempts', async () => {
+  const store = new MemoryStore();
+  store.operation.preparationAttempts = MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1;
+  store.operation.createdAt = new Date();
+  const events: string[] = [];
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => Promise.reject(baileysBadRequest('Error: Connection Closed')),
+      observe: (event: string) => {
+        events.push(event);
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.preparationAttempts, MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1);
+  assert.ok(events.includes('chatwoot_outbound_waiting_for_whatsapp'));
+  assert.ok(!events.includes('chatwoot_outbound_preparation_failed'));
+});
+
+test('waits for a closed WhatsApp connection before transport and sends once it reconnects', async () => {
+  const store = new MemoryStore();
+  store.operation.preparationAttempts = MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1;
+  store.operation.createdAt = new Date();
+  let closed = 3;
+  let sends = 0;
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async (operation, _context, onTransportStart) => {
+        if (closed > 0) {
+          closed -= 1;
+          throw baileysBadRequest('Error: Connection Closed');
+        }
+        await onTransportStart();
+        sends += 1;
+        return { whatsappMessageId: operation.plannedWhatsappMessageId, result: null };
+      },
+    }),
+  );
+
+  for (let i = 0; i < 3; i += 1) {
+    await queue.runOnce('transport');
+    assert.equal(store.operation.state, 'pending');
+    assert.equal(store.operation.preparationAttempts, MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1);
+    assert.equal(store.operation.sendAttempts, 0);
+  }
+  await queue.runOnce('transport');
+
+  assert.equal(sends, 1);
+  assert.equal(store.operation.state, 'callback_pending');
+});
+
+test('stops waiting for the connection after the wait cap and fails normally', async () => {
+  const store = new MemoryStore();
+  store.operation.preparationAttempts = MAX_OUTBOUND_PREPARATION_ATTEMPTS - 1;
+  store.operation.createdAt = new Date(Date.now() - MAX_OUTBOUND_CONNECTION_WAIT_MS - 1_000);
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({ send: async () => Promise.reject(baileysBadRequest('Error: Connection Closed')) }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+});
+
+test('still counts a genuine bad request as a preparation failure', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({ send: async () => Promise.reject(baileysBadRequest('Error: invalid jid')) }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'pending');
+  assert.equal(store.operation.preparationAttempts, 1);
+});
+
+// Baileys throws BadRequestException(onWhatsApp result) for a number without WhatsApp.
+const notOnWhatsapp = () => ({
+  status: 400,
+  error: 'Bad Request',
+  message: { jid: '6280000000000@s.whatsapp.net', exists: false, number: '6280000000000' },
+});
+
+test('recognises a number without WhatsApp, not groups or other bad requests', () => {
+  assert.equal(isWhatsappRecipientMissing(notOnWhatsapp()), true);
+  assert.equal(isWhatsappRecipientMissing({ ...notOnWhatsapp(), message: [notOnWhatsapp().message] }), true);
+  assert.equal(
+    isWhatsappRecipientMissing({ status: 400, message: { jid: '1203630@g.us', exists: false } }),
+    false,
+  );
+  assert.equal(isWhatsappRecipientMissing(baileysBadRequest('Error: invalid jid')), false);
+  assert.equal(isWhatsappRecipientMissing({ status: 500, message: notOnWhatsapp().message }), false);
+});
+
+test('fails at once without retries when the number is not on WhatsApp during preparation', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const events: string[] = [];
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      prepare: async () => Promise.reject(notOnWhatsapp()),
+      observe: (event: string) => {
+        events.push(event);
+      },
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(store.operation.lastErrorClass, 'WhatsappRecipientNotFound');
+  assert.equal(store.operation.preparationAttempts, 0);
+  assert.ok(events.includes('chatwoot_outbound_recipient_not_on_whatsapp'));
+  assert.ok(!events.includes('chatwoot_outbound_preparation_failed'));
+});
+
+test('fails at once without retries when the send finds the number is not on WhatsApp', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({ send: async () => Promise.reject(notOnWhatsapp()) }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(store.operation.lastErrorClass, 'WhatsappRecipientNotFound');
+  assert.equal(store.operation.sendAttempts, 0);
 });
