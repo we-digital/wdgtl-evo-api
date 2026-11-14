@@ -5,6 +5,7 @@ import test from 'node:test';
 import { isDeepStrictEqual } from 'node:util';
 
 import { Prisma } from '@prisma/client';
+import { proto } from 'baileys';
 import ts from 'typescript';
 
 import * as editHelpers from '../src/api/integrations/channel/whatsapp/normalized-whatsapp-edit';
@@ -81,6 +82,7 @@ function harness(fromMe = false, original: Record<string, any> = { conversation:
         assert.deepEqual(where.key.equals, source.key);
         assert.deepEqual(where.message.equals, source.message);
         assert.equal(where.messageTimestamp, source.messageTimestamp);
+        if (source.contextInfo === null) assert.equal(where.contextInfo.equals, Prisma.AnyNull);
         if (!CAS) return { count: 0 };
         Object.assign(source, structuredClone(data));
         calls.nativeWrites++;
@@ -318,7 +320,10 @@ test('NULL/missing/nontext payloads cannot clear original; changed media authori
 test('normalized update is handled before generic delivery dedup and upsert shares the qualified dispatcher', () => {
   const updateBody = update.getText(ast);
   assert(updateBody.indexOf('applyNativeWhatsappEdit') < updateBody.indexOf('const updateKey'));
-  assert.match(file, /await this\.applyNativeWhatsappEdit\(\s*editedMessage\.key,/);
+  assert.match(
+    file,
+    /await this\.applyNativeWhatsappEdit\(\s*\{ \.\.\.received\.key, id: editedMessage\.key\?\.id \},/,
+  );
 });
 
 test('actual Chatwoot edit service propagates failed ACK and returns success only after real edit request', async (t) => {
@@ -410,4 +415,43 @@ test('literal SDK event registration dispatches normalized edits and retries an 
   assert.equal(h.cache.size, 1);
   assert.equal(h.calls.edits.length, 2);
   assert.equal(h.calls.audits, 1);
+});
+
+// Baileys hands decoded WAProto instances; their unset fields read prototype defaults (null).
+const decoded = (message: Record<string, any>) => proto.Message.decode(proto.Message.encode(message).finish());
+
+test('decoded WAProto text edits from a peer or own device apply (prototype defaults ignored)', async () => {
+  for (const fromMe of [false, true]) {
+    const h = harness(fromMe, { extendedTextMessage: { text: 'before' } });
+    const body = decoded({ extendedTextMessage: { text: 'after' } });
+    assert.notEqual((body as any).conversation, undefined);
+    await h.deliver(body);
+    assert.equal(h.source.message.extendedTextMessage.text, 'after');
+    assert.equal(h.calls.edits.length, 1);
+    const dispatched = h.calls.edits[0].body.editedMessage;
+    assert.deepEqual(Object.keys(dispatched), ['extendedTextMessage']);
+    assert.equal(dispatched.extendedTextMessage.text, 'after');
+  }
+  const h = harness(false);
+  await h.deliver(decoded({ conversation: 'after' }));
+  assert.equal(h.source.message.conversation, 'after');
+});
+
+test('decoded WAProto caption edit applies; decoded empty text still cannot clear the original', async () => {
+  const h = harness(false, { imageMessage: { caption: 'before', mimetype: 'image/jpeg' } });
+  await h.deliver(decoded({ imageMessage: { caption: 'after', mimetype: 'image/jpeg' } }));
+  assert.equal(h.source.message.imageMessage.caption, 'after');
+  for (const body of [decoded({}), decoded({ conversation: '' }), decoded({ extendedTextMessage: {} })]) {
+    const blank = harness();
+    await assert.rejects(blank.deliver(body));
+    assert.deepEqual(blank.source, blank.before);
+  }
+});
+
+test('an original stored with JSON null context still accepts the edit (CAS matches any null)', async () => {
+  const h = harness();
+  h.source.contextInfo = null;
+  await h.deliver({ conversation: 'after' });
+  assert.equal(h.source.message.conversation, 'after');
+  assert.equal(h.calls.edits.length, 1);
 });

@@ -681,7 +681,8 @@ export class BaileysStartupService extends ChannelStartupService {
               instanceId: this.instanceId,
               key: { equals: source.key },
               message: { equals: source.message },
-              contextInfo: { equals: source.contextInfo ?? Prisma.DbNull },
+              // Prisma reads both SQL NULL and JSON null (inbound rows store the latter) as null.
+              contextInfo: { equals: source.contextInfo ?? Prisma.AnyNull },
               messageTimestamp: source.messageTimestamp,
               status: source.status,
             },
@@ -1444,8 +1445,10 @@ export class BaileysStartupService extends ChannelStartupService {
               await this.baileysCache.set(`protocol_${received.key.id}`, editedMessage.key.id, 60 * 60 * 24);
             }
 
+            // The protocol key is the sender's view (fromMe, chat); like Baileys, address the
+            // original from this envelope's key with the edited message id.
             await this.applyNativeWhatsappEdit(
-              editedMessage.key,
+              { ...received.key, id: editedMessage.key?.id },
               editedMessage.editedMessage,
               editedMessage.timestampMs
                 ? Math.floor(Number(editedMessage.timestampMs) / 1000)
