@@ -38,11 +38,33 @@ export async function withCanonicalChatwootMessageBinding<T>(
     await client.query(
       "SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='5s'; SET LOCAL idle_in_transaction_session_timeout='10s'",
     );
+    // Chatwoot locks peer (advisory, taken by the route function) ->
+    // conversation -> message. Take the peer lock before any message row lock:
+    // the reverse order deadlocked with the delivery callback, the edit echo and
+    // staff deletes, and a lost deadlock here delayed the WhatsApp mapping until
+    // the callback retry (staff edits in that window found no native message).
+    const unlocked = await client.query(
+      'SELECT conversation_id FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3',
+      [scope.messageId, scope.accountId, scope.inboxId],
+    );
+    if (unlocked.rows.length !== 1) throw new Error('Canonical mapping message identity mismatch');
+    await client.query('SELECT public.provider_message_conversation_route($1,$2,$3)', [
+      scope.accountId,
+      scope.inboxId,
+      Number(unlocked.rows[0].conversation_id),
+    ]);
     const original = await client.query(
       'SELECT conversation_id,source_id,message_type,private,additional_attributes FROM messages WHERE id=$1 AND account_id=$2 AND inbox_id=$3' +
         (scope.acknowledgedParts || scope.history ? ' FOR SHARE' : ''),
       [scope.messageId, scope.accountId, scope.inboxId],
     );
+    // A merge that moved the message committed before we got the peer lock;
+    // the caller retries the idempotent mapping with the new scope.
+    if (
+      original.rows.length === 1 &&
+      Number(original.rows[0].conversation_id) !== Number(unlocked.rows[0].conversation_id)
+    )
+      throw new Error('Canonical mapping message moved while locking');
     // An outgoing operator message gets its WA source ID only after this
     // existing binding call. Do not disable that established null-source path.
     const message = original.rows[0];

@@ -777,6 +777,33 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     });
   }
 
+  /**
+   * The staff delete probe deleted these parts natively itself. Close the
+   * queued deletions no worker holds, so the queue never waits for native rows
+   * the probe removes (that wait held the chat's outbound lane). Returns
+   * whether every retained part is now closed.
+   */
+  public async completeNativeDeletion(operations: StoredChatwootOutboundOperation[], now: Date): Promise<boolean> {
+    if (!operations.length) return true;
+    await this.repository.chatwootOutboundOperation.updateMany({
+      where: {
+        id: { in: operations.map((operation) => operation.id) },
+        state: 'delete_pending',
+        leaseOwner: null,
+      },
+      data: {
+        state: 'deleted',
+        completedAt: now,
+        transportOutcomeUnresolved: false,
+        lastErrorClass: null,
+      },
+    });
+    const open = await this.repository.chatwootOutboundOperation.count({
+      where: { id: { in: operations.map((operation) => operation.id) }, state: { not: 'deleted' } },
+    });
+    return open === 0;
+  }
+
   public async scheduleDeletion(
     id: string,
     workerId: string,
