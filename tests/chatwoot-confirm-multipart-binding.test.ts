@@ -118,8 +118,14 @@ async function runOriginalConsumer(
   const client = {
     query: async (sql: string) => {
       events.push(sql);
+      if (sql.startsWith('SELECT conversation_id FROM messages')) return { rows: [{ conversation_id: 8 }] };
       if (sql.startsWith('SELECT conversation_id,source_id')) {
         assert.equal(sql.endsWith(' FOR SHARE'), true);
+        // Peer lock (route function) first, then the message row (Chatwoot's order).
+        assert.ok(
+          events.slice(0, -1).some((event) => event.startsWith('SELECT public.provider_message_conversation_route')),
+          'message row locked before the peer lock',
+        );
         return { rows: [{ conversation_id: 8, source_id: source, message_type: 1, additional_attributes: attrs }] };
       }
       if (sql.startsWith('SELECT public.provider_message_conversation_route')) return { rows: [{ id: 8 }] };

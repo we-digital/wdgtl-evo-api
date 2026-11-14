@@ -4132,57 +4132,12 @@ export class ChatwootService {
             clearTimeout(deletionTimer);
           }
           if (!deletionContext) throw this.outboundBindingMismatch();
+          // Queued deletion is the fallback if the native delete below fails.
+          // Do not wake the worker: racing this probe it would revoke twice or
+          // wait for the native rows the probe removes.
           await this.outboundStore.requestDeletion(retained[0]);
-          this.outboundQueue.wake();
 
-          const neverSent = retained.every((operation) => Number(operation.sendAttempts || 0) === 0);
-          const mapped = await this.prismaRepository.message.findFirst({
-            where: {
-              chatwootMessageId: body.id,
-              instanceId: instance.instanceId,
-            },
-          });
-
-          // Never reached WA — queue cancel is enough for native-first success.
-          if (neverSent && !mapped) {
-            return { message: 'deleted' };
-          }
-
-          if (!waInstance?.client?.sendMessage) {
-            throw new BadRequestException('WhatsApp instance unavailable for native delete');
-          }
-          if (!mapped) {
-            // Deleted right after the send: the echo that links the native row
-            // to Chatwoot may not have arrived yet. The operations already know
-            // the exact WhatsApp ids they sent (planned before transport).
-            const sentKeys: WAMessageKey[] = [];
-            for (const operation of retained) {
-              const sentId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
-              if (sentId) sentKeys.push({ remoteJid: operation.payload.chatId, fromMe: true, id: sentId });
-            }
-            if (!sentKeys.length) throw new BadRequestException('WhatsApp message mapping missing for native delete');
-            for (const key of sentKeys) await waInstance.client.sendMessage(key.remoteJid, { delete: key });
-            return { message: 'deleted' };
-          }
-
-          const retainedKey = mapped.key as WAMessageKey;
-          if (
-            mapped.chatwootInboxId !== Number(body.inbox?.id) ||
-            mapped.chatwootConversationId !== Number(body.conversation?.id) ||
-            !retainedKey?.remoteJid ||
-            !this.outboundRemoteJidMatches(candidateDeletionChatId, retainedKey.remoteJid)
-          ) {
-            throw this.outboundBindingMismatch();
-          }
-
-          await waInstance.client.sendMessage(retainedKey.remoteJid, { delete: retainedKey });
-          await this.prismaRepository.message.deleteMany({
-            where: {
-              instanceId: instance.instanceId,
-              chatwootMessageId: body.id,
-            },
-          });
-          return { message: 'deleted' };
+          return this.deleteRetainedNatively(waInstance, instance, body, retained, candidateDeletionChatId);
         }
         const liveProvider = await this.prismaRepository.chatwoot.findUnique({
           where: { instanceId: instance.instanceId },
@@ -5057,6 +5012,144 @@ export class ChatwootService {
   }
 
   /**
+   * The WhatsApp key a staff edit targets. The Chatwoot id is linked to the
+   * native row only after the delivery callback succeeds, and a failed first
+   * callback is retried after a backoff of several seconds while Chatwoot
+   * already shows the source id. Like deletion, fall back to the ids the
+   * outbound queue recorded when it sent the parts; prefer the part that
+   * carries the text (multi-part sends put the caption on one part).
+   */
+  private async resolveNativeEditKey(chatId: string, body: any, instance: InstanceDto): Promise<WAMessageKey | null> {
+    const messageId = Number(body?.id);
+    const stored = await this.prismaRepository.message.findFirst({
+      where: { chatwootMessageId: messageId, instanceId: instance.instanceId },
+    });
+    const storedKey = stored?.key as WAMessageKey | undefined;
+    if (storedKey?.id) return storedKey;
+
+    const deadline = Date.now() + (this.nativeEditTransportWaitMs ?? 3000);
+    for (;;) {
+      const operations = (await this.outboundStore.retainedOperations(instance.instanceId, messageId)).filter(
+        (operation) =>
+          Number(body.account?.id) === operation.payload.origin.accountId &&
+          Number(body.inbox?.id) === operation.payload.origin.inboxId &&
+          Number(body.conversation?.id) === operation.payload.origin.conversationId &&
+          messageId === operation.payload.origin.messageId &&
+          this.outboundRemoteJidMatches(chatId, operation.payload.chatId) &&
+          !['delete_pending', 'deleted', 'failed', 'quarantined'].includes(operation.state),
+      );
+      if (!operations.length) return null;
+      const ordered = [
+        ...operations.filter((operation) => operation.payload.text),
+        ...operations.filter((operation) => !operation.payload.text),
+      ];
+      for (const operation of ordered) {
+        const sentId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
+        if (!sentId) continue;
+        const row = await this.prismaRepository.message.findFirst({
+          where: { instanceId: instance.instanceId, key: { path: ['id'], equals: sentId } },
+        });
+        const key = row?.key as WAMessageKey | undefined;
+        if (key?.id === sentId && key.fromMe && key.remoteJid && this.outboundRemoteJidMatches(chatId, key.remoteJid)) {
+          return key;
+        }
+      }
+      // Edited while the part is still in transport: give the send a moment.
+      const inTransport = operations.some((operation) =>
+        ['pending', 'preparing', 'sending', 'ambiguous'].includes(operation.state),
+      );
+      if (!inTransport || Date.now() >= deadline) return null;
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  }
+
+  /**
+   * Staff delete of a message the outbound queue still retains: revoke the
+   * sent parts natively, then close the queued deletions this made redundant.
+   */
+  private async deleteRetainedNatively(
+    waInstance: any,
+    instance: InstanceDto,
+    body: any,
+    retained: StoredChatwootOutboundOperation[],
+    candidateDeletionChatId: string,
+  ): Promise<{ message: string }> {
+    const neverSent = retained.every((operation) => Number(operation.sendAttempts || 0) === 0);
+    const mapped = await this.prismaRepository.message.findFirst({
+      where: {
+        chatwootMessageId: body.id,
+        instanceId: instance.instanceId,
+      },
+    });
+
+    // Never reached WA — queue cancel is enough for native-first success.
+    if (neverSent && !mapped) {
+      this.outboundQueue.wake();
+      return { message: 'deleted' };
+    }
+
+    if (!waInstance?.client?.sendMessage) {
+      throw new BadRequestException('WhatsApp instance unavailable for native delete');
+    }
+    if (!mapped) {
+      // Deleted right after the send: the echo that links the native row
+      // to Chatwoot may not have arrived yet. The operations already know
+      // the exact WhatsApp ids they sent (planned before transport).
+      const sentKeys: WAMessageKey[] = [];
+      for (const operation of retained) {
+        const sentId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
+        if (sentId) sentKeys.push({ remoteJid: operation.payload.chatId, fromMe: true, id: sentId });
+      }
+      if (!sentKeys.length) throw new BadRequestException('WhatsApp message mapping missing for native delete');
+      for (const key of sentKeys) await waInstance.client.sendMessage(key.remoteJid, { delete: key });
+      if (await this.outboundStore.completeNativeDeletion(retained, new Date())) {
+        await this.prismaRepository.message.deleteMany({
+          where: {
+            instanceId: instance.instanceId,
+            OR: sentKeys.map((key) => ({ key: { path: ['id'], equals: key.id } })),
+          },
+        });
+      }
+      return { message: 'deleted' };
+    }
+
+    const retainedKey = mapped.key as WAMessageKey;
+    if (
+      mapped.chatwootInboxId !== Number(body.inbox?.id) ||
+      mapped.chatwootConversationId !== Number(body.conversation?.id) ||
+      !retainedKey?.remoteJid ||
+      !this.outboundRemoteJidMatches(candidateDeletionChatId, retainedKey.remoteJid)
+    ) {
+      throw this.outboundBindingMismatch();
+    }
+
+    // Revoke every part the queue sent (multi-part sends), then close the
+    // queued deletions this probe made redundant.
+    const keys = new Map<string, WAMessageKey>([[retainedKey.id, retainedKey]]);
+    for (const operation of retained) {
+      const sentId = operation.whatsappMessageId || (await this.outboundStore.findSentMessageId(operation));
+      if (sentId && !keys.has(sentId)) {
+        keys.set(sentId, { remoteJid: retainedKey.remoteJid, fromMe: true, id: sentId });
+      }
+    }
+    for (const key of keys.values()) await waInstance.client.sendMessage(key.remoteJid, { delete: key });
+    const closed = await this.outboundStore.completeNativeDeletion(retained, new Date());
+    // A worker still holding a part removes its rows when it finishes.
+    if (closed) {
+      await this.prismaRepository.message.deleteMany({
+        where: {
+          instanceId: instance.instanceId,
+          chatwootMessageId: body.id,
+        },
+      });
+    }
+    return { message: 'deleted' };
+  }
+
+  /** Test seam: how long an edit waits for a part that is still being sent. */
+  private nativeEditTransportWaitMs?: number;
+
+  /**
    * Native WhatsApp edit (Baileys `{ edit: key }`) for Chatwoot native_edit_probe.
    * Chatwoot applies local text only after this succeeds.
    */
@@ -5069,14 +5162,13 @@ export class ChatwootService {
     const text = stripWhatsappMentionMarkdown(typeof body?.content === 'string' ? body.content : '');
     if (!text.trim() || !waInstance?.updateMessage) return null;
 
-    const stored = await this.prismaRepository.message.findFirst({
-      where: {
-        chatwootMessageId: Number(body.id),
-        instanceId: instance.instanceId,
-      },
-    });
-    const key = stored?.key as WAMessageKey | undefined;
-    if (!key?.id) return null;
+    const key = await this.resolveNativeEditKey(chatId, body, instance);
+    if (!key?.id) {
+      this.logger.warn(
+        JSON.stringify({ event: 'chatwoot_native_edit_unmapped', chatwootMessageId: body.id, targetChatId: chatId }),
+      );
+      return null;
+    }
 
     try {
       const messageSent = await waInstance.updateMessage(
