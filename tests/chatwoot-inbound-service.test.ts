@@ -44,6 +44,7 @@ import {
   inboundNativeSnapshot,
   inboundSourceCandidates,
   inboundSourceIdentityHash,
+  isBlankNativeCopy,
   isBlankReactionTwin,
   isInboundTransportOnly,
   MAX_NATIVE_COPIES,
@@ -121,6 +122,7 @@ function literalService() {
     inboundAcceptedSourceHashes,
     inboundSourceCandidates,
     inboundSourceIdentityHash,
+    isBlankNativeCopy,
     isBlankReactionTwin,
     isInboundTransportOnly,
     chatwootErrorFields,
@@ -1279,6 +1281,34 @@ test('history delivery closes sender-key-only blank copies as transport, without
   f.item.state = 'pending';
   await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundTransportOnly/);
   assert.equal(f.creates, 0);
+});
+
+test('history delivery closes blank reaction twins and blank native text as transport, not retries', async () => {
+  const reactionRow = { messageType: 'reactionMessage', message: { reactionMessage: { text: '' } } };
+  const f = fixture();
+  (f.provider as any).importMessages = true;
+  f.item.state = 'history_pending';
+  f.item.payload = { ...f.item.payload, messageType: 'conversation', message: { conversation: '' } };
+  f.item.payloadHash = inboundPayloadHash(f.item.payload);
+  f.item.id = inboundDeliveryId(f.item.instanceId, f.item.payload);
+  f.service.syncStoredHistoryRecoveryBatch = async () => assert.fail('no importer write');
+  f.service.prismaRepository.message.findMany = async (args: any) => (args?.select ? [reactionRow] : []);
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundTransportOnly/);
+  // Another row under the key still refuses as before.
+  f.service.prismaRepository.message.findMany = async (args: any) =>
+    args?.select ? [{ messageType: 'conversation', message: { conversation: 'other' } }] : [];
+  await assert.rejects(f.service.deliverQueuedInbound(f.item), /InboundNativeSourceUnavailable/);
+  // A stored native copy that is itself empty text has nothing to import either.
+  const g = fixture();
+  (g.provider as any).importMessages = true;
+  g.item.state = 'history_pending';
+  g.native.message = { conversation: '' };
+  g.item.payload = structuredClone(g.native);
+  g.item.payloadHash = inboundPayloadHash(g.item.payload);
+  g.item.id = inboundDeliveryId(g.item.instanceId, g.item.payload);
+  g.service.syncStoredHistoryRecoveryBatch = async () => assert.fail('no importer write');
+  await assert.rejects(g.service.deliverQueuedInbound(g.item), /InboundTransportOnly/);
+  assert.equal(f.creates + g.creates, 0);
 });
 
 test('existing receiver row stamped from the frozen payload encoding confirms without another POST (was ReceiverPayloadUnconfirmed)', async () => {

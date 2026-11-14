@@ -113,6 +113,7 @@ import {
   inboundNativeSnapshot,
   inboundSourceCandidates,
   inboundSourceIdentityHash,
+  isBlankNativeCopy,
   isBlankReactionTwin,
   isInboundTransportOnly,
   MAX_NATIVE_COPIES,
@@ -5993,14 +5994,26 @@ export class ChatwootService {
       }),
       item.payload,
     );
-    if (!sources.length) throw new Error('InboundNativeSourceUnavailable');
+    if (!sources.length) {
+      // Same rule as the live lane: a blank copy whose key holds only a reaction
+      // has nothing to import and must not retry for ever.
+      const underKey = (await this.prismaRepository.message.findMany({
+        where: { instanceId: item.instanceId, key: { path: ['id'], equals: item.sourceId.slice(5) } },
+        select: { messageType: true, message: true },
+        take: NATIVE_COPY_QUERY_LIMIT,
+      })) as unknown as Record<string, any>[];
+      if (isBlankReactionTwin(item.payload, underKey)) throw new Error('InboundTransportOnly');
+      throw new Error('InboundNativeSourceUnavailable');
+    }
     const resolved = resolveInboundNativeBody(sources, item.payload);
     // The resolved body is in the persisted (base64) byte encoding, while the
     // frozen payload is not: match the native row by encoding-insensitive identity.
     const identity = inboundSourceIdentityHash(resolved);
     const source = sources.find((row) => inboundSourceIdentityHash(row) === identity);
     if (!source) throw new Error('InboundNativeSourceAmbiguous');
-    if (isInboundTransportOnly(source)) throw new Error('InboundTransportOnly');
+    // An empty text copy (with or without a sender-key sidecar) carries no content.
+    if (isInboundTransportOnly(source) || (isBlankNativeCopy(source) && isBlankNativeCopy(item.payload)))
+      throw new Error('InboundTransportOnly');
     const settings = await this.prismaRepository.setting.findUnique({ where: { instanceId: item.instanceId } });
     const normalized = await normalizeStoredHistoryMessages(
       [source],
