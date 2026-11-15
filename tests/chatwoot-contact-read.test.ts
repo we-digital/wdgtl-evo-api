@@ -3,7 +3,9 @@ import test from 'node:test';
 
 import {
   buildContactReadRequest,
+  CONTACT_READ_COALESCE_MS,
   CONTACT_READ_RETRY_DELAYS_MS,
+  ContactReadCoalescer,
   contactReadTarget,
   isRetryableContactReadStatus,
   nextContactReadDelay,
@@ -120,6 +122,12 @@ test('a LID receipt for a phone-JID message waits for the binding, then posts co
   timers.shift()!();
   await new Promise((resolve) => setImmediate(resolve));
 
+  // Bound now: the receipt waits in the coalescing window, then posts once.
+  assert.equal(posts.length, 0);
+  assert.equal(timers.length, 1);
+  timers.shift()!();
+  await new Promise((resolve) => setImmediate(resolve));
+
   assert.deepEqual(posts, [{ target: { conversationId: 5, messageId: 11 }, token: 'read-token' }]);
 });
 
@@ -142,4 +150,154 @@ test('a receipt that never gets a binding is dropped after the last pause', asyn
   assert.equal(scheduled, 0);
   assert.match(warnings[0], /chatwoot_contact_read_dropped/);
   assert.match(warnings[0], /"reason":"unbound"/);
+});
+
+function manualCoalescer() {
+  const timers: Array<{ fn: () => void; ms: number }> = [];
+  const flushed: any[] = [];
+  const coalescer = new ContactReadCoalescer<string>(
+    async (read) => {
+      flushed.push(read);
+    },
+    CONTACT_READ_COALESCE_MS,
+    (fn, ms) => timers.push({ fn, ms }),
+  );
+  return { coalescer, timers, flushed };
+}
+
+test('a READ burst for one conversation becomes one contact_read with the newest message', async () => {
+  const { coalescer, timers, flushed } = manualCoalescer();
+  coalescer.add('inst', { conversationId: 5, messageId: 30 }, 0, 'a');
+  coalescer.add('inst', { conversationId: 5, messageId: 41 }, 2, 'b');
+  coalescer.add('inst', { conversationId: 5, messageId: 12 }, 1, 'c');
+
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].ms, CONTACT_READ_COALESCE_MS);
+  assert.equal(flushed.length, 0);
+
+  timers.shift()!.fn();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(flushed, [{ target: { conversationId: 5, messageId: 41 }, attempt: 0, receipts: 3, context: 'c' }]);
+  assert.equal(coalescer.size, 0);
+
+  // The next receipt opens a new window.
+  coalescer.add('inst', { conversationId: 5, messageId: 42 }, 0, 'd');
+  assert.equal(timers.length, 1);
+});
+
+test('conversations and WhatsApp numbers are coalesced separately', async () => {
+  const { coalescer, timers, flushed } = manualCoalescer();
+  coalescer.add('inst-1', { conversationId: 5, messageId: 10 }, 0, 'a');
+  coalescer.add('inst-1', { conversationId: 6, messageId: 11 }, 0, 'b');
+  coalescer.add('inst-2', { conversationId: 5, messageId: 12 }, 0, 'c');
+
+  assert.equal(timers.length, 3);
+  for (const timer of timers.splice(0)) timer.fn();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(
+    flushed.map((read) => read.target),
+    [
+      { conversationId: 5, messageId: 10 },
+      { conversationId: 6, messageId: 11 },
+      { conversationId: 5, messageId: 12 },
+    ],
+  );
+});
+
+test('the service sends one contact_read per conversation for a burst of receipts', async (t) => {
+  const ChatwootService = loadService(t);
+  const service = Object.create(ChatwootService.prototype) as any;
+  const byId: Record<string, any> = {
+    A: row(1, '111@lid', { key: { id: 'A', remoteJid: '111@lid', fromMe: true }, chatwootMessageId: 21 }),
+    B: row(2, '111@lid', { key: { id: 'B', remoteJid: '111@lid', fromMe: true }, chatwootMessageId: 23 }),
+    C: row(3, '111@lid', { key: { id: 'C', remoteJid: '111@lid', fromMe: true }, chatwootMessageId: 22 }),
+    D: row(4, '222@lid', {
+      key: { id: 'D', remoteJid: '222@lid', fromMe: true },
+      chatwootMessageId: 30,
+      chatwootConversationId: 9,
+    }),
+  };
+  service.prismaRepository = { $queryRaw: async (sql: any) => [byId[sql.values[1]]] };
+  const infos: string[] = [];
+  service.logger = { info: (line: string) => infos.push(line), warn() {} };
+  service.configService = { get: () => ({ READ_STATE_INGRESS_TOKEN: 'read-token' }) };
+  const posts: any[] = [];
+  service.contactRead = async (_instance: any, target: any) => posts.push(target);
+
+  const timers: Array<() => void> = [];
+  t.mock.method(global, 'setTimeout', (fn: () => void) => {
+    timers.push(fn);
+    return { unref() {} } as any;
+  });
+
+  const instance = { instanceId: 'instance-burst', instanceName: 'synthetic' };
+  for (const id of ['A', 'B', 'C', 'D'])
+    await service.forwardWhatsappContactRead(instance, { id, remoteJid: '111@lid', fromMe: true }, 0);
+
+  assert.equal(posts.length, 0);
+  assert.equal(timers.length, 2);
+  for (const fn of timers.splice(0)) fn();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(posts, [
+    { conversationId: 5, messageId: 23 },
+    { conversationId: 9, messageId: 30 },
+  ]);
+  assert.match(infos[0], /"receipts":3/);
+});
+
+test('a failed coalesced send retries with the newest receipt and keeps the drop limit', async (t) => {
+  const ChatwootService = loadService(t);
+  const service = Object.create(ChatwootService.prototype) as any;
+  const stored = { current: row(1, '111@lid', { chatwootMessageId: 50 }) };
+  service.prismaRepository = { $queryRaw: async () => [stored.current] };
+  const warnings: string[] = [];
+  service.logger = { info() {}, warn: (line: string) => warnings.push(line) };
+  service.configService = { get: () => ({ READ_STATE_INGRESS_TOKEN: 'read-token' }) };
+  const posts: any[] = [];
+  let failures = 1;
+  service.contactRead = async (_instance: any, target: any) => {
+    posts.push(target);
+    if (failures-- > 0) throw Object.assign(new Error('busy'), { response: { status: 503 } });
+  };
+
+  const timers: Array<{ fn: () => void; ms: number }> = [];
+  t.mock.method(global, 'setTimeout', (fn: () => void, ms: number) => {
+    timers.push({ fn, ms });
+    return { unref() {} } as any;
+  });
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+
+  const instance = { instanceId: 'instance-retry', instanceName: 'synthetic' };
+  await service.forwardWhatsappContactRead(instance, { id: 'OWN', fromMe: true }, 0);
+  timers.shift()!.fn(); // coalescing window
+  await settle();
+  assert.equal(posts.length, 1);
+
+  // 503 → retry after the first pause.
+  assert.equal(timers[0].ms, CONTACT_READ_RETRY_DELAYS_MS[0]);
+  // A newer receipt during the pause is merged into the retried send.
+  stored.current = row(2, '111@lid', { chatwootMessageId: 55 });
+  await service.forwardWhatsappContactRead(instance, { id: 'NEWER', fromMe: true }, 0);
+  timers.shift()!.fn(); // retry re-adds the older target into the open window
+  timers.shift()!.fn(); // window flush
+  await settle();
+
+  assert.deepEqual(posts[1], { conversationId: 5, messageId: 55 });
+  assert.equal(posts.length, 2);
+  assert.equal(timers.length, 0);
+
+  // Out of attempts: the coalesced send is dropped, not retried.
+  failures = 1;
+  await service.sendCoalescedContactRead({
+    target: { conversationId: 5, messageId: 55 },
+    attempt: CONTACT_READ_RETRY_DELAYS_MS.length,
+    receipts: 1,
+    context: { service, instance },
+  });
+  assert.equal(timers.length, 0);
+  assert.match(warnings.at(-1)!, /chatwoot_contact_read_dropped/);
+  assert.match(warnings.at(-1)!, /"reason":"chatwoot_unavailable"/);
 });

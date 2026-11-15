@@ -52,3 +52,57 @@ export function isRetryableContactReadStatus(status: unknown): boolean {
 export function nextContactReadDelay(attempt: number): number | null {
   return CONTACT_READ_RETRY_DELAYS_MS[attempt] ?? null;
 }
+
+// After a reconnect or an offline batch WhatsApp sends many READ receipts for
+// one chat at once. Each contact_read costs Chatwoot a request and a status job
+// that walks the conversation, and only the newest message matters: Chatwoot
+// marks everything up to it read. Receipts are collected per conversation for
+// a short window and sent once with the newest message.
+export const CONTACT_READ_COALESCE_MS = 1_000;
+
+export type CoalescedContactRead<C> = {
+  target: ContactReadTarget;
+  /** Lowest attempt among the merged receipts: the batch keeps the largest retry budget. */
+  attempt: number;
+  receipts: number;
+  context: C;
+};
+
+export class ContactReadCoalescer<C> {
+  private readonly pending = new Map<string, CoalescedContactRead<C>>();
+
+  constructor(
+    private readonly flush: (read: CoalescedContactRead<C>) => Promise<void>,
+    private readonly windowMs = CONTACT_READ_COALESCE_MS,
+    private readonly schedule: (fn: () => void, ms: number) => void = (fn, ms) => {
+      const timer = setTimeout(fn, ms);
+      timer.unref?.();
+    },
+    private readonly onError: (error: unknown) => void = () => undefined,
+  ) {}
+
+  get size(): number {
+    return this.pending.size;
+  }
+
+  /** `scope` separates WhatsApp numbers; Chatwoot conversation ids are unique per account. */
+  add(scope: string, target: ContactReadTarget, attempt: number, context: C): void {
+    const key = `${scope}:${target.conversationId}`;
+    const current = this.pending.get(key);
+    if (current) {
+      // Chatwoot message ids grow with creation time: the highest id is the newest read.
+      if (target.messageId > current.target.messageId) current.target = target;
+      current.attempt = Math.min(current.attempt, attempt);
+      current.receipts += 1;
+      current.context = context;
+      return;
+    }
+
+    this.pending.set(key, { target, attempt, receipts: 1, context });
+    this.schedule(() => {
+      const read = this.pending.get(key);
+      this.pending.delete(key);
+      if (read) this.flush(read).catch(this.onError);
+    }, this.windowMs);
+  }
+}
