@@ -81,6 +81,7 @@ import {
   isUsableArchiveMessageKey,
   resolveArchiveChatJid,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-native-guards';
+import { outboundMediaPrefetch } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-media-prefetch';
 import {
   buildWhatsAppReadCursor,
   selectWhatsAppOwnerReadTimestamps,
@@ -281,6 +282,9 @@ async function getVideoDuration(input: Buffer | string | Readable): Promise<numb
   return Math.round(parseFloat(duration));
 }
 
+// Defense-in-depth group sender-key-memory reset interval (see refreshGroupSenderKey).
+export const GROUP_SENDER_KEY_RESET_INTERVAL_MS = 10 * 60_000;
+
 export class BaileysStartupService extends ChannelStartupService {
   private readonly nativeEditQueue = new NativeWhatsappEditQueue();
   private messageProcessor = new BaileysMessageProcessor();
@@ -289,6 +293,8 @@ export class BaileysStartupService extends ChannelStartupService {
     WASocket,
     Map<string, Promise<{ groupJid: string; participantCount: number; deviceCount: number; sessionCount: number }>>
   >();
+  // Last defense-in-depth sender-key-memory reset per group, per socket.
+  private groupSenderKeyResets?: WeakMap<WASocket, Map<string, number>>;
 
   constructor(
     public readonly configService: ConfigService,
@@ -2651,7 +2657,19 @@ export class BaileysStartupService extends ChannelStartupService {
     // Baileys can retain stale device identities in sender-key-memory after a
     // group member changes phones. Use the client's cache-aware key store so
     // the next send redistributes the group sender key to current devices.
-    // See docs/operations/baileys-group-sender-key-refresh.md.
+    // See docs/operations/baileys-group-sender-key-refresh.md. Identity
+    // changes and participant-hash mismatches are repaired by the fork on
+    // their own, so this fallback runs at most once per interval per group:
+    // a burst of staff replies no longer re-fans the key to every device.
+    this.groupSenderKeyResets ??= new WeakMap();
+    let clientResets = this.groupSenderKeyResets.get(this.client);
+    if (!clientResets) {
+      clientResets = new Map();
+      this.groupSenderKeyResets.set(this.client, clientResets);
+    }
+    const lastReset = clientResets.get(groupJid);
+    if (lastReset !== undefined && Date.now() - lastReset < GROUP_SENDER_KEY_RESET_INTERVAL_MS) return false;
+    clientResets.set(groupJid, Date.now());
     await this.client.authState.keys.set({
       'sender-key-memory': {
         [groupJid]: null,
@@ -2857,7 +2875,8 @@ export class BaileysStartupService extends ChannelStartupService {
   ) {
     const isWA = await this.sendRecipients.resolve(
       number,
-      async () => (await this.whatsappNumber({ numbers: [number] }))?.shift(),
+      async () =>
+        (await this.cachedGroupRecipient(number)) ?? (await this.whatsappNumber({ numbers: [number] }))?.shift(),
       (resolved) => resolved?.exists === true,
     );
 
@@ -3364,10 +3383,16 @@ export class BaileysStartupService extends ChannelStartupService {
             };
           }
 
-          const response = await axios.get(mediaMessage.media, config);
+          const prefetched = await outboundMediaPrefetch.take(mediaMessage.media);
+          if (prefetched) {
+            responseContentType = prefetched.contentType;
+            imageBuffer = prefetched.data;
+          } else {
+            const response = await axios.get(mediaMessage.media, config);
+            responseContentType = response.headers?.['content-type'];
+            imageBuffer = Buffer.from(response.data, 'binary');
+          }
           this.throwIfOutboundAborted(mediaMessage.signal);
-          responseContentType = response.headers?.['content-type'];
-          imageBuffer = Buffer.from(response.data, 'binary');
         } else {
           imageBuffer = Buffer.from(mediaMessage.media, 'base64');
         }
@@ -3395,10 +3420,16 @@ export class BaileysStartupService extends ChannelStartupService {
               }),
             };
           }
-          const response = await axios.get(mediaMessage.media, config);
+          const prefetched = await outboundMediaPrefetch.take(mediaMessage.media);
+          if (prefetched) {
+            responseContentType = prefetched.contentType;
+            mediaInput = prefetched.data;
+          } else {
+            const response = await axios.get(mediaMessage.media, config);
+            responseContentType = response.headers?.['content-type'];
+            mediaInput = Buffer.from(response.data, 'binary');
+          }
           this.throwIfOutboundAborted(mediaMessage.signal);
-          responseContentType = response.headers?.['content-type'];
-          mediaInput = Buffer.from(response.data, 'binary');
         } else {
           mediaInput = Buffer.from(mediaMessage.media, 'base64');
         }
@@ -5218,6 +5249,16 @@ export class BaileysStartupService extends ChannelStartupService {
     }
   }
 
+  // A group send only needs to know the group exists: answer from the cached
+  // metadata (the same source Baileys uses for the send) instead of a live
+  // groupMetadata plus profile-picture query. A miss falls back to whatsappNumber.
+  private async cachedGroupRecipient(number: string): Promise<OnWhatsAppDto | undefined> {
+    const jid = createJid(number);
+    if (!isJidGroup(jid)) return undefined;
+    const group = await this.getGroupMetadataCache(jid).catch((): null => null);
+    return group?.id ? new OnWhatsAppDto(group.id, true, number, group.subject) : undefined;
+  }
+
   private getGroupMetadataCache = async (groupJid: string) => {
     if (!isJidGroup(groupJid)) return null;
 
@@ -5228,8 +5269,9 @@ export class BaileysStartupService extends ChannelStartupService {
         console.log(`Cache request for group: ${groupJid}`);
         const meta = await groupMetadataCache.get(groupJid);
 
+        // Stale entries refresh in the background; a send never waits for it.
         if (Date.now() - meta.timestamp > 3600000) {
-          await this.updateGroupMetadataCache(groupJid);
+          void this.updateGroupMetadataCache(groupJid);
         }
 
         return meta.data;

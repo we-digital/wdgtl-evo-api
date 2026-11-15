@@ -3,7 +3,10 @@ import test from 'node:test';
 
 import { generateForwardMessageContent, proto } from 'baileys';
 
-import { BaileysStartupService } from '../src/api/integrations/channel/whatsapp/whatsapp.baileys.service';
+import {
+  BaileysStartupService,
+  GROUP_SENDER_KEY_RESET_INTERVAL_MS,
+} from '../src/api/integrations/channel/whatsapp/whatsapp.baileys.service';
 
 const group = '120363000000000000@g.us';
 const direct = '628111111111@s.whatsapp.net';
@@ -80,6 +83,28 @@ test('normal send and native forward share first and subsequent group recovery, 
   assert.deepEqual(
     sends.map((s) => s.options.useCachedGroupMetadata),
     [false, true, false],
+  );
+});
+
+test('the defense-in-depth sender-key reset runs at most once per interval per group and socket', async () => {
+  const { wa, events, options, socket } = harness();
+  const realNow = Date.now;
+  let now = 1_000_000;
+  Date.now = () => now;
+  try {
+    await wa.sendMessage(group, { conversation: 'synthetic' }, options);
+    await wa.sendMessage(group, { conversation: 'synthetic' }, options);
+    await wa.sendMessage(group, { conversation: 'synthetic' }, options);
+    now += GROUP_SENDER_KEY_RESET_INTERVAL_MS;
+    await wa.sendMessage(group, { conversation: 'synthetic' }, options);
+    wa.client = socket();
+    await wa.sendMessage(group, { conversation: 'synthetic' }, options);
+  } finally {
+    Date.now = realNow;
+  }
+  assert.deepEqual(
+    events.filter((event) => event !== 'fence' && event !== 'transport'),
+    ['full-repair', 'cache-aware-reset', 'cache-aware-reset', 'full-repair'],
   );
 });
 

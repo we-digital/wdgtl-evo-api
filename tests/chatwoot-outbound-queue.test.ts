@@ -1303,7 +1303,7 @@ test('deletion webhook before callback claims deletion without callback or resen
   assert.equal(deletions, 1);
 });
 
-test('commits the exact WAID right after relay and releases the lane before local post-send work', async () => {
+test('commits the exact WAID right after relay and hands the callback over before local post-send work', async () => {
   const store = new MemoryStore();
   let stateAfterRelay: string | undefined;
   let leaseHeldAfterRelay: boolean | undefined;
@@ -1322,7 +1322,9 @@ test('commits the exact WAID right after relay and releases the lane before loca
 
   assert.equal(await queue.runOnce('transport'), true);
   assert.equal(stateAfterRelay, 'callback_pending');
-  assert.equal(leaseHeldAfterRelay, true);
+  // Released at the relay commit, so a maintenance slot can PATCH Chatwoot
+  // while the transport worker still writes its local history row.
+  assert.equal(leaseHeldAfterRelay, false);
   assert.equal(store.leaseHeld, false);
   assert.equal(store.released, 1);
   assert.equal(store.operation.sendAttempts, 1);
