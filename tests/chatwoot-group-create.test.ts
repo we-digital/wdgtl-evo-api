@@ -132,8 +132,7 @@ test('creates with the first reachable invitee and adds the rest one by one, 300
       ['c:1', 'added', null],
       ['c:2', 'skipped', 'privacy'],
       ['c:3', 'skipped', 'left_recently'],
-      // Already in the group counts as added: the note must not list them as missing.
-      ['c:4', 'added', null],
+      ['c:4', 'skipped', 'already_member'],
       ['c:5', 'skipped', 'blocked'],
       ['c:6', 'added', null],
     ],
@@ -150,38 +149,79 @@ test('invitees without a phone or not on WhatsApp are skipped before anything is
       { key: 'c:2', jid: pn(2), admin: false },
       { key: 'c:3', jid: '12345@lid', admin: false },
       { key: 'c:4', jid: '6281000000004:7@s.whatsapp.net', admin: false },
+      { key: 'c:5', jid: '99000000000005:3@lid', admin: false },
+      { key: 'c:6', jid: 'not-a-jid', admin: false },
     ]),
-    deps(socket).deps,
+    deps(socket, {
+      // Contacts stored by LID are invited by their phone JID from the Signal mapping.
+      resolvePhoneJidForLid: async (lid) => (lid === '99000000000005@lid' ? pn(5) : null),
+    }).deps,
   );
-  assert.deepEqual(calls[0], { method: 'onWhatsApp', args: [pn(2), pn(4)] });
+  assert.deepEqual(calls[0], { method: 'onWhatsApp', args: [pn(2), pn(4), pn(5)] });
   assert.deepEqual(calls[1].args, ['Visa team', [pn(4)]]);
   assert.deepEqual(
     reply.invitees.map(({ key, outcome, reason }) => [key, outcome, reason]),
     [
       ['c:1', 'skipped', 'no_phone'],
       ['c:2', 'skipped', 'not_on_whatsapp'],
-      ['c:3', 'skipped', 'no_phone'],
+      ['c:3', 'skipped', 'resolve_failed'],
       ['c:4', 'added', null],
+      ['c:5', 'added', null],
+      ['c:6', 'skipped', 'no_phone'],
     ],
   );
   assert.ok(reply.invite_link);
 });
 
-test('nobody reachable creates nothing unless empty groups are allowed', async () => {
+test('nobody reachable refuses with no_reachable_invitees and creates nothing', async () => {
   const { socket, calls } = fakeSocket({ notOnWhatsApp: [pn(1)] });
   await assert.rejects(
-    runGroupCreate(request([{ key: 'c:1', jid: pn(1), admin: false }]), deps(socket).deps),
+    runGroupCreate(
+      request([
+        { key: 'c:1', jid: pn(1), admin: false },
+        { key: 'c:2', jid: null, admin: false },
+      ]),
+      deps(socket).deps,
+    ),
     (error: any) => error instanceof GroupCreateError && error.code === 'no_reachable_invitees' && error.status === 422,
   );
   assert.equal(calls.filter((call) => call.method === 'groupCreate').length, 0);
+});
 
-  const empty = fakeSocket({ notOnWhatsApp: [pn(1)] });
+test('the creating account is never invited and never listed as missing', async () => {
+  const { socket, calls } = fakeSocket();
+  const self = '6280000000001@s.whatsapp.net';
   const reply = await runGroupCreate(
-    request([{ key: 'c:1', jid: pn(1), admin: false }]),
-    deps(empty.socket, { allowEmptyGroup: true }).deps,
+    request([
+      { key: 'i:self', jid: '6280000000001:12@s.whatsapp.net', admin: true },
+      { key: 'u:self-lid', jid: '99000000000999@lid', admin: true },
+      { key: 'c:1', jid: pn(1), admin: false },
+    ]),
+    deps(socket, { selfJids: [`6280000000001:12@s.whatsapp.net`, '99000000000999:12@lid'] }).deps,
   );
-  assert.deepEqual(empty.calls.find((call) => call.method === 'groupCreate')?.args, ['Visa team', []]);
-  assert.equal(reply.invitees[0].reason, 'not_on_whatsapp');
+  assert.deepEqual(calls[0], { method: 'onWhatsApp', args: [pn(1)] });
+  assert.equal(
+    calls.some((call) => call.args.flat().includes(self)),
+    false,
+  );
+  assert.deepEqual(
+    reply.invitees.map(({ key, outcome, reason, admin }) => [key, outcome, reason, admin]),
+    [
+      ['i:self', 'added', null, null],
+      ['u:self-lid', 'added', null, null],
+      ['c:1', 'added', null, null],
+    ],
+  );
+  assert.equal(reply.invite_link, null);
+
+  // Only the account itself: nobody to invite.
+  await assert.rejects(
+    runGroupCreate(
+      request([{ key: 'i:self', jid: self, admin: true }]),
+      deps(fakeSocket().socket, { selfJids: [self] }).deps,
+    ),
+    (error: any) => error.code === 'no_reachable_invitees',
+  );
 });
 
 test('an onWhatsApp failure is not_connected and creates nothing', async () => {
@@ -440,7 +480,7 @@ test('add status mapping and bare JIDs', () => {
   assert.deepEqual(groupAddOutcome('200'), { outcome: 'added', reason: null });
   assert.deepEqual(groupAddOutcome('403'), { outcome: 'skipped', reason: 'privacy' });
   assert.deepEqual(groupAddOutcome('408'), { outcome: 'skipped', reason: 'left_recently' });
-  assert.deepEqual(groupAddOutcome('409'), { outcome: 'added', reason: null });
+  assert.deepEqual(groupAddOutcome('409'), { outcome: 'skipped', reason: 'already_member' });
   assert.deepEqual(groupAddOutcome('401'), { outcome: 'skipped', reason: 'blocked' });
   assert.deepEqual(groupAddOutcome('500'), { outcome: 'skipped', reason: 'failed' });
   assert.equal(bareWhatsappPhoneJid('628123456789:12@s.whatsapp.net'), '628123456789@s.whatsapp.net');
@@ -478,7 +518,7 @@ test('idempotency: one run per request id, the stored reply on repeat, in_progre
   assert.deepEqual(await coordinator.status('k'), { status: 'in_progress' });
   // Another process holding the same store sees the claim.
   const otherProcess = new GroupCreateCoordinator(() => store);
-  await assert.rejects(otherProcess.create('k', run), (error: any) => error.code === 'in_progress');
+  assert.deepEqual(await otherProcess.create('k', run), { status: 'in_progress' });
   assert.deepEqual(await otherProcess.status('k'), { status: 'in_progress' });
   release();
   assert.deepEqual(await firstCall, okReply());
@@ -501,25 +541,61 @@ test('idempotency: a definite rejection releases the claim; an uncertain or unex
   assert.deepEqual(await coordinator.status('a'), { status: 'unknown' });
   assert.deepEqual(await coordinator.create('a', async () => okReply()), okReply());
 
-  await assert.rejects(
-    coordinator.create('b', async () => {
+  // In progress is a normal reply (HTTP 200), never an error.
+  assert.deepEqual(
+    await coordinator.create('b', async () => {
       throw new GroupCreateError('in_progress');
     }),
-    (error: any) => error.code === 'in_progress',
+    { status: 'in_progress' },
   );
   assert.deepEqual(await coordinator.status('b'), { status: 'in_progress' });
-  await assert.rejects(
-    coordinator.create('b', async () => assert.fail('must not run again')),
-    (error: any) => error.code === 'in_progress',
-  );
+  assert.deepEqual(await coordinator.create('b', async () => assert.fail('must not run again')), {
+    status: 'in_progress',
+  });
 
-  await assert.rejects(
-    coordinator.create('c', async () => {
+  assert.deepEqual(
+    await coordinator.create('c', async () => {
       throw new TypeError('bug somewhere');
     }),
-    (error: any) => error.code === 'in_progress',
+    { status: 'in_progress' },
   );
   assert.deepEqual(await coordinator.status('c'), { status: 'in_progress' });
+});
+
+test('a created group without its conversation stays in_progress until a status call completes it', async () => {
+  const store = new LocalGroupCreateStore();
+  const coordinator = new GroupCreateCoordinator(() => store);
+  const created = { ...okReply(), conversation: null };
+  assert.deepEqual(await coordinator.create('p', async () => created, 'Visa team'), { status: 'in_progress' });
+  assert.deepEqual(await coordinator.create('p', async () => assert.fail('must not run again')), {
+    status: 'in_progress',
+  });
+  // Without a completer (or when Chatwoot is still down) it stays in progress.
+  assert.deepEqual(await coordinator.status('p'), { status: 'in_progress' });
+  const subjects: string[] = [];
+  assert.deepEqual(
+    await coordinator.status('p', async (pending) => {
+      subjects.push(pending.subject);
+      throw new Error('chatwoot 502');
+    }),
+    { status: 'in_progress' },
+  );
+  let completions = 0;
+  const complete = async (pending: any) => {
+    completions++;
+    subjects.push(pending.subject);
+    await new Promise((resolve) => setTimeout(resolve, 5));
+    return { id: 31, database_id: 3100 };
+  };
+  const [first, second] = await Promise.all([coordinator.status('p', complete), coordinator.status('p', complete)]);
+  assert.deepEqual(first, { ...okReply(), conversation: { id: 31, database_id: 3100 } });
+  assert.deepEqual(second, first);
+  assert.equal(completions, 1);
+  assert.deepEqual(subjects, ['Visa team', 'Visa team']);
+  // Final now: later status calls and repeats answer the stored reply without completing again.
+  assert.deepEqual(await coordinator.status('p', complete), first);
+  assert.deepEqual(await coordinator.create('p', async () => assert.fail('must not run')), first);
+  assert.equal(completions, 1);
 });
 
 test('idempotency: a store that is down refuses before anything runs', async () => {

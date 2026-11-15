@@ -11,11 +11,13 @@
  *   conversation → add the others one at a time (~300 ms apart) → promote the
  *   colleagues → picture → invite code when anyone was skipped.
  *
- * Once groupCreate succeeded the reply is always `ok`: every later step only
- * degrades its own field. Before that, an error means nothing was created,
- * except an uncertain groupCreate (timeout, dropped socket), which keeps the
- * request `in_progress` so Chatwoot's status checks end in `unknown` and staff
- * look at the phone instead of a second group being made.
+ * Once groupCreate succeeded every later step only degrades its own field.
+ * The reply is `ok` with the Chatwoot conversation; when that conversation
+ * could not be resolved yet the request stays `in_progress` (HTTP 200) and the
+ * next `group_create_status` finishes it. Before groupCreate an error means
+ * nothing was created, except an uncertain groupCreate (timeout, dropped
+ * socket), which stays `in_progress` so Chatwoot's status checks end in
+ * `unknown` and staff look at the phone instead of a second group being made.
  */
 
 export const GROUP_CREATE_MAX_INVITEES = 20;
@@ -41,6 +43,7 @@ export type GroupCreateReason =
   | 'left_recently'
   | 'already_member'
   | 'blocked'
+  | 'resolve_failed'
   | 'rate_limited'
   | 'failed';
 
@@ -75,6 +78,11 @@ export type GroupCreateOkReply = {
 
 export type GroupCreateErrorReply = { status: 'error'; code: GroupCreateErrorCode };
 export type GroupCreateFinalReply = GroupCreateOkReply | GroupCreateErrorReply;
+/** Answered with HTTP 200 / a normal bus reply: the outcome follows on group_create_status. */
+export type GroupCreateInProgressReply = { status: 'in_progress' };
+/** A created group whose Chatwoot conversation is still to be resolved. */
+export type GroupCreatePending = { reply: GroupCreateOkReply; subject: string };
+export type GroupCreateStored = GroupCreateFinalReply | { status: 'in_progress'; pending?: GroupCreatePending };
 
 const HTTP_STATUS: Record<GroupCreateErrorCode, number> = {
   group_create_disabled: 403,
@@ -139,6 +147,13 @@ const positiveId = (value: unknown) => {
   return Number.isSafeInteger(id) && id > 0 ? id : null;
 };
 
+/** Bare LID JID, device suffix dropped; anything else is null. */
+export function bareWhatsappLid(value: unknown): string | null {
+  if (typeof value !== 'string') return null;
+  const match = /^(\d{5,24})(?::\d+)?@lid$/.exec(value.trim());
+  return match ? `${match[1]}@lid` : null;
+}
+
 /** Bare phone JID, device suffix dropped; anything else (LID, group, junk) is null. */
 export function bareWhatsappPhoneJid(value: unknown): string | null {
   if (typeof value !== 'string') return null;
@@ -197,9 +212,8 @@ export function groupAddOutcome(status: unknown): { outcome: 'added' | 'skipped'
   switch (String(status ?? '')) {
     case '200':
       return { outcome: 'added', reason: null };
-    // Already in the group: the goal is reached, so it is not "not added".
     case '409':
-      return { outcome: 'added', reason: null };
+      return { outcome: 'skipped', reason: 'already_member' };
     case '403':
       return { outcome: 'skipped', reason: 'privacy' };
     case '408':
@@ -242,8 +256,8 @@ export type GroupCreateDeps = {
   log(event: string, fields: Record<string, unknown>): void;
   pauseMs?: number;
   conversationAttempts?: number;
-  /** Create with nobody when no invitee is reachable (unverified on WhatsApp: canary only). */
-  allowEmptyGroup?: boolean;
+  /** The creating account (bare phone JID and LID): it owns the group and is never invited. */
+  selfJids?: string[];
 };
 
 const errorStatus = (error: any): number | null => {
@@ -291,12 +305,32 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
   const skip = (key: string, reason: GroupCreateReason) =>
     outcomes.set(key, { key, outcome: 'skipped', reason, admin: null });
 
+  const self = new Set(
+    (deps.selfJids ?? [])
+      .map((jid) => bareWhatsappPhoneJid(jid) ?? bareWhatsappLid(jid))
+      .filter((jid): jid is string => !!jid),
+  );
   // One entry per distinct phone JID; repeated JIDs copy the first outcome.
   const byJid = new Map<string, GroupCreateInvitee[]>();
   for (const invitee of request.invitees) {
-    const jid = bareWhatsappPhoneJid(invitee.jid);
+    let jid = bareWhatsappPhoneJid(invitee.jid);
+    const lid = jid ? null : bareWhatsappLid(invitee.jid);
+    if (lid && self.has(lid)) jid = lid;
+    else if (lid) {
+      // A contact stored by LID: invite its phone JID from the Signal mapping.
+      jid = bareWhatsappPhoneJid(await deps.resolvePhoneJidForLid(lid).catch(() => null));
+      if (!jid) {
+        skip(invitee.key, 'resolve_failed');
+        continue;
+      }
+    }
     if (!jid) {
       skip(invitee.key, 'no_phone');
+      continue;
+    }
+    // The creating account is the owner already: never invited, never listed as missing.
+    if (self.has(jid)) {
+      outcomes.set(invitee.key, { key: invitee.key, outcome: 'added', reason: null, admin: null });
       continue;
     }
     byJid.set(jid, [...(byJid.get(jid) ?? []), invitee]);
@@ -318,7 +352,7 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
       else invitees.forEach((invitee) => skip(invitee.key, 'not_on_whatsapp'));
     }
   }
-  if (!reachable.length && !deps.allowEmptyGroup) throw new GroupCreateError('no_reachable_invitees');
+  if (!reachable.length) throw new GroupCreateError('no_reachable_invitees');
 
   // The create IQ is the only step that can leave a group behind.
   let created: Awaited<ReturnType<GroupCreateSocket['groupCreate']>>;
@@ -475,8 +509,8 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
 export type GroupCreateStore = {
   /** true when this caller now owns the request id. */
   claim(key: string): Promise<boolean>;
-  get(key: string): Promise<GroupCreateFinalReply | { status: 'in_progress' } | null>;
-  put(key: string, reply: GroupCreateFinalReply): Promise<void>;
+  get(key: string): Promise<GroupCreateStored | null>;
+  put(key: string, value: GroupCreateStored): Promise<void>;
   /** Drops a claim whose run created nothing, so the same request id may run again. */
   release(key: string): Promise<void>;
 };
@@ -506,8 +540,8 @@ export class LocalGroupCreateStore implements GroupCreateStore {
     return this.live(key)?.value ?? null;
   }
 
-  async put(key: string, reply: GroupCreateFinalReply) {
-    this.entries.set(key, { at: this.now(), value: reply });
+  async put(key: string, value: GroupCreateStored) {
+    this.entries.set(key, { at: this.now(), value });
   }
 
   async release(key: string) {
@@ -540,8 +574,8 @@ export class RedisGroupCreateStore implements GroupCreateStore {
     return raw ? JSON.parse(raw) : null;
   }
 
-  async put(key: string, reply: GroupCreateFinalReply) {
-    await this.client().set(this.prefix + key, JSON.stringify(reply), { EX: GROUP_CREATE_TTL_SECONDS });
+  async put(key: string, value: GroupCreateStored) {
+    await this.client().set(this.prefix + key, JSON.stringify(value), { EX: GROUP_CREATE_TTL_SECONDS });
   }
 
   async release(key: string) {
@@ -554,20 +588,29 @@ export class RedisGroupCreateStore implements GroupCreateStore {
  * one process share the running promise; another process (or a later retry)
  * sees the store's in_progress claim or the stored reply.
  *
- * A definite rejection (nothing created: gate, not connected, nobody
- * reachable, create refused) releases the claim, so a retry after a reconnect
- * may run. Anything else that fails keeps the claim as in_progress for 24 h:
- * never risk a second group.
+ * - A definite rejection (nothing created: gate, not connected, nobody
+ *   reachable, create refused) releases the claim, so a retry may run.
+ * - Anything uncertain keeps the claim as in_progress for 24 h: never risk a
+ *   second group.
+ * - A created group without its Chatwoot conversation is stored as pending;
+ *   group_create_status completes it (it never creates a group).
+ * - In progress and duplicate claims answer `{status:'in_progress'}` as a
+ *   normal reply (HTTP 200), never an error.
  */
 export class GroupCreateCoordinator {
-  private readonly running = new Map<string, Promise<GroupCreateFinalReply>>();
+  private readonly running = new Map<string, Promise<GroupCreateFinalReply | GroupCreateInProgressReply>>();
+  private readonly completing = new Map<string, Promise<GroupCreateOkReply | GroupCreateInProgressReply>>();
 
   constructor(private readonly store: () => GroupCreateStore) {}
 
-  async create(key: string, run: () => Promise<GroupCreateOkReply>): Promise<GroupCreateOkReply> {
+  async create(
+    key: string,
+    run: () => Promise<GroupCreateOkReply>,
+    subject = '',
+  ): Promise<GroupCreateOkReply | GroupCreateInProgressReply> {
     const existing = this.running.get(key);
     if (existing) return this.unwrap(await existing);
-    const task = this.claimAndRun(key, run);
+    const task = this.claimAndRun(key, run, subject);
     this.running.set(key, task);
     try {
       return this.unwrap(await task);
@@ -576,17 +619,41 @@ export class GroupCreateCoordinator {
     }
   }
 
-  async status(key: string): Promise<GroupCreateFinalReply | { status: 'in_progress' } | { status: 'unknown' }> {
+  async status(
+    key: string,
+    complete?: (pending: GroupCreatePending) => Promise<GroupCreateOkReply['conversation']>,
+  ): Promise<GroupCreateFinalReply | GroupCreateInProgressReply | { status: 'unknown' }> {
     if (this.running.has(key)) return { status: 'in_progress' };
-    return (await this.store().get(key)) ?? { status: 'unknown' };
+    const stored = await this.store().get(key);
+    if (!stored) return { status: 'unknown' };
+    if (stored.status !== 'in_progress') return stored;
+    if (!('pending' in stored) || !stored.pending || !complete) return { status: 'in_progress' };
+    const running = this.completing.get(key);
+    if (running) return running;
+    const pending = stored.pending;
+    const task = (async (): Promise<GroupCreateOkReply | GroupCreateInProgressReply> => {
+      const conversation = await complete(pending).catch(() => null);
+      if (!conversation) return { status: 'in_progress' };
+      const reply: GroupCreateOkReply = { ...pending.reply, conversation };
+      await this.store()
+        .put(key, reply)
+        .catch(() => undefined);
+      return reply;
+    })().finally(() => this.completing.delete(key));
+    this.completing.set(key, task);
+    return task;
   }
 
-  private unwrap(reply: GroupCreateFinalReply): GroupCreateOkReply {
-    if (reply.status === 'ok') return reply;
-    throw new GroupCreateError(reply.code);
+  private unwrap(reply: GroupCreateFinalReply | GroupCreateInProgressReply) {
+    if (reply.status === 'error') throw new GroupCreateError(reply.code);
+    return reply;
   }
 
-  private async claimAndRun(key: string, run: () => Promise<GroupCreateOkReply>): Promise<GroupCreateFinalReply> {
+  private async claimAndRun(
+    key: string,
+    run: () => Promise<GroupCreateOkReply>,
+    subject: string,
+  ): Promise<GroupCreateFinalReply | GroupCreateInProgressReply> {
     const store = this.store();
     let claimed: boolean;
     try {
@@ -598,7 +665,7 @@ export class GroupCreateCoordinator {
     if (!claimed) {
       const stored = await store.get(key).catch(() => null);
       if (stored && stored.status !== 'in_progress') return stored;
-      return { status: 'error', code: 'in_progress' };
+      return { status: 'in_progress' };
     }
     let reply: GroupCreateOkReply;
     try {
@@ -608,7 +675,12 @@ export class GroupCreateCoordinator {
         await store.release(key).catch(() => undefined);
         return error.body;
       }
-      return { status: 'error', code: 'in_progress' };
+      return { status: 'in_progress' };
+    }
+    if (!reply.conversation) {
+      // The group exists but Chatwoot has no conversation for it yet.
+      await store.put(key, { status: 'in_progress', pending: { reply, subject } }).catch(() => undefined);
+      return { status: 'in_progress' };
     }
     // The group exists: answer it even when the store write fails (the claim then keeps in_progress).
     await store.put(key, reply).catch(() => undefined);

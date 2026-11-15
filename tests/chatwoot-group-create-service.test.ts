@@ -149,6 +149,8 @@ const createBody = (requestId = `req-${Date.now()}-${++sequence}`) => ({
     { key: 'c:1', kind: 'contact', jid: pn(1), admin: false },
     { key: 'c:2', kind: 'contact', jid: pn(2), admin: false },
     { key: 'i:3', kind: 'colleague_inbox', jid: pn(3), admin: true },
+    // The instance's own number (a colleague picking its own inbox): never invited.
+    { key: 'i:self', kind: 'colleague_inbox', jid: '6280000000001@s.whatsapp.net', admin: true },
   ],
   actor: { user_id: 7, name: 'Mila' },
 });
@@ -237,6 +239,7 @@ test('create end to end: group, Chatwoot conversation, outcomes; the status look
         ['c:1', 'added', null, null],
         ['c:2', 'skipped', 'privacy', null],
         ['i:3', 'added', null, 'promoted'],
+        ['i:self', 'added', null, null],
       ],
     );
     assert.equal(reply.invite_link, 'https://chat.whatsapp.com/Invite42');
@@ -319,7 +322,7 @@ test('ingress alone still resolves a group through the same resolver', async () 
   assert.equal(chatwoot.contacts.get(GROUP)?.name, 'Existing group (GROUP)');
 });
 
-test('provider self: PATCH with the bare JID once per connect; 404 is tolerated; gated off by default', async () => {
+test('provider self: PATCH with the bare JID once per connect; 404 is tolerated; gated per instance', async () => {
   const { service } = serviceFixture();
   const requests: any[] = [];
   service.privilegedChatwootRequest = async (_provider: unknown, params: any) => {
@@ -329,7 +332,12 @@ test('provider self: PATCH with the bare JID once per connect; 404 is tolerated;
   await service.reportProviderSelf(instance);
   assert.deepEqual(requests, []);
 
-  await withEnv({ CHATWOOT_PROVIDER_SELF_REPORT: 'true' }, async () => {
+  // Per instance: another instance listed does not switch this one on.
+  await withEnv({ CHATWOOT_PROVIDER_SELF_REPORT: 'wa-other' }, async () => {
+    await service.reportProviderSelf(instance);
+  });
+  assert.deepEqual(requests, []);
+  await withEnv({ CHATWOOT_PROVIDER_SELF_REPORT: 'wa-other,t-test' }, async () => {
     await service.reportProviderSelf(instance);
     await service.reportProviderSelf(instance);
   });
@@ -340,4 +348,52 @@ test('provider self: PATCH with the bare JID once per connect; 404 is tolerated;
       data: { whatsapp_jid: '6280000000001@s.whatsapp.net' },
     },
   ]);
+});
+
+test('a group whose Chatwoot conversation failed answers in_progress (200) and the status call completes it', async () => {
+  await withEnv({ CHATWOOT_GROUP_CREATE_INSTANCES: 't-test' }, async () => {
+    const chatwoot = fakeChatwoot();
+    const { service, socket, rosterSyncs } = serviceFixture(chatwoot);
+    const post = chatwoot.providerConversationRequest;
+    let chatwootDown = true;
+    service.providerConversationRequest = async (provider: unknown, method: string, data: any) => {
+      if (method === 'POST' && chatwootDown)
+        throw Object.assign(new Error('Bad Gateway'), { response: { status: 502 } });
+      return post(provider, method, data);
+    };
+    const sleep = global.setTimeout;
+    // The three conversation attempts wait 1 s and 2 s; keep the test fast.
+    (global as any).setTimeout = (fn: () => void, _ms: number) => sleep(fn, 0);
+    let reply: any;
+    const body = createBody();
+    try {
+      reply = await service.receiveWebhook(instance, body, admission);
+    } finally {
+      (global as any).setTimeout = sleep;
+    }
+    assert.deepEqual(reply, { status: 'in_progress' });
+    assert.equal(socket.calls.filter((call) => call.startsWith('create:')).length, 1);
+
+    const statusBody = {
+      event: 'group_create_status',
+      v: 1,
+      request_id: body.request_id,
+      account: { id: 1 },
+      inbox: { id: 42 },
+    };
+    assert.deepEqual(await service.receiveWebhook(instance, statusBody, admission), { status: 'in_progress' });
+    // A repeated create never makes a second group.
+    assert.deepEqual(await service.receiveWebhook(instance, body, admission), { status: 'in_progress' });
+    assert.equal(socket.calls.filter((call) => call.startsWith('create:')).length, 1);
+
+    chatwootDown = false;
+    const done = await service.receiveWebhook(instance, statusBody, admission);
+    assert.equal(done.status, 'ok');
+    assert.equal(done.group_peer, GROUP);
+    assert.deepEqual(done.conversation, { id: 70, database_id: 7000 });
+    assert.equal(chatwoot.contacts.get(GROUP)?.name, 'Canary group (GROUP)');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(rosterSyncs, [GROUP]);
+    assert.deepEqual(await service.receiveWebhook(instance, statusBody, admission), done);
+  });
 });

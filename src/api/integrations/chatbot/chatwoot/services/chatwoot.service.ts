@@ -8166,11 +8166,63 @@ export class ChatwootService {
     return groupCreateStoreKey(admission.routeInstanceId || instance.instanceId || instance.instanceName, requestId);
   }
 
+  /** The provider, inbox and socket a create (or its completion) runs against. */
+  private async groupCreateContext(
+    instance: InstanceDto,
+    admission: ChatwootOutboundWebhookHeaders,
+    expected?: { accountId: number; inboxId: number },
+  ) {
+    const context = admission.routeInstanceId
+      ? await this.authenticatedClientCw(instance, admission)
+      : await this.clientCw(instance);
+    if (!context?.provider?.enabled) throw new GroupCreateError('group_create_disabled');
+    const { provider } = context;
+    const inbox = await this.getInbox(instance);
+    if (!inbox) throw new GroupCreateError('group_create_disabled');
+    const inboxId = Number(inbox.id);
+    if (expected && (inboxId !== expected.inboxId || Number(provider.accountId) !== expected.accountId))
+      throw new GroupCreateError('invalid_request');
+    if (!(await this.providerConversationsEnabled(provider, inboxId).catch(() => false)))
+      throw new GroupCreateError('group_create_disabled');
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    return { provider, inboxId, waInstance };
+  }
+
+  private async ensureCreatedGroupConversation(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    groupJid: string,
+    subject: string,
+    syncRoster: boolean,
+  ) {
+    const resolved = await this.resolveProviderPeerConversation(instance, provider, inboxId, groupJid, {
+      group: { subject },
+    });
+    if (syncRoster) this.syncCreatedGroupRoster(instance, provider, inboxId, groupJid, resolved.id);
+    return { id: resolved.id, database_id: resolved.database_id };
+  }
+
+  // After the adds: the participants as they are now.
+  private syncCreatedGroupRoster(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    groupJid: string,
+    conversationId: number | null,
+  ) {
+    if (!conversationId) return;
+    void this.scheduleProviderGroupRoster(instance, provider, inboxId, groupJid, conversationId, true).catch(
+      () => undefined,
+    );
+  }
+
   /**
    * Chatwoot staff create a WhatsApp group (contract v1). The reply carries
-   * the group, its Chatwoot conversation and one outcome per invitee; a
-   * GroupCreateError means nothing was created (or, for in_progress, that the
-   * outcome is not known yet).
+   * the group, its Chatwoot conversation and one outcome per invitee, or
+   * `{status:'in_progress'}` (a duplicate, an uncertain create, or a group
+   * whose conversation the next status call completes). A GroupCreateError
+   * means nothing was created.
    */
   private async receiveGroupCreate(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
     this.requireAdmission(admission);
@@ -8179,72 +8231,77 @@ export class ChatwootService {
     const request = parseGroupCreateRequest(body);
     const key = this.groupCreateKey(instance, admission, request.requestId);
     const started = Date.now();
-    const reply = await this.groupCreates().create(key, async () => {
-      const context = admission.routeInstanceId
-        ? await this.authenticatedClientCw(instance, admission)
-        : await this.clientCw(instance);
-      if (!context?.provider?.enabled) throw new GroupCreateError('group_create_disabled');
-      const { provider } = context;
-      const inbox = await this.getInbox(instance);
-      if (!inbox || Number(inbox.id) !== request.inboxId || Number(provider.accountId) !== request.accountId)
-        throw new GroupCreateError('invalid_request');
-      const inboxId = Number(inbox.id);
-      if (!(await this.providerConversationsEnabled(provider, inboxId).catch(() => false)))
-        throw new GroupCreateError('group_create_disabled');
-      const waInstance = this.waMonitor.waInstances[instance.instanceName];
-      if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
-        throw new GroupCreateError('not_connected');
-      if (waInstance.localSettings?.groupsIgnore) throw new GroupCreateError('group_create_disabled');
-      return runGroupCreate(request, {
-        socket: waInstance.client,
-        resolvePhoneJidForLid: (lid) => waInstance.resolvePhoneJidForLid?.(lid) ?? Promise.resolve(null),
-        ensureConversation: async (groupJid, subject) => {
-          const resolved = await this.resolveProviderPeerConversation(instance, provider, inboxId, groupJid, {
-            group: { subject },
-          });
-          return { id: resolved.id, database_id: resolved.database_id };
-        },
-        afterCreate: (groupJid, conversationId) => {
-          if (conversationId)
-            void this.scheduleProviderGroupRoster(instance, provider, inboxId, groupJid, conversationId, true).catch(
-              () => undefined,
-            );
-        },
-        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
-        log: (event, fields) => this.logger.info(JSON.stringify({ event, instance: instance.instanceName, ...fields })),
-        allowEmptyGroup: process.env.CHATWOOT_GROUP_CREATE_ALLOW_EMPTY === 'true',
-      });
-    });
+    const reply = await this.groupCreates().create(
+      key,
+      async () => {
+        const { provider, inboxId, waInstance } = await this.groupCreateContext(instance, admission, request);
+        if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
+          throw new GroupCreateError('not_connected');
+        if (waInstance.localSettings?.groupsIgnore) throw new GroupCreateError('group_create_disabled');
+        const me = waInstance.client.user ?? waInstance.client.authState?.creds?.me;
+        return runGroupCreate(request, {
+          socket: waInstance.client,
+          resolvePhoneJidForLid: (lid) => waInstance.resolvePhoneJidForLid?.(lid) ?? Promise.resolve(null),
+          ensureConversation: (groupJid, subject) =>
+            this.ensureCreatedGroupConversation(instance, provider, inboxId, groupJid, subject, false),
+          afterCreate: (groupJid, conversationId) =>
+            this.syncCreatedGroupRoster(instance, provider, inboxId, groupJid, conversationId),
+          sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+          log: (event, fields) =>
+            this.logger.info(JSON.stringify({ event, instance: instance.instanceName, ...fields })),
+          selfJids: [me?.id, me?.lid].filter((jid): jid is string => typeof jid === 'string'),
+        });
+      },
+      request.subject,
+    );
     this.logger.info(
       JSON.stringify({
         event: 'chatwoot_group_create_answered',
         instance: instance.instanceName,
         requestId: request.requestId,
-        groupJid: reply.group_peer,
-        conversationId: reply.conversation?.id ?? null,
-        added: reply.invitees.filter((invitee) => invitee.outcome === 'added').length,
-        skipped: reply.invitees.filter((invitee) => invitee.outcome === 'skipped').length,
-        picture: reply.picture,
+        status: reply.status,
+        ...(reply.status === 'ok'
+          ? {
+              groupJid: reply.group_peer,
+              conversationId: reply.conversation?.id ?? null,
+              added: reply.invitees.filter((invitee) => invitee.outcome === 'added').length,
+              skipped: reply.invitees.filter((invitee) => invitee.outcome === 'skipped').length,
+              picture: reply.picture,
+            }
+          : {}),
         ms: Date.now() - started,
       }),
     );
     return reply;
   }
 
-  /** The stored outcome of one create; never creates anything. */
+  /**
+   * The stored outcome of one create. It never creates a group; a created
+   * group still missing its Chatwoot conversation is completed here.
+   */
   private async receiveGroupStatus(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
     this.requireAdmission(admission);
     const { requestId } = parseGroupStatusRequest(body);
-    return this.groupCreates().status(this.groupCreateKey(instance, admission, requestId));
+    return this.groupCreates().status(this.groupCreateKey(instance, admission, requestId), async (pending) => {
+      const { provider, inboxId } = await this.groupCreateContext(instance, admission);
+      return this.ensureCreatedGroupConversation(
+        instance,
+        provider,
+        inboxId,
+        pending.reply.group_peer,
+        pending.subject,
+        true,
+      );
+    });
   }
 
   /**
    * The inbox's own WhatsApp number for Chatwoot (colleague invitees), once
-   * per connect. Chatwoot without the endpoint answers 404: ignored. Gated by
-   * CHATWOOT_PROVIDER_SELF_REPORT=true.
+   * per connect. Chatwoot without the endpoint answers 404: ignored. Gated per
+   * instance by CHATWOOT_PROVIDER_SELF_REPORT (names or ids, "*", empty = off).
    */
   private async reportProviderSelf(instance: InstanceDto) {
-    if (process.env.CHATWOOT_PROVIDER_SELF_REPORT !== 'true') return;
+    if (!groupCreateInstanceEnabled(instance, process.env.CHATWOOT_PROVIDER_SELF_REPORT || '')) return;
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
       const jid = bareWhatsappPhoneJid(waInstance?.client?.user?.id ?? waInstance?.client?.authState?.creds?.me?.id);
