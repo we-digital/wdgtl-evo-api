@@ -188,7 +188,7 @@ test('nobody reachable refuses with no_reachable_invitees and creates nothing', 
   assert.equal(calls.filter((call) => call.method === 'groupCreate').length, 0);
 });
 
-test('the creating account is never invited and never listed as missing', async () => {
+test('the creating account is never invited and left out of invitees[]', async () => {
   const { socket, calls } = fakeSocket();
   const self = '6280000000001@s.whatsapp.net';
   const reply = await runGroupCreate(
@@ -204,13 +204,10 @@ test('the creating account is never invited and never listed as missing', async 
     calls.some((call) => call.args.flat().includes(self)),
     false,
   );
+  // The creating account is left out of invitees[] (contract v1.1 item 5).
   assert.deepEqual(
     reply.invitees.map(({ key, outcome, reason, admin }) => [key, outcome, reason, admin]),
-    [
-      ['i:self', 'added', null, null],
-      ['u:self-lid', 'added', null, null],
-      ['c:1', 'added', null, null],
-    ],
+    [['c:1', 'added', null, null]],
   );
   assert.equal(reply.invite_link, null);
 

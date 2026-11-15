@@ -305,6 +305,7 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
   const skip = (key: string, reason: GroupCreateReason) =>
     outcomes.set(key, { key, outcome: 'skipped', reason, admin: null });
 
+  const ownKeys = new Set<string>();
   const self = new Set(
     (deps.selfJids ?? [])
       .map((jid) => bareWhatsappPhoneJid(jid) ?? bareWhatsappLid(jid))
@@ -328,9 +329,9 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
       skip(invitee.key, 'no_phone');
       continue;
     }
-    // The creating account is the owner already: never invited, never listed as missing.
+    // The creating account owns the group: never invited, and left out of invitees[].
     if (self.has(jid)) {
-      outcomes.set(invitee.key, { key: invitee.key, outcome: 'added', reason: null, admin: null });
+      ownKeys.add(invitee.key);
       continue;
     }
     byJid.set(jid, [...(byJid.get(jid) ?? []), invitee]);
@@ -475,10 +476,12 @@ export async function runGroupCreate(request: GroupCreateRequest, deps: GroupCre
     }
   }
 
-  const invitees = request.invitees.map(
-    (invitee): GroupCreateInviteeOutcome =>
-      outcomes.get(invitee.key) ?? { key: invitee.key, outcome: 'skipped', reason: 'failed', admin: null },
-  );
+  const invitees = request.invitees
+    .filter((invitee) => !ownKeys.has(invitee.key))
+    .map(
+      (invitee): GroupCreateInviteeOutcome =>
+        outcomes.get(invitee.key) ?? { key: invitee.key, outcome: 'skipped', reason: 'failed', admin: null },
+    );
   let inviteLink: string | null = null;
   if (invitees.some((invitee) => invitee.outcome === 'skipped')) {
     try {

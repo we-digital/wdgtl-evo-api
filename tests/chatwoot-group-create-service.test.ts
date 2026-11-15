@@ -239,7 +239,6 @@ test('create end to end: group, Chatwoot conversation, outcomes; the status look
         ['c:1', 'added', null, null],
         ['c:2', 'skipped', 'privacy', null],
         ['i:3', 'added', null, 'promoted'],
-        ['i:self', 'added', null, null],
       ],
     );
     assert.equal(reply.invite_link, 'https://chat.whatsapp.com/Invite42');

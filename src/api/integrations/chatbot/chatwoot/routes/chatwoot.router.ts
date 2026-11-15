@@ -7,6 +7,7 @@ import {
   ChatwootHistorySyncBatchDto,
   ChatwootHistorySyncDto,
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
+import { GroupCreateError } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-create';
 import { HttpStatus } from '@api/routes/index.router';
 import { chatwootController } from '@api/server.module';
 import {
@@ -149,12 +150,19 @@ export class ChatwootRouter extends RouterBroker {
             });
           }
         }
-        const response = await this.dataValidate<InstanceDto>({
-          request: req,
-          schema: instanceSchema,
-          ClassRef: InstanceDto,
-          execute: (instance, data) => chatwootController.receiveWebhook(instance, data, admission),
-        });
+        let response: unknown;
+        try {
+          response = await this.dataValidate<InstanceDto>({
+            request: req,
+            schema: instanceSchema,
+            ClassRef: InstanceDto,
+            execute: (instance, data) => chatwootController.receiveWebhook(instance, data, admission),
+          });
+        } catch (error) {
+          // "Create group" refusals answer their own body, {"status":"error","code":...}: Chatwoot reads the code.
+          if (error instanceof GroupCreateError) return res.status(error.status).json(error.body);
+          throw error;
+        }
 
         res.status((response as any)?.accepted ? HttpStatus.ACCEPTED : HttpStatus.OK).json(response);
       });
