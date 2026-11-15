@@ -43,6 +43,13 @@ import {
   formatIncomingWhatsappMentions,
   stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
+import {
+  buildContactReadRequest,
+  ContactReadTarget,
+  contactReadTarget,
+  isRetryableContactReadStatus,
+  nextContactReadDelay,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-read';
 import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-sync';
 import {
   buildChatwootDeliveryFailureUpdate,
@@ -1133,6 +1140,121 @@ export class ChatwootService {
 
   public getCache() {
     return this.cache;
+  }
+
+  /**
+   * The customer read our message `key` (WhatsApp READ/PLAYED receipt).
+   *
+   * Looked up by id and direction only: the receipt names the chat by LID while
+   * the stored message often carries the phone JID (or an older LID), so an
+   * exact remoteJid match drops the receipt. Our own message ids are unique.
+   */
+  private async forwardWhatsappContactRead(instance: InstanceDto, key: WAMessageKey, attempt: number): Promise<void> {
+    const retry = (reason: string, status?: number) => {
+      const delay = nextContactReadDelay(attempt);
+      if (delay === null) {
+        this.logger.warn(
+          JSON.stringify({
+            event: 'chatwoot_contact_read_dropped',
+            instanceId: instance.instanceId,
+            reason,
+            status: status ?? null,
+            attempts: attempt + 1,
+          }),
+        );
+        return;
+      }
+      const timer = setTimeout(() => {
+        this.forwardWhatsappContactRead(instance, key, attempt + 1).catch((error) =>
+          this.logger.warn(
+            JSON.stringify({
+              event: 'chatwoot_contact_read_failed',
+              instanceId: instance.instanceId,
+              errorClass: error?.name || 'Error',
+            }),
+          ),
+        );
+      }, delay);
+      timer.unref?.();
+    };
+
+    let message: MessageModel | null;
+    try {
+      message = await this.getMessageByKeyId(instance, key.id, { fromMe: true });
+    } catch {
+      return retry('lookup_failed');
+    }
+    const target = contactReadTarget(message);
+    if (!target) return retry('unbound');
+
+    const token = this.configService.get<Chatwoot>('CHATWOOT').READ_STATE_INGRESS_TOKEN;
+    if (!token) {
+      await this.legacyContactLastSeen(instance, message);
+      return;
+    }
+
+    try {
+      await this.contactRead(instance, target, token);
+    } catch (error) {
+      const status = error?.response?.status;
+      if (isRetryableContactReadStatus(status)) return retry('chatwoot_unavailable', status);
+      this.logger.warn(
+        JSON.stringify({ event: 'chatwoot_contact_read_rejected', instanceId: instance.instanceId, status }),
+      );
+      return;
+    }
+    this.logger.info(
+      JSON.stringify({
+        event: 'chatwoot_contact_read_forwarded',
+        instanceId: instance.instanceId,
+        attempts: attempt + 1,
+      }),
+    );
+  }
+
+  private async contactRead(instance: InstanceDto, target: ContactReadTarget, token: string): Promise<void> {
+    const provider = await this.getProvider(instance);
+    const trustedBaseUrl = provider && this.trustedChatwootBaseUrl(provider);
+    if (!trustedBaseUrl) throw Object.assign(new Error('Chatwoot provider unavailable'), { response: { status: 503 } });
+
+    const request = buildContactReadRequest({
+      baseUrl: trustedBaseUrl,
+      accountId: provider.accountId,
+      conversationId: target.conversationId,
+      messageId: target.messageId,
+      token,
+    });
+    await axios.post(request.url, request.data, { headers: request.headers, timeout: 20_000, maxRedirects: 0 });
+  }
+
+  // Without the read-state token: the public contact API marks the whole
+  // conversation seen "now" (older behaviour, kept for deployments without it).
+  private async legacyContactLastSeen(instance: InstanceDto, message: MessageModel): Promise<void> {
+    const context = await this.clientCw(instance);
+    if (!context) return;
+    const { client, provider } = context;
+    const conversationId = message.chatwootConversationId;
+    let sourceId = message.chatwootContactInboxSourceId;
+    const inbox = (await this.getInbox(instance)) as inbox & { inbox_identifier?: string };
+
+    if (!sourceId && inbox) {
+      const conversation = (await client.conversations.get({
+        accountId: Number(provider.accountId),
+        conversationId: conversationId,
+      })) as conversation_show & {
+        last_non_activity_message: { conversation: { contact_inbox: contact_inboxes } };
+      };
+      sourceId = conversation.last_non_activity_message?.conversation?.contact_inbox?.source_id;
+    }
+
+    if (sourceId && inbox?.inbox_identifier) {
+      await chatwootRequest(this.getClientCwConfig(provider), {
+        method: 'POST',
+        url:
+          `/public/api/v1/inboxes/${inbox.inbox_identifier}/contacts/${encodeURIComponent(sourceId)}` +
+          `/conversations/${conversationId}/update_last_seen`,
+      });
+    }
   }
 
   public async externalRead(
@@ -6956,7 +7078,7 @@ export class ChatwootService {
         this.logger.warn('client not found');
         return null;
       }
-      const { client, provider } = context;
+      const { provider } = context;
 
       if (event === 'chats.update') {
         await this.applyNativeChatwootMuteFromWhatsapp(instance, provider, body);
@@ -7464,41 +7586,12 @@ export class ChatwootService {
       }
 
       if (event === 'messages.read') {
-        if (!body?.key?.id || !body?.key?.remoteJid) {
+        if (!body?.key?.id) {
           this.logger.warn('message id not found');
           return;
         }
 
-        const message = await this.getMessageByKeyId(instance, body.key.id, body.key);
-        const conversationId = message?.chatwootConversationId;
-        const contactInboxSourceId = message?.chatwootContactInboxSourceId;
-
-        if (conversationId) {
-          let sourceId = contactInboxSourceId;
-          const inbox = (await this.getInbox(instance)) as inbox & {
-            inbox_identifier?: string;
-          };
-
-          if (!sourceId && inbox) {
-            const conversation = (await client.conversations.get({
-              accountId: Number(provider.accountId),
-              conversationId: conversationId,
-            })) as conversation_show & {
-              last_non_activity_message: { conversation: { contact_inbox: contact_inboxes } };
-            };
-            sourceId = conversation.last_non_activity_message?.conversation?.contact_inbox?.source_id;
-          }
-
-          if (sourceId && inbox?.inbox_identifier) {
-            const url =
-              `/public/api/v1/inboxes/${inbox.inbox_identifier}/contacts/${sourceId}` +
-              `/conversations/${conversationId}/update_last_seen`;
-            await chatwootRequest(this.getClientCwConfig(provider), {
-              method: 'POST',
-              url: url,
-            });
-          }
-        }
+        await this.forwardWhatsappContactRead(instance, body.key, 0);
         return;
       }
 
