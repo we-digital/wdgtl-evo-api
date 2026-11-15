@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { monitorEventLoopDelay } from 'node:perf_hooks';
 
 import {
   ChatwootProviderDeliveryPart,
@@ -567,6 +568,7 @@ export class ChatwootOutboundQueue {
   private latencies: Record<OutboundLatencyMetric, number[]> = ChatwootOutboundQueue.emptyLatencies();
   private fenceSnapshotsReused = 0;
   private latencyTimer: NodeJS.Timeout | null = null;
+  private readonly loopDelay = monitorEventLoopDelay({ resolution: 20 });
 
   constructor(
     private readonly store: ChatwootOutboundStore,
@@ -581,6 +583,7 @@ export class ChatwootOutboundQueue {
     if (!this.stopped) return;
     this.stopped = false;
     await this.recoverExpired(new Date(), true);
+    this.loopDelay.enable();
     this.latencyTimer = setInterval(() => this.reportLatency(), OUTBOUND_LATENCY_REPORT_MS);
     this.latencyTimer.unref?.();
     this.schedule(0);
@@ -592,6 +595,7 @@ export class ChatwootOutboundQueue {
     this.timer = null;
     if (this.latencyTimer) clearInterval(this.latencyTimer);
     this.latencyTimer = null;
+    this.loopDelay.disable();
     await Promise.all(this.activeRuns);
     this.reportLatency();
   }
@@ -602,7 +606,10 @@ export class ChatwootOutboundQueue {
     const fenceReused = this.fenceSnapshotsReused;
     this.latencies = ChatwootOutboundQueue.emptyLatencies();
     this.fenceSnapshotsReused = 0;
-    if (window.total.length === 0) return;
+    if (window.total.length === 0) {
+      this.loopDelay.reset();
+      return;
+    }
     const metrics: Record<string, number | null> = { sent: window.total.length, fenceReused };
     for (const [metric, samples] of Object.entries(window)) {
       const sorted = [...samples].sort((a, b) => a - b);
@@ -610,6 +617,11 @@ export class ChatwootOutboundQueue {
       metrics[`${metric}P95Ms`] = percentile(sorted, 0.95);
     }
     metrics.totalMaxMs = Math.max(...window.total);
+    // Event-loop delay over the window: separates in-process stalls from slow IO.
+    metrics.eventLoopP50Ms = Math.round(this.loopDelay.percentile(50) / 1e6);
+    metrics.eventLoopP99Ms = Math.round(this.loopDelay.percentile(99) / 1e6);
+    metrics.eventLoopMaxMs = Math.round(this.loopDelay.max / 1e6);
+    this.loopDelay.reset();
     this.handler.observe?.('chatwoot_outbound_latency', metrics);
   }
 
@@ -646,6 +658,13 @@ export class ChatwootOutboundQueue {
       }
     }
     this.handler.observe?.('chatwoot_outbound_transport_sent', {
+      group: String((operation.payload as any)?.chatId || '').endsWith('@g.us') ? 1 : 0,
+      media: (operation.payload as any)?.attachmentUrl ? 1 : 0,
+      quoted:
+        (operation.payload as any)?.quotedWhatsappMessageId || (operation.payload as any)?.quotedChatwootMessageId
+          ? 1
+          : 0,
+      receiptToCommitMs: this.duration(operation.webhookReceivedAt, operation.createdAt),
       commitToClaimMs: this.duration(operation.createdAt, operation.claimedAt),
       validationMs: this.duration(operation.claimedAt, operation.validatedAt),
       preTransportMs: this.duration(operation.validatedAt, transportStartedAt),
@@ -815,6 +834,7 @@ export class ChatwootOutboundQueue {
     let snapshotReused = false;
     let transportCommitted = false;
     let transportCommit: Promise<void> | null = null;
+    let callbackReleased = false;
     // Called by the provider right after WhatsApp accepted the relay and before
     // optional local history/media/webhook work. Never throws into transport:
     // without a durable commit the final result path below decides as before.
@@ -843,6 +863,16 @@ export class ChatwootOutboundQueue {
         operation.sendStartedAt = transportStartedAt;
         operation.sentAt = sentAt;
         this.recordSent(operation, { fenceStartedAt, transportStartedAt, snapshotReused }, sentAt);
+        // Hand the Chatwoot callback to a maintenance slot right away instead
+        // of after local post-send work (history row, media re-upload,
+        // webhooks): staff see "sent" as soon as WhatsApp accepted the relay.
+        // The callback waits for the local history row itself before binding.
+        try {
+          await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
+          callbackReleased = true;
+        } catch {
+          // The final path below releases it once more.
+        }
         // The destination lane is free now; the next message may start.
         this.wake();
       })();
@@ -900,7 +930,8 @@ export class ChatwootOutboundQueue {
       );
       if (transportCommit) await transportCommit;
       if (transportCommitted) {
-        await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
+        if (!callbackReleased)
+          await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
         this.wake();
         return true;
       }
@@ -924,7 +955,8 @@ export class ChatwootOutboundQueue {
       if (transportCommitted) {
         // The exact WAID is already durable; a later local persistence error
         // or timeout must not turn a delivered message into an ambiguous one.
-        await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
+        if (!callbackReleased)
+          await this.store.releaseCallbackLease(operation.id, this.workerId, operation.claimGeneration, new Date());
         this.wake();
         return true;
       }
@@ -1197,6 +1229,9 @@ export class ChatwootOutboundQueue {
       messageToReceiptMs: this.duration(operation.messageCreatedAt, operation.webhookReceivedAt),
       receiptToCommitMs: this.duration(operation.webhookReceivedAt, operation.createdAt),
       sentToCallbackMs: this.duration(operation.sentAt, now),
+      sentToCallbackStartMs: this.duration(operation.sentAt, operation.callbackStartedAt),
+      callbackMs: this.duration(operation.callbackStartedAt, now),
+      messageToSentMs: this.duration(operation.messageCreatedAt, operation.sentAt),
       totalMs: this.duration(operation.messageCreatedAt ?? operation.createdAt, now),
     });
   }

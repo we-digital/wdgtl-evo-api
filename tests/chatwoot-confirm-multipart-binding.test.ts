@@ -39,7 +39,12 @@ function originalConsumer() {
   );
   const file = ts.createSourceFile('service.ts', source, ts.ScriptTarget.Latest, true);
   const klass = file.statements.find(ts.isClassDeclaration)!;
-  const methods = ['confirmQueuedOutbound', 'persistLocalChatwootMessageBinding', 'validCallbackProviderContext'].map(
+  const methods = [
+    'confirmQueuedOutbound',
+    'persistLocalChatwootMessageBinding',
+    'validCallbackProviderContext',
+    'sleepCancelable',
+  ].map(
     (name) => klass.members.find((member) => member.name?.getText(file) === name)!.getText(file),
   );
   const javascript = ts.transpileModule(`module.exports=class Consumer {${methods.join('\n')}}`, {
@@ -48,6 +53,10 @@ function originalConsumer() {
   const context = {
     // The provider bus is off in these sandboxes (utils/chatwoot-bus.ts).
     busInstanceEnabled: () => false,
+    LOCAL_BINDING_ROW_WAITS_MS: [0, 1, 1],
+    ChatwootService: { canonicalRoutingInstalled: false },
+    setTimeout,
+    clearTimeout,
     BUS_CAPTURE_CONVERSATION: -1,
     module: { exports: undefined as any },
     withCanonicalChatwootMessageBinding,

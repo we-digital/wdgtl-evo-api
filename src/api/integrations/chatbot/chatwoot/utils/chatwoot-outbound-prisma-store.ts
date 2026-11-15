@@ -518,9 +518,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     result: unknown,
     now: Date,
   ): Promise<boolean> {
-    // The lease stays with the transport worker until its local post-send work
-    // finishes; callback_pending is not lane blocking, so the next part or
-    // message of the same destination may already be claimed.
+    // The transport worker releases the lease right after this commit, so the
+    // Chatwoot callback runs while its local post-send work continues;
+    // callback_pending is not lane blocking, so the next part or message of
+    // the same destination may already be claimed.
     const updated = await this.repository.chatwootOutboundOperation.updateMany({
       where: { id, state: 'sending', leaseOwner: workerId, claimGeneration },
       data: {

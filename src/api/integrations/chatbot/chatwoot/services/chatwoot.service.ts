@@ -286,6 +286,7 @@ import {
   ChatwootBus,
   INBOUND_BUS_PUBLISHED,
 } from '../utils/chatwoot-bus';
+import { outboundMediaPrefetch, prefetchableChatwootUrl } from '../utils/chatwoot-outbound-media-prefetch';
 
 interface ChatwootMessage {
   messageId?: number;
@@ -350,6 +351,9 @@ export function chatwootIgnoresJid(ignoreJids: unknown, remoteJid: unknown): boo
   return jids.includes(remoteJid);
 }
 
+// Waits for the transport worker's local history row before the WAID binding (~6 s in all).
+const LOCAL_BINDING_ROW_WAITS_MS = [0, 100, 200, 400, 800, 1_600, 3_000];
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
@@ -378,6 +382,7 @@ export class ChatwootService {
   // Deliveries admitted from the bus in this process: delivery id -> receive time.
   // Process memory on purpose: after a restart every send re-reads Chatwoot.
   private readonly busFreshDeliveries = new Map<string, number>();
+  private static canonicalRoutingInstalled = false;
   private static bus: ChatwootBus | null = null;
   private static busOutcomesStarted = false;
   private static readonly busRosterSentAt = new Map<string, number>();
@@ -435,7 +440,9 @@ export class ChatwootService {
         observe: (event, metrics) =>
           event === 'chatwoot_outbound_preparation_failed'
             ? this.logger.warn(JSON.stringify({ event, ...metrics }))
-            : event === 'chatwoot_outbound_latency'
+            : event === 'chatwoot_outbound_latency' ||
+                event === 'chatwoot_outbound_transport_sent' ||
+                event === 'chatwoot_outbound_completed'
               ? this.logger.info(JSON.stringify({ event, ...metrics }))
               : this.logger.verbose(() => JSON.stringify({ event, ...metrics })),
       },
@@ -3053,6 +3060,8 @@ export class ChatwootService {
       // Only the content type is needed here; the send below downloads the file once.
       // HEAD first, then a one-byte range read for servers that refuse HEAD.
       const metadata = await resolveChatwootAttachmentMetadata(media, async () => {
+        const prefetched = typeof media === 'string' ? await outboundMediaPrefetch.peek(media) : null;
+        if (prefetched?.contentType) return prefetched.contentType;
         try {
           const head = await axios.head(media, { signal: options?.signal, timeout: 15_000 });
           if (head.headers['content-type']) return head.headers['content-type'];
@@ -3675,20 +3684,44 @@ export class ChatwootService {
     // Canonical local mapping requires the complete acknowledged multipart set.
     // Finish the idempotent callback sequence before taking any mapping lock;
     // a retry may start with a non-primary legacy source and a partial receipt.
+    // The callback now starts right after the relay, so the transport worker
+    // may still be writing the local history row: wait for it briefly instead
+    // of failing into a five-second callback retry.
     for (const callbackPart of callbackParts) {
-      const persisted = await this.persistLocalChatwootMessageBinding(
-        callbackPart.sourceId,
-        {
-          messageId: origin.messageId,
-          inboxId: origin.inboxId,
-          conversationId: origin.conversationId,
-          contactInboxSourceId: origin.contactInboxSourceId,
-        },
-        instance,
-        callbackParts,
-      );
+      let persisted = 0;
+      for (const waitMs of LOCAL_BINDING_ROW_WAITS_MS) {
+        if (waitMs > 0) await this.sleepCancelable(waitMs, signal);
+        persisted = await this.persistLocalChatwootMessageBinding(
+          callbackPart.sourceId,
+          {
+            messageId: origin.messageId,
+            inboxId: origin.inboxId,
+            conversationId: origin.conversationId,
+            contactInboxSourceId: origin.contactInboxSourceId,
+          },
+          instance,
+          callbackParts,
+        );
+        if (persisted === 1) break;
+      }
       if (persisted !== 1) throw new Error('LocalWhatsappMessageNotAcknowledged');
     }
+  }
+
+  private sleepCancelable(ms: number, signal: AbortSignal) {
+    return new Promise<void>((resolve, reject) => {
+      if (signal.aborted)
+        return reject(Object.assign(new Error('Outbound operation aborted'), { name: 'OutboundOperationAborted' }));
+      const timer = setTimeout(resolve, ms);
+      signal.addEventListener(
+        'abort',
+        () => {
+          clearTimeout(timer);
+          reject(Object.assign(new Error('Outbound operation aborted'), { name: 'OutboundOperationAborted' }));
+        },
+        { once: true },
+      );
+    });
   }
 
   private providerMatchesFrozenOutboundOrigin(provider: any, origin: ChatwootOutboundOrigin): boolean {
@@ -3918,6 +3951,11 @@ export class ChatwootService {
       }),
     );
     this.outboundQueue.wake();
+    // Start attachment downloads now; they overlap the claim and validation.
+    for (const part of parts) {
+      const url = (part.payload as any)?.attachmentUrl;
+      if (prefetchableChatwootUrl(url, provider.url)) outboundMediaPrefetch.start(url);
+    }
     return { accepted: true, operationCount: parts.length, recovered: enqueueResult.recovered };
   }
 
@@ -4740,16 +4778,21 @@ export class ChatwootService {
       );
     if (!this.configService.get<Chatwoot>('CHATWOOT').PROVIDER_CONVERSATION_BINDINGS)
       return persist(chatwootMessageIds);
-    const capability = await postgresClient
-      .getChatwootConnection()
-      .query(
-        "SELECT to_regclass('public.provider_conversation_routes') AS routes, to_regprocedure('public.provider_message_conversation_route(integer,integer,integer)') AS resolver",
-      );
-    // Deploy this EFO lock-order correction before the atomic CW migration.
-    // No route/deletion can exist while both migration objects are absent.
-    if (!capability.rows[0]?.routes && !capability.rows[0]?.resolver) return persist(chatwootMessageIds);
-    if (!capability.rows[0]?.routes || !capability.rows[0]?.resolver)
-      throw new Error('Incomplete canonical routing migration');
+    // The routing migration is permanent once applied: probe it until both
+    // objects exist, then skip the probe on every later callback.
+    if (!ChatwootService.canonicalRoutingInstalled) {
+      const capability = await postgresClient
+        .getChatwootConnection()
+        .query(
+          "SELECT to_regclass('public.provider_conversation_routes') AS routes, to_regprocedure('public.provider_message_conversation_route(integer,integer,integer)') AS resolver",
+        );
+      // Deploy this EFO lock-order correction before the atomic CW migration.
+      // No route/deletion can exist while both migration objects are absent.
+      if (!capability.rows[0]?.routes && !capability.rows[0]?.resolver) return persist(chatwootMessageIds);
+      if (!capability.rows[0]?.routes || !capability.rows[0]?.resolver)
+        throw new Error('Incomplete canonical routing migration');
+      ChatwootService.canonicalRoutingInstalled = true;
+    }
     const context = await this.clientCw(instance);
     const inbox = await this.getInbox(instance);
     if (!context || !inbox) throw new Error('Canonical mapping provider context unavailable');
