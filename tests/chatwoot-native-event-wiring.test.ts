@@ -99,16 +99,20 @@ test('actual group edit/reaction/reply methods scope colliding provider IDs to t
   assert.equal(await findNativeMessageByKey(service.prismaRepository, 'instance-1', 'SAME'), null);
 });
 
-test('read/delete wiring passes full event key; deletion only drops exact native peer/direction mappings', () => {
+test('delete wiring passes full event key and drops only exact native peer/direction mappings; reads match by id and direction', () => {
   const source = fs.readFileSync(require.resolve(servicePath), 'utf8');
   const ast = ts.createSourceFile('service.ts', source, ts.ScriptTarget.Latest, true);
   const klass = ast.statements.find(ts.isClassDeclaration)!;
   const event = klass.members.find((member) => member.name?.getText(ast) === 'processWhatsappEvent')!.getText(ast);
   const deleteStart = event.indexOf('if (event === Events.MESSAGES_DELETE)');
   const deleteBranch = event.slice(deleteStart, event.indexOf("if (event === 'messages.edit'", deleteStart));
-  const readBranch = event.slice(event.indexOf("if (event === 'messages.read')"));
-  for (const branch of [deleteBranch, readBranch])
-    assert.match(branch, /getMessageByKeyId\(instance, body\.key\.id, body\.key\)/);
+  assert.match(deleteBranch, /getMessageByKeyId\(instance, body\.key\.id, body\.key\)/);
+  // A READ receipt names the chat by LID while our stored message may carry the
+  // phone JID: it is matched by id and direction; an ambiguous id still matches nothing.
+  const readHelper = klass.members
+    .find((member) => member.name?.getText(ast) === 'forwardWhatsappContactRead')!
+    .getText(ast);
+  assert.match(readHelper, /getMessageByKeyId\(instance, key\.id, \{ fromMe: true \}\)/);
   assert.match(deleteBranch, /path: \['remoteJid'\], equals: \(message\.key as WAMessageKey\)\.remoteJid/);
   assert.match(deleteBranch, /path: \['fromMe'\], equals: \(message\.key as WAMessageKey\)\.fromMe/);
 });
