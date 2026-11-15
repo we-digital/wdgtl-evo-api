@@ -13,10 +13,14 @@ const message = (fromMe: boolean | undefined, pushName: string) => ({ key: { fro
 test('whole live provider path uses peer profile for outbound-first contact and heals only exact placeholder peer', async () => {
   const source = fs.readFileSync('src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts', 'utf8');
   const file = ts.createSourceFile('service.ts', source, ts.ScriptTarget.Latest, true);
+  // The live path and the body-free resolver it delegates to (shared with "Create group").
+  const methods = ['canonicalProviderConversation', 'resolveProviderPeerConversation', 'resolveProviderPeerConversationOnce'];
   const method = file.statements
     .find(ts.isClassDeclaration)!
-    .members.find((m) => m.name?.getText(file) === 'canonicalProviderConversation')!
-    .getText(file);
+    .members.filter((m) => methods.includes(m.name?.getText(file) ?? ''))
+    .map((m) => m.getText(file))
+    .join('\n');
+  assert.equal(method.split('private ').length - 1, methods.length);
   const deps = { ...names, ...history };
   const service: any = new Function(
     ...Object.keys(deps),

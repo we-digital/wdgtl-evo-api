@@ -66,6 +66,20 @@ import {
   isDeliverableChatwootOutgoing,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { recoverEncryptedHistoryEdit } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-encrypted-history-edit';
+import {
+  bareWhatsappPhoneJid,
+  GroupCreateCoordinator,
+  GroupCreateError,
+  groupCreateInstanceEnabled,
+  groupCreatePeerAllowlistActive,
+  GroupCreateStore,
+  groupCreateStoreKey,
+  LocalGroupCreateStore,
+  parseGroupCreateRequest,
+  parseGroupStatusRequest,
+  RedisGroupCreateStore,
+  runGroupCreate,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-create';
 import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import {
@@ -251,7 +265,8 @@ import {
   OutboundMessageProvenance,
 } from '@api/types/outbound-provenance';
 import { Events } from '@api/types/wa.types';
-import { Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
+import { redisClient } from '@cache/rediscache.client';
+import { CacheConf, Chatwoot, ConfigService, Database, HttpServer } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { BadRequestException } from '@exceptions';
 import ChatwootClient, {
@@ -336,6 +351,22 @@ const scheduledGroupSyncs = new Set<string>();
 const pendingGroupSyncs = new Map<string, string[] | undefined>();
 const groupSyncs = new Map<string, Promise<any>>();
 
+type ProviderPeerOptions = {
+  remoteLid?: string | null;
+  peerName?: string | null;
+  group?: { subject?: string };
+  rosterInboxId?: number;
+};
+type ProviderPeerConversation = {
+  id: number;
+  database_id: number;
+  contact_id: number;
+  inbox_id: number;
+  provider: 'whatsapp';
+  peer: string;
+  status?: string;
+};
+
 // Wrapper types whose durable admission validates the persisted byte encoding.
 const durableWrappedMediaTypes = ['associatedChildMessage'];
 
@@ -397,6 +428,12 @@ export class ChatwootService {
   // One queue per WhatsApp number per process: every channel builds its own ChatwootService,
   // and the API controller has another one; separate maps would pace one number twice.
   private static readonly avatarQueues = new Map<string, AvatarSyncQueue>();
+  // Group peer resolutions in flight, shared by every ChatwootService of this process.
+  private static readonly providerGroupResolutions = new Map<string, Promise<ProviderPeerConversation>>();
+  // "Create group": one coordinator and one fallback store per process (shared locks).
+  private static groupCreateCoordinator: GroupCreateCoordinator | null = null;
+  private static readonly localGroupCreateStore = new LocalGroupCreateStore();
+  private static readonly providerSelfReports = new Map<string, { jid: string; at: number }>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -647,7 +684,7 @@ export class ChatwootService {
 
   private async privilegedChatwootRequest(
     provider: ChatwootModel,
-    params: { method: 'POST' | 'DELETE'; path: string; data: Record<string, unknown> },
+    params: { method: 'POST' | 'PATCH' | 'DELETE'; path: string; data: Record<string, unknown> },
   ): Promise<void> {
     const config = this.configService.get<Chatwoot>('CHATWOOT');
     const url = requireTrustedChatwootUrl(provider.url, config.TRUSTED_BASE_URL, params.path);
@@ -743,10 +780,75 @@ export class ChatwootService {
     rosterGroup?: { subject?: string },
   ): Promise<number> {
     const remoteLid = isLidJid(body.key.remoteJid) ? toCanonicalHistoryJid(body.key.remoteJid) : null;
+    const resolved = await this.resolveProviderPeerConversation(instance, provider, inboxId, peer, {
+      remoteLid,
+      peerName: incomingWhatsappName(body),
+      group: rosterGroup,
+      rosterInboxId: rosterGroup ? inboxId : undefined,
+    });
+    if (isGroupJid(peer) && !rosterGroup) {
+      await this.ensureProviderGroupParticipant(instance, inboxId, body);
+      await this.scheduleProviderGroupRoster(instance, provider, inboxId, peer, resolved.id);
+    }
+    return resolved.id;
+  }
+
+  // One participant roster sync per group conversation every 30 minutes.
+  private async scheduleProviderGroupRoster(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    peer: string,
+    conversationId: number,
+    force = false,
+  ) {
+    const rosterKey = `${instance.instanceName}:providerParticipants-${inboxId}-${peer}`;
+    if (!force && (await this.cache.get(rosterKey)) === conversationId) return;
+    await this.cache.set(rosterKey, conversationId, 1800);
+    void this.syncWhatsappGroupParticipants(instance, provider, conversationId, peer);
+  }
+
+  /**
+   * The canonical Chatwoot contact and conversation of one WhatsApp peer,
+   * without an inbound message: inbound ingress and "Create group" share it.
+   *
+   * Group peers are single-flight per process across every ChatwootService
+   * (each channel builds its own): a create from Chatwoot and the first message
+   * in the new group resolve once. Across processes Chatwoot's unique contact
+   * identifier (422 → existing) and the provider binding (create-or-return)
+   * converge on one contact and one conversation.
+   */
+  private resolveProviderPeerConversation(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    peer: string,
+    options: ProviderPeerOptions = {},
+  ): Promise<ProviderPeerConversation> {
+    if (!isGroupJid(peer)) return this.resolveProviderPeerConversationOnce(instance, provider, inboxId, peer, options);
+    const key = `${provider.id}:${inboxId}:${peer}:${options.rosterInboxId ? 'roster' : 'live'}`;
+    const running = ChatwootService.providerGroupResolutions.get(key);
+    if (running) return running;
+    const task = this.resolveProviderPeerConversationOnce(instance, provider, inboxId, peer, options).finally(() => {
+      if (ChatwootService.providerGroupResolutions.get(key) === task)
+        ChatwootService.providerGroupResolutions.delete(key);
+    });
+    ChatwootService.providerGroupResolutions.set(key, task);
+    return task;
+  }
+
+  private async resolveProviderPeerConversationOnce(
+    instance: InstanceDto,
+    provider: ChatwootModel,
+    inboxId: number,
+    peer: string,
+    options: ProviderPeerOptions,
+  ): Promise<ProviderPeerConversation> {
+    const { remoteLid = null, group: knownGroup, rosterInboxId } = options;
     let contact: any = await this.findProviderContact(instance, peer);
     const isGroup = isGroupJid(peer);
     const user = peer.split('@')[0];
-    let peerName = incomingWhatsappName(body);
+    let peerName = options.peerName ?? null;
     if (!isGroup && !peerName && (!contact || replaceableWhatsappName(contact.name, user))) {
       const stored = await this.prismaRepository.contact.findFirst({
         where: { instanceId: provider.instanceId, remoteJid: peer },
@@ -756,7 +858,7 @@ export class ChatwootService {
     }
     if (!contact) {
       const group = isGroup
-        ? rosterGroup || (await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer))
+        ? knownGroup || (await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(peer))
         : null;
       contact = await this.createContact(
         instance,
@@ -766,7 +868,7 @@ export class ChatwootService {
         isGroup ? `${group.subject} (GROUP)` : peerName || user,
         undefined,
         peer,
-        rosterGroup ? inboxId : undefined,
+        rosterInboxId,
       );
     }
     if (
@@ -792,7 +894,7 @@ export class ChatwootService {
         aliases: remoteLid && remoteLid !== peer ? [remoteLid] : [],
         ...(provider.conversationPending ? { status: 'pending' } : {}),
       },
-      rosterGroup ? inboxId : undefined,
+      rosterInboxId,
     );
     if (
       !Number.isSafeInteger(resolved.id) ||
@@ -806,7 +908,7 @@ export class ChatwootService {
     ) {
       throw new Error('Chatwoot canonical provider conversation result is ambiguous');
     }
-    if (!rosterGroup && provider.conversationPending && resolved.status !== 'open' && resolved.status !== 'pending') {
+    if (!rosterInboxId && provider.conversationPending && resolved.status !== 'open' && resolved.status !== 'pending') {
       if (!['resolved', 'snoozed'].includes(resolved.status))
         throw new Error('Provider conversation status is unavailable');
       const context = await this.clientCw(instance);
@@ -816,15 +918,7 @@ export class ChatwootService {
         data: { status: 'pending' },
       });
     }
-    if (isGroup && !rosterGroup) {
-      await this.ensureProviderGroupParticipant(instance, inboxId, body);
-      const rosterKey = `${instance.instanceName}:providerParticipants-${inboxId}-${peer}`;
-      if ((await this.cache.get(rosterKey)) !== resolved.id) {
-        await this.cache.set(rosterKey, resolved.id, 1800);
-        void this.syncWhatsappGroupParticipants(instance, provider, resolved.id, peer);
-      }
-    }
-    return resolved.id;
+    return resolved as ProviderPeerConversation;
   }
 
   private async acquireGroupSyncSlot() {
@@ -4141,6 +4235,9 @@ export class ChatwootService {
     // Answered before any outbound work: in-memory enqueue only.
     if (body?.event === 'contact_avatar_request')
       return this.receiveAvatarRequest(instance, body, authenticatedAdmission);
+    // Synchronous provider actions for "Create group" (gated by CHATWOOT_GROUP_CREATE_INSTANCES).
+    if (body?.event === 'group_create_request') return this.receiveGroupCreate(instance, body, authenticatedAdmission);
+    if (body?.event === 'group_create_status') return this.receiveGroupStatus(instance, body, authenticatedAdmission);
     let outboundEnqueueAttempted = false;
     try {
       const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
@@ -7627,6 +7724,7 @@ export class ChatwootService {
 
       if (event === 'connection.update' && body.status === 'open') {
         this.scheduleParticipatingGroups(instance);
+        void this.reportProviderSelf(instance);
         const waInstance = this.waMonitor.waInstances[instance.instanceName];
         if (!waInstance) return;
 
@@ -8038,6 +8136,147 @@ export class ChatwootService {
       this.logger.info(JSON.stringify({ event: 'chatwoot_avatar_backfill_started', ...summary }));
     }
     return { ...summary, progress: queue.report() };
+  }
+
+  private requireAdmission(admission?: ChatwootOutboundWebhookHeaders) {
+    if (!admission) {
+      throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
+        name: 'ChatwootWebhookAuthenticationError',
+        status: 401,
+      });
+    }
+  }
+
+  private groupCreateStore(): GroupCreateStore {
+    const redis = this.configService.get<CacheConf>('CACHE')?.REDIS;
+    if (redis?.ENABLED && redis.URI)
+      return new RedisGroupCreateStore(
+        () => redisClient.getConnection() as any,
+        redis.PREFIX_KEY ? `${redis.PREFIX_KEY}:` : '',
+      );
+    return ChatwootService.localGroupCreateStore;
+  }
+
+  private groupCreates(): GroupCreateCoordinator {
+    ChatwootService.groupCreateCoordinator ??= new GroupCreateCoordinator(() => this.groupCreateStore());
+    return ChatwootService.groupCreateCoordinator;
+  }
+
+  private groupCreateKey(instance: InstanceDto, admission: ChatwootOutboundWebhookHeaders, requestId: string) {
+    return groupCreateStoreKey(admission.routeInstanceId || instance.instanceId || instance.instanceName, requestId);
+  }
+
+  /**
+   * Chatwoot staff create a WhatsApp group (contract v1). The reply carries
+   * the group, its Chatwoot conversation and one outcome per invitee; a
+   * GroupCreateError means nothing was created (or, for in_progress, that the
+   * outcome is not known yet).
+   */
+  private async receiveGroupCreate(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
+    this.requireAdmission(admission);
+    if (!groupCreateInstanceEnabled(instance)) throw new GroupCreateError('group_create_disabled');
+    if (groupCreatePeerAllowlistActive()) throw new GroupCreateError('allowlist_deployment');
+    const request = parseGroupCreateRequest(body);
+    const key = this.groupCreateKey(instance, admission, request.requestId);
+    const started = Date.now();
+    const reply = await this.groupCreates().create(key, async () => {
+      const context = admission.routeInstanceId
+        ? await this.authenticatedClientCw(instance, admission)
+        : await this.clientCw(instance);
+      if (!context?.provider?.enabled) throw new GroupCreateError('group_create_disabled');
+      const { provider } = context;
+      const inbox = await this.getInbox(instance);
+      if (!inbox || Number(inbox.id) !== request.inboxId || Number(provider.accountId) !== request.accountId)
+        throw new GroupCreateError('invalid_request');
+      const inboxId = Number(inbox.id);
+      if (!(await this.providerConversationsEnabled(provider, inboxId).catch(() => false)))
+        throw new GroupCreateError('group_create_disabled');
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
+        throw new GroupCreateError('not_connected');
+      if (waInstance.localSettings?.groupsIgnore) throw new GroupCreateError('group_create_disabled');
+      return runGroupCreate(request, {
+        socket: waInstance.client,
+        resolvePhoneJidForLid: (lid) => waInstance.resolvePhoneJidForLid?.(lid) ?? Promise.resolve(null),
+        ensureConversation: async (groupJid, subject) => {
+          const resolved = await this.resolveProviderPeerConversation(instance, provider, inboxId, groupJid, {
+            group: { subject },
+          });
+          return { id: resolved.id, database_id: resolved.database_id };
+        },
+        afterCreate: (groupJid, conversationId) => {
+          if (conversationId)
+            void this.scheduleProviderGroupRoster(instance, provider, inboxId, groupJid, conversationId, true).catch(
+              () => undefined,
+            );
+        },
+        sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+        log: (event, fields) => this.logger.info(JSON.stringify({ event, instance: instance.instanceName, ...fields })),
+        allowEmptyGroup: process.env.CHATWOOT_GROUP_CREATE_ALLOW_EMPTY === 'true',
+      });
+    });
+    this.logger.info(
+      JSON.stringify({
+        event: 'chatwoot_group_create_answered',
+        instance: instance.instanceName,
+        requestId: request.requestId,
+        groupJid: reply.group_peer,
+        conversationId: reply.conversation?.id ?? null,
+        added: reply.invitees.filter((invitee) => invitee.outcome === 'added').length,
+        skipped: reply.invitees.filter((invitee) => invitee.outcome === 'skipped').length,
+        picture: reply.picture,
+        ms: Date.now() - started,
+      }),
+    );
+    return reply;
+  }
+
+  /** The stored outcome of one create; never creates anything. */
+  private async receiveGroupStatus(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
+    this.requireAdmission(admission);
+    const { requestId } = parseGroupStatusRequest(body);
+    return this.groupCreates().status(this.groupCreateKey(instance, admission, requestId));
+  }
+
+  /**
+   * The inbox's own WhatsApp number for Chatwoot (colleague invitees), once
+   * per connect. Chatwoot without the endpoint answers 404: ignored. Gated by
+   * CHATWOOT_PROVIDER_SELF_REPORT=true.
+   */
+  private async reportProviderSelf(instance: InstanceDto) {
+    if (process.env.CHATWOOT_PROVIDER_SELF_REPORT !== 'true') return;
+    try {
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      const jid = bareWhatsappPhoneJid(waInstance?.client?.user?.id ?? waInstance?.client?.authState?.creds?.me?.id);
+      if (!jid) return;
+      const previous = ChatwootService.providerSelfReports.get(instance.instanceName);
+      // A flapping socket reconnects many times a minute; the identity does not change.
+      if (previous?.jid === jid && Date.now() - previous.at < 10 * 60_000) return;
+      ChatwootService.providerSelfReports.set(instance.instanceName, { jid, at: Date.now() });
+      const context = await this.clientCw(instance);
+      const inbox = context?.provider?.enabled ? await this.getInbox(instance) : null;
+      if (!inbox) return;
+      try {
+        await this.privilegedChatwootRequest(context.provider, {
+          method: 'PATCH',
+          path: `/api/v1/accounts/${context.provider.accountId}/inboxes/${inbox.id}/provider_self`,
+          data: { whatsapp_jid: jid },
+        });
+        this.logger.info(JSON.stringify({ event: 'chatwoot_provider_self_reported', instance: instance.instanceName }));
+      } catch (error) {
+        const status = (error as any)?.response?.status;
+        if (status !== 404) ChatwootService.providerSelfReports.delete(instance.instanceName);
+        this.logger[status === 404 ? 'info' : 'warn'](
+          JSON.stringify({
+            event: status === 404 ? 'chatwoot_provider_self_unsupported' : 'chatwoot_provider_self_failed',
+            instance: instance.instanceName,
+            status: status ?? null,
+          }),
+        );
+      }
+    } catch (error) {
+      this.logger.warn(`Provider self report failed for ${instance.instanceName}: ${(error as Error)?.message}`);
+    }
   }
 
   /**
