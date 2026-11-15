@@ -45,6 +45,8 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import {
   buildContactReadRequest,
+  CoalescedContactRead,
+  ContactReadCoalescer,
   ContactReadTarget,
   contactReadTarget,
   isRetryableContactReadStatus,
@@ -394,6 +396,10 @@ export function chatwootIgnoresJid(ignoreJids: unknown, remoteJid: unknown): boo
 
 // Waits for the transport worker's local history row before the WAID binding (~6 s in all).
 const LOCAL_BINDING_ROW_WAITS_MS = [0, 100, 200, 400, 800, 1_600, 3_000];
+
+type ContactReadContext = { service: ChatwootService; instance: InstanceDto };
+
+const contactReadScope = (instance: InstanceDto) => String(instance.instanceId || instance.instanceName);
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
@@ -1279,42 +1285,20 @@ export class ChatwootService {
    * exact remoteJid match drops the receipt. Our own message ids are unique.
    */
   private async forwardWhatsappContactRead(instance: InstanceDto, key: WAMessageKey, attempt: number): Promise<void> {
-    const retry = (reason: string, status?: number) => {
-      const delay = nextContactReadDelay(attempt);
-      if (delay === null) {
-        this.logger.warn(
-          JSON.stringify({
-            event: 'chatwoot_contact_read_dropped',
-            instanceId: instance.instanceId,
-            reason,
-            status: status ?? null,
-            attempts: attempt + 1,
-          }),
-        );
-        return;
-      }
-      const timer = setTimeout(() => {
-        this.forwardWhatsappContactRead(instance, key, attempt + 1).catch((error) =>
-          this.logger.warn(
-            JSON.stringify({
-              event: 'chatwoot_contact_read_failed',
-              instanceId: instance.instanceId,
-              errorClass: error?.name || 'Error',
-            }),
-          ),
-        );
-      }, delay);
-      timer.unref?.();
-    };
-
     let message: MessageModel | null;
     try {
       message = await this.getMessageByKeyId(instance, key.id, { fromMe: true });
     } catch {
-      return retry('lookup_failed');
+      return this.retryContactRead(instance, 'lookup_failed', attempt, undefined, () =>
+        this.forwardWhatsappContactRead(instance, key, attempt + 1),
+      );
     }
     const target = contactReadTarget(message);
-    if (!target) return retry('unbound');
+    if (!target) {
+      return this.retryContactRead(instance, 'unbound', attempt, undefined, () =>
+        this.forwardWhatsappContactRead(instance, key, attempt + 1),
+      );
+    }
 
     const token = this.configService.get<Chatwoot>('CHATWOOT').READ_STATE_INGRESS_TOKEN;
     if (!token) {
@@ -1322,11 +1306,41 @@ export class ChatwootService {
       return;
     }
 
+    ChatwootService.contactReads().add(contactReadScope(instance), target, attempt, { service: this, instance });
+  }
+
+  // Shared by every ChatwootService of the process (one per channel), so a burst
+  // for one conversation is sent once whichever service received it.
+  private static contactReadCoalescer: ContactReadCoalescer<ContactReadContext> | null = null;
+
+  private static contactReads(): ContactReadCoalescer<ContactReadContext> {
+    ChatwootService.contactReadCoalescer ??= new ContactReadCoalescer<ContactReadContext>(
+      (read) => read.context.service.sendCoalescedContactRead(read),
+      undefined,
+      undefined,
+      (error: any) =>
+        new Logger('ChatwootService').warn(
+          JSON.stringify({ event: 'chatwoot_contact_read_failed', errorClass: error?.name || 'Error' }),
+        ),
+    );
+    return ChatwootService.contactReadCoalescer;
+  }
+
+  private async sendCoalescedContactRead(read: CoalescedContactRead<ContactReadContext>): Promise<void> {
+    const { instance } = read.context;
+    const token = this.configService.get<Chatwoot>('CHATWOOT').READ_STATE_INGRESS_TOKEN;
+    if (!token) return;
+
     try {
-      await this.contactRead(instance, target, token);
+      await this.contactRead(instance, read.target, token);
     } catch (error) {
       const status = error?.response?.status;
-      if (isRetryableContactReadStatus(status)) return retry('chatwoot_unavailable', status);
+      if (isRetryableContactReadStatus(status)) {
+        // Back into the coalescer: a newer receipt that arrived meanwhile rides along.
+        return this.retryContactRead(instance, 'chatwoot_unavailable', read.attempt, status, async () =>
+          ChatwootService.contactReads().add(contactReadScope(instance), read.target, read.attempt + 1, read.context),
+        );
+      }
       this.logger.warn(
         JSON.stringify({ event: 'chatwoot_contact_read_rejected', instanceId: instance.instanceId, status }),
       );
@@ -1336,9 +1350,44 @@ export class ChatwootService {
       JSON.stringify({
         event: 'chatwoot_contact_read_forwarded',
         instanceId: instance.instanceId,
-        attempts: attempt + 1,
+        attempts: read.attempt + 1,
+        receipts: read.receipts,
       }),
     );
+  }
+
+  private retryContactRead(
+    instance: InstanceDto,
+    reason: string,
+    attempt: number,
+    status: number | undefined,
+    next: () => Promise<void>,
+  ): void {
+    const delay = nextContactReadDelay(attempt);
+    if (delay === null) {
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_contact_read_dropped',
+          instanceId: instance.instanceId,
+          reason,
+          status: status ?? null,
+          attempts: attempt + 1,
+        }),
+      );
+      return;
+    }
+    const timer = setTimeout(() => {
+      next().catch((error) =>
+        this.logger.warn(
+          JSON.stringify({
+            event: 'chatwoot_contact_read_failed',
+            instanceId: instance.instanceId,
+            errorClass: error?.name || 'Error',
+          }),
+        ),
+      );
+    }, delay);
+    timer.unref?.();
   }
 
   private async contactRead(instance: InstanceDto, target: ContactReadTarget, token: string): Promise<void> {
