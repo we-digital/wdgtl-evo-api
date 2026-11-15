@@ -3,6 +3,7 @@ import { instanceExistsGuard, instanceLoggedGuard } from '@api/guards/instance.g
 import Telemetry from '@api/guards/telemetry.guard';
 import { ChannelRouter } from '@api/integrations/channel/channel.router';
 import { ChatbotRouter } from '@api/integrations/chatbot/chatbot.router';
+import { groupResolveStats } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-resolve-stats';
 import { EventRouter } from '@api/integrations/event/event.router';
 import { StorageRouter } from '@api/integrations/storage/storage.router';
 import { waMonitor } from '@api/server.module';
@@ -163,6 +164,7 @@ if (metricsConfig.ENABLED) {
     );
     lines.push('# TYPE evolution_cache_device_keys gauge', `evolution_cache_device_keys ${cacheTotals.devices}`);
     lines.push('# TYPE evolution_cache_retry_keys gauge', `evolution_cache_retry_keys ${cacheTotals.retries}`);
+    lines.push(...groupResolveStats.lines());
     res.send(lines.join('\n') + '\n');
   });
 }

@@ -81,6 +81,7 @@ import {
   runGroupCreate,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-create';
 import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
+import { groupResolveStats } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-resolve-stats';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import {
   ignoresHistoryPeer,
@@ -351,6 +352,8 @@ const scheduledGroupSyncs = new Set<string>();
 const pendingGroupSyncs = new Map<string, string[] | undefined>();
 const groupSyncs = new Map<string, Promise<any>>();
 
+// A group resolution slower than this is logged on its own line.
+const GROUP_RESOLVE_SLOW_MS = 2_000;
 type ProviderPeerOptions = {
   remoteLid?: string | null;
   peerName?: string | null;
@@ -827,12 +830,44 @@ export class ChatwootService {
   ): Promise<ProviderPeerConversation> {
     if (!isGroupJid(peer)) return this.resolveProviderPeerConversationOnce(instance, provider, inboxId, peer, options);
     const key = `${provider.id}:${inboxId}:${peer}:${options.rosterInboxId ? 'roster' : 'live'}`;
+    const fields = { instance: instance.instanceName, inboxId, peer, roster: Boolean(options.rosterInboxId) };
     const running = ChatwootService.providerGroupResolutions.get(key);
-    if (running) return running;
-    const task = this.resolveProviderPeerConversationOnce(instance, provider, inboxId, peer, options).finally(() => {
-      if (ChatwootService.providerGroupResolutions.get(key) === task)
-        ChatwootService.providerGroupResolutions.delete(key);
-    });
+    if (running) {
+      groupResolveStats.join();
+      this.logger.info(JSON.stringify({ event: 'chatwoot_group_peer_resolve_joined', ...fields }));
+      return running;
+    }
+    const finish = groupResolveStats.begin();
+    const task = this.resolveProviderPeerConversationOnce(instance, provider, inboxId, peer, options)
+      .then(
+        (resolved) => {
+          const ms = finish(true);
+          if (ms >= GROUP_RESOLVE_SLOW_MS)
+            this.logger.info(
+              JSON.stringify({ event: 'chatwoot_group_peer_resolve_slow', ...fields, conversationId: resolved.id, ms }),
+            );
+          return resolved;
+        },
+        (error) => {
+          const ms = finish(false);
+          this.logger.warn(
+            JSON.stringify({
+              event: 'chatwoot_group_peer_resolve_failed',
+              ...fields,
+              ms,
+              errorClass: (error as Error)?.name || 'Error',
+              detail: String((error as Error)?.message || '').slice(0, 200),
+            }),
+          );
+          throw error;
+        },
+      )
+      .finally(() => {
+        if (ChatwootService.providerGroupResolutions.get(key) === task)
+          ChatwootService.providerGroupResolutions.delete(key);
+        const summary = groupResolveStats.takeSummary();
+        if (summary) this.logger.info(JSON.stringify({ event: 'chatwoot_group_peer_resolve_summary', ...summary }));
+      });
     ChatwootService.providerGroupResolutions.set(key, task);
     return task;
   }

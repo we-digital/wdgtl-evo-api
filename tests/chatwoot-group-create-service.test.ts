@@ -5,6 +5,7 @@ import test from 'node:test';
 
 import '@api/server.module';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import { groupResolveStats } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-resolve-stats';
 
 const GROUP = '120363000000888@g.us';
 const pn = (n: number) => `6281000000${String(n).padStart(3, '0')}@s.whatsapp.net`;
@@ -302,8 +303,14 @@ test('race: the first message in the new group and the create resolve one contac
       });
       return created;
     };
+    const before = groupResolveStats.snapshot();
     const reply = await creator.service.receiveWebhook(instance, createBody(), admission);
     const inboundConversation = await inbound;
+    const after = groupResolveStats.snapshot();
+    // The ingress caller joined the create's resolution: one run, one join, no error.
+    assert.equal(after.resolves - before.resolves, 1);
+    assert.equal(after.joins - before.joins, 1);
+    assert.equal(after.errors - before.errors, 0);
     assert.equal(inboundConversation, reply.conversation.id);
     assert.equal(chatwoot.calls.contactCreates, 1);
     assert.equal(chatwoot.contacts.size, 1);

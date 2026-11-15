@@ -610,6 +610,18 @@ test('idempotency: a store that is down refuses before anything runs', async () 
   );
 });
 
+test('a store read error on status is in_progress, never unknown or an error', async () => {
+  const coordinator = new GroupCreateCoordinator(() => ({
+    claim: async () => true,
+    get: async () => {
+      throw new Error('redis blip');
+    },
+    put: async () => undefined,
+    release: async () => undefined,
+  }));
+  assert.deepEqual(await coordinator.status('k'), { status: 'in_progress' });
+});
+
 test('the local store forgets after 24 h', async () => {
   const clock = { now: 0 };
   const store = new LocalGroupCreateStore(24 * 3600_000, () => clock.now);

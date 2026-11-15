@@ -627,7 +627,13 @@ export class GroupCreateCoordinator {
     complete?: (pending: GroupCreatePending) => Promise<GroupCreateOkReply['conversation']>,
   ): Promise<GroupCreateFinalReply | GroupCreateInProgressReply | { status: 'unknown' }> {
     if (this.running.has(key)) return { status: 'in_progress' };
-    const stored = await this.store().get(key);
+    let stored: GroupCreateStored | null;
+    try {
+      stored = await this.store().get(key);
+    } catch {
+      // A store blip says nothing about the create: uncertain, never a definite answer.
+      return { status: 'in_progress' };
+    }
     if (!stored) return { status: 'unknown' };
     if (stored.status !== 'in_progress') return stored;
     if (!('pending' in stored) || !stored.pending || !complete) return { status: 'in_progress' };
