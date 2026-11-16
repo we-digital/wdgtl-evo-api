@@ -2796,7 +2796,10 @@ export class ChatwootService {
         }
       }
     }
-    const data = new FormData();
+    // form-data buffers a stream source up to maxDataSize (2 MB by default) and then errors with
+    // "DelayedStream#maxDataSize of 2097152 bytes exceeded": every inbound photo, video or PDF over 2 MB failed and
+    // was retried forever. Chatwoot enforces its own attachment limit, so no cap here.
+    const data = new FormData({ maxDataSize: Infinity });
 
     if (content) {
       data.append('content', content);
@@ -3317,7 +3320,10 @@ export class ChatwootService {
       return;
     }
 
-    const data = new FormData();
+    // form-data buffers a stream source up to maxDataSize (2 MB by default) and then errors with
+    // "DelayedStream#maxDataSize of 2097152 bytes exceeded": every inbound photo, video or PDF over 2 MB failed and
+    // was retried forever. Chatwoot enforces its own attachment limit, so no cap here.
+    const data = new FormData({ maxDataSize: Infinity });
 
     if (content) {
       data.append('content', content);
