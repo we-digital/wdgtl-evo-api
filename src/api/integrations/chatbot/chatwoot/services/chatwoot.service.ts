@@ -44,6 +44,12 @@ import {
   stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import {
+  checkContactReachability,
+  CONTACT_REACHABILITY_EVENT,
+  ContactReachabilityReply,
+  parseReachabilityPhones,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-reachability';
+import {
   buildContactReadRequest,
   CoalescedContactRead,
   ContactReadCoalescer,
@@ -4421,6 +4427,8 @@ export class ChatwootService {
     // Synchronous provider actions for "Create group" (gated by CHATWOOT_GROUP_CREATE_INSTANCES).
     if (body?.event === 'group_create_request') return this.receiveGroupCreate(instance, body, authenticatedAdmission);
     if (body?.event === 'group_create_status') return this.receiveGroupStatus(instance, body, authenticatedAdmission);
+    if (body?.event === CONTACT_REACHABILITY_EVENT)
+      return this.receiveContactReachability(instance, body, authenticatedAdmission);
     let outboundEnqueueAttempted = false;
     try {
       const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
@@ -8541,6 +8549,37 @@ export class ChatwootService {
    * dialog someone opened (front of the queue), 'list' for a loaded conversation
    * list. Signed like every Chatwoot webhook; no Chatwoot or WhatsApp call here.
    */
+  /**
+   * Chatwoot asks whether numbers from a shared contact card have WhatsApp
+   * (contact_reachability_request v1): one batched whatsappNumber check.
+   */
+  private async receiveContactReachability(
+    instance: InstanceDto,
+    body: any,
+    admission?: ChatwootOutboundWebhookHeaders,
+  ): Promise<ContactReachabilityReply> {
+    this.requireAdmission(admission);
+    if (!groupCreateInstanceEnabled(instance, process.env.CHATWOOT_CONTACT_DISCOVERY_INSTANCES || ''))
+      return { status: 'error', code: 'discovery_disabled' };
+    const phones = parseReachabilityPhones(body);
+    if (!phones.length) return { status: 'error', code: 'invalid_request' };
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
+      return { status: 'error', code: 'not_connected' };
+    const started = Date.now();
+    const reply = await checkContactReachability(phones, (numbers) => waInstance.whatsappNumber({ numbers }));
+    this.logger.info(
+      JSON.stringify({
+        event: 'chatwoot_contact_reachability_answered',
+        instance: instance.instanceName,
+        phones: phones.length,
+        status: reply.status,
+        ms: Date.now() - started,
+      }),
+    );
+    return reply;
+  }
+
   private receiveAvatarRequest(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
     if (!admission) {
       throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
