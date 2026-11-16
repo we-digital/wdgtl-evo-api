@@ -7,7 +7,6 @@ import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/
 import {
   buildChatwootOutboundParts,
   chatwootAttachmentAlbumKind,
-  chatwootOutboundCallbackPartCount,
   ChatwootOutboundOrigin,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
@@ -53,35 +52,59 @@ const buildParts = (attachments: any[], albums = true, formattedText: string | n
     albums,
   });
 
-test('3 images + 1 pdf: album container first, its photos, then the document; one caption', () => {
-  const parts = buildParts([pdf(9), image(12), image(10), image(11)]);
+test('permit send [pdf, photo, photo]: PDF first with the caption, then the photos as one album', () => {
+  const parts = buildParts([image(12), pdf(10), image(11)]);
+  const parent = parts[1].plannedWhatsappMessageId;
 
-  assert.equal(parts.length, 5);
-  assert.ok(parts.every((part) => part.partCount === 5 && part.messageSetHash === parts[0].messageSetHash));
-  assert.deepEqual(parts[0].payload.album, { expectedImageCount: 3, expectedVideoCount: 0 });
-  assert.equal(parts[0].payload.attachmentUrl, undefined);
-  assert.equal(parts[0].payload.text, null);
-  assert.equal(parts[0].payload.quotedChatwootMessageId, undefined);
+  assert.equal(parts.length, 4);
+  assert.ok(parts.every((part) => part.partCount === 4 && part.messageSetHash === parts[0].messageSetHash));
   assert.deepEqual(
     parts.map((part) => part.payload.attachmentId),
-    [undefined, 10, 11, 12, 9],
+    [10, undefined, 11, 12],
   );
+  assert.deepEqual(parts[1].payload.album, { expectedImageCount: 2, expectedVideoCount: 0 });
+  assert.equal(parts[1].payload.quotedChatwootMessageId, undefined);
+  assert.deepEqual(
+    parts.map((part) => part.payload.text),
+    ['caption', null, null, null],
+  );
+  assert.deepEqual(
+    parts.map((part) => part.payload.albumParentWhatsappMessageId),
+    [undefined, undefined, parent, parent],
+  );
+  assert.ok([parts[0], parts[2], parts[3]].every((part) => part.payload.quotedChatwootMessageId === 99));
+});
+
+test('3 images + 1 pdf in upload order: album where the first photo stands, caption on that photo', () => {
+  const parts = buildParts([image(10), pdf(11), image(12), image(13)]);
+  const parent = parts[0].plannedWhatsappMessageId;
+
+  assert.deepEqual(
+    parts.map((part) => part.payload.attachmentId),
+    [undefined, 10, 12, 13, 11],
+  );
+  assert.deepEqual(parts[0].payload.album, { expectedImageCount: 3, expectedVideoCount: 0 });
   assert.deepEqual(
     parts.map((part) => part.payload.text),
     [null, 'caption', null, null, null],
   );
   assert.deepEqual(
     parts.map((part) => part.payload.albumParentWhatsappMessageId),
-    [
-      undefined,
-      parts[0].plannedWhatsappMessageId,
-      parts[0].plannedWhatsappMessageId,
-      parts[0].plannedWhatsappMessageId,
-      undefined,
-    ],
+    [undefined, parent, parent, parent, undefined],
   );
-  assert.ok(parts.slice(1).every((part) => part.payload.quotedChatwootMessageId === 99));
   assert.equal(new Set(parts.map((part) => part.plannedWhatsappMessageId)).size, 5);
+});
+
+test('mixed [pdf, photo, pdf, photo] keeps upload order around the album', () => {
+  const parts = buildParts([pdf(1), image(2), pdf(3), image(4)]);
+  assert.deepEqual(
+    parts.map((part) => (part.payload.album ? 'album' : part.payload.attachmentId)),
+    [1, 'album', 2, 4, 3],
+  );
+  assert.deepEqual(
+    parts.map((part) => part.payload.text),
+    ['caption', null, null, null, null],
+  );
 });
 
 test('1 image + 2 pdf: no album, unchanged parts and frozen identity', () => {
@@ -112,11 +135,11 @@ test('album identity is stable across attachment order and replay', () => {
   assert.deepEqual(first, replay);
   assert.deepEqual(
     first.map((part) => part.payload.attachmentId),
-    [undefined, 10, 11, 9],
+    [9, undefined, 10, 11],
   );
   const changed = buildParts([image(10), pdf(9), image(12)]);
   assert.notEqual(changed[0].messageSetHash, first[0].messageSetHash);
-  assert.notEqual(changed[0].plannedWhatsappMessageId, first[0].plannedWhatsappMessageId);
+  assert.notEqual(changed[1].plannedWhatsappMessageId, first[1].plannedWhatsappMessageId);
 });
 
 test('channels without albums keep one part per attachment', () => {
@@ -180,8 +203,20 @@ test('the album container is never reported to Chatwoot as a delivery part', asy
       ['WAID:3', 2, 3],
     ],
   );
-  assert.equal(chatwootOutboundCallbackPartCount(rows[0] as StoredChatwootOutboundOperation), 3);
-  assert.equal(chatwootOutboundCallbackPartCount(rows[1] as StoredChatwootOutboundOperation), 4);
+  assert.equal(status.expectedCallbackParts, 3);
+  // A document leader (permit order) still expects every media part, not the container.
+  const permit = buildParts([pdf(10), image(11), image(12)]).map((part) =>
+    stored(part, 'callback_pending', `WAID:${part.partIndex}`),
+  );
+  const permitStatus = await new ChatwootOutboundPrismaStore({
+    chatwootOutboundOperation: { findMany: async () => permit },
+  } as any).messageStatus(permit[0] as StoredChatwootOutboundOperation);
+  assert.equal(permitStatus.leader, true);
+  assert.equal(permitStatus.expectedCallbackParts, 3);
+  assert.deepEqual(
+    permitStatus.callbackParts.map((part) => part.sourceId),
+    ['WAID:0', 'WAID:2', 'WAID:3'],
+  );
 });
 
 test('a sent container whose media all failed is a failure; a failed container with sent media is partial', async () => {
@@ -323,19 +358,48 @@ test('Chatwoot sendAttachment keeps albumParentKey for photos only, never for do
   assert.equal(calls[1].albumParentKey, undefined);
 });
 
-test('durable send: container with its planned id, then photos naming it, document outside the album', async () => {
-  const parts = buildParts([image(10), image(11), pdf(12)]);
+test('flag off: the plan is exactly the pre-album one, planned ids included', () => {
+  const service: any = Object.create(ChatwootService.prototype);
+  service.configService = { get: () => ({ OUTBOUND_ALBUMS_ENABLED: false }) };
+  service.waMonitor = { waInstances: {} };
+  assert.equal(service.outboundAlbumsSupported({ instanceName: 'test-instance' }), false);
+  service.configService = { get: () => ({ OUTBOUND_ALBUMS_ENABLED: true }) };
+  assert.equal(service.outboundAlbumsSupported({ instanceName: 'test-instance' }), true);
+  service.waMonitor = { waInstances: { 'test-instance': { mediaMessage() {} } } };
+  assert.equal(service.outboundAlbumsSupported({ instanceName: 'test-instance' }), false);
+
+  // Values produced by origin/main (before albums) for the same message.
+  const parts = buildParts([image(12), pdf(10), image(11)], false);
+  assert.equal(parts[0].messageSetHash, 'b17ca25f9f0b1812ab8a64c4b3123f3e82e3e17b8cbb055541b4e5858bd28b68');
+  assert.deepEqual(
+    parts.map((part) => [part.payload.attachmentId, part.plannedWhatsappMessageId, part.payload.text]),
+    [
+      [10, 'WD08AEF7F8AB948A647E', 'caption'],
+      [11, 'WDC9DC987F61EA51D49F', null],
+      [12, 'WD03F9954AE2F6F9B7ED', null],
+    ],
+  );
+  assert.ok(parts.every((part) => !('album' in part.payload) && !('albumParentWhatsappMessageId' in part.payload)));
+});
+
+// Drives sendQueuedOutbound part by part like the lane does, keeping each
+// part's durable row in a fake store that the album lookups read.
+const durableSend = async (parts: any[], options: { headerFails?: boolean } = {}) => {
   const service: any = Object.create(ChatwootService.prototype);
   service.logger = { verbose() {}, debug() {}, error() {}, warn() {} };
   service.getQuotedMessage = async () => undefined;
+  const rows = parts.map((part) => stored(part, 'pending'));
+  service.outboundStore = { retainedOperations: async () => rows };
   const containers: any[] = [];
   const media: any[] = [];
+  const errors: string[] = [];
   const waInstance = {
     instanceId: 'instance-1',
     connectionStatus: { state: 'open' },
     albumContainerMessage: async (data: any) => {
       await data.beforeTransport?.();
       containers.push(data);
+      if (options.headerFails) throw Object.assign(new Error('relay failed'), { name: 'RelayFailed' });
       return { key: { id: data.messageId } };
     },
     mediaMessage: async (data: any) => {
@@ -345,29 +409,95 @@ test('durable send: container with its planned id, then photos naming it, docume
     },
   };
   const context = { instance: { instanceName: 'test-instance', instanceId: 'instance-1' }, waInstance };
-  let fences = 0;
-  for (const part of parts) {
-    const result = await service.sendQueuedOutbound(
-      stored(part, 'sending'),
-      context,
-      async () => {
-        fences += 1;
-      },
-      new AbortController().signal,
-    );
-    assert.equal(result.whatsappMessageId, part.plannedWhatsappMessageId);
+  for (const row of rows) {
+    row.state = 'sending';
+    try {
+      const result = await service.sendQueuedOutbound(
+        row,
+        context,
+        async () => undefined,
+        new AbortController().signal,
+      );
+      Object.assign(row, { state: 'callback_pending', whatsappMessageId: result.whatsappMessageId });
+    } catch (error) {
+      errors.push(error.name);
+      row.state = 'failed';
+    }
   }
+  return { containers, media, errors };
+};
 
-  assert.equal(fences, 4);
+test('durable permit send: PDF with caption, album header, photos joined to it', async () => {
+  const parts = buildParts([pdf(10), image(11), image(12)]);
+  const parent = parts[1].plannedWhatsappMessageId;
+  const { containers, media, errors } = await durableSend(parts);
+
+  assert.deepEqual(errors, []);
   assert.deepEqual(
     containers.map((data) => [data.messageId, data.expectedImageCount, data.expectedVideoCount]),
-    [[parts[0].plannedWhatsappMessageId, 2, 0]],
+    [[parent, 2, 0]],
   );
   assert.deepEqual(
     media.map((data) => [data.mediatype, data.albumParentKey?.id, data.caption]),
     [
-      ['image', parts[0].plannedWhatsappMessageId, 'caption'],
-      ['image', parts[0].plannedWhatsappMessageId, undefined],
+      ['document', undefined, 'caption'],
+      ['image', parent, undefined],
+      ['image', parent, undefined],
+    ],
+  );
+});
+
+test('a failed album header leaves no orphans: its photos go out as plain single media', async () => {
+  const parts = buildParts([image(10), image(11), pdf(12)]);
+  const { containers, media, errors } = await durableSend(parts, { headerFails: true });
+
+  assert.equal(containers.length, 1);
+  assert.deepEqual(errors, ['RelayFailed']);
+  assert.deepEqual(
+    media.map((data) => [data.mediatype, data.albumParentKey, data.caption]),
+    [
+      ['image', undefined, 'caption'],
+      ['image', undefined, undefined],
+      ['document', undefined, undefined],
+    ],
+  );
+});
+
+test('header counts use the sender type decision; a member sent as document does not join', async () => {
+  // Chatwoot calls all three images, but one is served as a PDF.
+  const parts = buildParts([
+    image(10),
+    image(11),
+    { id: 12, file_type: 'image', data_url: 'https://example.invalid/x.pdf' },
+  ]);
+  const parent = parts[0].plannedWhatsappMessageId;
+  assert.deepEqual(parts[0].payload.album, { expectedImageCount: 3, expectedVideoCount: 0 });
+  const { containers, media } = await durableSend(parts);
+
+  assert.deepEqual(
+    containers.map((data) => [data.expectedImageCount, data.expectedVideoCount]),
+    [[2, 0]],
+  );
+  assert.deepEqual(
+    media.map((data) => [data.mediatype, data.albumParentKey?.id]),
+    [
+      ['image', parent],
+      ['image', parent],
+      ['document', undefined],
+    ],
+  );
+});
+
+test('an album with fewer than two real photos sends no header and the photo goes out alone', async () => {
+  const parts = buildParts([image(10), { id: 11, file_type: 'image', data_url: 'https://example.invalid/x.pdf' }]);
+  const { containers, media, errors } = await durableSend(parts);
+
+  assert.equal(containers.length, 0);
+  assert.deepEqual(errors, ['AlbumNotNeeded']);
+  assert.deepEqual(
+    media.map((data) => [data.mediatype, data.albumParentKey, data.caption]),
+    [
+      ['image', undefined, 'caption'],
       ['document', undefined, undefined],
     ],
   );

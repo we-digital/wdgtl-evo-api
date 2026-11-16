@@ -1640,6 +1640,23 @@ test('fails at once without retries when the number is not on WhatsApp during pr
   assert.ok(!events.includes('chatwoot_outbound_preparation_failed'));
 });
 
+test('an album header with nothing to group fails at once without retries and without transport', async () => {
+  const store = new MemoryStore();
+  store.operation.createdAt = new Date();
+  const queue = new ChatwootOutboundQueue(
+    store,
+    validHandler({
+      send: async () => Promise.reject(Object.assign(new Error('no album'), { name: 'AlbumNotNeeded' })),
+    }),
+  );
+
+  await queue.runOnce('transport');
+
+  assert.equal(store.operation.state, 'failure_callback_pending');
+  assert.equal(store.operation.lastErrorClass, 'AlbumNotNeeded');
+  assert.equal(store.operation.preparationAttempts, 0);
+});
+
 test('fails at once without retries when the send finds the number is not on WhatsApp', async () => {
   const store = new MemoryStore();
   store.operation.createdAt = new Date();

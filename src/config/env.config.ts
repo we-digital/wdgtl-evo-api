@@ -322,6 +322,7 @@ export type Typebot = { ENABLED: boolean; API_VERSION: string; SEND_MEDIA_BASE64
 export type Chatwoot = {
   ENABLED: boolean;
   OUTBOUND_ASYNC_ENABLED: boolean;
+  OUTBOUND_ALBUMS_ENABLED: boolean;
   OUTBOUND_ASYNC_DRAIN_ONLY: boolean;
   MANAGED_HISTORY_RECONCILIATION: boolean;
   MESSAGE_DELETE: boolean;
@@ -839,6 +840,7 @@ export class ConfigService {
       CHATWOOT: {
         ENABLED: process.env?.CHATWOOT_ENABLED === 'true',
         OUTBOUND_ASYNC_ENABLED: process.env?.CHATWOOT_OUTBOUND_ASYNC_ENABLED === 'true',
+        OUTBOUND_ALBUMS_ENABLED: process.env?.CHATWOOT_OUTBOUND_ALBUMS_ENABLED === 'true',
         OUTBOUND_ASYNC_DRAIN_ONLY: process.env?.CHATWOOT_OUTBOUND_ASYNC_DRAIN_ONLY === 'true',
         MANAGED_HISTORY_RECONCILIATION: process.env?.CHATWOOT_MANAGED_HISTORY_RECONCILIATION_ENABLED === 'true',
         MESSAGE_DELETE: process.env.CHATWOOT_MESSAGE_DELETE === 'true',

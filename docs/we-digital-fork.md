@@ -1461,22 +1461,29 @@ imports (`recovery` uploads) are unchanged. Removal: drop the call in
 
 ## 2026-11-16 — Chatwoot outgoing photos as one WhatsApp album (C84)
 
-One public Chatwoot message with two or more photos/videos (Chatwoot
-`file_type` image/video, or a jpg/png/webp/mp4/3gp/mov/m4v name when the type is
-absent; gif/svg/tiff/dxf/dwg stay documents as in `sendAttachment`) and at most
-30 of them is planned by `buildChatwootOutboundParts` as: an album container
-part (identity `album:<sorted ids>`, payload `album{expectedImageCount,
-expectedVideoCount}`), the media sorted by attachment id with
-`albumParentWhatsappMessageId` = the container's planned WAID, then every other
-attachment as before. The text stays the caption of the first attachment (the
-first album photo). The container is sent by Baileys `albumContainerMessage`
-under the same transport fence and planned WAID; media go through
-`mediaMessage` with Baileys `albumParentKey` (remoteJid = resolved recipient),
-which `sendAttachment` keeps only for image/video. The container is never a
-Chatwoot delivery part: `messageStatus` drops it from callback parts, a sent
-container with no sent media is a failure, a failed container with sent media
-is partial success. Non-album messages keep their exact frozen identity; a
-loaded non-Baileys channel opts out. The legacy synchronous path
+Behind `CHATWOOT_OUTBOUND_ALBUMS_ENABLED` (default off; off = the exact
+pre-album plan and planned ids). One public Chatwoot message with two or more
+photos/videos (Chatwoot `file_type` image/video, or a jpg/png/webp/mp4/3gp/mov/m4v
+name when the type is absent; gif/svg/tiff/dxf/dwg stay documents) and at most
+30 of them is planned by `buildChatwootOutboundParts` in upload order
+(attachment id): the album container part (identity `album:<sorted ids>`) and all
+its media stand where the first photo/video stands; every other attachment keeps
+its place. The text is the caption of the first attachment in upload order (a
+document, or the first album photo). Example: [PDF, photo, photo] → PDF with the
+caption, album header, two photos.
+
+The container is sent by Baileys `albumContainerMessage` under the same fence
+and planned WAID. Its image/video counts come from the sender's own type
+decision (`chatwootAttachmentSendType`: served content type, gif/svg/... as
+documents) over its member parts; with fewer than two it sends nothing and ends
+as `AlbumNotNeeded` (terminal, no retry). Members go through `mediaMessage` with
+Baileys `albumParentKey` (remoteJid = resolved recipient) only when the header
+row is sent (`callback_pending`/`completed` with its planned WAID) and the
+member's own type is image/video; otherwise they go out as plain single media.
+The container is never a Chatwoot delivery part: `messageStatus` drops it from
+callback parts and reports `expectedCallbackParts`; a sent container with no
+sent media is a failure, a failed container with sent media is partial success.
+A loaded non-Baileys channel opts out. The legacy synchronous path
 (`CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`) still sends one message per
-attachment. Removal: drop the album planning block and the `payload.album`
-send branch; retained album rows then need the branch until drained.
+attachment. Removal: turn the flag off, drain retained album rows, then drop
+the album planning block and the `payload.album` send branch.

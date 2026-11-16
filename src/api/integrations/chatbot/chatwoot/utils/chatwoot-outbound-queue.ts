@@ -127,6 +127,8 @@ export interface ChatwootOutboundMessageStatus {
   leader: boolean;
   outcome: 'waiting' | 'success' | 'partial_success' | 'failure';
   callbackParts: ChatwootProviderDeliveryPart[];
+  /** Delivery parts of a complete success (album containers are not); defaults to partCount. */
+  expectedCallbackParts?: number;
 }
 
 export interface ChatwootOutboundStore {
@@ -393,8 +395,8 @@ export function buildChatwootOutboundParts(params: {
   }
 
   // Two or more photos/videos of one Chatwoot message go out as one WhatsApp
-  // album: a container part first, then those media tied to it, then every
-  // other attachment (documents can't join an album) as before.
+  // album. Upload order (attachment id) is kept: the album container and all
+  // its media stand where its first photo/video stands; documents can't join.
   const albumMedia = nativeForward || !params.albums ? [] : attachments.filter((attachment) => attachment.albumKind);
   const album =
     albumMedia.length >= MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS &&
@@ -408,8 +410,11 @@ export function buildChatwootOutboundParts(params: {
           },
         }
       : null;
+  const firstAlbumIndex = album ? attachments.findIndex((attachment) => attachment.albumKind) : -1;
   const orderedAttachments = album
-    ? [...albumMedia, ...attachments.filter((attachment) => !attachment.albumKind)]
+    ? attachments.flatMap((attachment, index) =>
+        index === firstAlbumIndex ? albumMedia : attachment.albumKind ? [] : [attachment],
+      )
     : attachments;
   type PartSpec = {
     identity: string;
@@ -421,15 +426,15 @@ export function buildChatwootOutboundParts(params: {
   const partSpecs: PartSpec[] = nativeForward
     ? [{ identity: `native-forward:${nativeForward.sourceChatwootMessageId}` }]
     : attachments.length > 0
-      ? [
-          ...(album ? [album] : []),
-          ...orderedAttachments.map(({ attachmentId, attachmentUrl, albumKind }) => ({
+      ? orderedAttachments.flatMap(({ attachmentId, attachmentUrl, albumKind }) => [
+          ...(album && attachmentId === albumMedia[0].attachmentId ? [album] : []),
+          {
             identity: `attachment:${attachmentId}`,
             attachmentId,
             attachmentUrl,
             ...(album && albumKind ? { inAlbum: true } : {}),
-          })),
-        ]
+          },
+        ])
       : [{ identity: 'text' }];
   // Unchanged canonical form for non-album messages keeps their frozen identity.
   const canonicalSet = partSpecs.map((part) => ({
@@ -474,8 +479,8 @@ export function buildChatwootOutboundParts(params: {
       payload: {
         chatId,
         // One Chatwoot message with N attachments becomes N WhatsApp messages;
-        // the text rides as the caption of the first attachment only (the first
-        // album item when there is an album), like a native album.
+        // the text rides as the caption of the first attachment in upload order
+        // only (a document, or the first album photo), like a native album.
         text:
           nativeForward ||
           part.album ||
@@ -554,6 +559,8 @@ interface OutboundTransportTiming {
 }
 export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
 export const MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS = 2;
+/** Album container whose media resolve to fewer than two photos/videos: never sent. */
+export const CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED = 'AlbumNotNeeded';
 export const MAX_CHATWOOT_OUTBOUND_ALBUM_ITEMS = 30;
 
 const plannedWhatsappMessageIdFor = (operationKey: string) => `WD${operationKey.slice(0, 18).toUpperCase()}`;
@@ -591,10 +598,6 @@ export function chatwootAttachmentAlbumKind(attachment: any, url: string): 'imag
 /** Album containers are transport-only parts and never a Chatwoot delivery part. */
 export const isChatwootOutboundAlbumContainer = (operation: { payload?: ChatwootOutboundPayload | null }) =>
   Boolean(operation?.payload?.album);
-
-/** How many delivery parts a complete success reports back to Chatwoot. */
-export const chatwootOutboundCallbackPartCount = (operation: StoredChatwootOutboundOperation) =>
-  operation.partCount - (operation.partIndex === 0 && isChatwootOutboundAlbumContainer(operation) ? 1 : 0);
 
 const errorClass = (error: unknown): string => {
   if (error && typeof error === 'object' && 'name' in error && typeof error.name === 'string')
@@ -1078,6 +1081,10 @@ export class ChatwootOutboundQueue {
         );
       } else if (isWhatsappRecipientMissing(error)) {
         await this.failRecipientMissing(operation);
+      } else if (classified === CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED) {
+        // Nothing was sent; the media go out as single messages.
+        await this.store.markFailureCallbackPending(operation, this.workerId, classified, new Date());
+        this.wake();
       } else if (this.waitsForWhatsapp(operation, error)) {
         await this.deferUntilWhatsappReady(operation, error);
       } else {
@@ -1163,7 +1170,8 @@ export class ChatwootOutboundQueue {
       if (
         !status.ready ||
         !status.leader ||
-        (status.outcome === 'success' && status.callbackParts.length !== chatwootOutboundCallbackPartCount(operation))
+        (status.outcome === 'success' &&
+          status.callbackParts.length !== (status.expectedCallbackParts ?? operation.partCount))
       ) {
         await this.store.deferCallback(
           operation.id,

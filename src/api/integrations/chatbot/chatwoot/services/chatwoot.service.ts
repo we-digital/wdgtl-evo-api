@@ -202,10 +202,12 @@ import {
 import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-prisma-store';
 import {
   buildChatwootOutboundParts,
+  CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED,
   ChatwootOutboundOrigin,
   ChatwootOutboundPhase,
   ChatwootOutboundQueue,
   chatwootWebhookMessageCreatedAt,
+  MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 import {
@@ -3359,6 +3361,56 @@ export class ChatwootService {
     }
   }
 
+  // The WhatsApp media type sendAttachment uses for a Chatwoot attachment URL;
+  // album planning counts photos/videos with the same decision.
+  private async chatwootAttachmentSendType(media: any, signal?: AbortSignal) {
+    // Only the content type is needed here; the send downloads the file once.
+    // HEAD first, then a one-byte range read for servers that refuse HEAD.
+    const metadata = await resolveChatwootAttachmentMetadata(media, async () => {
+      const prefetched = typeof media === 'string' ? await outboundMediaPrefetch.peek(media) : null;
+      if (prefetched?.contentType) return prefetched.contentType;
+      try {
+        const head = await axios.head(media, { signal: signal, timeout: 15_000 });
+        if (head.headers['content-type']) return head.headers['content-type'];
+      } catch (error) {
+        if (signal?.aborted) throw error;
+      }
+      const response = await axios.get(media, {
+        responseType: 'arraybuffer',
+        headers: { Range: 'bytes=0-0' },
+        signal: signal,
+        timeout: 30_000,
+      });
+      return response.headers['content-type'];
+    });
+    const fileName = metadata.fileName || 'document';
+    const mimeType = metadata.mimetype || '';
+
+    const parsedMedia = path.parse(fileName);
+
+    let type = 'document';
+
+    switch (mimeType.split('/')[0]) {
+      case 'image':
+        type = 'image';
+        break;
+      case 'video':
+        type = 'video';
+        break;
+      case 'audio':
+        type = 'audio';
+        break;
+      default:
+        type = 'document';
+        break;
+    }
+    const documentExtensions = ['.gif', '.svg', '.tiff', '.tif', '.dxf', '.dwg'];
+    if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
+      type = 'document';
+    }
+    return { type, fileName, mimeType };
+  }
+
   public async sendAttachment(
     waInstance: any,
     number: string,
@@ -3368,46 +3420,7 @@ export class ChatwootService {
     provenance?: OutboundMessageProvenance,
   ) {
     try {
-      // Only the content type is needed here; the send below downloads the file once.
-      // HEAD first, then a one-byte range read for servers that refuse HEAD.
-      const metadata = await resolveChatwootAttachmentMetadata(media, async () => {
-        const prefetched = typeof media === 'string' ? await outboundMediaPrefetch.peek(media) : null;
-        if (prefetched?.contentType) return prefetched.contentType;
-        try {
-          const head = await axios.head(media, { signal: options?.signal, timeout: 15_000 });
-          if (head.headers['content-type']) return head.headers['content-type'];
-        } catch (error) {
-          if (options?.signal?.aborted) throw error;
-        }
-        const response = await axios.get(media, {
-          responseType: 'arraybuffer',
-          headers: { Range: 'bytes=0-0' },
-          signal: options?.signal,
-          timeout: 30_000,
-        });
-        return response.headers['content-type'];
-      });
-      const fileName = metadata.fileName || 'document';
-      const mimeType = metadata.mimetype || '';
-
-      const parsedMedia = path.parse(fileName);
-
-      let type = 'document';
-
-      switch (mimeType.split('/')[0]) {
-        case 'image':
-          type = 'image';
-          break;
-        case 'video':
-          type = 'video';
-          break;
-        case 'audio':
-          type = 'audio';
-          break;
-        default:
-          type = 'document';
-          break;
-      }
+      const { type, fileName, mimeType } = await this.chatwootAttachmentSendType(media, options?.signal);
 
       if (type === 'audio') {
         const data: SendAudioDto = {
@@ -3429,11 +3442,6 @@ export class ChatwootService {
         const messageSent = await waInstance?.audioWhatsapp(data, null, true, provenance);
 
         return messageSent;
-      }
-
-      const documentExtensions = ['.gif', '.svg', '.tiff', '.tif', '.dxf', '.dwg'];
-      if (type === 'image' && parsedMedia && documentExtensions.includes(parsedMedia?.ext)) {
-        type = 'document';
       }
 
       const data: SendMediaDto = {
@@ -3811,6 +3819,39 @@ export class ChatwootService {
     return context?.waInstance?.connectionStatus?.state === 'open';
   }
 
+  private async albumOperations(operation: StoredChatwootOutboundOperation) {
+    return (
+      await this.outboundStore.retainedOperations(operation.instanceId, operation.payload.origin.messageId)
+    ).filter((candidate) => candidate.messageSetHash === operation.messageSetHash);
+  }
+
+  private async outboundAlbumCounts(operation: StoredChatwootOutboundOperation, signal: AbortSignal) {
+    const members = (await this.albumOperations(operation)).filter(
+      (candidate) =>
+        candidate.payload.albumParentWhatsappMessageId === operation.plannedWhatsappMessageId &&
+        candidate.payload.attachmentUrl,
+    );
+    const counts = { expectedImageCount: 0, expectedVideoCount: 0 };
+    for (const member of members) {
+      const { type } = await this.chatwootAttachmentSendType(member.payload.attachmentUrl, signal);
+      if (type === 'image') counts.expectedImageCount += 1;
+      if (type === 'video') counts.expectedVideoCount += 1;
+    }
+    return counts;
+  }
+
+  // The lane sends parts in order, so the header is settled before its media.
+  private async outboundAlbumHeaderSent(operation: StoredChatwootOutboundOperation): Promise<boolean> {
+    const parentId = operation.payload.albumParentWhatsappMessageId;
+    if (!parentId) return false;
+    const header = (await this.albumOperations(operation)).find(
+      (candidate) => candidate.payload.album && candidate.plannedWhatsappMessageId === parentId,
+    );
+    return Boolean(
+      header && header.whatsappMessageId === parentId && ['callback_pending', 'completed'].includes(header.state),
+    );
+  }
+
   private async sendQueuedOutbound(
     operation: StoredChatwootOutboundOperation,
     preparedContext: unknown,
@@ -3899,12 +3940,20 @@ export class ChatwootService {
           name: 'AlbumUnsupported',
         });
       }
+      // Count with the sender's own media-type decision (served content type,
+      // gif/svg/... as documents), so the header matches what really follows.
+      const counts = await this.outboundAlbumCounts(operation, signal);
+      if (counts.expectedImageCount + counts.expectedVideoCount < MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS) {
+        throw Object.assign(new Error('Fewer than two album photos/videos to send'), {
+          name: CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED,
+        });
+      }
       sendTelemetry('/message/sendAlbum');
       messageSent = await waInstance.albumContainerMessage(
         {
           number: payload.chatId,
-          expectedImageCount: payload.album.expectedImageCount,
-          expectedVideoCount: payload.album.expectedVideoCount,
+          expectedImageCount: counts.expectedImageCount,
+          expectedVideoCount: counts.expectedVideoCount,
           messageId: operation.plannedWhatsappMessageId,
           beforeTransport: onTransportStart,
           afterTransport,
@@ -3926,9 +3975,9 @@ export class ChatwootService {
           beforeTransport: onTransportStart,
           afterTransport,
           signal,
-          // The container's planned WAID is its real WAID (checked below), so the
-          // media can name its album without reading the container's row.
-          ...(payload.albumParentWhatsappMessageId
+          // Join the album only when its header was really sent; otherwise this
+          // goes out as a plain single photo instead of an orphaned album item.
+          ...((await this.outboundAlbumHeaderSent(operation))
             ? { albumParentKey: { fromMe: true, id: payload.albumParentWhatsappMessageId } }
             : {}),
         },
@@ -4229,6 +4278,8 @@ export class ChatwootService {
   // Only a loaded non-Baileys channel opts out, so the frozen part set of a
   // Baileys instance never depends on whether it was loaded at admission.
   private outboundAlbumsSupported(instance: InstanceDto): boolean {
+    // Off by default: with the flag off the plan (and every planned id) is exactly the pre-album one.
+    if (!this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ALBUMS_ENABLED) return false;
     const waInstance = this.waMonitor?.waInstances?.[instance.instanceName];
     return !waInstance || typeof waInstance.albumContainerMessage === 'function';
   }

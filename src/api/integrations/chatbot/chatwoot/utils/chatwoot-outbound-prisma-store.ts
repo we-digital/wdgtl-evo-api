@@ -924,6 +924,7 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       ready,
       leader: operation.partIndex === 0,
       outcome,
+      expectedCallbackParts: operations.filter((candidate) => !isChatwootOutboundAlbumContainer(candidate)).length,
       callbackParts: ready
         ? delivered.map((candidate, partIndex) => ({
             partKey: candidate.operationKey,
