@@ -240,8 +240,11 @@ import {
 import {
   chatwootReplyReferences,
   compactReplyToIds,
+  extractWhatsappReplyParticipant,
   extractWhatsappReplyStanzaId,
+  sameWhatsappUser,
   toChatwootWhatsappSourceId,
+  WhatsappQuoteParticipant,
   whatsappQuotedMessageContent,
   whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
@@ -5255,10 +5258,14 @@ export class ChatwootService {
     );
   }
 
-  private async getReplyToIds(msg: any, instance: InstanceDto): Promise<Record<string, string | number>> {
+  private async getReplyToIds(
+    msg: any,
+    instance: InstanceDto,
+  ): Promise<Record<string, string | number | WhatsappQuoteParticipant>> {
     let inReplyTo = null;
     let inReplyToExternalId = null;
     let quoteText = null;
+    let quoteParticipant: WhatsappQuoteParticipant | null = null;
 
     if (msg) {
       const stanzaId = extractWhatsappReplyStanzaId(msg);
@@ -5270,6 +5277,7 @@ export class ChatwootService {
           inReplyTo = message.chatwootMessageId;
         }
         quoteText = whatsappReplyQuoteSnapshotText(msg, message?.message);
+        quoteParticipant = this.quoteParticipant(instance, msg, message);
       }
     }
 
@@ -5277,7 +5285,26 @@ export class ChatwootService {
       in_reply_to: inReplyTo,
       in_reply_to_external_id: inReplyToExternalId,
       quote_text: quoteText,
+      quote_participant: quoteParticipant,
     });
+  }
+
+  // we:Digital (owner, 2026-11-16): who wrote the quoted message, for Chatwoot's reply header. The stored quoted
+  // message knows whether it was ours; otherwise our own number or LID is compared with contextInfo.participant.
+  private quoteParticipant(
+    instance: InstanceDto,
+    msg: any,
+    quoted: MessageModel | null,
+  ): WhatsappQuoteParticipant | null {
+    const jid = extractWhatsappReplyParticipant(msg);
+    const storedFromMe = (quoted?.key as { fromMe?: unknown } | undefined)?.fromMe;
+    let fromMe = typeof storedFromMe === 'boolean' ? storedFromMe : false;
+    if (typeof storedFromMe !== 'boolean' && jid) {
+      const user = (this.waMonitor.waInstances[instance.instanceName] as any)?.client?.user;
+      fromMe = [user?.id, user?.lid, instance.ownerJid].some((own) => sameWhatsappUser(jid, own));
+    }
+    if (!jid && !fromMe) return null;
+    return { ...(jid ? { jid } : {}), from_me: fromMe };
   }
 
   /**

@@ -67,6 +67,52 @@ export const extractWhatsappReplyStanzaId = (msg: unknown): string | null => {
   return extractFromMessageContent(body.message);
 };
 
+// we:Digital (2026-11-16): the quoted message's author, contextInfo.participant of the same contextInfo that
+// carries the stanzaId. Device suffixes are dropped (123:4@s.whatsapp.net -> 123@s.whatsapp.net).
+const readParticipant = (contextInfo: unknown): string | null => {
+  if (!readStanzaId(contextInfo)) return null;
+  const raw = (contextInfo as { participant?: unknown }).participant;
+  if (typeof raw !== 'string') return null;
+  const match = /^(\d+)(?::\d+)?@(s\.whatsapp\.net|lid)$/.exec(raw.trim());
+  return match ? `${match[1]}@${match[2]}` : null;
+};
+
+const extractParticipantFromContent = (message: unknown, depth = 0): string | null => {
+  if (!message || typeof message !== 'object' || depth > 4) return null;
+  const content = message as Record<string, unknown>;
+  if (readStanzaId(content.contextInfo)) return readParticipant(content.contextInfo);
+
+  for (const [key, value] of Object.entries(content)) {
+    if (!value || typeof value !== 'object') continue;
+    if (WRAPPER_KEYS.has(key)) {
+      const nested = extractParticipantFromContent((value as { message?: unknown }).message, depth + 1);
+      if (nested) return nested;
+      continue;
+    }
+    const contextInfo = (value as { contextInfo?: unknown }).contextInfo;
+    if (readStanzaId(contextInfo)) return readParticipant(contextInfo);
+  }
+
+  return null;
+};
+
+export const extractWhatsappReplyParticipant = (msg: unknown): string | null => {
+  if (!msg || typeof msg !== 'object') return null;
+  const body = msg as Record<string, unknown>;
+  if (readStanzaId(body.contextInfo)) return readParticipant(body.contextInfo);
+  return extractParticipantFromContent(body.message);
+};
+
+/** The same person on WhatsApp, whatever the device suffix. */
+export const sameWhatsappUser = (a: string | null | undefined, b: string | null | undefined): boolean => {
+  const user = (jid: string | null | undefined) => {
+    const match = typeof jid === 'string' ? /^(\d+)(?::\d+)?@(s\.whatsapp\.net|lid)$/.exec(jid.trim()) : null;
+    return match ? `${match[1]}@${match[2]}` : null;
+  };
+  const left = user(a);
+  return Boolean(left) && left === user(b);
+};
+
 const quotedMessageFromContext = (contextInfo: unknown): unknown | null => {
   if (!contextInfo || typeof contextInfo !== 'object') return null;
   return (contextInfo as ContextInfoLike).quotedMessage ?? null;
@@ -177,13 +223,16 @@ export const chatwootReplyReferences = (
   };
 };
 
+export type WhatsappQuoteParticipant = { jid?: string; from_me: boolean };
+
 /** Drop null reply ids so Chatwoot content_attributes stay clean. */
 export const compactReplyToIds = (ids: {
   in_reply_to: string | number | null;
   in_reply_to_external_id: string | null;
   quote_text?: string | null;
-}): Record<string, string | number> => {
-  const out: Record<string, string | number> = {};
+  quote_participant?: WhatsappQuoteParticipant | null;
+}): Record<string, string | number | WhatsappQuoteParticipant> => {
+  const out: Record<string, string | number | WhatsappQuoteParticipant> = {};
   if (ids.in_reply_to != null && ids.in_reply_to !== '') {
     out.in_reply_to = ids.in_reply_to;
   }
@@ -192,6 +241,10 @@ export const compactReplyToIds = (ids: {
   }
   if (ids.quote_text) {
     out.quote_text = ids.quote_text;
+  }
+  // Chatwoot names the quoted author from this hint when it does not hold the quoted message (and drops it).
+  if (ids.quote_participant && (ids.quote_participant.jid || ids.quote_participant.from_me)) {
+    out.quote_participant = ids.quote_participant;
   }
   return out;
 };
