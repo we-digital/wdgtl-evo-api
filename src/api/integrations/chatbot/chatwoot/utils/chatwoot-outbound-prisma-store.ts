@@ -7,6 +7,7 @@ import {
   ChatwootOutboundState,
   ChatwootOutboundStore,
   ChatwootOutboundWorkClass,
+  isChatwootOutboundAlbumContainer,
   StoredChatwootOutboundOperation,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-queue';
 import { PrismaRepository } from '@api/repository/repository.service';
@@ -909,11 +910,14 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
     );
     const failures = operations.filter((candidate) => ['failure_callback_pending', 'failed'].includes(candidate.state));
     const ready = !waiting && successes.length + failures.length === operations.length;
+    // An album container is transport only: it is never reported to Chatwoot,
+    // and a sent container alone (all media failed) is still a failure.
+    const delivered = successes.filter((candidate) => !isChatwootOutboundAlbumContainer(candidate));
     const outcome = !ready
       ? 'waiting'
       : successes.length === operations.length
         ? 'success'
-        : successes.length > 0
+        : delivered.length > 0
           ? 'partial_success'
           : 'failure';
     return {
@@ -921,10 +925,10 @@ export class ChatwootOutboundPrismaStore implements ChatwootOutboundStore {
       leader: operation.partIndex === 0,
       outcome,
       callbackParts: ready
-        ? successes.map((candidate, partIndex) => ({
+        ? delivered.map((candidate, partIndex) => ({
             partKey: candidate.operationKey,
             partIndex,
-            partCount: successes.length,
+            partCount: delivered.length,
             sourceId: candidate.whatsappMessageId,
           }))
         : [],

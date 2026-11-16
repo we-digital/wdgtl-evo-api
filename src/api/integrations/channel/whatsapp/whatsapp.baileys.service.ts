@@ -40,6 +40,7 @@ import {
   KeyType,
   MediaMessage,
   Options,
+  SendAlbumContainerDto,
   SendAlbumDto,
   SendAudioDto,
   SendButtonsDto,
@@ -2887,6 +2888,9 @@ export class BaileysStartupService extends ChannelStartupService {
     const sender = isWA.jid.toLowerCase();
 
     this.logger.verbose(`Sending message to ${sender}`);
+    const albumParentKey = options?.albumParentKey
+      ? { ...options.albumParentKey, remoteJid: options.albumParentKey.remoteJid || sender }
+      : undefined;
 
     try {
       if (options?.delay) {
@@ -2984,7 +2988,7 @@ export class BaileysStartupService extends ChannelStartupService {
             ephemeralExpiration: group?.ephemeralDuration,
             beforeTransport: options?.beforeTransport,
             signal: options?.signal,
-            albumParentKey: options?.albumParentKey,
+            albumParentKey,
           }),
         );
       } else {
@@ -3011,7 +3015,7 @@ export class BaileysStartupService extends ChannelStartupService {
             contextInfo,
             beforeTransport: options?.beforeTransport,
             signal: options?.signal,
-            albumParentKey: options?.albumParentKey,
+            albumParentKey,
           }),
         );
       }
@@ -3626,12 +3630,35 @@ export class BaileysStartupService extends ChannelStartupService {
         beforeTransport: data?.beforeTransport,
         afterTransport: data?.afterTransport,
         signal: data?.signal,
+        albumParentKey: data?.albumParentKey,
       },
       isIntegration,
       provenance,
     );
 
     return mediaSent;
+  }
+
+  // Only the albumMessage header; its media follow as mediaMessage with albumParentKey.
+  public async albumContainerMessage(
+    data: SendAlbumContainerDto,
+    isIntegration = false,
+    provenance?: OutboundMessageProvenance,
+  ) {
+    return await this.sendMessageWithTyping(
+      data.number,
+      { album: { expectedImageCount: data.expectedImageCount, expectedVideoCount: data.expectedVideoCount } } as any,
+      {
+        delay: data?.delay,
+        presence: 'composing',
+        messageId: data?.messageId,
+        beforeTransport: data?.beforeTransport,
+        afterTransport: data?.afterTransport,
+        signal: data?.signal,
+      },
+      isIntegration,
+      provenance,
+    );
   }
 
   // A WhatsApp album: one albumMessage container, then every item as a normal media

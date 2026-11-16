@@ -3449,6 +3449,10 @@ export class ChatwootService {
         beforeTransport: options?.beforeTransport,
         afterTransport: options?.afterTransport,
         signal: options?.signal,
+        // Only photos and videos can join a WhatsApp album; anything else stays a separate message.
+        ...(options?.albumParentKey && (type === 'image' || type === 'video')
+          ? { albumParentKey: options.albumParentKey }
+          : {}),
       };
 
       sendTelemetry('/message/sendMedia');
@@ -3889,6 +3893,26 @@ export class ChatwootService {
           signal,
         },
       );
+    } else if (payload.album) {
+      if (typeof waInstance.albumContainerMessage !== 'function') {
+        throw Object.assign(new Error('WhatsApp albums are not supported by this channel'), {
+          name: 'AlbumUnsupported',
+        });
+      }
+      sendTelemetry('/message/sendAlbum');
+      messageSent = await waInstance.albumContainerMessage(
+        {
+          number: payload.chatId,
+          expectedImageCount: payload.album.expectedImageCount,
+          expectedVideoCount: payload.album.expectedVideoCount,
+          messageId: operation.plannedWhatsappMessageId,
+          beforeTransport: onTransportStart,
+          afterTransport,
+          signal,
+        },
+        true,
+        provenance,
+      );
     } else if (payload.attachmentUrl) {
       messageSent = await this.sendAttachment(
         waInstance,
@@ -3902,6 +3926,11 @@ export class ChatwootService {
           beforeTransport: onTransportStart,
           afterTransport,
           signal,
+          // The container's planned WAID is its real WAID (checked below), so the
+          // media can name its album without reading the container's row.
+          ...(payload.albumParentWhatsappMessageId
+            ? { albumParentKey: { fromMe: true, id: payload.albumParentWhatsappMessageId } }
+            : {}),
         },
         provenance,
       );
@@ -4197,6 +4226,13 @@ export class ChatwootService {
     return 'deleted';
   }
 
+  // Only a loaded non-Baileys channel opts out, so the frozen part set of a
+  // Baileys instance never depends on whether it was loaded at admission.
+  private outboundAlbumsSupported(instance: InstanceDto): boolean {
+    const waInstance = this.waMonitor?.waInstances?.[instance.instanceName];
+    return !waInstance || typeof waInstance.albumContainerMessage === 'function';
+  }
+
   private async enqueueChatwootOutbound(
     instance: InstanceDto,
     provider: ChatwootModel,
@@ -4232,6 +4268,7 @@ export class ChatwootService {
       origin,
       mentioned: mentioned.length ? mentioned : undefined,
       nativeForward,
+      albums: this.outboundAlbumsSupported(instance),
     });
     const messageCreatedAt = chatwootWebhookMessageCreatedAt(body?.created_at, admission.receivedAt);
     const receivedAt = admission.receivedAt;

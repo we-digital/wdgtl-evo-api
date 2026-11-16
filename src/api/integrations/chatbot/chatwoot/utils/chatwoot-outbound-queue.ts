@@ -54,7 +54,19 @@ export interface ChatwootOutboundPayload {
   quoteText?: string;
   /** Native WhatsApp mention JIDs for group @notifications */
   mentioned?: string[];
+  /**
+   * Album container part: sends only WhatsApp's albumMessage header. It is not
+   * a Chatwoot delivery part (no attachment, no caption, no source id callback).
+   */
+  album?: ChatwootOutboundAlbum;
+  /** Planned WAID of this message's album container; the media joins that album. */
+  albumParentWhatsappMessageId?: string;
   origin: ChatwootOutboundOrigin;
+}
+
+export interface ChatwootOutboundAlbum {
+  expectedImageCount: number;
+  expectedVideoCount: number;
 }
 
 export interface ChatwootOutboundPart {
@@ -300,6 +312,8 @@ export function buildChatwootOutboundParts(params: {
     sourceChatwootMessageId: number;
     sourceWhatsappMessageId?: string;
   };
+  /** The channel can send WhatsApp albums (Baileys); otherwise every attachment stays separate. */
+  albums?: boolean;
 }): ChatwootOutboundPart[] {
   const instanceId = requiredString(params.instanceId, 'EVO instance id');
   const messageId = asRequiredInteger(params.body?.id, 'Chatwoot message id');
@@ -361,7 +375,7 @@ export function buildChatwootOutboundParts(params: {
   const attachments = (params.body?.attachments || []).map((attachment: any) => {
     const attachmentId = asRequiredInteger(attachment?.id, 'Chatwoot attachment id');
     const attachmentUrl = requiredString(attachment?.data_url, 'Chatwoot attachment URL');
-    return { attachmentId, attachmentUrl };
+    return { attachmentId, attachmentUrl, albumKind: chatwootAttachmentAlbumKind(attachment, attachmentUrl) };
   });
   attachments.sort((left, right) => left.attachmentId - right.attachmentId);
   if (new Set(attachments.map((attachment) => attachment.attachmentId)).size !== attachments.length) {
@@ -378,15 +392,51 @@ export function buildChatwootOutboundParts(params: {
     throw new Error('Invalid empty Chatwoot outbound message');
   }
 
-  const partSpecs = nativeForward
+  // Two or more photos/videos of one Chatwoot message go out as one WhatsApp
+  // album: a container part first, then those media tied to it, then every
+  // other attachment (documents can't join an album) as before.
+  const albumMedia = nativeForward || !params.albums ? [] : attachments.filter((attachment) => attachment.albumKind);
+  const album =
+    albumMedia.length >= MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS &&
+    albumMedia.length <= MAX_CHATWOOT_OUTBOUND_ALBUM_ITEMS &&
+    attachments.length < MAX_CHATWOOT_OUTBOUND_PARTS
+      ? {
+          identity: `album:${albumMedia.map((attachment) => attachment.attachmentId).join(',')}`,
+          album: {
+            expectedImageCount: albumMedia.filter((attachment) => attachment.albumKind === 'image').length,
+            expectedVideoCount: albumMedia.filter((attachment) => attachment.albumKind === 'video').length,
+          },
+        }
+      : null;
+  const orderedAttachments = album
+    ? [...albumMedia, ...attachments.filter((attachment) => !attachment.albumKind)]
+    : attachments;
+  type PartSpec = {
+    identity: string;
+    attachmentId?: number;
+    attachmentUrl?: string;
+    album?: ChatwootOutboundAlbum;
+    inAlbum?: boolean;
+  };
+  const partSpecs: PartSpec[] = nativeForward
     ? [{ identity: `native-forward:${nativeForward.sourceChatwootMessageId}` }]
     : attachments.length > 0
-      ? attachments.map((attachment) => ({ identity: `attachment:${attachment.attachmentId}`, ...attachment }))
+      ? [
+          ...(album ? [album] : []),
+          ...orderedAttachments.map(({ attachmentId, attachmentUrl, albumKind }) => ({
+            identity: `attachment:${attachmentId}`,
+            attachmentId,
+            attachmentUrl,
+            ...(album && albumKind ? { inAlbum: true } : {}),
+          })),
+        ]
       : [{ identity: 'text' }];
+  // Unchanged canonical form for non-album messages keeps their frozen identity.
   const canonicalSet = partSpecs.map((part) => ({
     identity: part.identity,
-    attachmentId: 'attachmentId' in part ? part.attachmentId : null,
-    attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : null,
+    attachmentId: part.attachmentId ?? null,
+    attachmentUrl: part.attachmentUrl ?? null,
+    ...(part.album ? { album: part.album } : {}),
   }));
   const messageSetHash = hash(
     JSON.stringify({
@@ -406,32 +456,42 @@ export function buildChatwootOutboundParts(params: {
     }),
   );
 
+  const operationKeyFor = (identity: string) => hash(`${instanceId}:${messageId}:${messageSetHash}:${hash(identity)}`);
+  const albumParentWhatsappMessageId = album ? plannedWhatsappMessageIdFor(operationKeyFor(album.identity)) : undefined;
+  const firstAttachmentIndex = partSpecs.findIndex((part) => part.attachmentUrl);
+
   return partSpecs.map((part, partIndex) => {
     const partIdentity = hash(part.identity);
-    const operationKey = hash(`${instanceId}:${messageId}:${messageSetHash}:${partIdentity}`);
+    const operationKey = operationKeyFor(part.identity);
     return {
       operationKey,
       messageSetHash,
       partIdentity,
       partIndex,
       partCount: partSpecs.length,
-      plannedWhatsappMessageId: `WD${operationKey.slice(0, 18).toUpperCase()}`,
+      plannedWhatsappMessageId: plannedWhatsappMessageIdFor(operationKey),
       laneKey: hash(`${instanceId}:${chatId}`),
       payload: {
         chatId,
         // One Chatwoot message with N attachments becomes N WhatsApp messages;
-        // the text rides as the caption of the first one only, like a native album.
+        // the text rides as the caption of the first attachment only (the first
+        // album item when there is an album), like a native album.
         text:
-          nativeForward || ('attachmentUrl' in part && (partIndex > 0 || !params.formattedText))
+          nativeForward ||
+          part.album ||
+          (part.attachmentUrl && (partIndex !== firstAttachmentIndex || !params.formattedText))
             ? null
             : params.formattedText,
-        attachmentId: 'attachmentId' in part ? part.attachmentId : undefined,
-        attachmentUrl: 'attachmentUrl' in part ? part.attachmentUrl : undefined,
+        attachmentId: part.attachmentId,
+        attachmentUrl: part.attachmentUrl,
         nativeForward,
-        quotedChatwootMessageId: quoted.chatwootMessageId,
-        quotedWhatsappMessageId: quoted.whatsappMessageId,
-        quoteText: quoted.quoteText,
-        mentioned: Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
+        quotedChatwootMessageId: part.album ? undefined : quoted.chatwootMessageId,
+        quotedWhatsappMessageId: part.album ? undefined : quoted.whatsappMessageId,
+        quoteText: part.album ? undefined : quoted.quoteText,
+        mentioned:
+          !part.album && Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
+        ...(part.album ? { album: part.album } : {}),
+        ...(part.inAlbum ? { albumParentWhatsappMessageId } : {}),
         origin: normalizedOrigin,
       },
     };
@@ -493,6 +553,48 @@ interface OutboundTransportTiming {
   snapshotReused?: boolean;
 }
 export const MAX_CHATWOOT_OUTBOUND_PARTS = 100;
+export const MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS = 2;
+export const MAX_CHATWOOT_OUTBOUND_ALBUM_ITEMS = 30;
+
+const plannedWhatsappMessageIdFor = (operationKey: string) => `WD${operationKey.slice(0, 18).toUpperCase()}`;
+
+// Same rule as the send path: these image formats go out as documents.
+const ALBUM_EXCLUDED_EXTENSIONS = new Set(['gif', 'svg', 'tiff', 'tif', 'dxf', 'dwg']);
+const ALBUM_IMAGE_EXTENSIONS = new Set(['jpg', 'jpeg', 'png', 'webp']);
+const ALBUM_VIDEO_EXTENSIONS = new Set(['mp4', '3gp', 'mov', 'm4v']);
+
+/**
+ * Whether a Chatwoot attachment can join a WhatsApp album, from the webhook's
+ * file_type (enum name or index) and the file extension; anything unclear is
+ * sent as before, outside an album.
+ */
+export function chatwootAttachmentAlbumKind(attachment: any, url: string): 'image' | 'video' | null {
+  let extension = typeof attachment?.extension === 'string' ? attachment.extension : '';
+  if (!extension) {
+    try {
+      extension = new URL(url).pathname.split('/').pop()?.split('.').slice(1).pop() || '';
+    } catch {
+      extension = '';
+    }
+  }
+  extension = extension.replace(/^\./, '').toLowerCase();
+  if (ALBUM_EXCLUDED_EXTENSIONS.has(extension)) return null;
+  const fileType = attachment?.file_type;
+  if (fileType === 'image' || fileType === 0) return 'image';
+  if (fileType === 'video' || fileType === 2) return 'video';
+  if (fileType !== undefined && fileType !== null) return null;
+  if (ALBUM_IMAGE_EXTENSIONS.has(extension)) return 'image';
+  if (ALBUM_VIDEO_EXTENSIONS.has(extension)) return 'video';
+  return null;
+}
+
+/** Album containers are transport-only parts and never a Chatwoot delivery part. */
+export const isChatwootOutboundAlbumContainer = (operation: { payload?: ChatwootOutboundPayload | null }) =>
+  Boolean(operation?.payload?.album);
+
+/** How many delivery parts a complete success reports back to Chatwoot. */
+export const chatwootOutboundCallbackPartCount = (operation: StoredChatwootOutboundOperation) =>
+  operation.partCount - (operation.partIndex === 0 && isChatwootOutboundAlbumContainer(operation) ? 1 : 0);
 
 const errorClass = (error: unknown): string => {
   if (error && typeof error === 'object' && 'name' in error && typeof error.name === 'string')
@@ -1061,7 +1163,7 @@ export class ChatwootOutboundQueue {
       if (
         !status.ready ||
         !status.leader ||
-        (status.outcome === 'success' && status.callbackParts.length !== operation.partCount)
+        (status.outcome === 'success' && status.callbackParts.length !== chatwootOutboundCallbackPartCount(operation))
       ) {
         await this.store.deferCallback(
           operation.id,

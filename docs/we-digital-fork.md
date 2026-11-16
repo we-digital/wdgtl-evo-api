@@ -1458,3 +1458,25 @@ original bytes before conversion. Unset URL or key disables it; any converter
 error keeps the original and logs only the error class. Cached-media recovery
 imports (`recovery` uploads) are unchanged. Removal: drop the call in
 `processWhatsappEvent` media branch and the util.
+
+## 2026-11-16 — Chatwoot outgoing photos as one WhatsApp album (C84)
+
+One public Chatwoot message with two or more photos/videos (Chatwoot
+`file_type` image/video, or a jpg/png/webp/mp4/3gp/mov/m4v name when the type is
+absent; gif/svg/tiff/dxf/dwg stay documents as in `sendAttachment`) and at most
+30 of them is planned by `buildChatwootOutboundParts` as: an album container
+part (identity `album:<sorted ids>`, payload `album{expectedImageCount,
+expectedVideoCount}`), the media sorted by attachment id with
+`albumParentWhatsappMessageId` = the container's planned WAID, then every other
+attachment as before. The text stays the caption of the first attachment (the
+first album photo). The container is sent by Baileys `albumContainerMessage`
+under the same transport fence and planned WAID; media go through
+`mediaMessage` with Baileys `albumParentKey` (remoteJid = resolved recipient),
+which `sendAttachment` keeps only for image/video. The container is never a
+Chatwoot delivery part: `messageStatus` drops it from callback parts, a sent
+container with no sent media is a failure, a failed container with sent media
+is partial success. Non-album messages keep their exact frozen identity; a
+loaded non-Baileys channel opts out. The legacy synchronous path
+(`CHATWOOT_OUTBOUND_ASYNC_ENABLED=false`) still sends one message per
+attachment. Removal: drop the album planning block and the `payload.album`
+send branch; retained album rows then need the branch until drained.
