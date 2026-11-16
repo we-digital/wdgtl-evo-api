@@ -4,6 +4,8 @@ import test from 'node:test';
 import {
   buildChatwootEvoRouteBinding,
   buildChatwootIngressAttributes,
+  CHATWOOT_WHATSAPP_READ_SOURCE,
+  chatwootEvoInboxAttributes,
   chatwootEvoRouteBindingsEqual,
   classifyChatwootIngressScope,
   compactChatwootIngressContext,
@@ -251,4 +253,21 @@ test('carries native group participant identity, not mutable push names or unpro
     { remoteJid: '123@g.us', fromMe: false, participant: 'bad@example.com', participantAlt: '155@s.whatsapp.net' },
   ])
     assert.equal(attrs(key).participant_jid, undefined);
+});
+
+test('EVO inbox attributes keep other keys and name WhatsApp as the read source', () => {
+  const binding = buildChatwootEvoRouteBinding({
+    inboxId: 7,
+    instanceId: 'instance-1',
+    instanceName: 'p-test',
+    receiverNumber: '628000000001@s.whatsapp.net',
+    signingKey: 'key',
+  });
+  assert.ok(binding);
+  const attributes = chatwootEvoInboxAttributes({ custom: 'kept', read_status_source: 'telegram' }, binding);
+  assert.equal(attributes.custom, 'kept');
+  assert.equal(attributes.read_status_source, CHATWOOT_WHATSAPP_READ_SOURCE);
+  assert.equal(attributes.we_digital_provider, 'evo_whatsapp');
+  assert.deepEqual(attributes.we_digital_route_binding, binding);
+  assert.equal(chatwootEvoInboxAttributes(null, binding).read_status_source, 'whatsapp');
 });
