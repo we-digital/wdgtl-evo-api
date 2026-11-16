@@ -91,6 +91,13 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+  // Joins an album sent before (Baileys albumParentKey); remoteJid defaults to the resolved recipient.
+  albumParentKey?: proto.IMessageKey;
+}
+
+export class SendAlbumContainerDto extends Metadata {
+  expectedImageCount: number;
+  expectedVideoCount: number;
 }
 
 export class AlbumItem {
