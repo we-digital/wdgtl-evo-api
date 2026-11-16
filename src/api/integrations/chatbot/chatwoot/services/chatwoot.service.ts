@@ -84,6 +84,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-create';
 import { legacyWhatsappGroupContent } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import { groupResolveStats } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-group-resolve-stats';
+import { heicMediaAsJpeg } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-heic-jpeg';
 import { preserveAlbumContainers } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-history-album';
 import {
   ignoresHistoryPeer,
@@ -7477,7 +7478,21 @@ export class ChatwootService {
             nameFile = `${Math.random().toString(36).substring(7)}.${mimeTypes.extension(downloadBase64.mimetype) || ''}`;
           }
 
-          const fileData = Buffer.from(downloadBase64.base64, 'base64');
+          // HEIC/HEIF photos become JPEG so Chatwoot can preview them (C74). The
+          // durable byte proof above already ran on the native bytes.
+          const media = await heicMediaAsJpeg(
+            {
+              bytes: Buffer.from(downloadBase64.base64, 'base64'),
+              fileName: nameFile,
+              mimetype: downloadBase64.mimetype || messageBody?.mimetype,
+            },
+            (event, fields) =>
+              this.logger[event.endsWith('failed') ? 'warn' : 'info'](
+                JSON.stringify({ event, instanceId: instance.instanceId, ...fields }),
+              ),
+          );
+          const fileData = media.bytes;
+          nameFile = media.fileName;
 
           const fileStream = new Readable();
           fileStream._read = () => {};
