@@ -59,3 +59,14 @@ with `plan_cache_mode = force_generic_plan`: both statements use the index.
 
 No application change or image recreation is needed. The index is not in
 `schema.prisma`, like the other operator indexes in this folder.
+
+## Run log
+
+- 2026-11-16 13:00 UTC, owner-approved, in a detached container on bbc-evo
+  (evo-api image and env, runner mounted under `/evolution`):
+  - preflight: no lock waiters, no idle-in-transaction sessions;
+  - the build took 20.4 s; the index is 120 MB (126,328,832 bytes), valid, ready and live;
+  - COUNT on the busiest chat (11,979 rows): 1.3 ms and 6 buffers on
+    `Msg_instance_remotejid_incoming_idx` (94 ms and ~11k buffers before);
+  - the UPDATE plan uses the index for both status ranges;
+  - the EVO error rate stayed at its baseline.
