@@ -145,6 +145,8 @@ function literalService() {
     axios: { post: async (..._args: any[]) => ({ data: { id: 9 } }) },
     i18next: { t: () => 'Contact' },
     formatIncomingWhatsappMentions: (value: string) => value,
+    // C74: HEIC conversion is covered in chatwoot-heic-jpeg.test.ts; here media passes through.
+    heicMediaAsJpeg: async (media: { bytes: Buffer; fileName: string }) => media,
   };
   vm.runInNewContext(js, context);
   const service = new context.module.exports();
