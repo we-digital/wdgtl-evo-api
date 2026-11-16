@@ -100,3 +100,21 @@ test('a failed record never blocks the send', async () => {
   await assert.rejects(wa.sendMessageWithTyping(peer, { conversation: 'synthetic' }));
   assert.equal(sent, true);
 });
+
+test('the Chatwoot ingress stamp carries origin only for fromMe and never fails delivery', async () => {
+  const { ChatwootService } = require('../src/api/integrations/chatbot/chatwoot/services/chatwoot.service.ts');
+  const service: any = Object.create(ChatwootService.prototype);
+  const repository = fakeRepository();
+  await recordApiSentMessage(repository, 'inst-1', '3EB0SYNTHETICAPI');
+  service.prismaRepository = repository;
+  service.waMonitor = { waInstances: { synthetic: { instanceId: 'inst-1' } } };
+  service.logger = { warn() {} };
+  const instance = { instanceName: 'synthetic' };
+  const body = (id: string, fromMe: boolean) => ({ key: { id, fromMe, remoteJid: '120363000000@g.us' } });
+
+  assert.equal(await service.ingressOrigin(instance, body('3EB0SYNTHETICAPI', true)), 'api');
+  assert.equal(await service.ingressOrigin(instance, body('3A0SYNTHETICPHONE', true)), 'native');
+  assert.equal(await service.ingressOrigin(instance, body('3EB0SYNTHETICAPI', false)), null);
+  service.prismaRepository = { apiSentMessage: { findUnique: async () => { throw new Error('db down'); } } };
+  assert.equal(await service.ingressOrigin(instance, body('3EB0SYNTHETICAPI', true)), null);
+});

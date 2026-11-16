@@ -3,6 +3,7 @@ import { isDeepStrictEqual } from 'node:util';
 
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
+import { FromMeOrigin, fromMeOrigin } from '@api/integrations/channel/whatsapp/api-sent-messages';
 import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/whatsapp/media-message-metadata';
 import { persistNativeForwardMessage } from '@api/integrations/channel/whatsapp/persist-native-forward-message';
 import {
@@ -2557,13 +2558,29 @@ export class ChatwootService {
 
     const user = this.waMonitor.waInstances[instance.instanceName]?.client?.user;
     const attributes = buildChatwootIngressAttributes(messageBody, route, clientSent, [user?.id, user?.lid]);
+    const origin = await this.ingressOrigin(instance, messageBody);
     return {
       ...attributes,
       we_digital_ingress: {
         ...attributes.we_digital_ingress,
         source_payload_sha256: messageBody?.key && messageBody?.message ? inboundPayloadHash(messageBody) : null,
+        ...(origin ? { origin } : {}),
       },
     };
+  }
+
+  // we:Digital (owner, 2026-11-16): a fromMe message is "api" when this API recorded its id before sending,
+  // otherwise "native" (phone, WhatsApp Web, another linked device). One primary-key lookup, no WhatsApp call.
+  private async ingressOrigin(instance: InstanceDto, messageBody: any): Promise<FromMeOrigin | null> {
+    if (messageBody?.key?.fromMe !== true) return null;
+    const instanceId = instance.instanceId ?? this.waMonitor.waInstances[instance.instanceName]?.instanceId;
+    try {
+      return await fromMeOrigin(this.prismaRepository as any, instanceId, messageBody.key.id);
+    } catch (error) {
+      // Unknown origin keeps Chatwoot's previous rule for the message; delivery never waits on this.
+      this.logger.warn(`fromMe origin lookup failed: ${formatCaughtError(error)}`);
+      return null;
+    }
   }
 
   public async getInbox(instance: InstanceDto, allowRebind = false): Promise<inbox | null> {
