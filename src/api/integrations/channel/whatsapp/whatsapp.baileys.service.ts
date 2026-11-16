@@ -5988,7 +5988,14 @@ export class BaileysStartupService extends ChannelStartupService {
           `ownersUnchanged=${result.owners_unchanged ?? 0}`,
       );
     } catch (error) {
-      this.logger.warn(`Unable to forward WhatsApp owner read for ${remoteJid}: ${formatCaughtError(error)}`);
+      const status = (error as any)?.response?.status;
+      const reason = (error as any)?.response?.data?.error;
+      this.logger.warn(
+        `Unable to forward WhatsApp owner read for ${remoteJid}: ` +
+          (status
+            ? `Chatwoot ${status}${reason ? ` (${String(reason).slice(0, 200)})` : ''}`
+            : formatCaughtError(error)),
+      );
     }
   }
 

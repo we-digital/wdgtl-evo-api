@@ -169,6 +169,8 @@ import {
 import {
   buildChatwootEvoRouteBinding,
   buildChatwootIngressAttributes,
+  CHATWOOT_WHATSAPP_READ_SOURCE,
+  chatwootEvoInboxAttributes,
   ChatwootEvoRouteBinding,
   chatwootEvoRouteBindingsEqual,
   extractChatwootIngressMentionJids,
@@ -244,8 +246,8 @@ import {
   extractWhatsappReplyStanzaId,
   sameWhatsappUser,
   toChatwootWhatsappSourceId,
-  WhatsappQuoteParticipant,
   whatsappQuotedMessageContent,
+  WhatsappQuoteParticipant,
   whatsappReplyQuoteSnapshotText,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
@@ -1596,6 +1598,7 @@ export class ChatwootService {
         additional_attributes: {
           we_digital_provider: 'evo_whatsapp',
           we_digital_provider_contract_version: 2,
+          read_status_source: CHATWOOT_WHATSAPP_READ_SOURCE,
         },
       };
 
@@ -2512,20 +2515,18 @@ export class ChatwootService {
       return inboxRecord;
     }
 
+    const currentAttributes = (inboxRecord as any)?.additional_attributes;
     const currentBinding = this.inboxRouteBinding(inboxRecord);
-    if (chatwootEvoRouteBindingsEqual(currentBinding, expectedBinding)) return inboxRecord;
+    const bindingCurrent = chatwootEvoRouteBindingsEqual(currentBinding, expectedBinding);
+    const readSourceCurrent = currentAttributes?.read_status_source === CHATWOOT_WHATSAPP_READ_SOURCE;
+    if (bindingCurrent && readSourceCurrent) return inboxRecord;
 
-    if (currentBinding && !allowRebind) {
+    if (!bindingCurrent && currentBinding && !allowRebind) {
       this.logger.warn(`Chatwoot route changed for ${instance.instanceName}; explicit integration update required`);
       return inboxRecord;
     }
 
-    const additionalAttributes = {
-      ...((inboxRecord as any)?.additional_attributes || {}),
-      we_digital_provider: 'evo_whatsapp',
-      we_digital_provider_contract_version: expectedBinding.version,
-      we_digital_route_binding: expectedBinding,
-    };
+    const additionalAttributes = chatwootEvoInboxAttributes(currentAttributes, expectedBinding);
 
     try {
       await axios.patch(

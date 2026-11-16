@@ -170,6 +170,21 @@ export const buildChatwootEvoRouteBinding = ({
   };
 };
 
+// Chatwoot accepts owner read receipts (external_read) only from an API inbox
+// whose read_status_source names the provider; without it every read is a 422.
+export const CHATWOOT_WHATSAPP_READ_SOURCE = 'whatsapp';
+
+export const chatwootEvoInboxAttributes = (
+  current: Record<string, unknown> | null | undefined,
+  binding: ChatwootEvoRouteBinding,
+): Record<string, unknown> => ({
+  ...(current || {}),
+  we_digital_provider: 'evo_whatsapp',
+  we_digital_provider_contract_version: binding.version,
+  we_digital_route_binding: binding,
+  read_status_source: CHATWOOT_WHATSAPP_READ_SOURCE,
+});
+
 export const chatwootEvoRouteBindingsEqual = (
   left: ChatwootEvoRouteBinding | null | undefined,
   right: ChatwootEvoRouteBinding | null | undefined,
