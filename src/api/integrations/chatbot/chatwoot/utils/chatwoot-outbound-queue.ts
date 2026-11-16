@@ -61,6 +61,8 @@ export interface ChatwootOutboundPayload {
   album?: ChatwootOutboundAlbum;
   /** Planned WAID of this message's album container; the media joins that album. */
   albumParentWhatsappMessageId?: string;
+  /** false = send text without a link preview (bbc-api system sends set content_attributes.link_preview=false). */
+  linkPreview?: false;
   origin: ChatwootOutboundOrigin;
 }
 
@@ -360,6 +362,7 @@ export function buildChatwootOutboundParts(params: {
   };
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
   const quoted = chatwootReplyReferences(params.body?.content_attributes);
+  const noLinkPreview = chatwootNoLinkPreview(params.body?.content_attributes);
   const nativeForward = params.nativeForward
     ? {
         sourceChatwootMessageId: asRequiredInteger(
@@ -497,10 +500,17 @@ export function buildChatwootOutboundParts(params: {
           !part.album && Array.isArray(params.mentioned) && params.mentioned.length ? params.mentioned : undefined,
         ...(part.album ? { album: part.album } : {}),
         ...(part.inAlbum ? { albumParentWhatsappMessageId } : {}),
+        ...(noLinkPreview ? { linkPreview: false as const } : {}),
         origin: normalizedOrigin,
       },
     };
   });
+}
+
+/** True when the Chatwoot message asks to be sent without a link preview (automated sends only). */
+export function chatwootNoLinkPreview(contentAttributes: unknown): boolean {
+  const attributes = contentAttributes as Record<string, unknown> | null | undefined;
+  return attributes?.link_preview === false;
 }
 
 /**

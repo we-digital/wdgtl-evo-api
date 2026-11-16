@@ -7,6 +7,7 @@ import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot
 import { validatesCurrentChatwootOutboundSnapshot } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import {
   buildChatwootOutboundParts,
+  chatwootNoLinkPreview,
   ChatwootOutboundHandler,
   chatwootWebhookMessageCreatedAt,
   ChatwootOutboundMessageStatus,
@@ -97,6 +98,25 @@ const exactSnapshotMatches = (operation: StoredChatwootOutboundOperation, finger
     expectedRoute: origin.routeBinding,
     currentRoute: origin.routeBinding,
   });
+
+test('carries link_preview=false from an automated Chatwoot message into every part without changing its identity', () => {
+  const textOnly = { ...webhook, attachments: [] };
+  const plain = buildParts(textOnly);
+  const noPreview = buildParts({ ...textOnly, content_attributes: { in_reply_to: 99, link_preview: false } });
+
+  assert.equal(plain.length, 1);
+  assert.equal('linkPreview' in plain[0].payload, false);
+  assert.equal(noPreview[0].payload.linkPreview, false);
+  assert.equal(noPreview[0].operationKey, plain[0].operationKey);
+  assert.equal(noPreview[0].messageSetHash, plain[0].messageSetHash);
+  // Only an explicit false disables previews; anything else keeps the default.
+  for (const value of [true, 'false', 0, null, undefined]) {
+    assert.equal(chatwootNoLinkPreview({ link_preview: value }), false);
+  }
+  assert.equal(chatwootNoLinkPreview(undefined), false);
+  assert.equal(chatwootNoLinkPreview({ link_preview: false }), true);
+  assert.equal(buildBaileysTransportOptions({ linkPreview: false }).linkPreview, false);
+});
 
 test('uses only the exact top-level message and creates attachment identities independent of array order', () => {
   const first = buildParts();

@@ -44,6 +44,16 @@ import {
   stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import {
+  checkContactReachability,
+  CONTACT_REACHABILITY_EVENT,
+  ContactReachabilityReply,
+  LocalLookupBudgetStore,
+  LookupBudgetStore,
+  parseReachabilityPhones,
+  RedisLookupBudgetStore,
+  takeLookupBudget,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-reachability';
+import {
   buildContactReadRequest,
   CoalescedContactRead,
   ContactReadCoalescer,
@@ -203,6 +213,7 @@ import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/
 import {
   buildChatwootOutboundParts,
   CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED,
+  chatwootNoLinkPreview,
   ChatwootOutboundOrigin,
   ChatwootOutboundPhase,
   ChatwootOutboundQueue,
@@ -3995,6 +4006,7 @@ export class ChatwootService {
           afterTransport,
           signal,
           mentioned: payload.mentioned,
+          linkPreview: payload.linkPreview,
         },
         true,
         provenance,
@@ -4421,6 +4433,8 @@ export class ChatwootService {
     // Synchronous provider actions for "Create group" (gated by CHATWOOT_GROUP_CREATE_INSTANCES).
     if (body?.event === 'group_create_request') return this.receiveGroupCreate(instance, body, authenticatedAdmission);
     if (body?.event === 'group_create_status') return this.receiveGroupStatus(instance, body, authenticatedAdmission);
+    if (body?.event === CONTACT_REACHABILITY_EVENT)
+      return this.receiveContactReachability(instance, body, authenticatedAdmission);
     let outboundEnqueueAttempted = false;
     try {
       const outboundConfig = this.configService.get<Chatwoot>('CHATWOOT');
@@ -4944,6 +4958,7 @@ export class ChatwootService {
               delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
               quoted: await this.getQuotedMessage(body, instance),
               mentioned: mentionedJids.length ? mentionedJids : undefined,
+              ...(chatwootNoLinkPreview(body?.content_attributes) ? { linkPreview: false } : {}),
             };
 
             sendTelemetry('/message/sendText');
@@ -8541,6 +8556,59 @@ export class ChatwootService {
    * dialog someone opened (front of the queue), 'list' for a loaded conversation
    * list. Signed like every Chatwoot webhook; no Chatwoot or WhatsApp call here.
    */
+  /**
+   * Chatwoot asks whether numbers from a shared contact card have WhatsApp
+   * (contact_reachability_request v1): one batched whatsappNumber check.
+   */
+  private async receiveContactReachability(
+    instance: InstanceDto,
+    body: any,
+    admission?: ChatwootOutboundWebhookHeaders,
+  ): Promise<ContactReachabilityReply> {
+    this.requireAdmission(admission);
+    if (!groupCreateInstanceEnabled(instance, process.env.CHATWOOT_CONTACT_DISCOVERY_INSTANCES || ''))
+      return { status: 'error', code: 'discovery_disabled' };
+    const phones = parseReachabilityPhones(body);
+    if (!phones.length) return { status: 'error', code: 'invalid_request' };
+    const waInstance = this.waMonitor.waInstances[instance.instanceName];
+    if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
+      return { status: 'error', code: 'not_connected' };
+    const started = Date.now();
+    const allowed = await takeLookupBudget(this.contactLookupBudget(), instance.instanceName, phones.length).catch(
+      () => 0,
+    );
+    const reply = await checkContactReachability(
+      phones,
+      (numbers) => waInstance.whatsappNumber({ numbers }),
+      undefined,
+      allowed,
+    );
+    this.logger.info(
+      JSON.stringify({
+        event: 'chatwoot_contact_reachability_answered',
+        instance: instance.instanceName,
+        phones: phones.length,
+        allowed,
+        status: reply.status,
+        ms: Date.now() - started,
+      }),
+    );
+    return reply;
+  }
+
+  private static localContactLookupBudget = new LocalLookupBudgetStore();
+
+  /** Per-instance lookup counters, in Redis when EVO has it (shared by replicas and restarts). */
+  private contactLookupBudget(): LookupBudgetStore {
+    const redis = this.configService.get<CacheConf>('CACHE')?.REDIS;
+    if (redis?.ENABLED && redis.URI)
+      return new RedisLookupBudgetStore(
+        () => redisClient.getConnection() as any,
+        redis.PREFIX_KEY ? `${redis.PREFIX_KEY}:` : '',
+      );
+    return ChatwootService.localContactLookupBudget;
+  }
+
   private receiveAvatarRequest(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
     if (!admission) {
       throw Object.assign(new Error('Authenticated Chatwoot webhook admission is required'), {
