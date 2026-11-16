@@ -48,3 +48,13 @@ decision.
 
 A recurring job (for example a daily run from the existing scheduler) can follow
 once the one-shot run has been observed.
+
+## Run log
+
+- 2026-11-16 07:14–07:38 UTC, owner-approved, in a detached container on
+  bbc-evo (evo-api image and env, script mounted under `/evolution`):
+  - cleared 200,296 rows in 10 min (259 batches);
+  - `VACUUM (ANALYZE)` took 13.5 min with `vacuum_cost_delay = 5ms`;
+  - live payload fell from about 7.1 GB to 1.43 GB;
+  - the files stay 7.7 GB on disk and the space is reused;
+  - no rows outside `confirmed` were touched, there were no lock waiters, and the EVO error rate stayed at its baseline.
