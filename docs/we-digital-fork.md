@@ -1442,3 +1442,19 @@ product, order and event messages are not delivered to Chatwoot. The inbound que
 `failed`. Both recovery modes take `--skip-unsupported`: the ledger mode closes its `likely_unsupported` rows the same
 way (CAS on state and attempts), and the native mode records them as `ignored` ledger rows so they stop showing up as
 gaps. Both are part of the plan hash.
+
+## HEIC/HEIF inbound photos become JPEG (C74)
+
+Owner decision 2026-11-16: Chatwoot cannot preview iPhone HEIC photos, so inbound
+HEIC/HEIF media is converted to JPEG before it reaches Chatwoot over HTTP or the
+bus. `chatwoot-heic-jpeg.ts` detects HEIC locally (mimetype `image/heic|heif`,
+`.heic/.heif/.hif` name, or ISO BMFF `ftyp` brand) and posts only those bytes to
+the shared converter `POST $MEDIA_CONVERTER_URL/v1/media/jpeg` (the recognizer,
+also used by the Telegram listener) with `Authorization: Bearer
+$MEDIA_CONVERTER_API_KEY`, 20 s timeout (`MEDIA_CONVERTER_TIMEOUT_MS`). The JPEG
+replaces the bytes and the file name gets `.jpg`, so the bus media ref and the
+Chatwoot upload carry `image/jpeg`. The durable native byte proof runs on the
+original bytes before conversion. Unset URL or key disables it; any converter
+error keeps the original and logs only the error class. Cached-media recovery
+imports (`recovery` uploads) are unchanged. Removal: drop the call in
+`processWhatsappEvent` media branch and the util.
