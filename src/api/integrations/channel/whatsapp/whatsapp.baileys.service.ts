@@ -143,6 +143,7 @@ import makeWASocket, {
   DisconnectReason,
   downloadContentFromMessage,
   downloadMediaMessage,
+  generateMessageIDV2,
   generateWAMessageFromContent,
   getAggregateVotesInPollMessage,
   GetCatalogOptions,
@@ -191,6 +192,7 @@ import sharp from 'sharp';
 import { PassThrough, Readable } from 'stream';
 import { v4 } from 'uuid';
 
+import { recordApiSentMessage } from './api-sent-messages';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
@@ -2886,6 +2888,19 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     const sender = isWA.jid.toLowerCase();
+
+    // we:Digital (owner, 2026-11-16): an API send (not Chatwoot's) gets its WhatsApp id planned and recorded
+    // before transport, so the fromMe echo is told apart from a phone/linked-device message (origin api/native).
+    if (!isIntegration) {
+      const messageId = options?.messageId || generateMessageIDV2(this.client?.user?.id);
+      options = { ...(options ?? {}), messageId } as Options;
+      try {
+        await recordApiSentMessage(this.prismaRepository as any, this.instanceId, messageId);
+      } catch (error) {
+        // The send never waits on attribution: without the record the echo is judged native.
+        this.logger.error(`API sent-message record failed: ${error?.message ?? error}`);
+      }
+    }
 
     this.logger.verbose(`Sending message to ${sender}`);
     const albumParentKey = options?.albumParentKey

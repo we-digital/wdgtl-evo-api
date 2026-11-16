@@ -891,3 +891,12 @@ model ApiOutboundOperation {
   @@unique([instanceId, plannedWhatsappMessageId], map: "ApiOutbound_instance_native_key")
   @@index([instanceId, state], map: "ApiOutbound_instance_state_idx")
 }
+
+// WhatsApp ids of messages sent through this API (owner, 2026-11-16): fromMe origin "api" vs "native".
+model ApiSentMessage {
+  instanceId String   @db.VarChar(100)
+  messageId  String   @db.VarChar(100)
+  createdAt  DateTime @default(now()) @db.Timestamp
+
+  @@id([instanceId, messageId])
+}
