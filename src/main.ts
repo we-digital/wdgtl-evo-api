@@ -6,7 +6,13 @@ import { whatsappIngestRunner } from '@api/integrations/channel/whatsapp/whatsap
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
-import { apiOutboundOperations, chatwootService, eventManager, waMonitor } from '@api/server.module';
+import {
+  apiOutboundOperations,
+  apiSentMessageRetention,
+  chatwootService,
+  eventManager,
+  waMonitor,
+} from '@api/server.module';
 import {
   Auth,
   Chatwoot,
@@ -166,6 +172,7 @@ async function bootstrap() {
   }
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
+  apiSentMessageRetention.start();
 
   let shuttingDown = false;
   const drainAndExit = async (signal: 'SIGTERM' | 'SIGINT') => {
@@ -188,6 +195,7 @@ async function bootstrap() {
         httpClosed,
         chatwootService.stopOutboundWorker(),
         apiOutboundOperations.stop(),
+        apiSentMessageRetention.stop(),
       ]);
       const failed = drains.find((result): result is PromiseRejectedResult => result.status === 'rejected');
       if (failed) throw failed.reason;
