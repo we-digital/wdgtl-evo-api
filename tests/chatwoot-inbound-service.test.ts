@@ -1,5 +1,8 @@
 import { cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-cached-media';
-import { retainedVideoProxyUrl } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video';
+import {
+  readRetainedChatwootMedia,
+  retainedVideoProxyUrl,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video';
 import { ignoresHistoryPeer, persistHistoryIngress } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-history-ingress';
 import { legacyWhatsappGroupContent } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-group-display';
 import assert from 'node:assert/strict';
@@ -106,7 +109,7 @@ function literalService() {
     retainedHistoryDisplayBody,
     retainedHistoryMedia,
     persistHistoryIngress, ignoresHistoryPeer, normalizeStoredHistoryMessages, toChatwootSourceId,
-    cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT, retainedVideoProxyUrl, URL,
+    cachedHistoryMediaType, nativeCachedMediaPayload, CACHED_MEDIA_FILE_LIMIT, retainedVideoProxyUrl, readRetainedChatwootMedia, URL,
     chatwootImport:{getHistoryContentMessage:(service:any,body:any)=>service.getConversationMessage(body.message)},
     createHash,
     isDeepStrictEqual,

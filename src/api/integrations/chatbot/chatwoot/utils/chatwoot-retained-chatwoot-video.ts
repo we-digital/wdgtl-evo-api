@@ -161,8 +161,66 @@ export function retainedVideoProxyUrl(
     url.username ||
     url.password ||
     url.hash ||
-    !url.pathname.startsWith('/rails/active_storage/blobs/proxy/')
+    !(
+      url.pathname.startsWith('/rails/active_storage/blobs/proxy/') ||
+      url.pathname.startsWith('/rails/active_storage/blobs/redirect/')
+    )
   )
     throw new Error('retained_cw_video_proxy_untrusted');
   return url.toString();
+}
+
+// Chatwoot serves downloads straight from the bucket since 2026-11-15: download_url is the ActiveStorage redirect,
+// which answers 302 to a presigned URL in the media bucket. Exactly one hop is followed, and only into the bucket
+// named by CHATWOOT_MEDIA_BUCKET_URL (for example https://sgp1.digitaloceanspaces.com/bbc-chatwoot-storage/). The
+// legacy proxy path is read directly. Without the setting a redirect is refused, as before.
+// `hop` is true only for the redirect request, which may answer 3xx; every other read must answer 2xx.
+export type RetainedMediaGet = (
+  url: string,
+  hop: boolean,
+) => Promise<{ status: number; headers: Record<string, any>; data: any }>;
+
+export function retainedMediaBucketPrefix(env: NodeJS.ProcessEnv = process.env): URL | null {
+  const raw = env.CHATWOOT_MEDIA_BUCKET_URL?.trim();
+  if (!raw) return null;
+  const prefix = new URL(raw.endsWith('/') ? raw : `${raw}/`);
+  if (prefix.protocol !== 'https:' || prefix.username || prefix.password || prefix.search || prefix.hash) return null;
+  return prefix;
+}
+
+export function isRetainedMediaBucketUrl(location: string, prefix: URL | null): boolean {
+  if (!prefix) return false;
+  let url: URL;
+  try {
+    url = new URL(location);
+  } catch {
+    return false;
+  }
+  return (
+    url.protocol === 'https:' &&
+    url.origin === prefix.origin &&
+    !url.username &&
+    !url.password &&
+    !url.hash &&
+    url.pathname.startsWith(prefix.pathname) &&
+    !url.pathname.slice(prefix.pathname.length).split('/').includes('..')
+  );
+}
+
+export async function readRetainedChatwootMedia(
+  url: string,
+  get: RetainedMediaGet,
+  prefix: URL | null = retainedMediaBucketPrefix(),
+) {
+  if (!new URL(url).pathname.startsWith('/rails/active_storage/blobs/redirect/')) return get(url, false);
+  const hop = await get(url, true);
+  const location = hop.headers?.location;
+  if (
+    hop.status < 300 ||
+    hop.status >= 400 ||
+    typeof location !== 'string' ||
+    !isRetainedMediaBucketUrl(location, prefix)
+  )
+    throw new Error('retained_cw_video_redirect_untrusted');
+  return get(location, false);
 }
