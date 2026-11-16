@@ -234,6 +234,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reply-context';
 import {
   readRetainedChatwootGroupVideo,
+  readRetainedChatwootMedia,
   RetainedChatwootVideo,
   retainedVideoProxyUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video';
@@ -3048,14 +3049,17 @@ export class ChatwootService {
           maxContentLength: 1024 * 1024,
         });
         const url = retainedVideoProxyUrl(copy, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin);
-        const stored = await axios.request({
-          method: 'GET',
-          url,
-          responseType: 'arraybuffer',
-          timeout: 60_000,
-          maxRedirects: 0,
-          maxContentLength: limit,
-        });
+        const stored = await readRetainedChatwootMedia(url, (target, hop) =>
+          axios.request({
+            method: 'GET',
+            url: target,
+            responseType: 'arraybuffer',
+            timeout: 60_000,
+            maxRedirects: 0,
+            maxContentLength: limit,
+            validateStatus: (status) => status >= 200 && status < (hop ? 400 : 300),
+          }),
+        );
         if (stored.headers['content-type']?.split(';')[0] !== copy.content_type)
           throw new Error('retained_cw_video_response_mime');
         return Buffer.from(stored.data);
@@ -6300,14 +6304,17 @@ export class ChatwootService {
       const url = retainedVideoProxyUrl(row, response.data?.payload, new URL(trusted.TRUSTED_BASE_URL).origin, {
         fileType: cachedHistoryMediaType(message) === 'document' ? 'file' : undefined,
       });
-      const stored = await axios.request({
-        method: 'GET',
-        url,
-        responseType: 'arraybuffer',
-        maxRedirects: 0,
-        timeout: 15000,
-        maxContentLength: CACHED_MEDIA_FILE_LIMIT,
-      });
+      const stored = await readRetainedChatwootMedia(url, (target, hop) =>
+        axios.request({
+          method: 'GET',
+          url: target,
+          responseType: 'arraybuffer',
+          maxRedirects: 0,
+          timeout: 15000,
+          maxContentLength: CACHED_MEDIA_FILE_LIMIT,
+          validateStatus: (status) => status >= 200 && status < (hop ? 400 : 300),
+        }),
+      );
       const bytes = Buffer.from(stored.data),
         native = nativeCachedMediaPayload(message);
       if (bytes.length !== Number(row.byte_size) || !createHash('sha256').update(bytes).digest().equals(native.digest))

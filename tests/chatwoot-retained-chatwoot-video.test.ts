@@ -209,7 +209,7 @@ test('unknown digest, corrupt bytes, unavailable or forbidden object never becom
   );
 });
 
-test('rotated API snapshot, redirected or foreign URLs cannot authorize bytes', () => {
+test('rotated API snapshot or foreign URLs cannot authorize bytes', () => {
   for (const change of [
     { source_id: 'WAID:another' },
     { message_type: 0 },
@@ -220,7 +220,6 @@ test('rotated API snapshot, redirected or foreign URLs cannot authorize bytes', 
   for (const url of [
     'https://attacker.example/file',
     'http://cw.example/rails/active_storage/blobs/proxy/signed/video.mp4',
-    'https://cw.example/rails/active_storage/blobs/redirect/signed/video.mp4',
     'https://username:password@cw.example/rails/active_storage/blobs/proxy/signed/video.mp4',
   ])
     assert.throws(() =>
@@ -397,4 +396,69 @@ test('a document stored by Chatwoot as file verifies only when the caller expect
   assert.match(retainedVideoProxyUrl(copy, asFile, 'https://cw.example', { fileType: 'file' }), /\/blobs\/proxy\//);
   // The override never widens: a video row no longer matches an expected file.
   assert.throws(() => retainedVideoProxyUrl(copy, payload, 'https://cw.example', { fileType: 'file' }));
+});
+
+test('download_url may be the ActiveStorage redirect; one hop into the configured bucket only', async () => {
+  const { isRetainedMediaBucketUrl, readRetainedChatwootMedia, retainedMediaBucketPrefix } = await import(
+    '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-retained-chatwoot-video'
+  );
+  const prefix = retainedMediaBucketPrefix({ CHATWOOT_MEDIA_BUCKET_URL: 'https://sgp1.example-spaces.com/bbc-media' });
+  assert.ok(prefix);
+  const signed = 'https://sgp1.example-spaces.com/bbc-media/abc123?X-Amz-Signature=s';
+  assert.equal(isRetainedMediaBucketUrl(signed, prefix), true);
+  for (const bad of [
+    'http://sgp1.example-spaces.com/bbc-media/abc123',
+    'https://evil.example/bbc-media/abc123',
+    'https://sgp1.example-spaces.com/other-bucket/abc123',
+    'https://sgp1.example-spaces.com/bbc-media-x/abc123',
+    'https://u:p@sgp1.example-spaces.com/bbc-media/abc123',
+    'not a url',
+  ])
+    assert.equal(isRetainedMediaBucketUrl(bad, prefix), false, bad);
+  assert.equal(retainedMediaBucketPrefix({}), null);
+
+  const calls: string[] = [];
+  const redirect = 'https://cw.example/rails/active_storage/blobs/redirect/signed/video.mp4?disposition=attachment';
+  const ok = await readRetainedChatwootMedia(
+    redirect,
+    async (url, hop) => {
+      calls.push(`${hop}:${url}`);
+      return url === redirect
+        ? { status: 302, headers: { location: signed }, data: null }
+        : { status: 200, headers: { 'content-type': 'video/mp4' }, data: bytes };
+    },
+    prefix,
+  );
+  assert.equal(ok.status, 200);
+  assert.deepEqual(calls, [`true:${redirect}`, `false:${signed}`]);
+
+  await assert.rejects(
+    readRetainedChatwootMedia(
+      redirect,
+      async () => ({ status: 302, headers: { location: 'https://evil.example/x' }, data: null }),
+      prefix,
+    ),
+    /retained_cw_video_redirect_untrusted/,
+  );
+  await assert.rejects(
+    readRetainedChatwootMedia(redirect, async () => ({ status: 302, headers: { location: signed }, data: null }), null),
+    /retained_cw_video_redirect_untrusted/,
+  );
+
+  const proxy = 'https://cw.example/rails/active_storage/blobs/proxy/signed/video.mp4';
+  const direct: string[] = [];
+  await readRetainedChatwootMedia(
+    proxy,
+    async (url, hop) => (direct.push(`${hop}:${url}`), { status: 200, headers: {}, data: bytes }),
+    prefix,
+  );
+  assert.deepEqual(direct, [`false:${proxy}`]);
+  assert.equal(
+    retainedVideoProxyUrl(
+      copy,
+      [{ ...payload[0], attachments: [{ ...payload[0].attachments[0], download_url: redirect }] }],
+      'https://cw.example',
+    ),
+    redirect,
+  );
 });
