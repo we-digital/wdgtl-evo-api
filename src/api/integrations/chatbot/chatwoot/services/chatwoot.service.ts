@@ -47,7 +47,11 @@ import {
   checkContactReachability,
   CONTACT_REACHABILITY_EVENT,
   ContactReachabilityReply,
+  LocalLookupBudgetStore,
+  LookupBudgetStore,
   parseReachabilityPhones,
+  RedisLookupBudgetStore,
+  takeLookupBudget,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-contact-reachability';
 import {
   buildContactReadRequest,
@@ -8567,17 +8571,39 @@ export class ChatwootService {
     if (!waInstance?.client || waInstance.connectionStatus?.state !== 'open')
       return { status: 'error', code: 'not_connected' };
     const started = Date.now();
-    const reply = await checkContactReachability(phones, (numbers) => waInstance.whatsappNumber({ numbers }));
+    const allowed = await takeLookupBudget(this.contactLookupBudget(), instance.instanceName, phones.length).catch(
+      () => 0,
+    );
+    const reply = await checkContactReachability(
+      phones,
+      (numbers) => waInstance.whatsappNumber({ numbers }),
+      undefined,
+      allowed,
+    );
     this.logger.info(
       JSON.stringify({
         event: 'chatwoot_contact_reachability_answered',
         instance: instance.instanceName,
         phones: phones.length,
+        allowed,
         status: reply.status,
         ms: Date.now() - started,
       }),
     );
     return reply;
+  }
+
+  private static localContactLookupBudget = new LocalLookupBudgetStore();
+
+  /** Per-instance lookup counters, in Redis when EVO has it (shared by replicas and restarts). */
+  private contactLookupBudget(): LookupBudgetStore {
+    const redis = this.configService.get<CacheConf>('CACHE')?.REDIS;
+    if (redis?.ENABLED && redis.URI)
+      return new RedisLookupBudgetStore(
+        () => redisClient.getConnection() as any,
+        redis.PREFIX_KEY ? `${redis.PREFIX_KEY}:` : '',
+      );
+    return ChatwootService.localContactLookupBudget;
   }
 
   private receiveAvatarRequest(instance: InstanceDto, body: any, admission?: ChatwootOutboundWebhookHeaders) {
