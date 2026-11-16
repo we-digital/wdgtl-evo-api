@@ -1,3 +1,4 @@
+import { ApiSentMessageRetention } from '@api/integrations/channel/whatsapp/api-sent-message-retention';
 import { CacheEngine } from '@cache/cacheengine';
 import { Chatwoot, configService, ProviderSession } from '@config/env.config';
 import { eventEmitter } from '@config/event.config';
@@ -63,6 +64,10 @@ if (configService.get<ProviderSession>('PROVIDER').ENABLED) {
 }
 
 export const prismaRepository = new PrismaRepository(configService);
+export const apiSentMessageRetention = new ApiSentMessageRetention(
+  prismaRepository as any,
+  new Logger('ApiSentMessageRetention'),
+);
 export const apiOutboundOperations = new ApiOutboundOperations(
   new ApiOutboundPrismaStore(prismaRepository, process.env.DATABASE_PROVIDER || 'postgresql'),
 );
