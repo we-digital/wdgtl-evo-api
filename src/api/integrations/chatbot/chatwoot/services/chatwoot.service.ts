@@ -213,6 +213,7 @@ import { ChatwootOutboundPrismaStore } from '@api/integrations/chatbot/chatwoot/
 import {
   buildChatwootOutboundParts,
   CHATWOOT_OUTBOUND_ALBUM_NOT_NEEDED,
+  chatwootNoLinkPreview,
   ChatwootOutboundOrigin,
   ChatwootOutboundPhase,
   ChatwootOutboundQueue,
@@ -4005,6 +4006,7 @@ export class ChatwootService {
           afterTransport,
           signal,
           mentioned: payload.mentioned,
+          linkPreview: payload.linkPreview,
         },
         true,
         provenance,
@@ -4956,6 +4958,7 @@ export class ChatwootService {
               delay: Math.floor(Math.random() * (2000 - 500 + 1)) + 500,
               quoted: await this.getQuotedMessage(body, instance),
               mentioned: mentionedJids.length ? mentionedJids : undefined,
+              ...(chatwootNoLinkPreview(body?.content_attributes) ? { linkPreview: false } : {}),
             };
 
             sendTelemetry('/message/sendText');
