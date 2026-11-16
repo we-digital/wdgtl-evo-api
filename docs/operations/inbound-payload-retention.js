@@ -12,7 +12,9 @@ const pauseMs = Number(process.env.RETENTION_PAUSE_MS || 200);
 const apply = process.env.RETENTION_APPLY === 'yes';
 if (!Number.isInteger(days) || days < 7) throw new Error('RETENTION_DAYS must be an integer >= 7');
 
-const scope = `state = 'confirmed' AND "confirmedAt" IS NOT NULL AND "confirmedAt" < $1 AND payload <> '{}'::jsonb`;
+// confirmedAt is timestamp without time zone in UTC. Keep the cutoff as text:
+// a JS Date round-trip shifts it by the container's TZ (evo-api runs -03).
+const scope = `state = 'confirmed' AND "confirmedAt" IS NOT NULL AND "confirmedAt" < $1::timestamp AND payload <> '{}'::jsonb`;
 
 (async () => {
   const c = new Client({ connectionString: process.env.DATABASE_CONNECTION_URI, ssl: { rejectUnauthorized: false } });
@@ -21,7 +23,7 @@ const scope = `state = 'confirmed' AND "confirmedAt" IS NOT NULL AND "confirmedA
   await c.query(`SET statement_timeout = '120s'`);
   await c.query(`SET lock_timeout = '2s'`);
   const { rows: [{ cutoff }] } = await c.query(
-    `SELECT (now() AT TIME ZONE 'utc') - make_interval(days => $1) AS cutoff`, [days]);
+    `SELECT ((now() AT TIME ZONE 'utc') - make_interval(days => $1))::text AS cutoff`, [days]);
 
   const { rows: [plan] } = await c.query(
     `SELECT count(*)::int AS rows, coalesce(sum(pg_column_size(payload)), 0)::bigint AS bytes,

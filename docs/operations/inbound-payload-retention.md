@@ -23,8 +23,8 @@ any other state are never touched.
 `state = 'confirmed'`, `confirmedAt` older than `RETENTION_DAYS` (default 7,
 minimum 7), payload not already `{}`.
 
-Dry-run on 2026-11-16 09:08 UTC with this script: **199,350 rows, 5.7 GB of
-payload** (5,993,291,602 bytes of compressed column size) out of about 255k
+Dry-run on 2026-11-16 06:20 UTC with this script: **199,539 rows, 5.7 GB of
+payload** (5,996,077,012 bytes of compressed column size) out of about 255k
 confirmed rows. The table total was 7.7 GB. Other states (461
 `already_present`, 448 `ignored`, 2 `history_pending`) are out of scope.
 
