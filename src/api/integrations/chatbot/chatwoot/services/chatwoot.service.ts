@@ -224,6 +224,7 @@ import {
   ChatwootOutboundOrigin,
   ChatwootOutboundPhase,
   ChatwootOutboundQueue,
+  chatwootSharedContact,
   chatwootWebhookMessageCreatedAt,
   MIN_CHATWOOT_OUTBOUND_ALBUM_ITEMS,
   StoredChatwootOutboundOperation,
@@ -4023,6 +4024,22 @@ export class ChatwootService {
         },
         provenance,
       );
+    } else if (payload.sharedContact && typeof waInstance.contactCardMessage === 'function') {
+      sendTelemetry('/message/sendContact');
+      messageSent = await waInstance.contactCardMessage(
+        {
+          number: payload.chatId,
+          name: payload.sharedContact.name,
+          phones: payload.sharedContact.phones,
+          quoted,
+          messageId: operation.plannedWhatsappMessageId,
+          beforeTransport: onTransportStart,
+          afterTransport,
+          signal,
+        },
+        true,
+        provenance,
+      );
     } else {
       sendTelemetry('/message/sendText');
       messageSent = await waInstance.textMessage(
@@ -4990,11 +5007,25 @@ export class ChatwootService {
               ...(chatwootNoLinkPreview(body?.content_attributes) ? { linkPreview: false } : {}),
             };
 
-            sendTelemetry('/message/sendText');
+            const sharedContact = chatwootSharedContact(body?.content_attributes);
+            const sendsCard = sharedContact && typeof waInstance?.contactCardMessage === 'function';
+            sendTelemetry(sendsCard ? '/message/sendContact' : '/message/sendText');
 
             let messageSent: any;
             try {
-              messageSent = await waInstance?.textMessage(data, true, buildChatwootOutboundProvenance(body));
+              messageSent = sendsCard
+                ? await waInstance.contactCardMessage(
+                    {
+                      number: chatId,
+                      name: sharedContact.name,
+                      phones: sharedContact.phones,
+                      quoted: data.quoted,
+                      delay: data.delay,
+                    },
+                    true,
+                    buildChatwootOutboundProvenance(body),
+                  )
+                : await waInstance?.textMessage(data, true, buildChatwootOutboundProvenance(body));
               if (!messageSent) {
                 throw new Error('Message not sent');
               }

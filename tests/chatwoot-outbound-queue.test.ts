@@ -2,12 +2,14 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import { buildBaileysTransportOptions } from '@api/integrations/channel/whatsapp/chatwoot-transport-options';
+import { buildContactVcard } from '@utils/contact-vcard';
 import { BaileysStartupService } from '@api/integrations/channel/whatsapp/whatsapp.baileys.service';
 import { ChatwootProviderDeliveryPart } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-delivery-status';
 import { validatesCurrentChatwootOutboundSnapshot } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-binding';
 import {
   buildChatwootOutboundParts,
   chatwootNoLinkPreview,
+  chatwootSharedContact,
   ChatwootOutboundHandler,
   chatwootWebhookMessageCreatedAt,
   ChatwootOutboundMessageStatus,
@@ -98,6 +100,61 @@ const exactSnapshotMatches = (operation: StoredChatwootOutboundOperation, finger
     expectedRoute: origin.routeBinding,
     currentRoute: origin.routeBinding,
   });
+
+test('a picked contact becomes a contact-card part; other messages keep their identity', () => {
+  const textOnly = { ...webhook, attachments: [] };
+  const card = { name: 'Legal Department', phones: ['+6281234567890', '+6281200000001'] };
+  const plain = buildParts(textOnly);
+  const withCard = buildParts({ ...textOnly, content_attributes: { in_reply_to: 99, shared_contact: card } });
+
+  assert.equal('sharedContact' in plain[0].payload, false);
+  assert.equal(withCard.length, 1);
+  assert.deepEqual(withCard[0].payload.sharedContact, card);
+  // The readable text stays as the fallback for channels without cards.
+  assert.equal(withCard[0].payload.text, 'caption');
+  assert.notEqual(withCard[0].messageSetHash, plain[0].messageSetHash);
+  // Attachments win: a card only rides on a text-only message.
+  const withFile = buildParts({ ...webhook, content_attributes: { shared_contact: card } });
+  assert.ok(withFile.every((part) => !('sharedContact' in part.payload)));
+});
+
+test('reads only a well-formed shared_contact', () => {
+  assert.deepEqual(chatwootSharedContact({ shared_contact: { name: ' Kitas\n Dept ', phones: ['+62811111111'] } }), {
+    name: 'Kitas  Dept',
+    phones: ['+62811111111'],
+  });
+  for (const bad of [
+    undefined,
+    {},
+    { shared_contact: 'x' },
+    { shared_contact: { name: '', phones: ['+62811111111'] } },
+    { shared_contact: { name: 'A', phones: [] } },
+    { shared_contact: { name: 'A', phones: ['0811111111'] } },
+    { shared_contact: { name: 'A', phones: ['+62811111111', 5] } },
+    { shared_contact: { name: 'x'.repeat(101), phones: ['+62811111111'] } },
+    { shared_contact: { name: 'A', phones: Array.from({ length: 6 }, (_, i) => `+6281111111${i}`) } },
+  ]) {
+    assert.equal(chatwootSharedContact(bad), null);
+  }
+});
+
+test('contact vCard carries waid for every number and escapes the name', () => {
+  const vcard = buildContactVcard('BBC; Legal, Bali', ['+6281234567890', '+62 812 0000 0001']);
+  assert.equal(
+    vcard,
+    [
+      'BEGIN:VCARD',
+      'VERSION:3.0',
+      'N:;BBC\\; Legal\\, Bali;;;',
+      'FN:BBC\\; Legal\\, Bali',
+      'item1.TEL;type=CELL;waid=6281234567890:+6281234567890',
+      'item1.X-ABLabel:Mobile',
+      'item2.TEL;type=CELL;waid=6281200000001:+6281200000001',
+      'item2.X-ABLabel:Other',
+      'END:VCARD',
+    ].join('\n'),
+  );
+});
 
 test('carries link_preview=false from an automated Chatwoot message into every part without changing its identity', () => {
   const textOnly = { ...webhook, attachments: [] };
