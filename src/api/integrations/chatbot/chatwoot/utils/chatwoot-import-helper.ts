@@ -166,9 +166,12 @@ class ChatwootImport {
         }
 
         // inserting contacts in chatwoot db
-        let sqlInsert = `INSERT INTO contacts
-          (name, phone_number, account_id, identifier, created_at, updated_at) VALUES `;
-        const bindInsert = [provider.accountId];
+        // A number another contact already holds (a Telegram contact merged by number,
+        // a LID or older duplicate) is not inserted again: live ingress finds that
+        // contact by phone, and a second same-number contact found first by identifier
+        // breaks every conversation bound to the original one.
+        const bindInsert: (string | number)[] = [provider.accountId];
+        const rows: string[] = [];
 
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
@@ -177,24 +180,31 @@ class ChatwootImport {
             ? `${contact.pushName} (GROUP)`
             : whatsappContactName(contact.pushName) || contact.remoteJid.split('@')[0];
           bindInsert.push(contactName);
-          const bindName = `$${bindInsert.length}`;
+          const bindName = `$${bindInsert.length}::text`;
 
           let bindPhoneNumber: string;
           if (!isGroup) {
             bindInsert.push(`+${contact.remoteJid.split('@')[0]}`);
-            bindPhoneNumber = `$${bindInsert.length}`;
+            bindPhoneNumber = `$${bindInsert.length}::text`;
           } else {
-            bindPhoneNumber = 'NULL';
+            bindPhoneNumber = 'NULL::text';
           }
           bindInsert.push(contact.remoteJid);
-          const bindIdentifier = `$${bindInsert.length}`;
+          const bindIdentifier = `$${bindInsert.length}::text`;
 
-          sqlInsert += `(${bindName}, ${bindPhoneNumber}, $1, ${bindIdentifier}, NOW(), NOW()),`;
+          rows.push(`(${bindName}, ${bindPhoneNumber}, ${bindIdentifier})`);
         }
-        if (sqlInsert.slice(-1) === ',') {
-          sqlInsert = sqlInsert.slice(0, -1);
-        }
-        sqlInsert += ` ON CONFLICT (identifier, account_id)
+        const sqlInsert = `INSERT INTO contacts
+          (name, phone_number, account_id, identifier, created_at, updated_at)
+          SELECT incoming.name, incoming.phone_number, $1::integer, incoming.identifier, NOW(), NOW()
+          FROM (VALUES ${rows.join(', ')}) AS incoming(name, phone_number, identifier)
+          WHERE incoming.phone_number IS NULL OR NOT EXISTS (
+            SELECT 1 FROM contacts other
+            WHERE other.account_id = $1::integer
+              AND other.phone_number = incoming.phone_number
+              AND other.identifier IS DISTINCT FROM incoming.identifier
+          )
+          ON CONFLICT (identifier, account_id)
                        DO UPDATE SET
                         name = CASE WHEN contacts.identifier LIKE '%@g.us'
                           OR contacts.name IS NULL OR btrim(contacts.name) = ''
@@ -218,18 +228,13 @@ class ChatwootImport {
 
         await pgClient.query(sqlTag);
 
-        let sqlInsertLabel = `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at) VALUES `;
-
-        contactsChunk.forEach((contact) => {
-          const bindTaggableId = `(SELECT id FROM contacts WHERE identifier = '${contact.remoteJid}' AND account_id = ${provider.accountId})`;
-          sqlInsertLabel += `($1, $2, ${bindTaggableId}, $3, NOW()),`;
-        });
-
-        if (sqlInsertLabel.slice(-1) === ',') {
-          sqlInsertLabel = sqlInsertLabel.slice(0, -1);
-        }
-
-        await pgClient.query(sqlInsertLabel, [tagId, 'Contact', 'labels']);
+        // Only contacts this import holds by identifier; skipped numbers have none.
+        await pgClient.query(
+          `INSERT INTO taggings (tag_id, taggable_type, taggable_id, context, created_at)
+           SELECT $1::integer, $2::text, contact.id, $3::text, NOW() FROM contacts contact
+           WHERE contact.account_id = $4::integer AND contact.identifier = ANY($5::text[])`,
+          [tagId, 'Contact', 'labels', provider.accountId, contactsChunk.map((contact) => contact.remoteJid)],
+        );
 
         contactsChunk = this.sliceIntoChunks(contacts, 3000);
       }
