@@ -57,7 +57,7 @@ test('native group forward refreshes devices and sessions before fencing, retain
   assert.deepEqual(events, ['full-repair', 'fence', 'transport']);
   assert.equal(sends[0].options.useCachedGroupMetadata, false);
   assert.equal(sends[0].options.messageId, options.messageId);
-  assert.equal(sends[0].content.forward, original);
+  assert.deepEqual(sends[0].content.forward, original);
   assert.equal(sends[0].content.force, true);
   assert.equal(result.key.id, options.messageId);
   assert.equal(JSON.stringify(original), before);
@@ -278,4 +278,87 @@ test('real installed Signal reproduces linked-only readability and restored SKDM
     assert.equal(decoded.extendedTextMessage.text, 'synthetic');
     assert.equal(decoded.extendedTextMessage.contextInfo.isForwarded, true);
   }
+});
+
+// C170: a stored group message carries the sender key of the chat it came from and its own message context.
+function storedGroupImage() {
+  const bytes = Buffer.alloc(32, 7);
+  return {
+    key: { id: 'SYNTHETIC-GROUP-IMAGE', fromMe: true, remoteJid: '120363111111111111@g.us' },
+    message: {
+      mediaUrl: 'https://synthetic.invalid/media.jpeg',
+      imageMessage: proto.Message.ImageMessage.fromObject({
+        url: 'https://mmg.whatsapp.net/synthetic',
+        directPath: '/synthetic',
+        mimetype: 'image/jpeg',
+        mediaKey: bytes,
+        fileSha256: bytes,
+        fileEncSha256: bytes,
+        caption: 'synthetic caption',
+        contextInfo: { mentionedJid: [] },
+      }).toJSON(),
+      messageContextInfo: { messageSecret: Buffer.alloc(32, 8).toString('base64') },
+      senderKeyDistributionMessage: {
+        groupId: '120363111111111111@g.us',
+        axolotlSenderKeyDistributionMessage: Buffer.alloc(16, 9).toString('base64'),
+      },
+    },
+  };
+}
+
+test('installed Baileys alone marks the copied sender key, not the picture, and keeps the other group key', () => {
+  const forwarded = generateForwardMessageContent(storedGroupImage() as any, true);
+  const decoded = proto.Message.decode(proto.Message.encode(forwarded).finish());
+  assert.equal(decoded.senderKeyDistributionMessage?.groupId, '120363111111111111@g.us');
+  assert.notEqual(decoded.imageMessage.contextInfo?.isForwarded, true);
+});
+
+test('native forward sends only the picture, marked as forwarded, without the source chat sender key', async () => {
+  const { wa, sends, options } = harness(false);
+  const original = storedGroupImage();
+  const before = JSON.stringify(original);
+  await wa.nativeForwardMessage(group, original, options);
+  const sent = sends[0].content.forward;
+  assert.deepEqual(Object.keys(sent.message), ['imageMessage']);
+  assert.deepEqual(sent.key, original.key);
+  const decoded = proto.Message.decode(
+    proto.Message.encode(generateForwardMessageContent(sent, sends[0].content.force)).finish(),
+  );
+  assert.equal(decoded.senderKeyDistributionMessage, null);
+  assert.equal(decoded.messageContextInfo, null);
+  assert.equal(decoded.imageMessage.contextInfo.isForwarded, true);
+  assert.equal(decoded.imageMessage.contextInfo.forwardingScore, 1);
+  assert.equal(decoded.imageMessage.directPath, '/synthetic');
+  assert.equal(decoded.imageMessage.caption, 'synthetic caption');
+  assert.equal(JSON.stringify(original), before);
+});
+
+test('native forward unwraps a captioned document and forwards the document itself', async () => {
+  const { wa, sends, options } = harness(false);
+  await wa.nativeForwardMessage(
+    direct,
+    {
+      key: { id: 'SYNTHETIC-DOC', fromMe: false },
+      message: {
+        documentWithCaptionMessage: { message: { documentMessage: { fileName: 'synthetic.pdf', caption: 'c' } } },
+        messageContextInfo: { messageSecret: 'AAAA' },
+      },
+    },
+    options,
+  );
+  assert.deepEqual(Object.keys(sends[0].content.forward.message), ['documentMessage']);
+});
+
+test('a source without message content never reaches the transport', async () => {
+  const { wa, sends, events, options } = harness();
+  await assert.rejects(
+    wa.nativeForwardMessage(
+      group,
+      { key: { id: 'SYNTHETIC-EMPTY' }, message: { senderKeyDistributionMessage: { groupId: group } } },
+      options,
+    ),
+    { name: 'NativeForwardSourceMissing' },
+  );
+  assert.equal(sends.length, 0);
+  assert.deepEqual(events, []);
 });

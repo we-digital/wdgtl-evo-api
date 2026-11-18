@@ -206,6 +206,7 @@ import {
   projectNativeWhatsappEdit,
   qualifyNativeWhatsappEditKey,
 } from './normalized-whatsapp-edit';
+import { nativeForwardSource } from './native-forward-content';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { RecentOutboundMessages } from './recent-outbound-messages';
 import { SendRecipientCache } from './send-recipient-cache';
@@ -4273,6 +4274,7 @@ export class BaileysStartupService extends ChannelStartupService {
     options?: Pick<Options, 'messageId' | 'beforeTransport' | 'signal'>,
   ) {
     const jid = createJid(number);
+    const forward = nativeForwardSource(source);
     if (options?.signal?.aborted) {
       const error = new Error('Outbound operation aborted before native forward transport');
       error.name = 'OutboundOperationAborted';
@@ -4295,7 +4297,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const messageSent = await this.client.sendMessage(
       jid,
       {
-        forward: source,
+        forward,
         force: true,
       },
       { ...transportOptions, ...(options?.messageId ? { messageId: options.messageId } : {}) },
