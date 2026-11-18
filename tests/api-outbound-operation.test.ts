@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { ApiOutboundConflict, ApiOutboundHooks, ApiOutboundOperations, ApiOutboundRecord,
-  ApiOutboundStore, isApiNonRecipient } from '../src/api/services/api-outbound-operation';
+  ApiOutboundStore, describeSendFailure, isApiNonRecipient } from '../src/api/services/api-outbound-operation';
 
 const id = '00112233-4455-8677-8899-aabbccddeeff';
 const peer = '628111111111@s.whatsapp.net';
@@ -195,4 +195,39 @@ test('a caller timeout keeps a renewable shared lease while another API process 
   assert.equal(result.operation.state, 'unknown'); assert.equal(result.operation.retryAllowed, false); assert.equal(sends, 1);
   release(); await first.stop();
   assert.equal((await second.status(id, 'instance'))!.operation.state, 'sent');
+});
+
+test('an uncoded pre-transport failure is reported with its cause, without URLs or phone numbers', async () => {
+  const store = new Store();
+  const reported: any[] = [];
+  const operations = new ApiOutboundOperations(store, () => new Date(1000), 120_000, 180_000, (failure) => reported.push(failure));
+  const failure = Object.assign(new Error('Request failed with status code 404 for https://link.example/abc?token=secret to 628111111111'),
+    { response: { status: 404 } });
+  const view = await operations.send(id, 'instance-1', 'sendMedia', payload, false, async () => { throw failure; });
+  assert.equal(view.operation.state, 'pending');
+  assert.equal(store.row!.lastErrorCode, 'API_SEND_FAILED');
+  assert.equal(reported.length, 1);
+  assert.equal(reported[0].operationId, id);
+  assert.equal(reported[0].instanceId, 'instance-1');
+  assert.equal(reported[0].status, 404);
+  assert.equal(reported[0].errorClass, 'Error');
+  assert.doesNotMatch(reported[0].message, /secret|628111111111|https?:/);
+  assert.match(reported[0].message, /status code 404 for <url> to <num>/);
+});
+
+test('coded failures and a throwing reporter do not change the send outcome', async () => {
+  const store = new Store();
+  const reported: any[] = [];
+  const operations = new ApiOutboundOperations(store, () => new Date(1000), 120_000, 180_000, (failure) => {
+    reported.push(failure);
+    throw new Error('logger down');
+  });
+  await operations.send(id, 'instance-1', 'sendText', payload, false, async () => { throw new Error('EVO_LOCK_TIMEOUT'); });
+  assert.equal(store.row!.lastErrorCode, 'EVO_LOCK_TIMEOUT');
+  assert.equal(reported.length, 0);
+  store.row!.nextAttemptAt = new Date(0);
+  await operations.send(id, 'instance-1', 'sendText', payload, false, async () => { throw new TypeError('fetch failed'); });
+  assert.equal(store.row!.lastErrorCode, 'API_SEND_FAILED');
+  assert.equal(reported.length, 1);
+  assert.deepEqual(describeSendFailure('plain'), { errorClass: 'string', status: undefined, message: 'plain' });
 });
