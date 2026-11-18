@@ -231,3 +231,15 @@ test('coded failures and a throwing reporter do not change the send outcome', as
   assert.equal(reported.length, 1);
   assert.deepEqual(describeSendFailure('plain'), { errorClass: 'string', status: undefined, message: 'plain' });
 });
+
+test('a JID-addressed send to a number not on WhatsApp is terminal, as the lookup echoes the JID', async () => {
+  const jidPayload = { number: peer, mediatype: 'document', media: 'https://link.example/doc.pdf', fileName: 'doc.pdf' };
+  const negative = { status: 400, message: [{ exists: false, number: peer, jid: peer }] };
+  assert.equal(isApiNonRecipient(negative, jidPayload), true);
+  assert.equal(isApiNonRecipient({ ...negative, message: [{ exists: false, number: '628999999999@s.whatsapp.net', jid: peer }] }, jidPayload), false);
+  const store = new Store();
+  const operations = new ApiOutboundOperations(store, () => new Date(1000));
+  const view = await operations.send(id, 'instance-1', 'sendMedia', jidPayload, false, async () => { throw negative; });
+  assert.equal(view.operation.state, 'failed');
+  assert.equal(store.row!.lastErrorCode, 'EVO_RECIPIENT_NOT_ON_WHATSAPP');
+});

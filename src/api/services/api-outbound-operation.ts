@@ -65,7 +65,9 @@ export const isApiNonRecipient = (error: any, payload: any): boolean => {
     item &&
     !Array.isArray(item) &&
     item.exists === false &&
-    item.number === number &&
+    // The lookup echoes the number as it was asked: bbc-api sends a JID (628…@s.whatsapp.net), so compare the digits.
+    // Comparing the raw value made every "not on WhatsApp" JID send a retryable API_SEND_FAILED (BBC C156, 2026-11-18).
+    String(item.number ?? '').replace(/\D/g, '') === number &&
     item.jid === `${number}@s.whatsapp.net` &&
     Object.keys(item).every((key) => ['number', 'jid', 'exists', 'name'].includes(key))
   );
