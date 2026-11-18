@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { OnWhatsAppDto } from '../src/api/dto/chat.dto';
 import { ApiOutboundConflict, ApiOutboundHooks, ApiOutboundOperations, ApiOutboundRecord,
   ApiOutboundStore, describeSendFailure, isApiNonRecipient } from '../src/api/services/api-outbound-operation';
 
@@ -242,4 +243,26 @@ test('a JID-addressed send to a number not on WhatsApp is terminal, as the looku
   const view = await operations.send(id, 'instance-1', 'sendMedia', jidPayload, false, async () => { throw negative; });
   assert.equal(view.operation.state, 'failed');
   assert.equal(store.row!.lastErrorCode, 'EVO_RECIPIENT_NOT_ON_WHATSAPP');
+});
+
+test('the real lookup DTO (own undefined name/lid) for a JID not on WhatsApp is terminal', async () => {
+  const jidPayload = { number: peer, text: 'x' };
+  const dto = new OnWhatsAppDto(peer, false, peer);
+  assert.ok(Object.keys(dto).includes('lid'));
+  const negative = { status: 400, error: 'Bad Request', message: [dto] };
+  assert.equal(isApiNonRecipient(negative, jidPayload), true);
+  assert.equal(isApiNonRecipient({ ...negative, message: [new OnWhatsAppDto(peer, false, peer, undefined, '123@lid')] }, jidPayload), true);
+  assert.equal(isApiNonRecipient({ ...negative, message: [{ ...dto, extra: 1 }] }, jidPayload), false);
+  const store = new Store();
+  const view = await new ApiOutboundOperations(store, () => new Date(1000)).send(id, 'instance-1', 'sendText', jidPayload, false, async () => { throw negative; });
+  assert.equal(view.operation.state, 'failed');
+  assert.equal(store.row!.lastErrorCode, 'EVO_RECIPIENT_NOT_ON_WHATSAPP');
+});
+
+test('a plain-object HTTP error is described by its message, masked', () => {
+  const described = describeSendFailure({ status: 400, error: 'Bad Request', message: [{ jid: '628111111111@s.whatsapp.net', exists: false }] });
+  assert.equal(described.status, 400);
+  assert.equal(described.errorClass, 'object');
+  assert.match(described.message, /"exists":false/);
+  assert.doesNotMatch(described.message, /628111111111/);
 });
