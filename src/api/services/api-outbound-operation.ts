@@ -69,7 +69,8 @@ export const isApiNonRecipient = (error: any, payload: any): boolean => {
     // Comparing the raw value made every "not on WhatsApp" JID send a retryable API_SEND_FAILED (BBC C156, 2026-11-18).
     String(item.number ?? '').replace(/\D/g, '') === number &&
     item.jid === `${number}@s.whatsapp.net` &&
-    Object.keys(item).every((key) => ['number', 'jid', 'exists', 'name'].includes(key))
+    // The lookup returns OnWhatsAppDto instances: name and lid are own properties even when undefined (BBC C156).
+    Object.entries(item).every(([key, value]) => value === undefined || ['number', 'jid', 'exists', 'name', 'lid'].includes(key))
   );
 };
 
@@ -89,7 +90,13 @@ export interface ApiOutboundHooks {
 
 /** What an uncoded pre-transport failure was, without URLs (they carry tokens) or long numbers (phones). */
 export function describeSendFailure(error: unknown) {
-  const raw = error instanceof Error ? error.message : String(error);
+  // EVO's HTTP exceptions throw plain objects ({ status, error, message: [...] }): describe their message, not "[object Object]".
+  const raw =
+    error instanceof Error
+      ? error.message
+      : error && typeof error === 'object'
+        ? JSON.stringify((error as any).message ?? error)
+        : String(error);
   const status = (error as any)?.response?.status ?? (error as any)?.status;
   return {
     errorClass: error instanceof Error ? error.constructor.name : typeof error,
