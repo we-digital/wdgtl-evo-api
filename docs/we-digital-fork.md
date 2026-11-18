@@ -52,6 +52,14 @@ before transport. Direct sends and flag-off behavior remain unchanged. Preserve
 source media, force-forward semantics, planned WhatsApp IDs and post-transport
 acknowledgement retention; never fall back or replay an ambiguous send.
 
+C170 (2026-11-18): the forward source is reduced to its one content key
+(`native-forward-content.ts`) before Baileys' `generateForwardMessageContent`.
+A stored message also holds its chat's `senderKeyDistributionMessage` and
+`messageContextInfo`; Baileys copies them and marks the forward on the first key
+after its protobuf round-trip (the SKDM), so group forwards carried another
+group's sender key and the phone app dropped them. Keep this until upstream
+picks the content key with `getContentType` and drops delivery-only fields.
+
 MessageUpdate has an additive nullable `providerErrorCode` (VARCHAR(6)) in both
 provider schemas. Only numeric Baileys negative-ACK codes are retained and added
 to existing message-update webhooks. Error dedup separates distinct codes. Raw
