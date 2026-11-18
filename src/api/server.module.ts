@@ -68,8 +68,13 @@ export const apiSentMessageRetention = new ApiSentMessageRetention(
   prismaRepository as any,
   new Logger('ApiSentMessageRetention'),
 );
+const apiOutboundLogger = new Logger('ApiOutboundOperations');
 export const apiOutboundOperations = new ApiOutboundOperations(
   new ApiOutboundPrismaStore(prismaRepository, process.env.DATABASE_PROVIDER || 'postgresql'),
+  undefined,
+  undefined,
+  undefined,
+  (failure) => apiOutboundLogger.warn(JSON.stringify({ event: 'api_outbound_send_failed', ...failure })),
 );
 
 export const waMonitor = new WAMonitoringService(
