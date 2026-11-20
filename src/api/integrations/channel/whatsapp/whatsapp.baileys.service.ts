@@ -1,3 +1,4 @@
+import { StanzaTrace, traceBaileysLogger } from './stanza-trace';
 import { isDeepStrictEqual } from 'node:util';
 
 import { getCollectionsDto } from '@api/dto/business.dto';
@@ -344,6 +345,22 @@ export class BaileysStartupService extends ChannelStartupService {
   private endSession = false;
   private historySyncFullRequestedForSocket = false;
   private logBaileys = this.configService.get<Log>('LOG').BAILEYS;
+
+  // Diagnostic stanza trace for the 50-min status-ack stream errors (logging only).
+  // On unless EVO_STANZA_TRACE=false.
+  private stanzaTraceState: StanzaTrace | null = null;
+  private stanzaTraceTimer: NodeJS.Timeout | null = null;
+  private stanzaTraceEnabled(): boolean {
+    return process.env.EVO_STANZA_TRACE !== 'false';
+  }
+  private stanzaTrace(): StanzaTrace {
+    if (!this.stanzaTraceState) {
+      this.stanzaTraceState = new StanzaTrace(this.instance?.name ?? 'unknown', (line) => this.logger.info(line));
+      this.stanzaTraceTimer = setInterval(() => this.stanzaTraceState?.report(), 10 * 60_000);
+      this.stanzaTraceTimer.unref?.();
+    }
+    return this.stanzaTraceState;
+  }
   private eventProcessingQueue: Promise<void> = Promise.resolve();
   private clientGeneration = 0;
 
@@ -949,7 +966,9 @@ export class BaileysStartupService extends ChannelStartupService {
     const socketConfig: UserFacingSocketConfig = {
       ...options,
       version,
-      logger: P({ level: this.logBaileys }),
+      logger: this.stanzaTraceEnabled()
+        ? traceBaileysLogger(P({ level: this.logBaileys }), (args) => this.stanzaTrace().baileysDebug(args))
+        : P({ level: this.logBaileys }),
       printQRInTerminal: false,
       auth: {
         creds: this.instance.authState.state.creds,
@@ -1009,6 +1028,11 @@ export class BaileysStartupService extends ChannelStartupService {
     this.clientGeneration++;
     const clientGeneration = this.clientGeneration;
     this.client = makeWASocket(socketConfig);
+    if (this.stanzaTraceEnabled()) {
+      const trace = this.stanzaTrace();
+      this.client.ws.on('frame', (frame) => trace.inbound(frame));
+      this.client.ws.on('CB:stream:error', (node) => trace.streamError(node));
+    }
 
     if (this.localSettings.wavoipToken && this.localSettings.wavoipToken.length > 0) {
       useVoiceCallsBaileys(this.localSettings.wavoipToken, this.client, this.connectionStatus.state as any, true);
