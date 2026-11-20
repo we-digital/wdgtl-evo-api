@@ -6,8 +6,11 @@ import {
 // Staff read external_error on the failed message, so known terminal causes
 // get a plain sentence; everything else keeps the generic text.
 export const WHATSAPP_RECIPIENT_NOT_FOUND = 'WhatsappRecipientNotFound';
+// The send event reached EVO without the ids it needs (e.g. no conversation id).
+export const BUS_OUTBOUND_INVALID = 'ChatwootBusOutboundInvalid';
 const DELIVERY_FAILURE_REASONS: Record<string, string> = {
   [WHATSAPP_RECIPIENT_NOT_FOUND]: 'This number is not on WhatsApp',
+  [BUS_OUTBOUND_INVALID]: 'Not sent. Please send the message again.',
 };
 
 export const buildChatwootDeliveryFailureUpdate = (

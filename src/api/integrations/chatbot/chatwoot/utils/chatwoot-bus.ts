@@ -20,6 +20,28 @@ export const BUS_PARTITIONS = 16;
 export const BUS_MEDIA_BUCKET = 'media';
 export const BUS_FEEDBACK_CONSUMER = 'evo-feedback';
 export const BUS_OUTBOUND_CONSUMER = 'evo-outbound';
+
+// A handler error that redelivery can never fix (a malformed event body). The
+// consumer terms the message instead of naking it every 5 s for ever.
+export function busTerminalError(message: string): Error {
+  return Object.assign(new Error(message), { name: 'BusTerminalError', busTerminal: true });
+}
+export const isBusTerminalError = (error: unknown): boolean =>
+  (error as { busTerminal?: unknown })?.busTerminal === true;
+
+// The ids a CW_OUT message_created event must carry to be sent at all. Returns
+// the first missing one; Chatwoot published at least one first message of a
+// new conversation without conversation.id (11-17, redelivered for 3 days).
+export function busOutboundMissingId(payload: any): string | null {
+  if (payload?.event !== 'message_created') return null;
+  const valid = (value: unknown) =>
+    Number.isSafeInteger(Number(value)) && Number(value) > 0 && value !== null && value !== '';
+  if (!valid(payload?.id)) return 'message';
+  if (!valid(payload?.account?.id)) return 'account';
+  if (!valid(payload?.inbox?.id)) return 'inbox';
+  if (!valid(payload?.conversation?.id)) return 'conversation';
+  return null;
+}
 // Sentinel returned by a delivery that was handed to the bus.
 export const INBOUND_BUS_PUBLISHED = Symbol('InboundBusPublished');
 // A published row waits this long for Chatwoot's outcome before the ledger
@@ -167,7 +189,8 @@ export class ChatwootBus {
 
   // Durable pull consumer processed strictly one message at a time in stream
   // order (per-chat order is preserved end to end). A handler error naks the
-  // message for redelivery after 5 s.
+  // message for redelivery after 5 s; an error marked terminal (see
+  // busTerminalError) can never succeed on redelivery and is termed instead.
   async consume(
     stream: string,
     durable: string,
@@ -197,9 +220,12 @@ export class ChatwootBus {
           await handle(msg.subject, msg.json(), msg.headers as any);
           msg.ack();
         } catch (error) {
-          msg.nak(5_000);
-          this.observe('chatwoot_bus_consume_failed', {
+          const terminal = isBusTerminalError(error);
+          if (terminal) msg.term(String((error as Error)?.message || 'terminal').slice(0, 100));
+          else msg.nak(5_000);
+          this.observe(terminal ? 'chatwoot_bus_consume_terminated' : 'chatwoot_bus_consume_failed', {
             stream,
+            seq: msg.seq,
             errorClass: (error as Error)?.name || 'Error',
             detail: String((error as Error)?.message || '').slice(0, 200),
           });

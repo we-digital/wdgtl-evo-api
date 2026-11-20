@@ -66,6 +66,7 @@ import { extractChatwootContacts } from '@api/integrations/chatbot/chatwoot/util
 import {
   buildChatwootDeliveryFailureUpdate,
   buildChatwootDeliverySuccessUpdate,
+  BUS_OUTBOUND_INVALID,
   ChatwootProviderContext,
   ChatwootProviderDeliveryPart,
   isChatwootDeliveryFailureAcknowledged,
@@ -331,9 +332,11 @@ import {
   busFreshSendEnabled,
   busInstanceEnabled,
   BusMediaRef,
+  busOutboundMissingId,
   busOutboundPeerAllowed,
   BusOutcome,
   busSubject,
+  busTerminalError,
   ChatwootBus,
   INBOUND_BUS_PUBLISHED,
 } from '../utils/chatwoot-bus';
@@ -4216,6 +4219,43 @@ export class ChatwootService {
     return { handled: true, data: reply.data };
   }
 
+  // Marks a Chatwoot message failed when its outbound event can never be sent.
+  // The conversation id comes from the event or, when the event lacks it, from
+  // the Chatwoot database (read-only). Resolves whether Chatwoot acknowledged it.
+  private async failInvalidBusOutbound(
+    instance: { id: string; name: string },
+    provider: any,
+    payload: any,
+  ): Promise<boolean> {
+    const messageId = Number(payload?.id);
+    const accountId = Number(payload?.account?.id ?? provider?.accountId);
+    if (!Number.isSafeInteger(messageId) || messageId <= 0 || !Number.isSafeInteger(accountId) || accountId <= 0)
+      return false;
+    let conversationId = Number(payload?.conversation?.id);
+    if (!Number.isSafeInteger(conversationId) || conversationId <= 0) {
+      if (!this.pgClient || !this.isImportHistoryAvailable()) return false;
+      const { rows } = await this.pgClient.query(
+        `SELECT c.display_id FROM messages m JOIN conversations c ON c.id = m.conversation_id AND c.account_id = m.account_id
+         WHERE m.id = $1 AND m.account_id = $2 LIMIT 1`,
+        [messageId, accountId],
+      );
+      conversationId = Number(rows[0]?.display_id);
+      if (!Number.isSafeInteger(conversationId) || conversationId <= 0) return false;
+    }
+    const failure = buildChatwootDeliveryFailureUpdate(accountId, conversationId, messageId, BUS_OUTBOUND_INVALID);
+    const viaBus: any = await this.patchChatwootMessageViaBus(provider, failure);
+    const response: any = viaBus?.handled
+      ? viaBus.data
+      : await updateChatwootMessageJson(
+          this.getClientCwConfig(provider),
+          failure.accountId,
+          failure.conversationId,
+          failure.messageId,
+          failure.data,
+        );
+    return isChatwootDeliveryFailureAcknowledged(response, messageId);
+  }
+
   private patchChatwootMessageViaBus(
     provider: any,
     update: { accountId: number; conversationId: number; messageId: number; data: Record<string, unknown> },
@@ -7074,6 +7114,23 @@ export class ChatwootService {
     if (!instance || !provider?.enabled) {
       this.busObserve('chatwoot_bus_outbound_unroutable', { instanceId, deliveryId });
       return;
+    }
+    const missing = busOutboundMissingId(body.payload);
+    if (missing) {
+      // Retrying the same body can never send it: mark the Chatwoot message
+      // failed (when its conversation can still be found) and drop the event.
+      const marked = await this.failInvalidBusOutbound(instance, provider, body.payload).catch(() => false);
+      this.logger.warn(
+        JSON.stringify({
+          event: 'chatwoot_bus_outbound_invalid',
+          instanceId,
+          deliveryId,
+          missing,
+          messageId: Number(body.payload?.id) || null,
+          markedFailed: marked,
+        }),
+      );
+      throw busTerminalError(`Chatwoot outbound event without ${missing} id`);
     }
     const peer = chatwootOutboundDestination(body.payload?.conversation);
     if (!busOutboundPeerAllowed(peer)) {
