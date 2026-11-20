@@ -1,16 +1,24 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 
+import { canonicalInboundBody } from './chatwoot-inbound-native-source';
 import {
   InboundAck,
   InboundDelivery,
   InboundLane,
+  inboundPayloadHash,
   InboundStore,
   InboundTerminalReason,
   InboundTerminalState,
 } from './chatwoot-inbound-queue';
 
+// Settled rows (delivered, ignored, already in Chatwoot) are kept this long for
+// diagnosis and duplicate suppression, then deleted. Failed rows stay for recovery.
+export const INBOUND_RETENTION_STATES = ['confirmed', 'ignored', 'already_present'] as const;
+export const INBOUND_RETENTION_MS = 14 * 24 * 60 * 60 * 1000;
+
 // This delegate is generated from both supported provider schemas at image build time.
 interface Delegate {
+  deleteMany(args: any): Promise<{ count: number }>;
   upsert(args: any): Promise<InboundDelivery>;
   findMany(args: any): Promise<InboundDelivery[]>;
   updateMany(args: any): Promise<{ count: number }>;
@@ -30,6 +38,9 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     // An 'ignored' row only proves its own frozen payload carried no content
     // (e.g. a sender-key-only copy). Different content under the same key reopens it.
     if (stored.state !== 'ignored' || stored.payloadHash === item.payloadHash) return stored;
+    // Rows admitted before the ledger stored base64 bytes hash the same source
+    // differently: compare in the stored encoding before reopening.
+    if (inboundPayloadHash(canonicalInboundBody(stored.payload), true) === item.payloadHash) return stored;
     const reopened = await this.rows.updateMany({
       where: { id: item.id, state: 'ignored', payloadHash: stored.payloadHash },
       data: {
@@ -216,6 +227,33 @@ export class ChatwootInboundPrismaStore implements InboundStore {
           leaseOwner: null,
         },
         data: { nextAttemptAt: now },
+      })
+    ).count;
+  }
+  /**
+   * Deletes up to `limit` settled rows last scheduled before `before`. The state +
+   * nextAttemptAt prefix walks Cwi_pending_idx, so the 7 GB of TOAST is never read
+   * to find them; updatedAt guards rows touched again since (recovery, bus outcome).
+   */
+  async prune(before: Date, limit: number): Promise<number> {
+    const take = Math.max(1, Math.min(Math.trunc(limit), 5_000));
+    const rows = await this.rows.findMany({
+      where: {
+        state: { in: [...INBOUND_RETENTION_STATES] },
+        nextAttemptAt: { lt: before },
+        updatedAt: { lt: before },
+      },
+      select: { id: true },
+      take,
+    });
+    if (!rows.length) return 0;
+    return (
+      await this.rows.deleteMany({
+        where: {
+          id: { in: rows.map((row) => row.id) },
+          state: { in: [...INBOUND_RETENTION_STATES] },
+          updatedAt: { lt: before },
+        },
       })
     ).count;
   }

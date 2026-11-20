@@ -156,7 +156,10 @@ import {
   NATIVE_COPY_QUERY_LIMIT,
   resolveInboundNativeBody,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-native-source';
-import { ChatwootInboundPrismaStore } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
+import {
+  ChatwootInboundPrismaStore,
+  INBOUND_RETENTION_MS,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-inbound-prisma-store';
 import {
   ChatwootInboundQueue,
   InboundDelivery,
@@ -543,7 +546,10 @@ export class ChatwootService {
   }
 
   public async startOutboundWorker() {
-    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) this.inboundQueue.start();
+    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+      this.inboundQueue.start();
+      this.startInboundRetention();
+    }
     if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && process.env.CHATWOOT_BUS_URL) this.startBusOutcomes();
     if (!this.configService.get<Chatwoot>('CHATWOOT').OUTBOUND_ASYNC_ENABLED) return;
     await this.bootstrapOutboundWebhookSecrets();
@@ -584,7 +590,154 @@ export class ChatwootService {
     }
   }
 
+  /**
+   * Deletes settled ledger rows older than CHATWOOT_INBOUND_RETENTION_DAYS (default
+   * 14, 0 = off) in small batches: first 5 minutes after start, then hourly.
+   * Failed rows are never deleted here; recovery still needs them.
+   */
+  private startInboundRetention() {
+    if (this.inboundRetentionTimer) return;
+    const raw = process.env.CHATWOOT_INBOUND_RETENTION_DAYS;
+    const days = raw === undefined || raw === '' ? INBOUND_RETENTION_MS / 86_400_000 : Number(raw);
+    if (!Number.isFinite(days) || days <= 0) return;
+    const keepMs = Math.max(1, days) * 86_400_000;
+    const run = async () => {
+      if (this.inboundRetentionRunning) return;
+      this.inboundRetentionRunning = true;
+      const started = Date.now();
+      let deleted = 0;
+      let batches = 0;
+      try {
+        const before = new Date(Date.now() - keepMs);
+        for (; batches < 500; batches++) {
+          const count = await this.inboundStore.prune(before, 1_000);
+          deleted += count;
+          if (count < 1_000) break;
+          await new Promise((resolve) => setTimeout(resolve, 250));
+        }
+        if (deleted)
+          this.logger.info(
+            JSON.stringify({
+              event: 'chatwoot_inbound_retention',
+              deleted,
+              batches: batches + 1,
+              keepDays: days,
+              ms: Date.now() - started,
+            }),
+          );
+      } catch (error) {
+        this.logger.warn(
+          JSON.stringify({ event: 'chatwoot_inbound_retention_failed', deleted, errorClass: error?.name || 'Error' }),
+        );
+      } finally {
+        this.inboundRetentionRunning = false;
+      }
+    };
+    const first = setTimeout(() => void run(), 5 * 60_000);
+    first.unref?.();
+    this.inboundRetentionTimer = setInterval(() => void run(), 60 * 60_000);
+    this.inboundRetentionTimer.unref?.();
+  }
+  private inboundRetentionTimer: NodeJS.Timeout | null = null;
+  private inboundRetentionRunning = false;
+
+  // Inbound media prefetch: the download starts when the message is admitted to the
+  // ledger, not when its per-chat lane reaches it, so a photo or album no longer
+  // waits behind the messages ahead of it and text behind it waits less.
+  private static readonly MEDIA_PREFETCH_TYPES = new Set([
+    'imageMessage',
+    'documentMessage',
+    'documentWithCaptionMessage',
+    'videoMessage',
+    'audioMessage',
+    'stickerMessage',
+    'ptvMessage',
+  ]);
+  private static readonly MEDIA_PREFETCH_TTL_MS = 120_000;
+  private static readonly MEDIA_PREFETCH_MAX_ENTRIES = 24;
+  private static readonly MEDIA_PREFETCH_MAX_INFLIGHT = 4;
+  private static readonly MEDIA_PREFETCH_MAX_BYTES = 150 * 1024 * 1024;
+  private readonly mediaPrefetch = new Map<string, { at: number; promise: Promise<any | null>; bytes: number }>();
+  private mediaPrefetchInflight = 0;
+  private mediaPrefetchBytes = 0;
+
+  private mediaPrefetchKey(instance: InstanceDto, body: any): string | null {
+    const key = body?.key;
+    if (!instance?.instanceId || typeof key?.id !== 'string' || typeof key?.remoteJid !== 'string') return null;
+    return [instance.instanceId, key.remoteJid, key.id, String(key.fromMe)].join('|');
+  }
+
+  private dropMediaPrefetch(key: string) {
+    const entry = this.mediaPrefetch.get(key);
+    if (!entry) return;
+    this.mediaPrefetch.delete(key);
+    this.mediaPrefetchBytes = Math.max(0, this.mediaPrefetchBytes - entry.bytes);
+  }
+
+  private prefetchInboundMedia(instance: InstanceDto, body: any) {
+    try {
+      if (!ChatwootService.MEDIA_PREFETCH_TYPES.has(body?.messageType)) return;
+      const key = this.mediaPrefetchKey(instance, body);
+      if (!key || this.mediaPrefetch.has(key)) return;
+      const now = Date.now();
+      for (const [old, entry] of this.mediaPrefetch)
+        if (now - entry.at > ChatwootService.MEDIA_PREFETCH_TTL_MS) this.dropMediaPrefetch(old);
+      if (
+        this.mediaPrefetchInflight >= ChatwootService.MEDIA_PREFETCH_MAX_INFLIGHT ||
+        this.mediaPrefetch.size >= ChatwootService.MEDIA_PREFETCH_MAX_ENTRIES ||
+        this.mediaPrefetchBytes >= ChatwootService.MEDIA_PREFETCH_MAX_BYTES
+      )
+        return;
+      const waInstance = this.waMonitor.waInstances[instance.instanceName];
+      if (!waInstance?.getBase64FromMediaMessage) return;
+      this.mediaPrefetchInflight++;
+      const entry = { at: now, bytes: 0, promise: null as Promise<any | null> };
+      entry.promise = Promise.resolve()
+        .then(() => waInstance.getBase64FromMediaMessage({ message: structuredClone(body) }))
+        .then((result: any) => {
+          const bytes = typeof result?.base64 === 'string' ? result.base64.length : 0;
+          if (this.mediaPrefetch.get(key) === entry) {
+            entry.bytes = bytes;
+            this.mediaPrefetchBytes += bytes;
+            if (this.mediaPrefetchBytes > ChatwootService.MEDIA_PREFETCH_MAX_BYTES) this.dropMediaPrefetch(key);
+          }
+          return result ?? null;
+        })
+        .catch(() => null)
+        .finally(() => {
+          this.mediaPrefetchInflight--;
+        });
+      this.mediaPrefetch.set(key, entry);
+    } catch {
+      // Prefetch is an optimisation only; the lane downloads by itself.
+    }
+  }
+
+  /** The prefetched download when there is a usable one, else a fresh download (same call as before). */
+  private async downloadInboundMedia(instance: InstanceDto, body: any, waInstance: any): Promise<any> {
+    const key = this.mediaPrefetchKey(instance, body);
+    const entry = key ? this.mediaPrefetch?.get(key) : undefined;
+    if (entry) {
+      const started = Date.now();
+      const result = await entry.promise;
+      this.dropMediaPrefetch(key!);
+      if (result?.base64 && Date.now() - entry.at <= ChatwootService.MEDIA_PREFETCH_TTL_MS) {
+        this.logger.verbose(() =>
+          JSON.stringify({
+            event: 'chatwoot_inbound_media_prefetch_used',
+            instanceId: instance.instanceId,
+            waitedMs: Date.now() - started,
+          }),
+        );
+        return result;
+      }
+    }
+    return waInstance?.getBase64FromMediaMessage({ message: structuredClone(body) });
+  }
+
   public async stopOutboundWorker() {
+    if (this.inboundRetentionTimer) clearInterval(this.inboundRetentionTimer);
+    this.inboundRetentionTimer = null;
     await Promise.all([this.outboundQueue.stop(), this.inboundQueue.stop()]);
     // Drain after the queues: in-flight publishes and acks complete first.
     await ChatwootService.bus?.stop();
@@ -5875,15 +6028,18 @@ export class ChatwootService {
 
     if (!hasMuteUpdate && !hasPinUpdate && !hasArchiveUpdate) return;
 
-    const stored = await this.prismaRepository.message.findFirst({
-      where: {
-        instanceId: instance.instanceId,
-        key: { path: ['remoteJid'], equals: remoteJid },
-        chatwootConversationId: { not: null },
-      },
-      orderBy: { messageTimestamp: 'desc' },
-    });
-    const conversationId = stored?.chatwootConversationId;
+    // key->>'remoteJid' hits Msg_instance_remotejid_id_idx. The Prisma JSON path
+    // filter (key #> '{remoteJid}') has no index and walked every message of the
+    // instance for each pin/mute/archive update, which reconnects emit in bulk.
+    const latest = (await this.prismaRepository.$queryRaw`
+      SELECT "chatwootConversationId" FROM "Message"
+      WHERE "instanceId" = ${instance.instanceId}
+        AND "key"->>'remoteJid' = ${remoteJid}
+        AND "chatwootConversationId" IS NOT NULL
+      ORDER BY "messageTimestamp" DESC
+      LIMIT 1
+    `) as { chatwootConversationId: number | null }[];
+    const conversationId = latest[0]?.chatwootConversationId;
     if (!conversationId) {
       this.logger.verbose(JSON.stringify({ event: 'chatwoot_chat_update_target_missing', remoteJid }));
       return;
@@ -6296,6 +6452,7 @@ export class ChatwootService {
       return { delivery: Promise.resolve(null) };
     this.enqueueInboundAvatars(instance, body);
     const stored = await this.inboundQueue.admit(this.inboundRecord(instance, provider, body, 'pending'));
+    if (stored.state === 'pending') this.prefetchInboundMedia(instance, body);
     return { delivery: this.inboundQueue.deliverAdmitted(stored) };
   }
 
@@ -6390,7 +6547,14 @@ export class ChatwootService {
     const accountId = Number(provider.accountId);
     if (!Number.isSafeInteger(accountId) || accountId <= 0 || !instance.instanceId)
       throw new Error('InboundRouteUnavailable');
-    const raw = JSON.stringify(body);
+    // The ledger keeps the persisted (base64) byte encoding, like the native Message
+    // row and native-gap rows. JSON of a raw Uint8Array is a {"0":..,"1":..} object,
+    // ~15x larger: a document thumbnail took 560 KB instead of 36 KB, and the table
+    // grew 1.1-1.4 GB a week. Delivery matches native rows by encoding-insensitive
+    // identity, so both encodings stay valid; one serialisation serves size, payload
+    // and hash.
+    const payload = canonicalInboundBody(body);
+    const raw = JSON.stringify(payload);
     if (Buffer.byteLength(raw) > 2 * 1024 * 1024) throw new Error('InboundPayloadTooLarge');
     const now = new Date();
     return {
@@ -6404,8 +6568,8 @@ export class ChatwootService {
       peer: body.key.remoteJid,
       sourceId: 'WAID:' + body.key.id,
       fromMe: body.key.fromMe,
-      payload: JSON.parse(raw),
-      payloadHash: inboundPayloadHash(body),
+      payload,
+      payloadHash: inboundPayloadHash(payload, true),
       state,
       attempts: 0,
       nextAttemptAt: now,
@@ -7680,9 +7844,7 @@ export class ChatwootService {
           try {
             // The download normalizes media key fields in place; it must never
             // touch the delivered body, whose hash is the receiver stamp.
-            downloadBase64 = await waInstance?.getBase64FromMediaMessage({
-              message: structuredClone(body),
-            });
+            downloadBase64 = await this.downloadInboundMedia(instance, body, waInstance);
             if (!downloadBase64?.base64) throw new Error('InboundNativeMediaUnavailable');
             if (this.durableInboundBodies.has(body)) {
               const native = nativeCachedMediaPayload(body);

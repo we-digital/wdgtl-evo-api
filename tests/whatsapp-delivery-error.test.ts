@@ -35,6 +35,9 @@ function harness(saveUpdates = true) {
         create: async ({ data }: any) => {
           rows.push(data);
         },
+        createMany: async ({ data }: any) => {
+          rows.push(...data);
+        },
       },
       chat: { findFirst: async () => null },
     },
