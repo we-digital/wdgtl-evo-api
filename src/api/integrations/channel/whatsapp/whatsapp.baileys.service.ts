@@ -39,6 +39,7 @@ import {
   ContactMessage,
   KeyType,
   MediaMessage,
+  Metadata,
   Options,
   SendAlbumContainerDto,
   SendAlbumDto,
@@ -117,6 +118,7 @@ import ffmpegPath from '@ffmpeg-installer/ffmpeg';
 import { Boom } from '@hapi/boom';
 import { createId as cuid } from '@paralleldrive/cuid2';
 import { Instance, Message, Prisma } from '@prisma/client';
+import { buildContactVcard } from '@utils/contact-vcard';
 import { createJid } from '@utils/createJid';
 import { fetchLatestWaWebVersion } from '@utils/fetchLatestWaWebVersion';
 import { formatCaughtError } from '@utils/formatCaughtError';
@@ -4262,6 +4264,34 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     return await this.sendMessageWithTyping(data.number, { ...message }, {});
+  }
+
+  /**
+   * One contact card (name + numbers) from a Chatwoot reply. Same transport
+   * options as textMessage, so the durable queue keeps its planned WhatsApp id.
+   */
+  public async contactCardMessage(
+    data: Metadata & { name: string; phones: string[] },
+    isIntegration = false,
+    provenance?: OutboundMessageProvenance,
+  ) {
+    if (!data.name?.trim() || !data.phones?.length)
+      throw new BadRequestException('Contact name and number are required');
+    return await this.sendMessageWithTyping(
+      data.number,
+      { contactMessage: { displayName: data.name.trim(), vcard: buildContactVcard(data.name, data.phones) } },
+      {
+        delay: data?.delay,
+        presence: 'composing',
+        quoted: data?.quoted,
+        messageId: data?.messageId,
+        beforeTransport: data?.beforeTransport,
+        afterTransport: data?.afterTransport,
+        signal: data?.signal,
+      },
+      isIntegration,
+      provenance,
+    );
   }
 
   public async reactionMessage(data: SendReactionDto) {

@@ -63,7 +63,40 @@ export interface ChatwootOutboundPayload {
   albumParentWhatsappMessageId?: string;
   /** false = send text without a link preview (bbc-api system sends set content_attributes.link_preview=false). */
   linkPreview?: false;
+  /**
+   * Staff picked a contact in Chatwoot (content_attributes.shared_contact): the
+   * customer gets a WhatsApp contact card; `text` stays the readable fallback.
+   */
+  sharedContact?: ChatwootOutboundSharedContact;
   origin: ChatwootOutboundOrigin;
+}
+
+export interface ChatwootOutboundSharedContact {
+  name: string;
+  /** E.164 numbers, first one is the main number. */
+  phones: string[];
+}
+
+export const MAX_SHARED_CONTACT_PHONES = 5;
+const SHARED_CONTACT_PHONE = /^\+[1-9]\d{6,14}$/;
+
+/**
+ * The contact card Chatwoot asks for (content_attributes.shared_contact =
+ * {name, phones}), or null when absent or malformed: then the message's text
+ * goes out as before.
+ */
+export function chatwootSharedContact(contentAttributes: unknown): ChatwootOutboundSharedContact | null {
+  const card = (contentAttributes as Record<string, any> | null | undefined)?.shared_contact;
+  if (!card || typeof card !== 'object' || Array.isArray(card)) return null;
+  // eslint-disable-next-line no-control-regex
+  const name = typeof card.name === 'string' ? card.name.replace(/[\u0000-\u001f\u007f]+/g, ' ').trim() : '';
+  if (!name || name.length > 100) return null;
+  if (!Array.isArray(card.phones) || card.phones.length === 0 || card.phones.length > MAX_SHARED_CONTACT_PHONES) {
+    return null;
+  }
+  const phones = [...new Set(card.phones.map((phone: unknown) => (typeof phone === 'string' ? phone.trim() : '')))];
+  if (!phones.every((phone: string) => SHARED_CONTACT_PHONE.test(phone))) return null;
+  return { name, phones: phones as string[] };
 }
 
 export interface ChatwootOutboundAlbum {
@@ -363,6 +396,7 @@ export function buildChatwootOutboundParts(params: {
   const chatId = requiredString(params.chatId, 'WhatsApp destination');
   const quoted = chatwootReplyReferences(params.body?.content_attributes);
   const noLinkPreview = chatwootNoLinkPreview(params.body?.content_attributes);
+  const rawSharedContact = chatwootSharedContact(params.body?.content_attributes);
   const nativeForward = params.nativeForward
     ? {
         sourceChatwootMessageId: asRequiredInteger(
@@ -396,6 +430,8 @@ export function buildChatwootOutboundParts(params: {
   ) {
     throw new Error('Invalid empty Chatwoot outbound message');
   }
+  // A contact card is a text-only message (no attachments, not a forward).
+  const sharedContact = !nativeForward && attachments.length === 0 ? rawSharedContact : null;
 
   // Two or more photos/videos of one Chatwoot message go out as one WhatsApp
   // album. Upload order (attachment id) is kept: the album container and all
@@ -456,6 +492,8 @@ export function buildChatwootOutboundParts(params: {
       ...(quoted.quoteText ? { quoteText: quoted.quoteText } : {}),
       mentioned: Array.isArray(params.mentioned) ? [...params.mentioned].sort() : [],
       nativeForward: nativeForward || null,
+      // Only contact cards add the key, so every other message keeps its frozen identity.
+      ...(sharedContact ? { sharedContact } : {}),
       // Contact and contact-inbox numeric IDs strengthen new snapshots, but are
       // excluded from the frozen identity so pre-upgrade retained rows replay
       // against their original operation keys instead of being quarantined.
@@ -501,6 +539,7 @@ export function buildChatwootOutboundParts(params: {
         ...(part.album ? { album: part.album } : {}),
         ...(part.inAlbum ? { albumParentWhatsappMessageId } : {}),
         ...(noLinkPreview ? { linkPreview: false as const } : {}),
+        ...(sharedContact ? { sharedContact } : {}),
         origin: normalizedOrigin,
       },
     };
