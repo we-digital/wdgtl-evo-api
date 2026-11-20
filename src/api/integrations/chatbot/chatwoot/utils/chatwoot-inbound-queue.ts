@@ -44,11 +44,15 @@ export interface InboundStore {
     state: InboundTerminalState,
     errorClass: string,
     lane?: InboundLane,
+    reason?: InboundTerminalReason,
   ): Promise<boolean>;
 }
 // already_present: the receiver inbox owns this source; it is never POSTed again.
 export type InboundTerminalState = 'failed' | 'ignored' | 'already_present';
 export type InboundLane = 'live' | 'history';
+// Why a retryable row was closed: its age passed the failure cap, or (history
+// lane) it used up its attempts. Kept in the row result and in the event.
+export type InboundTerminalReason = 'age_exceeded' | 'attempts_exhausted';
 export const INBOUND_ACTIVE_STATES = ['pending', 'history_pending'] as const;
 
 // Bounded retry: quick retries for transient receiver errors, then a slow
@@ -63,6 +67,17 @@ export const INBOUND_RECEIVER_OUTAGE_ERRORS = ['AxiosError'];
 export function inboundRetryDelayMs(attempts: number): number {
   const index = Math.max(0, Math.trunc(attempts) - 1);
   return INBOUND_RETRY_SCHEDULE_MS[index] ?? INBOUND_RETRY_STEADY_MS;
+}
+// History lane: a row that keeps failing is closed after this many attempts
+// (receiver outages excluded), so it can never hold the lane for days.
+export const INBOUND_HISTORY_MAX_ATTEMPTS = 12;
+export const INBOUND_HISTORY_RETRY_MAX_MS = 3_600_000;
+// History retries back off past the steady step: 5, 10, 20, 40, then 60 min.
+export function inboundHistoryRetryDelayMs(attempts: number): number {
+  const quick = Math.max(0, Math.trunc(attempts) - 1);
+  if (quick < INBOUND_RETRY_SCHEDULE_MS.length) return INBOUND_RETRY_SCHEDULE_MS[quick];
+  const doublings = quick - INBOUND_RETRY_SCHEDULE_MS.length;
+  return Math.min(INBOUND_HISTORY_RETRY_MAX_MS, INBOUND_RETRY_STEADY_MS * 2 ** Math.min(doublings, 10));
 }
 
 // Message types Chatwoot cannot render (owner decision 2026-11-11): they are
@@ -132,6 +147,7 @@ function percentile(sorted: number[], p: number): number {
 export interface InboundQueueOptions {
   concurrency?: number;
   failAfterMs?: number;
+  historyMaxAttempts?: number;
   latencyReportMs?: number;
 }
 
@@ -200,6 +216,15 @@ export function inboundDeliveryId(instanceId: string, body: InboundPayload): str
     .digest('hex');
 }
 
+interface LatencyBucket {
+  provider: number[];
+  queue: number[];
+  failed: number;
+  // Rows closed because they used up their attempts (history lane).
+  exhausted: number;
+}
+const emptyBucket = (): LatencyBucket => ({ provider: [], queue: [], failed: 0, exhausted: 0 });
+
 export class ChatwootInboundQueue {
   private readonly owner = randomUUID();
   private readonly active = new Map<string, Promise<InboundAck | undefined>>();
@@ -213,9 +238,10 @@ export class ChatwootInboundQueue {
   private refill = false;
   private readonly concurrency: number;
   private readonly failAfterMs: number;
+  private readonly historyMaxAttempts: number;
   private receiverOutageSeen = false;
   private readonly latencyReportMs: number;
-  private latencies: Record<string, { provider: number[]; queue: number[]; failed: number }> = {};
+  private latencies: Record<string, LatencyBucket> = {};
   constructor(
     private readonly store: InboundStore,
     private readonly deliver: (item: InboundDelivery) => Promise<InboundAck>,
@@ -228,6 +254,7 @@ export class ChatwootInboundQueue {
   ) {
     this.concurrency = Math.max(1, Math.min(32, Math.trunc(options.concurrency ?? 2)));
     this.failAfterMs = Math.max(60_000, options.failAfterMs ?? INBOUND_FAIL_AFTER_MS);
+    this.historyMaxAttempts = Math.max(1, Math.trunc(options.historyMaxAttempts ?? INBOUND_HISTORY_MAX_ATTEMPTS));
     this.latencyReportMs = Math.max(1_000, options.latencyReportMs ?? 60_000);
   }
 
@@ -373,7 +400,7 @@ export class ChatwootInboundQueue {
     return work;
   }
   private record(lane: string, providerMs: number | null, queueMs: number | null) {
-    const bucket = (this.latencies[lane] ??= { provider: [], queue: [], failed: 0 });
+    const bucket = (this.latencies[lane] ??= emptyBucket());
     if (providerMs !== null && bucket.provider.length < 10_000) bucket.provider.push(providerMs);
     if (queueMs !== null && bucket.queue.length < 10_000) bucket.queue.push(queueMs);
   }
@@ -387,6 +414,7 @@ export class ChatwootInboundQueue {
         lane,
         confirmed: provider.length,
         failed: bucket.failed,
+        exhausted: bucket.exhausted,
         providerP50Ms: provider.length ? percentile(provider, 0.5) : null,
         providerP95Ms: provider.length ? percentile(provider, 0.95) : null,
         queueP50Ms: queue.length ? percentile(queue, 0.5) : null,
@@ -479,21 +507,35 @@ export class ChatwootInboundQueue {
       if (INBOUND_RECEIVER_OUTAGE_ERRORS.includes(errorClass)) this.receiverOutageSeen = true;
       const at = this.now().getTime();
       const age = at - new Date(item.createdAt ?? at).getTime();
-      const terminal: InboundTerminalState | undefined =
-        terminalErrors[errorClass] ?? (age >= this.failAfterMs ? 'failed' : undefined);
-      if (terminal && !lost && (await this.store.fail(item.id, this.owner, terminal, errorClass, lane))) {
-        if (terminal === 'failed') (this.latencies[lane] ??= { provider: [], queue: [], failed: 0 }).failed++;
+      // Receiver outages never use up history attempts: the row did nothing wrong.
+      const exhausted =
+        lane === 'history' &&
+        attempts >= this.historyMaxAttempts &&
+        !INBOUND_RECEIVER_OUTAGE_ERRORS.includes(errorClass);
+      const reason: InboundTerminalReason | undefined = terminalErrors[errorClass]
+        ? undefined
+        : age >= this.failAfterMs
+          ? 'age_exceeded'
+          : exhausted
+            ? 'attempts_exhausted'
+            : undefined;
+      const terminal: InboundTerminalState | undefined = terminalErrors[errorClass] ?? (reason ? 'failed' : undefined);
+      if (terminal && !lost && (await this.store.fail(item.id, this.owner, terminal, errorClass, lane, reason))) {
+        const bucket = (this.latencies[lane] ??= emptyBucket());
+        if (terminal === 'failed') bucket.failed++;
+        if (reason === 'attempts_exhausted') bucket.exhausted++;
         this.observe(`chatwoot_inbound_${terminal}`, {
           instanceId: item.instanceId,
           lane,
           errorClass,
+          ...(reason ? { reason } : {}),
           ...(errorDetail ? { errorDetail } : {}),
           attempts,
           ageMs: age,
         });
         return;
       }
-      const delay = this.retryMs ?? inboundRetryDelayMs(attempts);
+      const delay = this.retryMs ?? (lane === 'history' ? inboundHistoryRetryDelayMs : inboundRetryDelayMs)(attempts);
       await this.store.defer(item.id, this.owner, errorClass, new Date(at + delay));
       this.observe('chatwoot_inbound_pending', {
         instanceId: item.instanceId,

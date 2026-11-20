@@ -1767,3 +1767,33 @@ test('the recovery tool computes the same provider fingerprint as the service', 
   };
   assert.equal(inboundProviderFingerprint(provider), service.inboundProviderFingerprint(provider));
 });
+
+test('a row live delivery already created is confirmed by identity: arrival time and live format may differ', async () => {
+  const f = fixture();
+  const binding = { messageId: 9, conversationId: 77 };
+  const instance = { instanceId: 'one', instanceName: 'one' };
+  f.service.getConversationMessage = (msg: any) => msg.conversation;
+  const row = {
+    ...f.owner(),
+    display_id: 77,
+    created_at_epoch: f.native.messageTimestamp + 12,
+    content: '**Synthetic sender:** live formatted text',
+  };
+  f.rows = [row];
+  // Imported by history: the exact timestamp and content are still required.
+  await assert.rejects(
+    f.service.verifyQueuedHistoryDestination(f.native, instance, f.provider, 42, binding),
+    /InboundHistoryDestinationUnconfirmed/,
+  );
+  // Already present (importer outcome "existing"): identity is enough.
+  await f.service.verifyQueuedHistoryDestination(f.native, instance, f.provider, 42, binding, true);
+  // Identity still decides: another conversation, a private note, another direction or a deletion never pass.
+  for (const changed of [{ display_id: 78 }, { private: true }, { message_type: 1 }, { content_attributes: { deleted: true } }, { id: 10 }]) {
+    f.rows = [{ ...row, ...changed }];
+    await assert.rejects(
+      f.service.verifyQueuedHistoryDestination(f.native, instance, f.provider, 42, binding, true),
+      /InboundHistoryDestinationUnconfirmed/,
+    );
+  }
+  assert.equal(f.creates, 0);
+});
