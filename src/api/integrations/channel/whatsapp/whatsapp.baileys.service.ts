@@ -2654,6 +2654,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const baileysConfig = this.configService.get<BaileysConfig>('BAILEYS');
 
     if (!baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH) return false;
+    if (baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH_SKIP?.includes(this.instance.name)) return false;
 
     let clientRepairs = this.groupSenderKeyRepairs.get(this.client);
     if (!clientRepairs) {

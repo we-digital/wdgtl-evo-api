@@ -31,6 +31,8 @@ export type Log = {
 
 export type BaileysConfig = {
   FORCE_GROUP_SENDER_KEY_REFRESH: boolean;
+  // Instance names that skip the forced refresh while it is on (a per-number trial).
+  FORCE_GROUP_SENDER_KEY_REFRESH_SKIP: string[];
 };
 
 export type ProviderSession = {
@@ -765,6 +767,10 @@ export class ConfigService {
       },
       BAILEYS: {
         FORCE_GROUP_SENDER_KEY_REFRESH: process.env?.BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH === 'true',
+        FORCE_GROUP_SENDER_KEY_REFRESH_SKIP: (process.env?.BAILEYS_FORCE_GROUP_SENDER_KEY_REFRESH_SKIP || '')
+          .split(',')
+          .map((name) => name.trim())
+          .filter(Boolean),
       },
       DEL_INSTANCE: isBooleanString(process.env?.DEL_INSTANCE)
         ? process.env.DEL_INSTANCE === 'true'
