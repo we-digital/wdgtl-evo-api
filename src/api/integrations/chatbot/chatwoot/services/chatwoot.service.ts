@@ -592,7 +592,7 @@ export class ChatwootService {
 
   /**
    * Deletes settled ledger rows older than CHATWOOT_INBOUND_RETENTION_DAYS (default
-   * 14, 0 = off) in small batches: first 5 minutes after start, then hourly.
+   * 14, 0 = off) in batches of 500 with a 1 s pause, at most 100k rows per run: first 5 minutes after start, then hourly.
    * Failed rows are never deleted here; recovery still needs them.
    */
   private startInboundRetention() {
@@ -609,11 +609,11 @@ export class ChatwootService {
       let batches = 0;
       try {
         const before = new Date(Date.now() - keepMs);
-        for (; batches < 500; batches++) {
-          const count = await this.inboundStore.prune(before, 1_000);
+        for (; batches < 200; batches++) {
+          const count = await this.inboundStore.prune(before, 500);
           deleted += count;
-          if (count < 1_000) break;
-          await new Promise((resolve) => setTimeout(resolve, 250));
+          if (count < 500) break;
+          await new Promise((resolve) => setTimeout(resolve, 1_000));
         }
         if (deleted)
           this.logger.info(

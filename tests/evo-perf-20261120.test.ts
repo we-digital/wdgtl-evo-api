@@ -199,3 +199,78 @@ test('idle outbound polling probes one claim per class and backs off; wake() res
     mock.timers.reset();
   }
 });
+
+test('after retention deletes a confirmed row, a redelivered old message lands on the same Chatwoot message (already_present)', async () => {
+  // Ledger with retention, as the Prisma store behaves.
+  const rows = new Map<string, any>();
+  const store: any = {
+    enqueue: async (item: InboundDelivery) => {
+      if (!rows.has(item.id)) rows.set(item.id, structuredClone(item));
+      return structuredClone(rows.get(item.id));
+    },
+    due: async () => [],
+    claim: async (id: string, owner: string) => {
+      const row = rows.get(id);
+      if (!row || row.state !== 'pending') return false;
+      Object.assign(row, { leaseOwner: owner, attempts: row.attempts + 1 });
+      return true;
+    },
+    renew: async () => true,
+    finish: async (id: string, owner: string, ack: any) => {
+      const row = rows.get(id);
+      if (row?.leaseOwner !== owner) return false;
+      Object.assign(row, { state: 'confirmed', result: ack, leaseOwner: null });
+      return true;
+    },
+    defer: async () => {},
+    fail: async () => true,
+    prune: async () => {
+      let n = 0;
+      for (const [id, row] of rows) if (row.state === 'confirmed') (rows.delete(id), n++);
+      return n;
+    },
+  };
+  // Chatwoot receiver: messages are unique per (inbox_id, source_id), like
+  // index_messages_on_inbox_id_and_source_id_new_unique + WhatsappSourceIdempotency.
+  const messages = new Map<string, number>();
+  const outcomes: string[] = [];
+  const receiver = async (item: InboundDelivery) => {
+    const key = `42|${item.sourceId}`;
+    const existing = messages.get(key);
+    outcomes.push(existing ? 'already_present' : 'created');
+    if (!existing) messages.set(key, 1000 + messages.size);
+    return { id: messages.get(key)!, inbox_id: 42, conversation_id: 7 };
+  };
+  const queue = new ChatwootInboundQueue(store, receiver);
+  const body = canonicalInboundBody(documentBody());
+  const record = (): InboundDelivery => ({
+    id: inboundDeliveryId('instance', body),
+    instanceId: 'instance',
+    instanceName: 'synthetic',
+    providerId: 'p',
+    providerFingerprint: 'f'.repeat(64),
+    accountId: 1,
+    inboxId: null,
+    peer: body.key.remoteJid,
+    sourceId: 'WAID:' + body.key.id,
+    fromMe: false,
+    payload: body,
+    payloadHash: inboundPayloadHash(body, true),
+    state: 'pending',
+    attempts: 0,
+    nextAttemptAt: new Date(0),
+    leaseOwner: null,
+    leaseExpiresAt: null,
+    result: null,
+  });
+  const first = await queue.submit(record());
+  assert.equal(await store.prune(), 1);
+  assert.equal(rows.size, 0);
+  // WhatsApp redelivers (or a history resync replays) the same message weeks later.
+  const again = await queue.submit(record());
+  assert.deepEqual(outcomes, ['created', 'already_present']);
+  assert.equal(messages.size, 1);
+  assert.equal(again!.id, first!.id);
+  assert.equal([...rows.values()][0].state, 'confirmed');
+  await queue.stop();
+});
