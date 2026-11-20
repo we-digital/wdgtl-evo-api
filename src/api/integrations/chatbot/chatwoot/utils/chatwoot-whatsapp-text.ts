@@ -9,9 +9,9 @@ import { stripWhatsappMentionMarkdown } from '@api/integrations/chatbot/chatwoot
 export function chatwootMarkdownToWhatsapp(content: string | null | undefined): string {
   if (!content) return stripWhatsappMentionMarkdown(content);
   const formatted = content
-    .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // * -> _ (italic)
-    .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // ** -> * (bold)
-    .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // ~~ -> ~ (strike)
-    .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```'); // ` -> ``` (mono)
+    .replace(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // * -> _ (italic)
+    .replace(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // ** -> * (bold)
+    .replace(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // ~~ -> ~ (strike)
+    .replace(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```'); // ` -> ``` (mono)
   return stripWhatsappMentionMarkdown(formatted);
 }
