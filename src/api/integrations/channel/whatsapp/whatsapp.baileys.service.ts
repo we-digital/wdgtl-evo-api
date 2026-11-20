@@ -973,12 +973,7 @@ export class BaileysStartupService extends ChannelStartupService {
         }
 
         const isGroupJid = this.localSettings.groupsIgnore && isJidGroup(jid);
-        // Statuses are never ignored at the socket: Baileys drops an ignored stanza with
-        // only an ACK, never the delivery receipt WhatsApp waits for, so the server
-        // redelivers the status and closes the stream ~50 min later
-        // (<stream:error><ack class="status"/>), reconnecting every session that got one.
-        // They are processed (decrypt + receipt) and dropped in messages.upsert instead.
-        const isBroadcast = !this.localSettings.readStatus && isJidBroadcast(jid) && jid !== 'status@broadcast';
+        const isBroadcast = !this.localSettings.readStatus && isJidBroadcast(jid);
         const isNewsletter = isJidNewsletter(jid);
 
         return isGroupJid || isBroadcast || isNewsletter;
@@ -1065,9 +1060,6 @@ export class BaileysStartupService extends ChannelStartupService {
 
   private readonly chatHandle = {
     'chats.upsert': async (chats: Chat[]) => {
-      // Received statuses touch the status@broadcast chat; with readStatus off it is not kept.
-      if (!this.localSettings.readStatus) chats = chats.filter((chat) => chat.id !== 'status@broadcast');
-      if (!chats.length) return;
       const existingChatIds = await this.prismaRepository.chat.findMany({
         where: { instanceId: this.instanceId },
         select: { remoteJid: true },
@@ -1099,8 +1091,6 @@ export class BaileysStartupService extends ChannelStartupService {
         }
       >[],
     ) => {
-      if (!this.localSettings.readStatus) chats = chats.filter((chat) => chat.id !== 'status@broadcast');
-      if (!chats.length) return;
       const chatsRaw = chats.map((chat) => {
         return {
           remoteJid: chat.id,
@@ -1416,9 +1406,6 @@ export class BaileysStartupService extends ChannelStartupService {
     ) => {
       const ingressReceivedAt = Date.now();
       for (const received of messages) {
-        // Statuses reach this handler only so Baileys could receipt them (shouldIgnoreJid):
-        // with readStatus off nothing is stored, forwarded or announced.
-        if (received?.key?.remoteJid === 'status@broadcast' && !this.localSettings.readStatus) continue;
         try {
           if (
             received?.messageStubParameters?.some?.((param) =>
