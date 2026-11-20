@@ -1,13 +1,24 @@
 import { PrismaRepository } from '@api/repository/repository.service';
 
-import { InboundAck, InboundDelivery, InboundLane, InboundStore, InboundTerminalState } from './chatwoot-inbound-queue';
+import {
+  InboundAck,
+  InboundDelivery,
+  InboundLane,
+  InboundStore,
+  InboundTerminalReason,
+  InboundTerminalState,
+} from './chatwoot-inbound-queue';
 
 // This delegate is generated from both supported provider schemas at image build time.
 interface Delegate {
   upsert(args: any): Promise<InboundDelivery>;
   findMany(args: any): Promise<InboundDelivery[]>;
   updateMany(args: any): Promise<{ count: number }>;
+  groupBy(args: any): Promise<{ instanceId: string; _min: { nextAttemptAt: Date | null } }[]>;
 }
+// History rows fetched per instance in one poll. The queue runs one history row per
+// instance at a time, so a few rows per instance keep every instance moving.
+const HISTORY_ROWS_PER_INSTANCE = 2;
 export class ChatwootInboundPrismaStore implements InboundStore {
   private readonly rows: Delegate;
   constructor(repository: PrismaRepository) {
@@ -37,16 +48,17 @@ export class ChatwootInboundPrismaStore implements InboundStore {
   async due(now: Date, limit: number) {
     const size = Math.max(0, Math.min(Math.trunc(limit), 50));
     if (!size) return [];
+    const where = (state: string, extra: Record<string, unknown> = {}) => ({
+      state,
+      nextAttemptAt: { lte: now },
+      OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
+      ...extra,
+    });
     const due = (state: string, take: number, fresh?: boolean) =>
       take <= 0
         ? Promise.resolve([] as InboundDelivery[])
         : this.rows.findMany({
-            where: {
-              state,
-              nextAttemptAt: { lte: now },
-              OR: [{ leaseExpiresAt: null }, { leaseExpiresAt: { lt: now } }],
-              ...(fresh === undefined ? {} : { attempts: fresh ? 0 : { gt: 0 } }),
-            },
+            where: where(state, fresh === undefined ? {} : { attempts: fresh ? 0 : { gt: 0 } }),
             orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
             take,
           });
@@ -54,8 +66,36 @@ export class ChatwootInboundPrismaStore implements InboundStore {
     // not delay new messages. Reconnect history only fills what live leaves.
     const fresh = await due('pending', size, true);
     const retry = await due('pending', size - fresh.length, false);
-    const history = await due('history_pending', size - fresh.length - retry.length);
+    const history = await this.dueHistory(where, size - fresh.length - retry.length);
     return [...fresh, ...retry, ...history];
+  }
+  // Reconnect history is shared fairly between instances: a few rows of every
+  // instance with due history, interleaved, oldest instance first. A large or
+  // failing backlog of one number can no longer hold the lane for the others.
+  private async dueHistory(where: (state: string, extra?: Record<string, unknown>) => any, take: number) {
+    if (take <= 0) return [] as InboundDelivery[];
+    const instances = await this.rows.groupBy({
+      by: ['instanceId'],
+      where: where('history_pending'),
+      _min: { nextAttemptAt: true },
+      orderBy: { _min: { nextAttemptAt: 'asc' } },
+      take,
+    });
+    if (!instances.length) return [] as InboundDelivery[];
+    const per = Math.max(1, Math.min(HISTORY_ROWS_PER_INSTANCE, Math.floor(take / instances.length)));
+    const batches = await Promise.all(
+      instances.map(({ instanceId }) =>
+        this.rows.findMany({
+          where: where('history_pending', { instanceId }),
+          orderBy: [{ nextAttemptAt: 'asc' }, { id: 'asc' }],
+          take: per,
+        }),
+      ),
+    );
+    const rows: InboundDelivery[] = [];
+    for (let round = 0; round < per; round++)
+      for (const batch of batches) if (batch[round] && rows.length < take) rows.push(batch[round]);
+    return rows;
   }
   async claim(id: string, owner: string, now: Date, until: Date) {
     return (
@@ -114,7 +154,14 @@ export class ChatwootInboundPrismaStore implements InboundStore {
       ).count === 1
     );
   }
-  async fail(id: string, owner: string, state: InboundTerminalState, errorClass: string, lane?: InboundLane) {
+  async fail(
+    id: string,
+    owner: string,
+    state: InboundTerminalState,
+    errorClass: string,
+    lane?: InboundLane,
+    reason?: InboundTerminalReason,
+  ) {
     return (
       (
         await this.rows.updateMany({
@@ -124,7 +171,7 @@ export class ChatwootInboundPrismaStore implements InboundStore {
             lastErrorClass: errorClass.slice(0, 100),
             leaseOwner: null,
             leaseExpiresAt: null,
-            ...(lane ? { result: { terminal: state, lane } } : {}),
+            ...(lane ? { result: { terminal: state, lane, ...(reason ? { reason } : {}) } } : {}),
           },
         })
       ).count === 1

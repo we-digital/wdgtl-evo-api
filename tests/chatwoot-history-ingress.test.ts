@@ -67,16 +67,20 @@ test('indexed due lanes put fresh live rows ahead of live retries, and history o
   const rows: Record<string, any[]> = {
     fresh: [{ id: 'live-new' }],
     retry: [{ id: 'live-retry' }],
-    history: [{ id: 'history' }],
+    history: [{ id: 'history', instanceId: 'one' }],
   };
   const store = new ChatwootInboundPrismaStore({chatwootInboundDelivery:{findMany:async (args:any) => {
     calls.push(args);
-    if (args.where.state === 'history_pending') return rows.history.slice(0, args.take);
+    if (args.where.state === 'history_pending')
+      return rows.history.filter((row) => row.instanceId === args.where.instanceId).slice(0, args.take);
     return (args.where.attempts === 0 ? rows.fresh : rows.retry).slice(0, args.take);
+  }, groupBy:async (args:any) => {
+    calls.push({ ...args, group: true });
+    return [...new Set(rows.history.map((row) => row.instanceId))].slice(0, args.take).map((instanceId) => ({ instanceId, _min: { nextAttemptAt: new Date() } }));
   }}} as any);
   assert.deepEqual((await store.due(new Date(),8)).map(row=>row.id),['live-new','live-retry','history']);
-  assert.deepEqual(calls.map(call=>[call.where.state, call.where.attempts ?? null, call.take]),[
-    ['pending', 0, 8], ['pending', { gt: 0 }, 7], ['history_pending', null, 6],
+  assert.deepEqual(calls.map(call=>[call.group ? 'group' : call.where.state, call.where.attempts ?? call.where.instanceId ?? null, call.take]),[
+    ['pending', 0, 8], ['pending', { gt: 0 }, 7], ['group', null, 6], ['history_pending', 'one', 2],
   ]);
   assert.ok(calls.every(call=>call.where.nextAttemptAt && call.where.OR && call.orderBy));
   // A full live window leaves no history fetch at all.
@@ -85,6 +89,21 @@ test('indexed due lanes put fresh live rows ahead of live retries, and history o
   assert.equal((await store.due(new Date(), 8)).length, 8);
   assert.deepEqual(calls.map(call=>call.where.state), ['pending']);
   assert.equal((await store.due(new Date(), 500)).length <= 50, true);
+});
+
+test('history is shared between instances: a large failing backlog cannot hold the lane', async () => {
+  // Instance "stuck" has 4000 old due rows; "fresh" has newer rows. Both get rows in every poll.
+  const history = [
+    ...Array.from({ length: 4000 }, (_, i) => ({ id: 'stuck-' + i, instanceId: 'stuck', at: i })),
+    ...Array.from({ length: 10 }, (_, i) => ({ id: 'fresh-' + i, instanceId: 'fresh', at: 10_000 + i })),
+  ];
+  const store = new ChatwootInboundPrismaStore({chatwootInboundDelivery:{
+    findMany:async (args:any) => args.where.state === 'pending' ? [] :
+      history.filter((row) => row.instanceId === args.where.instanceId).sort((a, b) => a.at - b.at).slice(0, args.take),
+    groupBy:async (args:any) => ['stuck', 'fresh'].slice(0, args.take).map((instanceId) => ({ instanceId, _min: { nextAttemptAt: new Date() } })),
+  }} as any);
+  const due = await store.due(new Date(), 40);
+  assert.deepEqual(due.map((row) => row.id), ['stuck-0', 'fresh-0', 'stuck-1', 'fresh-1']);
 });
 
 const text = fs.readFileSync('src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts','utf8');

@@ -1363,6 +1363,37 @@ up to 9,275. Causes and changes:
   minute. Exactly-once is unchanged: every attempt still reads receiver owners
   before any POST.
 
+### 2026-11-20 fair history lane, attempt cap, paced LID reconcile
+
+- **Already-present history rows confirm by identity.** A history row whose
+  source the importer finds already in the inbox (outcome `existing`, written
+  earlier by live delivery) is confirmed when source, inbox, conversation,
+  binding peer, direction, non-private and non-deleted match. Its `created_at`
+  is the live arrival time (seconds to hours after the WhatsApp timestamp) and
+  its content uses the live format, so neither is compared. Imported rows keep
+  the exact timestamp/content check. Before this, 4,488 p-katya rows that were
+  all in Chatwoot already retried every 5 min for two days
+  (`InboundHistoryDestinationUnconfirmed`).
+- **Fair history selection.** `due()` groups due history rows by instance
+  (oldest first) and takes up to 2 rows of each, interleaved. One large or
+  failing backlog no longer holds the lane for the other numbers.
+- **History attempt cap.** A history row is `failed` after
+  `CHATWOOT_INBOUND_HISTORY_MAX_ATTEMPTS` (12) attempts; receiver outages
+  (`AxiosError`) do not count. The row keeps its real `lastErrorClass`, and
+  `result.reason = attempts_exhausted` (age cap: `age_exceeded`). The
+  `chatwoot_inbound_failed` event carries `reason`, and
+  `chatwoot_inbound_latency` reports `exhausted` per lane. History retries back
+  off 5, 10, 20, 40, then 60 min.
+- **LID reconcile.** `lid-mapping.update` no longer runs inline on the
+  per-instance event queue. Mappings go to one process-wide scheduler:
+  coalesced per instance+LID, one at a time, ≤2/s. A 429 pauses the whole drain
+  (Retry-After, else 5 s doubling to 2 min) and requeues the mapping (5 attempts).
+  Contacts are looked up in the Chatwoot database first (identifier, then
+  phone), so a mapping without a provisional `@lid` contact costs no API call;
+  the REST search/filter is only the fallback. Logs name the HTTP status and
+  endpoint shape (`chatwoot_lid_reconcile_throttled|failed|drained`) instead of
+  `ApiError: Generic Error`.
+
 ### 2026-11-10 idempotent receiver fast path (stage 3)
 
 With `CHATWOOT_INBOUND_RECEIVER_IDEMPOTENCY=true`, live delivery skips the

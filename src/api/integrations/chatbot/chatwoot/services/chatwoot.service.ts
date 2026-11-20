@@ -179,6 +179,10 @@ import {
   selectChatwootPhysicalReceiverNumber,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-ingress-scope';
 import {
+  describeChatwootError,
+  LidReconcileScheduler,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-lid-reconcile';
+import {
   deliverWithoutMedia,
   mediaFailureKind,
   mediaUnavailableContent,
@@ -464,6 +468,9 @@ export class ChatwootService {
   private static groupCreateCoordinator: GroupCreateCoordinator | null = null;
   private static readonly localGroupCreateStore = new LocalGroupCreateStore();
   private static readonly providerSelfReports = new Map<string, { jid: string; at: number }>();
+  // LID → phone reconciles, paced for the whole process (Chatwoot rate-limits per IP).
+  private static lidReconcile: LidReconcileScheduler | null = null;
+  private static readonly lidReconcileOwners = new Map<string, ChatwootService>();
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -489,6 +496,7 @@ export class ChatwootService {
       {
         concurrency: Math.max(1, Math.min(32, outboundConfig.INBOUND_CONCURRENCY || 10)),
         failAfterMs: Math.max(3_600_000, outboundConfig.INBOUND_FAIL_AFTER_MS || 86_400_000),
+        historyMaxAttempts: Math.max(3, outboundConfig.INBOUND_HISTORY_MAX_ATTEMPTS || 12),
       },
     );
     this.outboundFenceSnapshotMaxAgeMs = outboundFenceSnapshotMaxAgeMs(
@@ -6382,6 +6390,11 @@ export class ChatwootService {
     provider: ChatwootModel,
     inboxId: number,
     binding: { messageId: number; conversationId: number },
+    // The importer found this source already in the inbox and wrote nothing. Such a
+    // row was created by live delivery: created_at is its arrival time (seconds to
+    // hours after the WhatsApp timestamp) and its content uses the live format, so
+    // only the identity (source, inbox, conversation, peer, direction) is compared.
+    preexisting = false,
   ) {
     const sourceId = toChatwootSourceId((message.key as any).id);
     const read = async () =>
@@ -6420,8 +6433,8 @@ export class ChatwootService {
       row.private !== false ||
       Number(row.message_type) !== ((message.key as any).fromMe ? 1 : 0) ||
       row.peer !== (message.key as any).remoteJid ||
-      Math.floor(Number(row.created_at_epoch)) !== message.messageTimestamp ||
-      !contents.includes(row.content || '') ||
+      (!preexisting && Math.floor(Number(row.created_at_epoch)) !== message.messageTimestamp) ||
+      (!preexisting && !contents.includes(row.content || '')) ||
       row.content_attributes?.deleted ||
       row.content_attributes?.message_deleted
     )
@@ -6583,7 +6596,14 @@ export class ChatwootService {
       !['bound', 'existing'].includes(binding.status)
     )
       throw new Error('InboundHistoryOutcomeUnconfirmed');
-    await this.verifyQueuedHistoryDestination(normalized.messages[0], instance, provider, inbox.id, binding);
+    await this.verifyQueuedHistoryDestination(
+      normalized.messages[0],
+      instance,
+      provider,
+      inbox.id,
+      binding,
+      result.outcomes[0].status === 'existing',
+    );
     const fresh = await this.prismaRepository.message.findUnique({ where: { id: source.id } });
     if (
       !fresh ||
@@ -8870,6 +8890,58 @@ export class ChatwootService {
     );
   }
 
+  // Queues a Baileys LID mapping for a paced, coalesced reconcile (one process-wide
+  // drain, see chatwoot-lid-reconcile.ts) instead of running it on the event queue.
+  public scheduleLidIdentityReconcile(instance: InstanceDto, lid: string, phoneJid: string) {
+    if (!isLidJid(lid) || !isPhoneJid(phoneJid) || !instance?.instanceName) return;
+    ChatwootService.lidReconcile ??= new LidReconcileScheduler(
+      (job) =>
+        // The newest service for the instance owns the run (instances get recreated).
+        (ChatwootService.lidReconcileOwners.get(job.instanceName) ?? this).reconcileLidIdentity(
+          { instanceName: job.instanceName },
+          job.lid,
+          job.phoneJid,
+        ),
+      (event, fields) =>
+        event === 'chatwoot_lid_reconcile_failed'
+          ? this.logger.warn(JSON.stringify({ event, ...fields }))
+          : this.logger.info(JSON.stringify({ event, ...fields })),
+    );
+    ChatwootService.lidReconcileOwners.set(instance.instanceName, this);
+    ChatwootService.lidReconcile.enqueue({ instanceName: instance.instanceName, lid, phoneJid });
+  }
+
+  // Contact by exact identifier (or, with `phoneNumber`, by phone) from the Chatwoot
+  // database. undefined = no database here or an ambiguous phone match: ask the API.
+  private async lidReconcileDbContact(
+    provider: ChatwootModel,
+    lookup: { identifier: string } | { phoneNumber: string },
+  ): Promise<{ id: number; identifier: string | null } | null | undefined> {
+    let available = false;
+    try {
+      available = !!this.pgClient && !!this.isImportHistoryAvailable();
+    } catch {
+      available = false;
+    }
+    if (!available) return undefined;
+    const accountId = Number(provider.accountId);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0) return undefined;
+    const byIdentifier = 'identifier' in lookup;
+    const { rows } = await this.pgClient.query(
+      `SELECT id, identifier FROM contacts WHERE account_id = $1 AND ${
+        byIdentifier ? 'identifier = $2' : 'phone_number = $2'
+      } ORDER BY id LIMIT 2`,
+      [accountId, byIdentifier ? lookup.identifier : `+${lookup.phoneNumber}`],
+    );
+    if (rows.length > 1) return byIdentifier ? { id: Number(rows[0].id), identifier: rows[0].identifier } : undefined;
+    return rows.length ? { id: Number(rows[0].id), identifier: rows[0].identifier } : null;
+  }
+
+  private async lidReconcileContactByIdentifier(instance: InstanceDto, provider: ChatwootModel, identifier: string) {
+    const stored = await this.lidReconcileDbContact(provider, { identifier });
+    return stored !== undefined ? stored : this.findContactByIdentifier(instance, identifier);
+  }
+
   public async reconcileLidIdentity(instance: InstanceDto, lid: string, phoneJid: string) {
     if (!isLidJid(lid) || !isPhoneJid(phoneJid)) {
       return { status: 'invalid_mapping' };
@@ -8883,15 +8955,21 @@ export class ChatwootService {
 
     const canonicalLid = toCanonicalHistoryJid(lid);
     const canonicalPhoneJid = toCanonicalHistoryJid(phoneJid);
-    const provisionalContact = await this.findContactByIdentifier(instance, canonicalLid);
+    // Database first: most mappings have no provisional contact at all, and then
+    // a reconnect burst costs no Chatwoot API call.
+    const provisionalContact = await this.lidReconcileContactByIdentifier(instance, provider, canonicalLid);
     if (!provisionalContact?.id) {
       return { status: 'no_provisional_contact' };
     }
 
     const phoneNumber = canonicalPhoneJid.split('@')[0].split(':')[0];
+    const storedPhoneContact = async () => {
+      const stored = await this.lidReconcileDbContact(provider, { phoneNumber });
+      return stored !== undefined ? stored : this.findContact(instance, phoneNumber);
+    };
     const canonicalContact =
-      (await this.findContactByIdentifier(instance, canonicalPhoneJid)) ||
-      (await this.findContact(instance, phoneNumber));
+      (await this.lidReconcileContactByIdentifier(instance, provider, canonicalPhoneJid)) ||
+      (await storedPhoneContact());
 
     if (canonicalContact?.id && canonicalContact.id !== provisionalContact.id) {
       const merged = await this.mergeContacts(canonicalContact.id, provisionalContact.id, provider);
@@ -8906,7 +8984,7 @@ export class ChatwootService {
       identifier: canonicalPhoneJid,
       phone_number: `+${phoneNumber}`,
     });
-    const updatedContact = await this.findContactByIdentifier(instance, canonicalPhoneJid);
+    const updatedContact = await this.lidReconcileContactByIdentifier(instance, provider, canonicalPhoneJid);
     if (updatedContact?.id !== provisionalContact.id) {
       throw new Error(`Unable to update provisional Chatwoot LID contact for ${instance.instanceName}`);
     }
@@ -8955,9 +9033,7 @@ export class ChatwootService {
         }
       } catch (error) {
         failed++;
-        this.logger.error(
-          `Unable to reconcile stored Chatwoot LID contact ${contact.identifier}: ${formatCaughtError(error)}`,
-        );
+        this.logger.error(`Unable to reconcile stored Chatwoot LID contact: ${describeChatwootError(error)}`);
       }
     }
 

@@ -2305,14 +2305,16 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (events['lid-mapping.update'] && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
               const mapping = events['lid-mapping.update'];
+              // Off the serialized event queue: a re-pair burst of mappings is
+              // coalesced and paced for the Chatwoot API (it answered 429 inline).
               try {
-                await this.chatwootService.reconcileLidIdentity(
+                this.chatwootService.scheduleLidIdentityReconcile(
                   { instanceName: this.instance.name },
                   mapping.lid,
                   mapping.pn,
                 );
               } catch (error) {
-                this.logger.error(`Unable to reconcile Chatwoot LID identity: ${formatCaughtError(error)}`);
+                this.logger.error(`Unable to schedule Chatwoot LID identity reconcile: ${formatCaughtError(error)}`);
               }
             }
 

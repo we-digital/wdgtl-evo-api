@@ -480,3 +480,64 @@ test('canonical group resolution stops when participant contact creation has no 
     );
   }
 });
+
+test('LID reconcile reads contacts from the Chatwoot database first: no provisional contact = no API call', async () => {
+  const { service } = serviceFixture(async () => null);
+  const queries: any[][] = [];
+  service.isImportHistoryAvailable = () => true;
+  service.pgClient = {
+    query: async (sql: string, params: any[]) => {
+      queries.push([sql.includes('phone_number') ? 'phone' : 'identifier', params[1]]);
+      return { rows: [] };
+    },
+  };
+  service.findContactByIdentifier = async () => assert.fail('API search must not run when the database answers');
+  service.findContact = async () => assert.fail('API filter must not run when the database answers');
+  assert.deepEqual(await service.reconcileLidIdentity(instance, '222:7@lid', '628123@s.whatsapp.net'), {
+    status: 'no_provisional_contact',
+  });
+  assert.deepEqual(queries, [['identifier', '222@lid']]);
+});
+
+test('LID reconcile from the database updates the provisional contact and verifies it there', async () => {
+  const { service } = serviceFixture(async () => null);
+  let updated = false;
+  service.isImportHistoryAvailable = () => true;
+  service.pgClient = {
+    query: async (sql: string, params: any[]) => {
+      if (sql.includes('phone_number')) return { rows: [] };
+      if (params[1] === '222@lid') return { rows: [{ id: 9, identifier: '222@lid' }] };
+      return { rows: updated ? [{ id: 9, identifier: params[1] }] : [] };
+    },
+  };
+  service.findContactByIdentifier = async () => assert.fail('API search must not run');
+  service.findContact = async () => assert.fail('API filter must not run');
+  service.updateContact = async () => {
+    updated = true;
+    return { id: 9 };
+  };
+  service.removeUnresolvedLidLabel = async () => undefined;
+  assert.deepEqual(await service.reconcileLidIdentity(instance, '222:7@lid', '628123@s.whatsapp.net'), {
+    status: 'updated',
+  });
+});
+
+test('an ambiguous phone match in the database falls back to the API lookup', async () => {
+  const { service } = serviceFixture(async () => null);
+  service.isImportHistoryAvailable = () => true;
+  service.pgClient = {
+    query: async (sql: string, params: any[]) => {
+      if (sql.includes('phone_number')) return { rows: [{ id: 5 }, { id: 6 }] };
+      if (params[1] === '222@lid') return { rows: [{ id: 9, identifier: '222@lid' }] };
+      return { rows: [] };
+    },
+  };
+  const merged: number[][] = [];
+  service.findContact = async () => ({ id: 5 });
+  service.mergeContacts = async (base: number, mergee: number) => (merged.push([base, mergee]), { id: base });
+  service.removeUnresolvedLidLabel = async () => undefined;
+  assert.deepEqual(await service.reconcileLidIdentity(instance, '222:7@lid', '628123@s.whatsapp.net'), {
+    status: 'merged',
+  });
+  assert.deepEqual(merged, [[5, 9]]);
+});
