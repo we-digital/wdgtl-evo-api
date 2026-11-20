@@ -42,7 +42,6 @@ import {
   buildWhatsappGroupParticipantSnapshots,
   extractWhatsappMentionJids,
   formatIncomingWhatsappMentions,
-  stripWhatsappMentionMarkdown,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-channel-mentions';
 import {
   checkContactReachability,
@@ -277,6 +276,7 @@ import {
   requireTrustedChatwootUrl,
   resolveTrustedChatwootBaseUrl,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-trusted-egress';
+import { chatwootMarkdownToWhatsapp } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-whatsapp-text';
 import { createHistoryDatabaseScope } from '@api/integrations/chatbot/chatwoot/utils/history-database-scope';
 import {
   HISTORY_PAGE_SIZE,
@@ -4747,14 +4747,7 @@ export class ChatwootService {
       const chatId = candidateChatId;
       // Chatwoot to Whatsapp
       const mentionedJids = extractWhatsappMentionJids(body);
-      const messageReceivedRaw = body.content
-        ? body.content
-            .replaceAll(/(?<!\*)\*((?!\s)([^\n*]+?)(?<!\s))\*(?!\*)/g, '_$1_') // Substitui * por _
-            .replaceAll(/\*{2}((?!\s)([^\n*]+?)(?<!\s))\*{2}/g, '*$1*') // Substitui ** por *
-            .replaceAll(/~{2}((?!\s)([^\n*]+?)(?<!\s))~{2}/g, '~$1~') // Substitui ~~ por ~
-            .replaceAll(/(?<!`)`((?!\s)([^`*]+?)(?<!\s))`(?!`)/g, '```$1```') // Substitui ` por ```
-        : body.content;
-      const messageReceived = stripWhatsappMentionMarkdown(messageReceivedRaw);
+      const messageReceived = chatwootMarkdownToWhatsapp(body.content);
 
       const senderName = body?.sender?.available_name || body?.sender?.name;
       const expectedRoute = this.buildEvoRouteBinding(instance, provider, body.inbox?.id);
@@ -5709,7 +5702,7 @@ export class ChatwootService {
     body: any,
     instance: InstanceDto,
   ): Promise<any | null> {
-    const text = stripWhatsappMentionMarkdown(typeof body?.content === 'string' ? body.content : '');
+    const text = chatwootMarkdownToWhatsapp(typeof body?.content === 'string' ? body.content : '');
     if (!text.trim() || !waInstance?.updateMessage) return null;
 
     const key = await this.resolveNativeEditKey(chatId, body, instance);
