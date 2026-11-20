@@ -10,11 +10,18 @@ const text = fs.readFileSync('src/api/integrations/channel/whatsapp/whatsapp.bai
 const ast = ts.createSourceFile('service.ts', text, ts.ScriptTarget.Latest, true);
 let ignore: ts.Expression | undefined;
 let upsert: ts.Expression | undefined;
+const chatHandlers: Record<string, ts.Expression> = {};
 function visit(node: ts.Node) {
   if (ts.isPropertyAssignment(node) && ts.isIdentifier(node.name) && node.name.text === 'shouldIgnoreJid')
     ignore = node.initializer;
   if (ts.isPropertyAssignment(node) && ts.isStringLiteral(node.name) && node.name.text === 'messages.upsert')
     upsert = node.initializer;
+  if (
+    ts.isPropertyAssignment(node) &&
+    ts.isStringLiteral(node.name) &&
+    (node.name.text === 'chats.upsert' || node.name.text === 'chats.update')
+  )
+    chatHandlers[node.name.text] = node.initializer;
   ts.forEachChild(node, visit);
 }
 visit(ast);
@@ -48,15 +55,31 @@ test('statuses reach Baileys processing (receipt) even with readStatus off; othe
   assert.equal(on('1234567890@broadcast'), false);
 });
 
-test('with readStatus off a status is dropped before anything is stored, forwarded or announced', async () => {
-  const touched: string[] = [];
-  const context = new Proxy({ localSettings: { readStatus: false } } as Record<string, any>, {
+// Any access outside localSettings throws: prismaRepository (Message/Chat/ledger rows),
+// chatwootService (ledger admission and the Chatwoot bus), sendDataWebhook, and
+// client (readMessages = a read/viewed receipt) are all unreachable for a status.
+function guardedContext(touched: string[]) {
+  return new Proxy({ localSettings: { readStatus: false } } as Record<string, any>, {
     get(target, property) {
       if (property in target) return target[property as string];
       touched.push(String(property));
       throw new Error(`touched ${String(property)}`);
     },
   });
+}
+
+test('chat events of the status@broadcast chat touch no database, webhook or Chatwoot', async () => {
+  for (const name of ['chats.upsert', 'chats.update']) {
+    const touched: string[] = [];
+    const handler = new Function(`${compile(chatHandlers[name])}; return fn;`).call(guardedContext(touched));
+    await handler([{ id: 'status@broadcast', unreadCount: 1, conversationTimestamp: 1 }]);
+    assert.deepEqual(touched, [], name);
+  }
+});
+
+test('with readStatus off a status is dropped before anything is stored, forwarded or announced', async () => {
+  const touched: string[] = [];
+  const context = guardedContext(touched);
   const handler = new Function(`${compile(upsert!)}; return fn;`).call(context);
   const status = {
     key: { id: 'SYNTHETICSTATUS', remoteJid: 'status@broadcast', fromMe: false, participant: '1@lid' },
