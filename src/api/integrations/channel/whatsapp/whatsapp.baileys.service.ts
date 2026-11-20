@@ -1660,11 +1660,11 @@ export class BaileysStartupService extends ChannelStartupService {
             received?.message?.ptvMessage ||
             received?.message?.audioMessage;
 
-          if (this.localSettings.readMessages && received.key.id !== 'status@broadcast') {
+          if (this.localSettings.readMessages && received.key.remoteJid !== 'status@broadcast') {
             await this.client.readMessages([received.key]);
           }
 
-          if (this.localSettings.readStatus && received.key.id === 'status@broadcast') {
+          if (this.localSettings.readStatus && received.key.remoteJid === 'status@broadcast') {
             await this.client.readMessages([received.key]);
           }
 
@@ -1850,7 +1850,8 @@ export class BaileysStartupService extends ChannelStartupService {
                 instanceId: string;
               } = {
                 remoteJid: received.key.remoteJid,
-                pushName: received.key.fromMe ? '' : received.key.fromMe == null ? '' : received.pushName,
+                // Our own messages carry our name, not the peer's: keep the stored one.
+                pushName: received.key.fromMe === false ? received.pushName : (contact?.pushName ?? ''),
                 // Never ask WhatsApp on the message path: cached or stored URL only.
                 profilePicUrl: await this.peekCachedProfilePictureUrl(received.key.remoteJid, contact?.profilePicUrl),
                 instanceId: this.instanceId,
@@ -1920,6 +1921,8 @@ export class BaileysStartupService extends ChannelStartupService {
       this.logger.verbose(`Update messages (${args.length})`);
 
       const readChatToUpdate: Record<string, true> = {}; // {remoteJid: true}
+      // MessageUpdate rows of this event, written in one statement at the end.
+      const messageUpdates: any[] = [];
 
       for await (const { key, update } of args) {
         if (settings?.groupsIgnore && key.remoteJid?.includes('@g.us')) {
@@ -1949,7 +1952,6 @@ export class BaileysStartupService extends ChannelStartupService {
         const cached = await this.baileysCache.get(updateKey);
 
         const secondsSinceEpoch = Math.floor(Date.now() / 1000);
-        console.log('CACHE:', { cached, updateKey, messageTimestamp: update.messageTimestamp, secondsSinceEpoch });
 
         if (
           (update.messageTimestamp && update.messageTimestamp === cached) ||
@@ -2029,8 +2031,9 @@ export class BaileysStartupService extends ChannelStartupService {
 
             const searchId = originalMessageId || key.id;
 
+            // Only the columns the receipt needs: SELECT * detoasted the whole message JSON.
             const messages = (await this.prismaRepository.$queryRaw`
-              SELECT * FROM "Message"
+              SELECT id, status, "messageTimestamp" FROM "Message"
               WHERE "instanceId" = ${this.instanceId}
               AND "key"->>'id' = ${searchId}
               LIMIT 1
@@ -2096,14 +2099,17 @@ export class BaileysStartupService extends ChannelStartupService {
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.MESSAGE_UPDATE) {
             // eslint-disable-next-line @typescript-eslint/no-unused-vars
             const { message: _msg, ...messageData } = message;
-            await this.prismaRepository.messageUpdate.create({ data: messageData });
+            messageUpdates.push(messageData);
           }
 
           const existingChat = await this.prismaRepository.chat.findFirst({
             where: { instanceId: this.instanceId, remoteJid: message.remoteJid },
+            select: { id: true, unreadMessages: true },
           });
 
-          if (existingChat) {
+          // Receipts (mostly delivery acks of our own sends) rarely change the
+          // unread count: write and announce the chat only when it does.
+          if (existingChat && existingChat.unreadMessages !== 0) {
             const chatToInsert = { remoteJid: message.remoteJid, instanceId: this.instanceId, unreadMessages: 0 };
 
             this.sendDataWebhook(Events.CHATS_UPSERT, [chatToInsert]);
@@ -2115,6 +2121,21 @@ export class BaileysStartupService extends ChannelStartupService {
               }
             }
           }
+        }
+      }
+
+      if (messageUpdates.length) {
+        try {
+          await this.prismaRepository.messageUpdate.createMany({ data: messageUpdates });
+        } catch (error) {
+          this.logger.warn(
+            JSON.stringify({
+              event: 'message_update_batch_failed',
+              instanceId: this.instanceId,
+              rows: messageUpdates.length,
+              errorClass: error?.name || 'Error',
+            }),
+          );
         }
       }
 
@@ -2633,6 +2654,7 @@ export class BaileysStartupService extends ChannelStartupService {
     const baileysConfig = this.configService.get<BaileysConfig>('BAILEYS');
 
     if (!baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH) return false;
+    if (baileysConfig.FORCE_GROUP_SENDER_KEY_REFRESH_SKIP?.includes(this.instance.name)) return false;
 
     let clientRepairs = this.groupSenderKeyRepairs.get(this.client);
     if (!clientRepairs) {
@@ -4570,11 +4592,18 @@ export class BaileysStartupService extends ChannelStartupService {
     }
 
     for (const remoteJid of Array.from(new Set(candidates.filter(Boolean)))) {
-      const messages = await this.prismaRepository.message.findMany({
-        where: { key: { path: ['remoteJid'], equals: remoteJid }, instanceId: this.instance.id },
-        orderBy: { messageTimestamp: 'desc' },
-        take: 1,
-      });
+      // key->>'remoteJid' uses Msg_instance_remotejid_id_idx; Prisma's JSON path
+      // filter compiles to key #> '{remoteJid}', which no index covers, and walked
+      // every message of the instance.
+      const latest = (await this.prismaRepository.$queryRaw`
+        SELECT id FROM "Message"
+        WHERE "instanceId" = ${this.instance.id} AND "key"->>'remoteJid' = ${remoteJid}
+        ORDER BY "messageTimestamp" DESC
+        LIMIT 1
+      `) as { id: string }[];
+      const messages = latest.length
+        ? await this.prismaRepository.message.findMany({ where: { id: latest[0].id }, take: 1 })
+        : [];
       if (messages.length > 0) {
         return messages[0] as unknown as LastMessage;
       }

@@ -88,6 +88,9 @@ function literalService() {
     'requestInboundConversation',
     'createMessage',
     'processWhatsappEvent',
+    'mediaPrefetchKey',
+    'dropMediaPrefetch',
+    'downloadInboundMedia',
   ].map((name) => klass.members.find((m) => m.name?.getText(file) === name)!.getText(file));
   const js = ts.transpileModule(`module.exports=class Consumer {${methods.join('\n')}}`, {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.CommonJS },

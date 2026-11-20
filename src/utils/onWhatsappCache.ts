@@ -72,13 +72,65 @@ function normalizeJid(jid: string | null | undefined): string | null {
   return jid.startsWith('+') ? jid.slice(1) : jid;
 }
 
+// Every stored direct message calls saveOnWhatsappCache for its chat. An item that
+// was saved unchanged a moment ago needs no database round trip at all.
+const SAVE_MEMO_TTL_MS = 10 * 60 * 1000;
+const SAVE_MEMO_MAX = 20_000;
+const saveMemo = new Map<string, number>();
+function saveMemoKey(item: ISaveOnWhatsappCacheParams): string {
+  return [normalizeJid(item.remoteJid) ?? '', normalizeJid(item.remoteJidAlt) ?? '', item.lid ?? ''].join('|');
+}
+function recentlySaved(key: string, now: number): boolean {
+  const at = saveMemo.get(key);
+  if (at === undefined) return false;
+  if (now - at <= SAVE_MEMO_TTL_MS) return true;
+  saveMemo.delete(key);
+  return false;
+}
+function rememberSaved(key: string, now: number) {
+  if (saveMemo.size >= SAVE_MEMO_MAX) saveMemo.delete(saveMemo.keys().next().value);
+  saveMemo.set(key, now);
+}
+/** Test hook. */
+export function clearOnWhatsappSaveMemo() {
+  saveMemo.clear();
+}
+
+// Bounded parallelism: contacts.upsert can pass hundreds of items at once.
+const SAVE_CONCURRENCY = 4;
+
+/**
+ * Finds the cache row of a JID set. The unique remoteJid index answers almost every
+ * lookup; the jidOptions substring scan (a sequential scan of the whole table) only
+ * runs when no row is keyed by one of the JIDs.
+ */
+async function findExistingRecord(remoteJid: string, expandedJids: string[]) {
+  const exact = await prismaRepository.isOnWhatsapp.findFirst({
+    where: { remoteJid: { in: [...new Set([remoteJid, ...expandedJids])] } },
+  });
+  if (exact) return exact;
+  return prismaRepository.isOnWhatsapp.findFirst({
+    where: { OR: expandedJids.map((jid) => ({ jidOptions: { contains: jid } })) },
+  });
+}
+
 export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
   if (!configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
     return;
   }
 
-  // Processa todos os itens em paralelo para melhor performance
-  const processingPromises = data.map(async (item) => {
+  const queue = [...data];
+  const worker = async () => {
+    for (let item = queue.shift(); item; item = queue.shift()) await saveOne(item);
+  };
+  await Promise.allSettled(Array.from({ length: Math.min(SAVE_CONCURRENCY, queue.length) }, worker));
+}
+
+async function saveOne(item: ISaveOnWhatsappCacheParams) {
+  const memoKey = saveMemoKey(item);
+  const now = Date.now();
+  if (!item.verified && recentlySaved(memoKey, now)) return;
+  {
     try {
       const remoteJid = normalizeJid(item.remoteJid);
       if (!remoteJid) {
@@ -100,14 +152,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
       // Às vezes acontece do remoteJid atual NÃO ESTAR no jidOptions ainda, ocasionando o erro:
       // 'Unique constraint failed on the fields: (`remoteJid`)'
       // Isso acontece principalmente em grupos que possuem o número do criador no ID (ex.: '559911223345-1234567890@g.us')
-      const existingRecord = await prismaRepository.isOnWhatsapp.findFirst({
-        where: {
-          OR: [
-            ...expandedJids.map((jid) => ({ jidOptions: { contains: jid } })),
-            { remoteJid: remoteJid }, // TODO: Descobrir o motivo que causa o remoteJid não estar (às vezes) incluso na lista de jidOptions
-          ],
-        },
-      });
+      const existingRecord = await findExistingRecord(remoteJid, expandedJids);
 
       logger.verbose(
         `[saveOnWhatsappCache] Register exists for [${expandedJids.join(',')}]? => ${existingRecord ? existingRecord.remoteJid : 'Not found'}`,
@@ -158,6 +203,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
             });
           }
           logger.verbose(`[saveOnWhatsappCache] Data for ${remoteJid} is already up-to-date. Skipping update.`);
+          rememberSaved(memoKey, now);
           return; // Pula para o próximo item
         }
 
@@ -169,6 +215,7 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
           where: { id: existingRecord.id },
           data: dataPayload,
         });
+        rememberSaved(memoKey, now);
       } else {
         // Cria nova entrada
         logger.verbose(
@@ -177,16 +224,14 @@ export async function saveOnWhatsappCache(data: ISaveOnWhatsappCacheParams[]) {
         await prismaRepository.isOnWhatsapp.create({
           data: dataPayload,
         });
+        rememberSaved(memoKey, now);
       }
     } catch (e) {
       // Loga o erro mas não para a execução dos outros promises
       logger.error(`[saveOnWhatsappCache] Error processing item for ${item.remoteJid}: `);
       logger.error(e);
     }
-  });
-
-  // Espera todas as operações paralelas terminarem
-  await Promise.allSettled(processingPromises);
+  }
 }
 
 export async function getOnWhatsappCache(remoteJids: string[]) {
@@ -199,15 +244,28 @@ export async function getOnWhatsappCache(remoteJids: string[]) {
 
   if (configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP) {
     const remoteJidsWithoutPlus = remoteJids.map((remoteJid) => getAvailableNumbers(remoteJid)).flat();
+    const fresh = {
+      gte: dayjs().subtract(configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP_DAYS, 'days').toDate(),
+    };
 
-    const onWhatsappCache = await prismaRepository.isOnWhatsapp.findMany({
-      where: {
-        OR: remoteJidsWithoutPlus.map((remoteJid) => ({ jidOptions: { contains: remoteJid } })),
-        updatedAt: {
-          gte: dayjs().subtract(configService.get<Database>('DATABASE').SAVE_DATA.IS_ON_WHATSAPP_DAYS, 'days').toDate(),
-        },
-      },
-    });
+    // Exact keys first (unique index); the jidOptions substring scan only for the rest.
+    const exact = remoteJidsWithoutPlus.length
+      ? await prismaRepository.isOnWhatsapp.findMany({
+          where: { remoteJid: { in: [...new Set(remoteJidsWithoutPlus)] }, updatedAt: fresh },
+        })
+      : [];
+    const covered = new Set(exact.flatMap((row) => [row.remoteJid, ...row.jidOptions.split(',')]));
+    const rest = remoteJidsWithoutPlus.filter((jid) => !covered.has(jid));
+    const scanned = rest.length
+      ? await prismaRepository.isOnWhatsapp.findMany({
+          where: {
+            OR: rest.map((remoteJid) => ({ jidOptions: { contains: remoteJid } })),
+            id: { notIn: exact.map((row) => row.id) },
+            updatedAt: fresh,
+          },
+        })
+      : [];
+    const onWhatsappCache = [...exact, ...scanned];
 
     results = onWhatsappCache.map((item) => ({
       remoteJid: item.remoteJid,

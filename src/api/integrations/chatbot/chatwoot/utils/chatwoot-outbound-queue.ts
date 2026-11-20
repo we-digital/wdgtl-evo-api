@@ -843,9 +843,16 @@ export class ChatwootOutboundQueue {
 
   public wake() {
     if (this.stopped) return;
+    this.idleTicks = 0;
     if (this.timer) clearTimeout(this.timer);
     this.schedule(0);
   }
+
+  // Idle ticks in a row. While idle, one claim per work class probes for work
+  // (instead of filling every slot) and the tick backs off up to 4 s; admissions
+  // and finished work call wake(), so new sends never wait for the backoff.
+  private idleTicks = 0;
+  static readonly IDLE_POLL_MAX_MS = 4_000;
 
   public async runOnce(workClass: ChatwootOutboundWorkClass = 'any'): Promise<boolean> {
     const now = new Date();
@@ -1400,9 +1407,18 @@ export class ChatwootOutboundQueue {
     this.timer = setTimeout(() => {
       this.timer = null;
       if (this.stopped) return;
-      this.fillSlots('transport', this.concurrency.transport);
-      this.fillSlots('maintenance', this.concurrency.maintenance);
-      this.schedule(this.pollIntervalMs);
+      const probe = this.idleTicks > 0;
+      const before = this.activeRuns.size;
+      this.fillSlots('transport', probe ? 1 : this.concurrency.transport);
+      this.fillSlots('maintenance', probe ? 1 : this.concurrency.maintenance);
+      // Runs still in flight from earlier ticks count as activity.
+      if (before > 0) this.idleTicks = 0;
+      else this.idleTicks += 1;
+      const backoff =
+        this.idleTicks > 1
+          ? Math.min(ChatwootOutboundQueue.IDLE_POLL_MAX_MS, this.pollIntervalMs * 2 ** (this.idleTicks - 1))
+          : this.pollIntervalMs;
+      this.schedule(backoff);
     }, delayMs);
     this.timer.unref?.();
   }

@@ -152,7 +152,10 @@ export interface InboundQueueOptions {
 }
 
 // Hash only native source fields; CW back-pointers and delivery receipts are not source content.
-export function inboundPayloadHash(body: InboundPayload): string {
+// `plain`: the body is already plain JSON (e.g. canonicalInboundBody output or a
+// row read back from the ledger), so the JSON round trip that flattens Buffers and
+// toJSON objects is skipped. The digest is the same either way.
+export function inboundPayloadHash(body: InboundPayload, plain = false): string {
   const source = Object.fromEntries(
     ['key', 'message', 'messageType', 'messageTimestamp', 'contextInfo', 'participant', 'pushName'].map((k) => [
       k,
@@ -171,7 +174,7 @@ export function inboundPayloadHash(body: InboundPayload): string {
           )
         : v;
   return createHash('sha256')
-    .update(JSON.stringify(stable(JSON.parse(JSON.stringify(source)))))
+    .update(JSON.stringify(stable(plain ? source : JSON.parse(JSON.stringify(source)))))
     .digest('hex');
 }
 // Binds a ledger row to the exact Chatwoot provider configuration it was admitted under.
@@ -306,18 +309,38 @@ export class ChatwootInboundQueue {
     const waiters = this.slotWaiters.splice(0);
     for (const wake of waiters) wake();
   }
+  // Idle polling backs off 1 s → 2 s → 4 s while nothing is due; any started
+  // delivery resets it. Live admissions never wait for the poller (deliverAdmitted).
+  static readonly POLL_MIN_MS = 1_000;
+  static readonly POLL_MAX_MS = 4_000;
+  private pollDelayMs = ChatwootInboundQueue.POLL_MIN_MS;
+  private schedulePoll() {
+    if (this.stopped) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.fill()
+        .then((started) => {
+          this.pollDelayMs = started.length
+            ? ChatwootInboundQueue.POLL_MIN_MS
+            : Math.min(ChatwootInboundQueue.POLL_MAX_MS, this.pollDelayMs * 2);
+        })
+        .catch((e) => this.observe('chatwoot_inbound_poll_failed', { errorClass: e?.name || 'Error' }))
+        .finally(() => this.schedulePoll());
+    }, this.pollDelayMs);
+    this.timer.unref?.();
+  }
   start() {
     this.stopped = false;
     if (this.timer) return;
-    this.timer = setInterval(() => this.kick(), 1_000);
-    this.timer.unref?.();
+    this.pollDelayMs = ChatwootInboundQueue.POLL_MIN_MS;
+    this.schedulePoll();
     this.reportTimer = setInterval(() => this.reportLatency(), this.latencyReportMs);
     this.reportTimer.unref?.();
     this.kick();
   }
   async stop() {
     this.stopped = true;
-    if (this.timer) clearInterval(this.timer);
+    if (this.timer) clearTimeout(this.timer);
     if (this.reportTimer) clearInterval(this.reportTimer);
     this.timer = null;
     this.reportTimer = null;
@@ -394,6 +417,7 @@ export class ChatwootInboundQueue {
       for (const key of keys) this.activeChats.delete(key);
       if (history) this.activeHistory--;
       this.releaseSlotWaiters();
+      this.pollDelayMs = ChatwootInboundQueue.POLL_MIN_MS;
       if (this.timer && !this.stopped) this.kick();
     });
     this.active.set(item.id, work);
