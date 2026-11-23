@@ -1,4 +1,3 @@
-import { StanzaTrace, traceBaileysLogger } from './stanza-trace';
 import { isDeepStrictEqual } from 'node:util';
 
 import { getCollectionsDto } from '@api/dto/business.dto';
@@ -130,7 +129,7 @@ import { sendTelemetry } from '@utils/sendTelemetry';
 import useMultiFileAuthStatePrisma from '@utils/use-multi-file-auth-state-prisma';
 import { AuthStateProvider } from '@utils/use-multi-file-auth-state-provider-files';
 import { useMultiFileAuthStateRedisDb } from '@utils/use-multi-file-auth-state-redis-db';
-import { replaceableWhatsappName, whatsappProfileName } from '@utils/whatsapp-contact-name';
+import { fitVarChar, replaceableWhatsappName, whatsappProfileName } from '@utils/whatsapp-contact-name';
 import axios from 'axios';
 import makeWASocket, {
   AnyMessageContent,
@@ -199,6 +198,7 @@ import { recordApiSentMessage } from './api-sent-messages';
 import { BaileysMessageProcessor } from './baileysMessage.processor';
 import { BaileysTransportOptions, buildBaileysTransportOptions } from './chatwoot-transport-options';
 import { formatMediaPreparationErrorLog, resolveMediaMessageMetadata } from './media-message-metadata';
+import { nativeForwardSource } from './native-forward-content';
 import { expiredNativeMediaStatus, nativeMediaBytes, refreshExpiredNativeMedia } from './native-media-refresh';
 import {
   LAST_WHATSAPP_PROVIDER_EDIT_TIMESTAMP,
@@ -209,16 +209,17 @@ import {
   projectNativeWhatsappEdit,
   qualifyNativeWhatsappEditKey,
 } from './normalized-whatsapp-edit';
-import { nativeForwardSource } from './native-forward-content';
 import { persistNativeForwardMessage } from './persist-native-forward-message';
 import { RecentOutboundMessages } from './recent-outbound-messages';
 import { SendRecipientCache } from './send-recipient-cache';
+import { StanzaTrace, traceBaileysLogger } from './stanza-trace';
 import { useVoiceCallsBaileys } from './voiceCalls/useVoiceCallsBaileys';
 import {
   ORIGINAL_WHATSAPP_TIMESTAMP,
   originalWhatsappTimestamp,
   whatsappEditAllowed,
 } from './whatsapp-edit-restrictions';
+import { EventStepQueue, eventStepStallMs } from './whatsapp-event-queue';
 
 export interface ExtendedIMessageKey extends proto.IMessageKey {
   remoteJidAlt?: string;
@@ -361,7 +362,6 @@ export class BaileysStartupService extends ChannelStartupService {
     }
     return this.stanzaTraceState;
   }
-  private eventProcessingQueue: Promise<void> = Promise.resolve();
   private clientGeneration = 0;
 
   // Cache TTL constants (in seconds)
@@ -1096,7 +1096,7 @@ export class BaileysStartupService extends ChannelStartupService {
         .map((chat) => ({
           remoteJid: chat.id,
           instanceId: this.instanceId,
-          name: chat.name,
+          name: fitVarChar(chat.name),
           unreadMessages: chat.unreadCount !== undefined ? chat.unreadCount : 0,
         }));
 
@@ -1365,7 +1365,7 @@ export class BaileysStartupService extends ChannelStartupService {
             continue;
           }
 
-          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: chat.name });
+          chatsRaw.push({ remoteJid: chat.id, instanceId: this.instanceId, name: fitVarChar(chat.name) });
         }
 
         this.sendDataWebhook(Events.CHATS_SET, chatsRaw);
@@ -1522,7 +1522,7 @@ export class BaileysStartupService extends ChannelStartupService {
               try {
                 await this.prismaRepository.chat.update({
                   where: { id: existingChat.id },
-                  data: { name: received.pushName },
+                  data: { name: fitVarChar(received.pushName) },
                 });
               } catch {
                 console.log(`Chat insert record ignored: ${received.key.remoteJid} - ${this.instanceId}`);
@@ -2316,158 +2316,190 @@ export class BaileysStartupService extends ChannelStartupService {
   };
 
   private eventHandler(clientGeneration = this.clientGeneration) {
+    // One queue per socket: a step stalled on an old socket never blocks the next one.
+    const queue = new EventStepQueue({
+      stallMs: eventStepStallMs(process.env.EVO_EVENT_STEP_STALL_MS),
+      onStall: (report) =>
+        this.logger.error(
+          JSON.stringify({ event: 'whatsapp_event_step_stalled', instanceId: this.instanceId, ...report }),
+        ),
+      onLateSettle: (report) =>
+        this.logger.warn(
+          JSON.stringify({ event: 'whatsapp_event_step_settled_late', instanceId: this.instanceId, ...report }),
+        ),
+      onError: (error, report) =>
+        this.logger.error(
+          `Baileys event step failed (${report.events.join(',')} at ${report.stage}): ${formatCaughtError(error)}`,
+        ),
+    });
+
     this.client.ev.process(async (events) => {
-      this.eventProcessingQueue = this.eventProcessingQueue.then(async () => {
-        try {
-          if (!this.endSession) {
-            const database = this.configService.get<Database>('DATABASE');
-            const settings = await this.findSettings();
+      if (this.endSession) return;
 
-            if (events.call) {
-              const call = events.call[0];
+      // Connection state and credentials never wait behind message processing: a
+      // stalled data step must not hide a close (restart/reconnect) or lose new keys.
+      if (events['connection.update']) {
+        void this.connectionUpdate(events['connection.update'], clientGeneration).catch((error) =>
+          this.logger.error(`Connection update failed: ${formatCaughtError(error)}`),
+        );
+      }
 
-              if (settings?.rejectCall && call.status == 'offer') {
-                this.client.rejectCall(call.id, call.from);
-              }
+      if (events['creds.update']) {
+        void Promise.resolve()
+          .then(() => this.instance.authState.saveCreds())
+          .catch((error) => this.logger.error(`Unable to save credentials: ${formatCaughtError(error)}`));
+      }
 
-              if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
-                if (call.from.endsWith('@lid')) {
-                  call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
-                }
-                const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+      const names = Object.keys(events).filter((name) => name !== 'connection.update' && name !== 'creds.update');
+      if (!names.length) return;
 
-                this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
-              }
+      void queue.push(names, async (stage) => {
+        if (this.endSession) return;
+        const database = this.configService.get<Database>('DATABASE');
+        stage('settings');
+        const settings = await this.findSettings();
 
-              this.sendDataWebhook(Events.CALL, call);
-            }
-
-            if (events['connection.update']) {
-              this.connectionUpdate(events['connection.update'], clientGeneration);
-            }
-
-            if (events['creds.update']) {
-              this.instance.authState.saveCreds();
-            }
-
-            if (events['lid-mapping.update'] && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
-              const mapping = events['lid-mapping.update'];
-              // Off the serialized event queue: a re-pair burst of mappings is
-              // coalesced and paced for the Chatwoot API (it answered 429 inline).
-              try {
-                this.chatwootService.scheduleLidIdentityReconcile(
-                  { instanceName: this.instance.name },
-                  mapping.lid,
-                  mapping.pn,
-                );
-              } catch (error) {
-                this.logger.error(`Unable to schedule Chatwoot LID identity reconcile: ${formatCaughtError(error)}`);
-              }
-            }
-
-            if (events['identity-change']) {
-              const recovery = events['identity-change'];
-              this.logger.info(
-                `Identity recovery for ${recovery.jid}: ${recovery.refreshedSessions} sessions refreshed, ` +
-                  `${recovery.deviceEntriesRemoved} sender-key entries removed from ${recovery.groupsUpdated}/` +
-                  `${recovery.groupsChecked} groups`,
-              );
-            }
-
-            if (events['messaging-history.set']) {
-              const payload = events['messaging-history.set'];
-              await this.messageHandle['messaging-history.set'](payload);
-            }
-
-            if (events['messages.upsert']) {
-              const payload = events['messages.upsert'];
-
-              // this.messageProcessor.processMessage(payload, settings);
-              await this.messageHandle['messages.upsert'](payload, settings);
-            }
-
-            if (events['messages.update']) {
-              const payload = events['messages.update'];
-              await this.messageHandle['messages.update'](payload, settings);
-            }
-
-            if (events['message-receipt.update']) {
-              const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
-              const remotesJidMap = selectWhatsAppOwnerReadTimestamps(payload);
-
-              await Promise.all(
-                Object.keys(remotesJidMap).map(async (remoteJid) =>
-                  this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
-                ),
-              );
-            }
-
-            if (events['presence.update']) {
-              const payload = events['presence.update'];
-
-              if (settings?.groupsIgnore && payload.id.includes('@g.us')) {
-                return;
-              }
-
-              this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
-            }
-
-            if (!settings?.groupsIgnore) {
-              if (events['groups.upsert']) {
-                const payload = events['groups.upsert'];
-                this.groupHandler['groups.upsert'](payload);
-              }
-
-              if (events['groups.update']) {
-                const payload = events['groups.update'];
-                this.groupHandler['groups.update'](payload);
-              }
-
-              if (events['group-participants.update']) {
-                const payload = events['group-participants.update'] as any;
-                this.groupHandler['group-participants.update'](payload);
-              }
-            }
-
-            if (events['chats.upsert']) {
-              const payload = events['chats.upsert'];
-              this.chatHandle['chats.upsert'](payload);
-            }
-
-            if (events['chats.update']) {
-              const payload = events['chats.update'];
-              await this.chatHandle['chats.update'](payload);
-            }
-
-            if (events['chats.delete']) {
-              const payload = events['chats.delete'];
-              this.chatHandle['chats.delete'](payload);
-            }
-
-            if (events['contacts.upsert']) {
-              const payload = events['contacts.upsert'];
-              await this.contactHandle['contacts.upsert'](payload);
-            }
-
-            if (events['contacts.update']) {
-              const payload = events['contacts.update'];
-              await this.contactHandle['contacts.update'](payload);
-            }
-
-            if (events[Events.LABELS_ASSOCIATION]) {
-              const payload = events[Events.LABELS_ASSOCIATION];
-              this.labelHandle[Events.LABELS_ASSOCIATION](payload, database);
-              return;
-            }
-
-            if (events[Events.LABELS_EDIT]) {
-              const payload = events[Events.LABELS_EDIT];
-              this.labelHandle[Events.LABELS_EDIT](payload);
-              return;
-            }
+        // Each event type is isolated: a failing history batch must not drop the live
+        // messages.upsert that Baileys flushed in the same buffer.
+        const step = async (name: string, work: () => unknown) => {
+          stage(name);
+          try {
+            await work();
+          } catch (error) {
+            this.logger.error(`Baileys ${name} failed: ${formatCaughtError(error)}`);
           }
-        } catch (error) {
-          this.logger.error(error);
+        };
+
+        if (events.call) {
+          await step('call', async () => {
+            const call = events.call[0];
+
+            if (settings?.rejectCall && call.status == 'offer') {
+              this.client.rejectCall(call.id, call.from);
+            }
+
+            if (settings?.msgCall?.trim().length > 0 && call.status == 'offer') {
+              if (call.from.endsWith('@lid')) {
+                call.from = await this.client.signalRepository.lidMapping.getPNForLID(call.from as string);
+              }
+              const msg = await this.client.sendMessage(call.from, { text: settings.msgCall });
+
+              this.client.ev.emit('messages.upsert', { messages: [msg], type: 'notify' });
+            }
+
+            this.sendDataWebhook(Events.CALL, call);
+          });
+        }
+
+        if (events['lid-mapping.update'] && this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
+          const mapping = events['lid-mapping.update'];
+          // Off the serialized event queue: a re-pair burst of mappings is
+          // coalesced and paced for the Chatwoot API (it answered 429 inline).
+          await step('lid-mapping.update', () =>
+            this.chatwootService.scheduleLidIdentityReconcile(
+              { instanceName: this.instance.name },
+              mapping.lid,
+              mapping.pn,
+            ),
+          );
+        }
+
+        if (events['identity-change']) {
+          const recovery = events['identity-change'];
+          this.logger.info(
+            `Identity recovery for ${recovery.jid}: ${recovery.refreshedSessions} sessions refreshed, ` +
+              `${recovery.deviceEntriesRemoved} sender-key entries removed from ${recovery.groupsUpdated}/` +
+              `${recovery.groupsChecked} groups`,
+          );
+        }
+
+        // Live messages first: a slow or failing history batch must not hold them.
+        if (events['messages.upsert']) {
+          await step('messages.upsert', () =>
+            this.messageHandle['messages.upsert'](events['messages.upsert'], settings),
+          );
+        }
+
+        if (events['messaging-history.set']) {
+          await step('messaging-history.set', () =>
+            this.messageHandle['messaging-history.set'](events['messaging-history.set']),
+          );
+        }
+
+        if (events['messages.update']) {
+          await step('messages.update', () =>
+            this.messageHandle['messages.update'](events['messages.update'], settings),
+          );
+        }
+
+        if (events['message-receipt.update']) {
+          await step('message-receipt.update', async () => {
+            const payload = events['message-receipt.update'] as MessageUserReceiptUpdate[];
+            const remotesJidMap = selectWhatsAppOwnerReadTimestamps(payload);
+
+            await Promise.all(
+              Object.keys(remotesJidMap).map(async (remoteJid) =>
+                this.updateMessagesReadedByTimestamp(remoteJid, remotesJidMap[remoteJid]),
+              ),
+            );
+          });
+        }
+
+        if (events['presence.update']) {
+          const payload = events['presence.update'];
+
+          if (!(settings?.groupsIgnore && payload.id.includes('@g.us'))) {
+            this.sendDataWebhook(Events.PRESENCE_UPDATE, payload);
+          }
+        }
+
+        if (!settings?.groupsIgnore) {
+          if (events['groups.upsert']) {
+            const payload = events['groups.upsert'];
+            void step('groups.upsert', () => this.groupHandler['groups.upsert'](payload));
+          }
+
+          if (events['groups.update']) {
+            const payload = events['groups.update'];
+            void step('groups.update', () => this.groupHandler['groups.update'](payload));
+          }
+
+          if (events['group-participants.update']) {
+            const payload = events['group-participants.update'] as any;
+            void step('group-participants.update', () => this.groupHandler['group-participants.update'](payload));
+          }
+        }
+
+        if (events['chats.upsert']) {
+          const payload = events['chats.upsert'];
+          void step('chats.upsert', () => this.chatHandle['chats.upsert'](payload));
+        }
+
+        if (events['chats.update']) {
+          await step('chats.update', () => this.chatHandle['chats.update'](events['chats.update']));
+        }
+
+        if (events['chats.delete']) {
+          const payload = events['chats.delete'];
+          void step('chats.delete', () => this.chatHandle['chats.delete'](payload));
+        }
+
+        if (events['contacts.upsert']) {
+          await step('contacts.upsert', () => this.contactHandle['contacts.upsert'](events['contacts.upsert']));
+        }
+
+        if (events['contacts.update']) {
+          await step('contacts.update', () => this.contactHandle['contacts.update'](events['contacts.update']));
+        }
+
+        if (events[Events.LABELS_ASSOCIATION]) {
+          const payload = events[Events.LABELS_ASSOCIATION];
+          void step(Events.LABELS_ASSOCIATION, () => this.labelHandle[Events.LABELS_ASSOCIATION](payload, database));
+        }
+
+        if (events[Events.LABELS_EDIT]) {
+          const payload = events[Events.LABELS_EDIT];
+          void step(Events.LABELS_EDIT, () => this.labelHandle[Events.LABELS_EDIT](payload));
         }
       });
     });
@@ -5789,11 +5821,12 @@ export class BaileysStartupService extends ChannelStartupService {
 
     const messageRaw = {
       key: message.key, // Save key exactly as it comes from Baileys
-      pushName:
+      pushName: fitVarChar(
         message.pushName ||
-        (message.key.fromMe
-          ? 'Você'
-          : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
+          (message.key.fromMe
+            ? 'Você'
+            : message?.participant || (message.key?.participant ? message.key.participant.split('@')[0] : null)),
+      ),
       status: status[message.status],
       message: this.deserializeMessageBuffers({ ...message.message }),
       contextInfo: this.deserializeMessageBuffers(contentMsg?.contextInfo),
