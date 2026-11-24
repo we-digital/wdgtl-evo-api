@@ -3,6 +3,7 @@ import test from 'node:test';
 
 import {
   formatMediaPreparationErrorLog,
+  mediaContentType,
   resolveChatwootAttachmentMetadata,
   resolveMediaMessageMetadata,
   sanitizeMediaFileName,
@@ -89,4 +90,50 @@ test('media preparation logs retain only a bounded error class', () => {
   const unsafeNameLog = formatMediaPreparationErrorLog('whatsapp_media_prepare_error', maliciousNameError);
   assert.equal(unsafeNameLog, '{"event":"whatsapp_media_prepare_error","errorClass":"Error"}');
   assert.doesNotMatch(unsafeNameLog, /user|password|TOPSECRET|FRAGMENTSECRET/);
+});
+
+// C289: a 182-character PDF name was cut to "….p" and sent as text/x-pascal.
+test('long file names keep their extension and their type', async () => {
+  const stem =
+    '24 NOVEMBER 2026 BBC - bayar 2 nomor warmeking UNTUK IDENFINITE-TERM EMPLOYMENT AGREEMENT (PKWTT) PT Thirteen DAN ' +
+    'Surat Pernyataan Penutupan Perusahaan PT CONCIERGE VISA SERVICES';
+  const longName = `${stem}.pdf`;
+  assert.equal(longName.length, 182);
+
+  const sanitized = sanitizeMediaFileName(longName);
+  assert.equal(sanitized.length, 180);
+  assert.match(sanitized, /\.pdf$/);
+  assert.equal(sanitized, `${stem.slice(0, 176)}.pdf`);
+
+  assert.deepEqual(resolveMediaMessageMetadata({ mediaType: 'document', fileName: longName }), {
+    fileName: sanitized,
+    mimetype: 'application/pdf',
+  });
+
+  const chatwootUrl = `https://chatwoot.example.test/rails/active_storage/blobs/redirect/abc/${encodeURIComponent(longName)}`;
+  const fromChatwoot = await resolveChatwootAttachmentMetadata(chatwootUrl, async () => 'text/plain');
+  assert.deepEqual(fromChatwoot, { fileName: sanitized, mimetype: 'application/pdf' });
+
+  const xlsx = sanitizeMediaFileName(`${'a'.repeat(300)}.xlsx`);
+  assert.equal(xlsx, `${'a'.repeat(175)}.xlsx`);
+});
+
+test('long names without a real extension are cut plainly and never split a surrogate pair', () => {
+  const validity = `eVisa_${'N'.repeat(200)}_09.10.2026-09.10.2027`;
+  const cut = sanitizeMediaFileName(validity);
+  assert.equal(cut, validity.slice(0, 180));
+
+  const emoji = sanitizeMediaFileName(`${'😀'.repeat(200)}.pdf`);
+  assert.equal(Array.from(emoji).length, 180);
+  assert.match(emoji, /^(😀)+\.pdf$/);
+
+  assert.equal(sanitizeMediaFileName('short name.pdf'), 'short name.pdf');
+});
+
+test('the inbound bus type comes from WhatsApp, not from the name', () => {
+  assert.equal(mediaContentType('application/pdf'), 'application/pdf');
+  assert.equal(mediaContentType('Application/PDF; charset=binary'), 'application/pdf');
+  assert.equal(mediaContentType('application/octet-stream'), undefined);
+  assert.equal(mediaContentType(null), undefined);
+  assert.equal(mediaContentType('pdf'), undefined);
 });

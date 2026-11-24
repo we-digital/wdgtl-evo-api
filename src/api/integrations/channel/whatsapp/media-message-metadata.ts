@@ -55,10 +55,29 @@ export const sanitizeMediaFileName = (value?: string): string | undefined => {
     .replace(UNSAFE_FILE_NAME_CHARACTERS, '_')
     .replace(/_+/g, '_')
     .replace(/^[.\s_]+/, '')
-    .replace(/[.\s]+$/, '')
-    .slice(0, MAX_FILE_NAME_LENGTH);
+    .replace(/[.\s]+$/, '');
 
-  return sanitized || undefined;
+  return limitFileNameLength(sanitized) || undefined;
+};
+
+// A real extension: 1–10 letters/digits with at least one letter, so a date
+// tail like ".2027" is not taken for one.
+const REAL_EXTENSION = /\.(?=[A-Za-z0-9]{0,9}[A-Za-z])[A-Za-z0-9]{1,10}$/;
+
+// Long names are shortened in the stem, never in the extension: cutting
+// "….pdf" to "….p" made WhatsApp and Chatwoot type it text/x-pascal (C289).
+// Counts code points so a cut never splits a surrogate pair.
+const limitFileNameLength = (name: string): string => {
+  const chars = Array.from(name);
+  if (chars.length <= MAX_FILE_NAME_LENGTH) return name;
+
+  const extension = name.match(REAL_EXTENSION)?.[0] ?? '';
+  const stemChars = Array.from(name.slice(0, name.length - extension.length));
+  const stem = stemChars
+    .slice(0, MAX_FILE_NAME_LENGTH - Array.from(extension).length)
+    .join('')
+    .replace(/[.\s_]+$/, '');
+  return stem ? `${stem}${extension}` : chars.slice(0, MAX_FILE_NAME_LENGTH).join('');
 };
 
 const normalizeMimeType = (value: unknown, preserveParameters = false): string | undefined => {
@@ -120,4 +139,11 @@ export const formatMediaPreparationErrorLog = (event: MediaPreparationLogEvent, 
   const errorClass = SAFE_ERROR_CLASS.test(candidate) ? candidate : 'Error';
 
   return JSON.stringify({ event, errorClass });
+};
+
+// The bare type WhatsApp reported for a file, or undefined when it is missing,
+// invalid or only "application/octet-stream" (then the name may decide).
+export const mediaContentType = (value: unknown): string | undefined => {
+  const essence = normalizeMimeType(value);
+  return essence && essence !== 'application/octet-stream' ? essence : undefined;
 };
