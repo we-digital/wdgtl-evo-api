@@ -4,7 +4,10 @@ import { isDeepStrictEqual } from 'node:util';
 import { InstanceDto } from '@api/dto/instance.dto';
 import { Options, Quoted, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
 import { FromMeOrigin, fromMeOrigin } from '@api/integrations/channel/whatsapp/api-sent-messages';
-import { resolveChatwootAttachmentMetadata } from '@api/integrations/channel/whatsapp/media-message-metadata';
+import {
+  mediaContentType,
+  resolveChatwootAttachmentMetadata,
+} from '@api/integrations/channel/whatsapp/media-message-metadata';
 import { persistNativeForwardMessage } from '@api/integrations/channel/whatsapp/persist-native-forward-message';
 import {
   ChatwootDto,
@@ -414,7 +417,7 @@ const BUS_ROSTER_RESEND_MS = 30 * 60_000;
 
 interface BusCapture {
   message?: { content: string | null; message_type: string; content_attributes: Record<string, unknown> };
-  file?: { bytes: Buffer; fileName: string };
+  file?: { bytes: Buffer; fileName: string; contentType?: string };
 }
 
 // The same rules processWhatsappEvent applies with provider.ignoreJids.
@@ -2984,6 +2987,9 @@ export class ChatwootService {
       mediaType: string;
       nativeSource?: { message_type: string; sha256: string };
     },
+    // The type WhatsApp gave the file (after HEIC→JPEG); never guessed from a
+    // possibly cut name (C289).
+    fileContentType?: string,
   ) {
     const busCapture = !recovery && messageBody ? this.busCaptures?.get(messageBody) : undefined;
     if (sourceId && !busCapture && this.isImportHistoryAvailable()) {
@@ -3009,7 +3015,7 @@ export class ChatwootService {
 
     data.append('attachments[]', fileStream, {
       filename: fileName,
-      ...(recovery ? { contentType: recovery.mimetype } : {}),
+      ...(recovery ? { contentType: recovery.mimetype } : fileContentType ? { contentType: fileContentType } : {}),
     });
 
     let expectedContentAttributes: Record<string, unknown> = {};
@@ -3055,7 +3061,7 @@ export class ChatwootService {
         message_type: messageType,
         content_attributes: expectedContentAttributes,
       };
-      busCapture.file = { bytes: Buffer.concat(chunks), fileName };
+      busCapture.file = { bytes: Buffer.concat(chunks), fileName, contentType: fileContentType };
       return { id: BUS_CAPTURE_CONVERSATION } as any;
     }
 
@@ -7359,7 +7365,10 @@ export class ChatwootService {
     let attachments: BusMediaRef[] = [];
     let mediaUnavailableText: string | null = null;
     if (capture.file) {
-      const contentType = mimeTypes.lookup(capture.file.fileName) || 'application/octet-stream';
+      const contentType =
+        mediaContentType(capture.file.contentType) ||
+        mimeTypes.lookup(capture.file.fileName) ||
+        'application/octet-stream';
       attachments = [
         await ChatwootService.busClient(this.busObserve).putMedia(
           `${item.instanceId}/${body.key.id}`,
@@ -7938,6 +7947,8 @@ export class ChatwootService {
               quotedMsg,
               provider,
               clientSent,
+              undefined,
+              media.mimetype,
             );
 
             if (!send) {
@@ -7959,6 +7970,8 @@ export class ChatwootService {
               quotedMsg,
               provider,
               clientSent,
+              undefined,
+              media.mimetype,
             );
 
             if (!send) {
