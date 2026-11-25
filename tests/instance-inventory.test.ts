@@ -173,7 +173,7 @@ test('synthetic PostgreSQL: identical fields, fresh state and no history counts 
       const start = performance.now();
       for (let i = 0; i < 12; i++) await monitor.instanceInfo();
       const fullMs = performance.now() - start;
-      // Counts come from the 2-minute cache filled by the first full call above.
+      // Counts come from the 5-minute cache filled by the first full call above.
       assert.equal(queries.filter(q => /\bCOUNT\s*\(/i.test(q)).length, 0);
       await db.instance.update({ where: { id: 'synthetic' }, data: { connectionStatus: 'close' } });
       assert.equal((await monitor.instanceInfo(undefined, false))[0].connectionStatus, 'close');

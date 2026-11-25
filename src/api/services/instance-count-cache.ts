@@ -23,8 +23,8 @@ export class InstanceCountCache {
 
   constructor(
     private readonly repository: () => InstanceCountRepository,
-    private readonly freshMs = 120_000,
-    private readonly maxStaleMs = 30 * 60_000,
+    private readonly freshMs = 5 * 60_000,
+    private readonly maxStaleMs = 60 * 60_000,
     private readonly now: () => number = Date.now,
     private readonly onError: (error: unknown) => void = () => undefined,
   ) {}

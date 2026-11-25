@@ -43,11 +43,11 @@ export class WAMonitoringService {
 
   private readonly providerSession: ProviderSession;
 
-  // Display-only history counts for fetchInstances, refreshed at most every 2 min.
+  // Display-only history counts for fetchInstances: fresh 5 min, stale-while-refresh up to 60 min.
   private readonly instanceCounts = new InstanceCountCache(
     () => this.prismaRepository as unknown as InstanceCountRepository,
-    120_000,
-    30 * 60_000,
+    5 * 60_000,
+    60 * 60_000,
     Date.now,
     (error) => this.logger.warn(`instance count refresh failed: ${(error as Error)?.message ?? error}`),
   );

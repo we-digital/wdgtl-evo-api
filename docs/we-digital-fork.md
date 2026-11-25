@@ -1192,7 +1192,7 @@ lightweight mode before release.
 longer comes from Prisma's `_count` include, which joined a COUNT over every
 Message row of every instance on each call (prod 11-17..11-25: 2,827 calls,
 1.08 s mean, 72 s max). `InstanceCountCache` (`src/api/services/instance-count-cache.ts`)
-serves counts up to 2 min old from memory. Between 2 and 30 min old, it serves the
+serves counts up to 5 min old from memory. Between 5 and 60 min old, it serves the
 cached counts and starts one background refresh. Older or missing counts are
 recounted before the answer, and concurrent callers share that recount. A
 refresh is three `groupBy instanceId` counts restricted to the listed ids.
