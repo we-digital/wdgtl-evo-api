@@ -16,6 +16,8 @@ test('scoped native SQL selects the exact peer and direction, unscoped collision
   const outgoing = row({ id: 'outgoing', key: { ...first.key, fromMe: true } });
   const prisma = { $queryRaw: async (sql: any) => {
     assert.match(sql.text, /LIMIT 33/);
+    // Sorting on an expression keeps the lookup on Msg_instance_source_key_idx (see the PR's EXPLAIN).
+    assert.match(sql.text, /ORDER BY \(id \|\| ''\) LIMIT 33/);
     assert.deepEqual(sql.values.slice(0, 2), ['instance-1', 'COLLISION']);
     return [first, foreignPeer, outgoing].filter((value) =>
       (!sql.text.includes("key->>'remoteJid'") || value.key.remoteJid === sql.values[2]) &&

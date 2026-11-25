@@ -13,6 +13,7 @@ import { rmSync } from 'fs';
 import { join } from 'path';
 
 import { CacheService } from './cache.service';
+import { InstanceCountCache, InstanceCountRepository } from './instance-count-cache';
 
 export class WAMonitoringService {
   constructor(
@@ -41,6 +42,15 @@ export class WAMonitoringService {
   private readonly delInstanceTimeouts: Record<string, NodeJS.Timeout> = {};
 
   private readonly providerSession: ProviderSession;
+
+  // Display-only history counts for fetchInstances, refreshed at most every 2 min.
+  private readonly instanceCounts = new InstanceCountCache(
+    () => this.prismaRepository as unknown as InstanceCountRepository,
+    120_000,
+    30 * 60_000,
+    Date.now,
+    (error) => this.logger.warn(`instance count refresh failed: ${(error as Error)?.message ?? error}`),
+  );
 
   public delInstanceTime(instance: string) {
     const time = this.configService.get<DelInstance>('DEL_INSTANCE');
@@ -116,11 +126,13 @@ export class WAMonitoringService {
         Sqs: true,
         Websocket: true,
         Setting: true,
-        _count: includeCounts ? { select: { Message: true, Contact: true, Chat: true } } : false,
       },
     });
 
-    return instances;
+    if (!includeCounts || !instances.length) return instances;
+
+    const counts = await this.instanceCounts.get(instances.map((instance) => instance.id));
+    return instances.map((instance) => ({ ...instance, _count: counts.get(instance.id) }));
   }
 
   public async instanceInfoById(instanceId?: string, number?: string, includeCounts = true) {

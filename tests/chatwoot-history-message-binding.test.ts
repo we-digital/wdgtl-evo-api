@@ -57,7 +57,7 @@ function fixture(options: { row?: any; target?: any; aliases?: any[]; lockedAlia
       $queryRaw: async (sql: any) => {
         if (sql.text.includes('FOR SHARE')) { events.push('alias-lock'); return options.lockedAliasEvidence || options.aliasEvidence || []; }
         events.push('native-lock');
-        assert.match(sql.text, /FOR UPDATE/);
+        assert.match(sql.text, /ORDER BY \(id \|\| ''\) LIMIT 33 FOR UPDATE/);
         assert.deepEqual(sql.values.slice(0, 2), ['instance-1', 'SOURCE1']);
         assert.match(sql.text, /key->>'remoteJid'/);
         assert.match(sql.text, /key->>'fromMe'/);
