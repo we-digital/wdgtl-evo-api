@@ -1,39 +1,50 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { confirmProviderDeletionBeforeDroppingMapping } from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-provider-deletion';
+import {
+  confirmProviderDeletionBeforeMarkingLocal,
+  markWhatsappKeyDeleted,
+} from '../src/api/integrations/chatbot/chatwoot/utils/chatwoot-provider-deletion';
 
-test('provider deletion drops the WhatsApp mapping only after Chatwoot confirms the soft delete', async () => {
+test('provider deletion marks the EVO row only after Chatwoot confirms the soft delete', async () => {
   const calls: string[] = [];
 
-  const result = await confirmProviderDeletionBeforeDroppingMapping({
+  const result = await confirmProviderDeletionBeforeMarkingLocal({
     softDelete: async () => {
       calls.push('soft-delete');
       return 'confirmed';
     },
-    dropMapping: async () => {
-      calls.push('drop-mapping');
+    markLocal: async () => {
+      calls.push('mark-local');
     },
   });
 
   assert.equal(result, 'confirmed');
-  assert.deepEqual(calls, ['soft-delete', 'drop-mapping']);
+  assert.deepEqual(calls, ['soft-delete', 'mark-local']);
 });
 
-test('provider deletion preserves the WhatsApp mapping when Chatwoot fails', async () => {
-  let mappingDropped = false;
+test('provider deletion leaves the EVO row untouched when Chatwoot fails', async () => {
+  let marked = false;
 
   await assert.rejects(
-    confirmProviderDeletionBeforeDroppingMapping({
+    confirmProviderDeletionBeforeMarkingLocal({
       softDelete: async () => {
         throw new Error('Chatwoot unavailable');
       },
-      dropMapping: async () => {
-        mappingDropped = true;
+      markLocal: async () => {
+        marked = true;
       },
     }),
     /Chatwoot unavailable/,
   );
 
-  assert.equal(mappingDropped, false);
+  assert.equal(marked, false);
+});
+
+test('the marked key keeps the WhatsApp identity and only adds deleted', () => {
+  const key = { id: 'ABC', remoteJid: '62811@s.whatsapp.net', fromMe: false, participant: undefined };
+  assert.deepEqual(markWhatsappKeyDeleted(key), { ...key, deleted: true });
+  assert.deepEqual(key, { id: 'ABC', remoteJid: '62811@s.whatsapp.net', fromMe: false, participant: undefined });
+  assert.deepEqual(markWhatsappKeyDeleted(null), { deleted: true });
+  assert.deepEqual(markWhatsappKeyDeleted(['x']), { deleted: true });
 });
