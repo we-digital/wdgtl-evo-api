@@ -239,7 +239,12 @@ import {
   ChatwootOutboundWebhookHeaders,
   verifyChatwootOutboundWebhook,
 } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-outbound-webhook-auth';
-import { confirmProviderDeletionBeforeDroppingMapping } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-deletion';
+import {
+  confirmProviderDeletionBeforeMarkingLocal,
+  markWhatsappKeyDeleted,
+  providerDeleteFastPath,
+  ProviderDeleteLimiter,
+} from '@api/integrations/chatbot/chatwoot/utils/chatwoot-provider-deletion';
 import { resolveWhatsappReactionKey } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-reaction-key';
 import {
   buildWhatsappReactionActor,
@@ -438,6 +443,19 @@ const contactReadScope = (instance: InstanceDto) => String(instance.instanceId |
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
+  private readonly providerDeletes = new ProviderDeleteLimiter({
+    onDrop: (instanceId) =>
+      this.logger.warn(JSON.stringify({ event: 'whatsapp_provider_delete_dropped', instanceId, reason: 'queue_full' })),
+    onFailure: (instanceId, error, attempt, final) =>
+      this.logger[final ? 'error' : 'warn'](
+        JSON.stringify({
+          event: final ? 'whatsapp_provider_delete_failed' : 'whatsapp_provider_delete_retry',
+          instanceId,
+          attempt,
+          ...chatwootErrorFields(error),
+        }),
+      ),
+  });
   private readonly extendedHistorySyncKey = 'chatwoot:extendedHistorySync';
   private readonly historySyncCheckpointKey = 'chatwoot:historySyncCheckpoint';
   private readonly outboundStore: ChatwootOutboundPrismaStore;
@@ -6463,6 +6481,9 @@ export class ChatwootService {
   }
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
+    // WhatsApp revokes: bounded per instance, retried, outside the inbound fence (owner 2026-11-25).
+    if (event === Events.MESSAGES_DELETE)
+      return this.providerDeletes.run(instance.instanceId, () => this.applyWhatsappProviderDelete(instance, body));
     const deliveryKey = chatwootIngressDeliveryKey({
       event,
       instanceId: instance.instanceId,
@@ -7668,6 +7689,75 @@ export class ChatwootService {
     return context.conversationId;
   }
 
+  /**
+   * Owner, 2026-11-25: a message deleted in WhatsApp (by the customer, or by
+   * staff on the phone) stays in Chatwoot, marked deleted. Chatwoot only
+   * soft-marks provider deletes, so this no longer depends on the upstream
+   * CHATWOOT_MESSAGE_DELETE switch (off in prod, which dropped every revoke).
+   * Throws only for retryable failures (the limiter retries them).
+   */
+  private async applyWhatsappProviderDelete(instance: InstanceDto, body: any) {
+    if (!body?.key?.id) {
+      this.logger.warn('message id not found');
+      return;
+    }
+
+    // Cheap check on the plain row first: unmapped rows and rows already marked
+    // (our own staff delete echoed back, a repeated revoke) end here.
+    const row = await this.getMessageByKeyId(instance, body.key.id, body.key);
+    const decision = providerDeleteFastPath(row);
+    if (decision !== 'proceed') {
+      if (decision === 'unmapped')
+        this.logger.warn(
+          JSON.stringify({ event: 'whatsapp_provider_delete_unmapped', instanceId: instance.instanceId }),
+        );
+      return;
+    }
+
+    const context = await this.clientCw(instance);
+    if (!context) return;
+    const { provider } = context;
+
+    let message: MessageModel | null;
+    try {
+      message = await this.getNativeEventTarget(instance, body.key.id, body.key);
+    } catch (error) {
+      // The Chatwoot side of the binding is gone or ambiguous: nothing to mark,
+      // and a retry would not change that.
+      if (!/destination source is missing or ambiguous/.test(String((error as Error)?.message))) throw error;
+      message = null;
+    }
+    if (!message?.chatwootMessageId || !message?.chatwootConversationId) {
+      this.logger.warn(JSON.stringify({ event: 'whatsapp_provider_delete_unmapped', instanceId: instance.instanceId }));
+      return;
+    }
+
+    await confirmProviderDeletionBeforeMarkingLocal({
+      softDelete: () =>
+        this.privilegedChatwootRequest(provider, {
+          method: 'DELETE',
+          path: `/api/v1/accounts/${provider.accountId}/conversations/${message.chatwootConversationId}/messages/${message.chatwootMessageId}`,
+          data: { skip_native: true, provider_source: 'whatsapp' },
+        }),
+      // EVO keeps its row (content, quotes, the Chatwoot mapping) and only
+      // marks it deleted, like DELETE_DATA.LOGICAL_MESSAGE_DELETE does.
+      // updateMany: a row removed meanwhile is not an error (no P2025).
+      markLocal: () =>
+        this.prismaRepository.message.updateMany({
+          where: { id: message.id },
+          data: { key: markWhatsappKeyDeleted(message.key) as Prisma.InputJsonObject, status: 'DELETED' },
+        }),
+    });
+    this.logger.info(
+      JSON.stringify({
+        event: 'whatsapp_provider_delete_marked',
+        instanceId: instance.instanceId,
+        fromMe: (message.key as WAMessageKey)?.fromMe === true,
+      }),
+    );
+    return { message: 'deleted' };
+  }
+
   private async processWhatsappEvent(event: string, instance: InstanceDto, body: any) {
     try {
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
@@ -8137,41 +8227,7 @@ export class ChatwootService {
         }
       }
 
-      if (event === Events.MESSAGES_DELETE) {
-        const chatwootDelete = this.configService.get<Chatwoot>('CHATWOOT').MESSAGE_DELETE;
-
-        if (chatwootDelete === true) {
-          if (!body?.key?.id) {
-            this.logger.warn('message id not found');
-            return;
-          }
-
-          const message = await this.getMessageByKeyId(instance, body.key.id, body.key);
-
-          if (message?.chatwootMessageId && message?.chatwootConversationId) {
-            await confirmProviderDeletionBeforeDroppingMapping({
-              softDelete: () =>
-                this.privilegedChatwootRequest(provider, {
-                  method: 'DELETE',
-                  path: `/api/v1/accounts/${provider.accountId}/conversations/${message.chatwootConversationId}/messages/${message.chatwootMessageId}`,
-                  data: { skip_native: true, provider_source: 'whatsapp' },
-                }),
-              dropMapping: () =>
-                this.prismaRepository.message.deleteMany({
-                  where: {
-                    instanceId: instance.instanceId,
-                    AND: [
-                      { key: { path: ['id'], equals: body.key.id } },
-                      { key: { path: ['remoteJid'], equals: (message.key as WAMessageKey).remoteJid } },
-                      { key: { path: ['fromMe'], equals: (message.key as WAMessageKey).fromMe } },
-                    ],
-                  },
-                }),
-            });
-            return { message: 'deleted' };
-          }
-        }
-      }
+      if (event === Events.MESSAGES_DELETE) return this.applyWhatsappProviderDelete(instance, body);
 
       if (event === 'messages.edit' || event === 'send.message.update') {
         const editedMessageContentRaw =

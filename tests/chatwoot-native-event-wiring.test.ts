@@ -99,22 +99,42 @@ test('actual group edit/reaction/reply methods scope colliding provider IDs to t
   assert.equal(await findNativeMessageByKey(service.prismaRepository, 'instance-1', 'SAME'), null);
 });
 
-test('delete wiring passes full event key and drops only exact native peer/direction mappings; reads match by id and direction', () => {
+test('delete wiring passes the full event key, always marks Chatwoot and keeps the EVO row; reads match by id and direction', () => {
   const source = fs.readFileSync(require.resolve(servicePath), 'utf8');
   const ast = ts.createSourceFile('service.ts', source, ts.ScriptTarget.Latest, true);
   const klass = ast.statements.find(ts.isClassDeclaration)!;
   const event = klass.members.find((member) => member.name?.getText(ast) === 'processWhatsappEvent')!.getText(ast);
-  const deleteStart = event.indexOf('if (event === Events.MESSAGES_DELETE)');
-  const deleteBranch = event.slice(deleteStart, event.indexOf("if (event === 'messages.edit'", deleteStart));
+  // processWhatsappEvent only delegates; eventWhatsapp routes revokes through the per-instance limiter.
+  assert.match(
+    event,
+    /if \(event === Events\.MESSAGES_DELETE\) return this\.applyWhatsappProviderDelete\(instance, body\);/,
+  );
+  const ingress = klass.members.find((member) => member.name?.getText(ast) === 'eventWhatsapp')!.getText(ast);
+  assert.match(
+    ingress,
+    /if \(event === Events\.MESSAGES_DELETE\)\s*return this\.providerDeletes\.run\(instance\.instanceId, \(\) => this\.applyWhatsappProviderDelete\(instance, body\)\);/,
+  );
+  const deleteBranch = klass.members
+    .find((member) => member.name?.getText(ast) === 'applyWhatsappProviderDelete')!
+    .getText(ast);
+  // Cheap plain-row check before any binding reconciliation.
+  assert.ok(deleteBranch.indexOf('providerDeleteFastPath(row)') < deleteBranch.indexOf('getNativeEventTarget('));
   assert.match(deleteBranch, /getMessageByKeyId\(instance, body\.key\.id, body\.key\)/);
+  // Same binding reconciliation as edits, so a merged conversation still finds its message.
+  assert.match(deleteBranch, /getNativeEventTarget\(instance, body\.key\.id, body\.key\)/);
+  // Owner 2026-11-25: every WhatsApp revoke is marked in Chatwoot, whatever CHATWOOT_MESSAGE_DELETE says,
+  // and EVO keeps its row (marked deleted) instead of removing it.
+  assert.doesNotMatch(deleteBranch, /MESSAGE_DELETE;|chatwootDelete/);
+  assert.doesNotMatch(deleteBranch, /deleteMany/);
+  assert.match(deleteBranch, /provider_source: 'whatsapp'/);
+  assert.match(deleteBranch, /status: 'DELETED'/);
   // A READ receipt names the chat by LID while our stored message may carry the
   // phone JID: it is matched by id and direction; an ambiguous id still matches nothing.
   const readHelper = klass.members
     .find((member) => member.name?.getText(ast) === 'forwardWhatsappContactRead')!
     .getText(ast);
   assert.match(readHelper, /getMessageByKeyId\(instance, key\.id, \{ fromMe: true \}\)/);
-  assert.match(deleteBranch, /path: \['remoteJid'\], equals: \(message\.key as WAMessageKey\)\.remoteJid/);
-  assert.match(deleteBranch, /path: \['fromMe'\], equals: \(message\.key as WAMessageKey\)\.fromMe/);
+  assert.match(deleteBranch, /updateMany\(\{\s*where: \{ id: message\.id \}/);
 });
 
 test('actual durable ingress gives colliding native IDs distinct peer/direction identities and never trusts a local mapping as delivery', async (t) => {
