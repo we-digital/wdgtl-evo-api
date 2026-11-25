@@ -4,6 +4,8 @@ import test from 'node:test';
 import vm from 'node:vm';
 import ts from 'typescript';
 
+import { InstanceCountCache } from '../src/api/services/instance-count-cache';
+
 // Execute the literal production methods without booting provider sockets or schedulers.
 function methods(path: string, names: string[], globals: Record<string, unknown> = {}) {
   const file = ts.createSourceFile(path, readFileSync(path, 'utf8'), ts.ScriptTarget.Latest, true);
@@ -27,16 +29,22 @@ function fixture() {
       const where = args.where;
       if (where.token) return where.token === 'scoped' && (!where.id || where.id === row.id) &&
         (!where.name || where.name === row.name) ? [row] : [];
-      return [{ ...row, connectionStatus, Chatwoot: { enabled: true },
-        ...(args.include._count ? { _count: { Message: 17, Contact: 3, Chat: 2 } } : {}) }];
+      return [{ ...row, connectionStatus, Chatwoot: { enabled: true } }];
     },
     findFirst: async ({ where }: any) => where.id === row.id || where.number === row.number ? row : null,
-  } };
+  },
+  ...Object.fromEntries(Object.entries({ message: 17, contact: 3, chat: 2 }).map(([table, n]) => [table, {
+    groupBy: async (args: any) => {
+      calls.push({ groupBy: table, ...plain(args) });
+      return args.where.instanceId.in.includes(row.id) ? [{ instanceId: row.id, _count: { _all: n } }] : [];
+    },
+  }])) };
   const configService = { get: (key: string) => key === 'DATABASE' ?
     { CONNECTION: { CLIENT_NAME: 'client' } } : { API_KEY: { KEY: 'global' } } };
   const monitor = methods('src/api/services/monitor.service.ts', ['instanceInfo', 'instanceInfoById'],
     { NotFoundException: Error });
-  Object.assign(monitor, { prismaRepository: repository, configService, waInstances: { one: {} } });
+  Object.assign(monitor, { prismaRepository: repository, configService, waInstances: { one: {} },
+    instanceCounts: new InstanceCountCache(() => repository as any) });
   const controller = methods('src/api/controllers/instance.controller.ts', ['fetchInstances'],
     { UnauthorizedException: Error });
   Object.assign(controller, { prismaRepository: repository, configService, waMonitor: monitor });
@@ -75,7 +83,7 @@ test('omitted and true preserve exact counts; false omits only counts, not integ
   const { _count, ...rest } = full[0];
   assert.deepEqual(_count, { Message: 17, Contact: 3, Chat: 2 });
   assert.deepEqual(light, [rest]);
-  assert.equal(f.calls.at(-1).include._count, false);
+  assert.equal('_count' in f.calls.at(-1).include, false);
   assert.equal(f.calls.at(-1).where.clientName, 'client');
   f.setState('close');
   assert.equal((await f.request({ includeCounts: 'false' }))[0].connectionStatus, 'close');
@@ -89,7 +97,7 @@ for (const key of ['global', 'scoped']) {
       const light = await f.request({ ...query, includeCounts: 'false' }, key);
       const { _count, ...rest } = full[0];
       assert.deepEqual(light, [rest]);
-      assert.equal(f.calls.at(-1).include._count, false);
+      assert.equal('_count' in f.calls.at(-1).include, false);
       if (key === 'scoped') {
         assert.ok(f.calls.some(call => call.where.token === 'scoped'));
         assert.deepEqual(f.calls.at(-1).where.name, { in: ['one'] });
@@ -137,6 +145,7 @@ test('synthetic PostgreSQL: identical fields, fresh state and no history counts 
     const monitor = methods('src/api/services/monitor.service.ts', ['instanceInfo', 'instanceInfoById'],
       { NotFoundException: Error });
     Object.assign(monitor, { prismaRepository: db, waInstances: { synthetic: {} },
+      instanceCounts: new InstanceCountCache(() => db as any),
       configService: { get: () => ({ CONNECTION: { CLIENT_NAME: 'optimization-synthetic' } }) } });
     try {
       await db.instance.create({ data: { id: 'synthetic', name: 'synthetic', clientName: 'optimization-synthetic',
@@ -164,13 +173,28 @@ test('synthetic PostgreSQL: identical fields, fresh state and no history counts 
       const start = performance.now();
       for (let i = 0; i < 12; i++) await monitor.instanceInfo();
       const fullMs = performance.now() - start;
-      assert.equal(queries.filter(q => /\bCOUNT\s*\(/i.test(q)).length, 12);
+      // Counts come from the 5-minute cache filled by the first full call above.
+      assert.equal(queries.filter(q => /\bCOUNT\s*\(/i.test(q)).length, 0);
       await db.instance.update({ where: { id: 'synthetic' }, data: { connectionStatus: 'close' } });
       assert.equal((await monitor.instanceInfo(undefined, false))[0].connectionStatus, 'close');
       const named = plain(await monitor.instanceInfo(['synthetic'], false));
       assert.equal(named.length, 1);
       assert.equal('_count' in named[0], false);
-      console.log(JSON.stringify({ syntheticRows: 100000, requestsPerMode: 12, fullCountQueries: 12,
+      console.log(JSON.stringify({ syntheticRows: 100000, requestsPerMode: 12, fullCountQueries: 0,
         lightCountQueries: 0, fullMs, lightMs, connectionStateFresh: true }));
     } finally { await db.$disconnect(); }
   });
+
+test('full inventory: counts are shared from the cache, not recounted per request', async () => {
+  const f = fixture();
+  const first = await f.request();
+  assert.deepEqual(first[0]._count, { Message: 17, Contact: 3, Chat: 2 });
+  for (let i = 0; i < 5; i++) assert.deepEqual(await f.request(), first);
+  assert.equal(f.calls.filter(call => call.groupBy).length, 3);
+  // One grouped count per table, restricted to the listed ids; never Prisma's all-rows _count join.
+  for (const call of f.calls.filter(c => c.groupBy)) {
+    assert.deepEqual(call.by, ['instanceId']);
+    assert.deepEqual(call.where, { instanceId: { in: ['id-one'] } });
+  }
+  assert.ok(f.calls.filter(call => call.include).every(call => !('_count' in call.include)));
+});

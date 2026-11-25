@@ -148,10 +148,12 @@ export async function reconcileHistoryMessageBinding(
     async (binding) =>
       prisma.$transaction(
         async (tx) => {
+          // (id || ''): same order, but the lookup stays on Msg_instance_source_key_idx
+          // (see findNativeMessagesByKey).
           const rows = await tx.$queryRaw<Message[]>(Prisma.sql`
         SELECT * FROM "Message" WHERE "instanceId"=${source.instanceId} AND key->>'id'=${key.id}
           AND key->>'remoteJid'=${key.remoteJid} AND key->>'fromMe'=${String(key.fromMe)}
-          ORDER BY id LIMIT 33 FOR UPDATE`);
+          ORDER BY (id || '') LIMIT 33 FOR UPDATE`);
           if (
             rows.length < 1 ||
             rows.length > 32 ||

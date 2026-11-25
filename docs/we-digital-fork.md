@@ -1188,6 +1188,18 @@ Focused regression: `npx tsx --test tests/instance-inventory.test.ts`; local rea
 Prisma synthetic comparison must demonstrate equal fields and zero count SQL in
 lightweight mode before release.
 
+**2026-11-25: cached counters.** The full response keeps `_count`, but it no
+longer comes from Prisma's `_count` include, which joined a COUNT over every
+Message row of every instance on each call (prod 11-17..11-25: 2,827 calls,
+1.08 s mean, 72 s max). `InstanceCountCache` (`src/api/services/instance-count-cache.ts`)
+serves counts up to 5 min old from memory. Between 5 and 60 min old, it serves the
+cached counts and starts one background refresh. Older or missing counts are
+recounted before the answer, and concurrent callers share that recount. A
+refresh is three `groupBy instanceId` counts restricted to the listed ids.
+Connection state and integration fields are still read fresh on every request.
+Reapply: keep `instanceInfo` free of the `_count` include and merge counts from
+the cache.
+
 ### Single production bundle (same optimization release)
 
 `tsup.config.ts` now builds only `src/main.ts` as CommonJS. `package.json` and

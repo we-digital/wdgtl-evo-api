@@ -114,11 +114,14 @@ async function findNativeKeyRows(
     (scope?.fromMe !== undefined && typeof scope.fromMe !== 'boolean')
   )
     return [];
+  // ORDER BY (id || '') keeps the same order but matches no index, so the planner
+  // always looks the key up on Msg_instance_source_key_idx. A plain ORDER BY id
+  // LIMIT may instead walk Msg_instance_remotejid_id_idx over the whole chat.
   return prisma.$queryRaw<Message[]>(Prisma.sql`
     SELECT * FROM "Message" WHERE "instanceId"=${instanceId} AND key->>'id'=${keyId}
       ${scope?.remoteJid !== undefined ? Prisma.sql`AND key->>'remoteJid'=${scope.remoteJid}` : Prisma.empty}
       ${scope?.fromMe !== undefined ? Prisma.sql`AND key->>'fromMe'=${String(scope.fromMe)}` : Prisma.empty}
-      ORDER BY id LIMIT 33`);
+      ORDER BY (id || '') LIMIT 33`);
 }
 
 export async function findNativeMessageByKey(
