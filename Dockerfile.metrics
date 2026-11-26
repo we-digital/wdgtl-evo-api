@@ -1,4 +1,4 @@
-FROM evoapicloud/evolution-api:latest AS base
+FROM evoapicloud/evolution-api:latest@sha256:b2712c06caf333c7a7ade3bbbdd25f70c32abb74537ec75f786c24c99675deb3 AS base
 WORKDIR /evolution
 
 # Copiamos apenas o necessário para recompilar o dist com as mudanças locais
@@ -9,7 +9,7 @@ COPY src ./src
 RUN npm run build
 
 # Runtime final: reaproveita a imagem oficial e apenas sobrepõe o dist
-FROM evoapicloud/evolution-api:latest AS final
+FROM evoapicloud/evolution-api:latest@sha256:b2712c06caf333c7a7ade3bbbdd25f70c32abb74537ec75f786c24c99675deb3 AS final
 WORKDIR /evolution
 COPY --from=base /evolution/dist ./dist
 
