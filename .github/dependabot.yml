@@ -1,15 +1,8 @@
+# No github-actions entry: the workflow is hash-locked by .github/we-digital-actions-allowlist.txt and has no PR
+# CI, so action bumps must be made by hand with the allowlist refresh. npm: security updates only
+# (open-pull-requests-limit: 0 stops version-update PRs on this large untested fork).
 version: 2
 updates:
-  - package-ecosystem: "github-actions"
-    directory: "/"
-    schedule:
-      interval: "weekly"
-    cooldown:
-      default-days: 5
-    open-pull-requests-limit: 5
-    groups:
-      github-actions-all:
-        patterns: ["*"]
   - package-ecosystem: "docker"
     directory: "/"
     schedule:
@@ -24,9 +17,4 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    cooldown:
-      default-days: 5
-    open-pull-requests-limit: 5
-    groups:
-      npm-all:
-        patterns: ["*"]
+    open-pull-requests-limit: 0
